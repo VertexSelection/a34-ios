@@ -1,0 +1,548 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c604511..91809be 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/ruby_keys.c			standard
++bsd/dev/a34_touch.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_touch.c b/bsd/dev/a34_touch.c
+new file mode 100644
+index 0000000..aaec1dc
+--- /dev/null
++++ b/bsd/dev/a34_touch.c
+@@ -0,0 +1,453 @@
++/*
++ * A34: the Goodix GT9895 touchscreen (Berlin-D firmware), polled.
++ *
++ * Hardware (Samsung's A34 kernel 6.6 and the bare-metal probe, tools/payload/
++ * a34touch.c in the a34-ios repo):
++ *   - I2C0 at 0x11e00000 (mt6877: mt_i2c_regs_v2, 8-byte FIFO, byte-wide data
++ *     port, slave address in SLAVE_ADDR1), its APDMA channel at 0x10220200,
++ *     source clock i2c_sel = univpll/20 = 124.8 MHz; run at 400 kHz, polled
++ *   - chip address 0x5d, 4-byte big-endian register addresses
++ *   - AVDD = MT6359P LDO vio28 at 3.0 V; the boot loader leaves it off
++ *   - touch data at 0x10308 (read from the chip's IC info): 8-byte header
++ *     (byte 0 bit 7 = touch event, byte 2 low nibble = record count, bytes 6-7
++ *     = 16-bit sum of bytes 0-5), then 16-byte records and one 16-bit sum over
++ *     all of them. Writing 0 to 0x10308 hands the buffer back to the chip.
++ *   - record: b0 bits 1:0 type (0 touch), 5:2 id, 7:6 action (1 down, 2 move,
++ *     3 up); x = b1 << 4 | b3 >> 4, y = b2 << 4 | (b3 & 15), panel pixels
++ *
++ * A thread reads the header every 10 ms (8 ms while a finger is down) instead
++ * of taking the EINT14 interrupt; one header read is ~0.3 ms of bus time.
++ * Coordinates go to SweetHIDTouch, which knows the panel size (0903).
++ *
++ * Boot arg a34touch=1 (default off). a34touchlog=N logs the first N raw
++ * event frames (default 24).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#include "ruby_hal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void a34_touch_init(void);
++
++#define AT_PAGE          0x4000u
++
++/* 0x11e00000 page: I2C0 registers and the imp_iic_wrap_w clock gates. */
++#define AT_I2C_PA        0x11e00000u
++#define AT_IMPW_CLR      0x1e04u           /* CLK_IMPW_AP_CLOCK_I2C0 bit 0 */
++/* 0x10000000 page: topckgen and infracfg_ao. */
++#define AT_TOP_PA        0x10000000u
++#define AT_IFRAO_CLR0    0x1084u           /* ifrao_i2c_pseudo bit 11 */
++#define AT_IFRAO_CLR1    0x10a8u           /* ifrao_apdma bit 18 */
++#define AT_TOP_CFG10     0x00b0u           /* i2c_sel: [1:0] parent */
++/* 0x10220000 page: AP-DMA; I2C0's channel at +0x200. */
++#define AT_APDMA_PA      0x10220000u
++#define AT_APDMA_I2C0    0x0200u
++#define AT_PWRAP_PA      0x10026000u
++#define AT_PW_ACC        0x880u
++#define AT_PW_WDATA      0x884u
++#define AT_PW_STA        0x8a8u
++
++#define VIO28_CON0       0x1d64u           /* RG_LDO_VIO28_EN bit 0 */
++#define VIO28_MON        0x1d68u           /* DA_VIO28_B_EN bit 0 */
++#define VIO28_ANA_CON0   0x1faau           /* VOSEL [11:8], 0xb = 3.0 V */
++
++/* mt_i2c_regs_v2 */
++#define I_DATA           0x00u
++#define I_INTR_MASK      0x08u
++#define I_INTR_STAT      0x0cu
++#define I_CONTROL        0x10u
++#define I_TRANSFER_LEN   0x14u
++#define I_TRANSAC_LEN    0x18u
++#define I_DELAY_LEN      0x1cu
++#define I_TIMING         0x20u
++#define I_START          0x24u
++#define I_EXT_CONF       0x28u
++#define I_LTIMING        0x2cu
++#define I_HS             0x30u
++#define I_IO_CONFIG      0x34u
++#define I_FIFO_ADDR_CLR  0x38u
++#define I_SDA_TIMING     0x3cu
++#define I_LEN_AUX        0x44u
++#define I_CLOCK_DIV      0x48u
++#define I_SOFTRESET      0x50u
++#define I_SCL_MIS_COMP   0x90u
++#define I_SLAVE_ADDR1    0x94u
++
++#define ST_COMP          0x1u
++#define ST_ERRORS        0xeu              /* ACKERR, HS_NACKERR, ARB_LOST */
++
++#define GT_ADDR7         0x5du
++#define GT_VERSION       0x10014u
++#define GT_TOUCH         0x10308u
++#define GT_FINGERS       10
++#define GT_REC           16
++
++static vm_offset_t at_i2c, at_top, at_apdma, at_pwrap;
++static bool at_started;
++static int at_sleep_chan;
++static uint32_t at_parent;
++static uint32_t at_log_left = 24;
++static uint64_t at_frames, at_errors;
++static bool at_down[GT_FINGERS];
++
++static inline void
++at_w16(vm_offset_t base, uint32_t off, uint16_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint16_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline void
++at_w8(vm_offset_t base, uint32_t off, uint8_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint8_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline uint8_t
++at_r8(vm_offset_t base, uint32_t off)
++{
++	uint8_t v = *(volatile uint8_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++at_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&at_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++at_pwrap_write(uint16_t reg, uint16_t val)
++{
++	int i;
++
++	for (i = 0; i < 100000; i++)
++		if (((ruby_rd32(at_pwrap, AT_PW_STA) >> 1) & 7u) == 0)
++			break;
++	if (i == 100000)
++		return ETIMEDOUT;
++	ruby_wr32(at_pwrap, AT_PW_WDATA, val);
++	ruby_wr32(at_pwrap, AT_PW_ACC, (1u << 29) | reg);
++	for (i = 0; i < 100000; i++)
++		if (((ruby_rd32(at_pwrap, AT_PW_STA) >> 1) & 7u) == 0)
++			return 0;
++	return ETIMEDOUT;
++}
++
++/* 400 kHz from i2c-mt65xx.c's mtk_i2c_set_speed, per i2c_sel parent:
++ * 26 MHz, mainpll/32 = 68.25 MHz, univpll/20 = 124.8 MHz. */
++static const uint16_t at_timing[3]  = { 0x01b, 0x40c, 0x419 };
++static const uint16_t at_ltiming[3] = { 0x025, 0x114, 0x123 };
++static const uint16_t at_ext[3]     = { 0x1301, 0x3201, 0x5801 };
++static const uint16_t at_sda[3]     = { 0x100a, 0x1005, 0x100a };
++
++static void
++at_i2c_init(void)
++{
++	uint32_t p = at_parent > 2 ? 0 : at_parent;
++
++	at_w16(at_i2c, I_START, 0);
++	at_w16(at_i2c, I_INTR_STAT, ruby_rd16(at_i2c, I_INTR_STAT));
++	ruby_wr32(at_apdma, AT_APDMA_I2C0 + 0x0c, 1);
++	delay(2);
++	ruby_wr32(at_apdma, AT_APDMA_I2C0 + 0x0c, 0);
++	delay(2);
++	ruby_wr32(at_apdma, AT_APDMA_I2C0 + 0x0c, 0x6);
++	at_w16(at_i2c, I_SOFTRESET, 0x21);
++	delay(2);
++	ruby_wr32(at_apdma, AT_APDMA_I2C0 + 0x0c, 0);
++	at_w16(at_i2c, I_SOFTRESET, 0);
++	ruby_wr32(at_apdma, AT_APDMA_I2C0 + 0x18, 0x4);
++	at_w16(at_i2c, I_IO_CONFIG, 0x3);
++	at_w16(at_i2c, I_TIMING, at_timing[p]);
++	at_w16(at_i2c, I_HS, 0);
++	at_w16(at_i2c, I_LTIMING, at_ltiming[p]);
++	at_w16(at_i2c, I_EXT_CONF, at_ext[p]);
++	at_w16(at_i2c, I_CLOCK_DIV, 0);
++	at_w16(at_i2c, I_SCL_MIS_COMP, 0);
++	at_w16(at_i2c, I_SDA_TIMING, at_sda[p]);
++	at_w16(at_i2c, I_CONTROL, 0x32c);
++	at_w16(at_i2c, I_DELAY_LEN, 2);
++}
++
++/* One FIFO transaction: wlen (1..8) bytes out, then, if rlen (0..8), a
++ * repeated start and rlen bytes in. */
++static int
++at_xfer(const uint8_t *w, uint32_t wlen, uint8_t *r, uint32_t rlen)
++{
++	uint64_t deadline, now;
++	uint16_t st;
++	uint32_t i;
++
++	at_w16(at_i2c, I_CONTROL, rlen ? 0x3a : 0x28);
++	at_w16(at_i2c, I_SLAVE_ADDR1, GT_ADDR7 << 1);
++	at_w16(at_i2c, I_INTR_STAT, 0x20f);
++	at_w16(at_i2c, I_FIFO_ADDR_CLR, 1);
++	at_w16(at_i2c, I_INTR_MASK, 0);
++	at_w16(at_i2c, I_TRANSFER_LEN, (uint16_t)wlen);
++	at_w16(at_i2c, I_LEN_AUX, (uint16_t)rlen);
++	at_w16(at_i2c, I_TRANSAC_LEN, rlen ? 2 : 1);
++	for (i = 0; i < wlen; i++)
++		at_w8(at_i2c, I_DATA, w[i]);
++	at_w16(at_i2c, I_START, 1);
++	nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		st = ruby_rd16(at_i2c, I_INTR_STAT);
++		if (st & (ST_COMP | ST_ERRORS))
++			break;
++		now = mach_absolute_time();
++		if (now > deadline)
++			break;
++	}
++	at_w16(at_i2c, I_INTR_STAT, st);
++	if ((st & ST_ERRORS) || !(st & ST_COMP)) {
++		at_i2c_init();
++		return EIO;
++	}
++	for (i = 0; i < rlen; i++)
++		r[i] = at_r8(at_i2c, I_DATA);
++	return 0;
++}
++
++static int
++at_read(uint32_t reg, uint8_t *buf, uint32_t len)
++{
++	while (len) {
++		uint32_t n = len > 8 ? 8 : len;
++		uint8_t a[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16),
++		    (uint8_t)(reg >> 8), (uint8_t)reg };
++		int err = at_xfer(a, 4, buf, n);
++		if (err)
++			return err;
++		reg += n;
++		buf += n;
++		len -= n;
++	}
++	return 0;
++}
++
++static int
++at_write_byte(uint32_t reg, uint8_t val)
++{
++	uint8_t w[5] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16),
++	    (uint8_t)(reg >> 8), (uint8_t)reg, val };
++	return at_xfer(w, 5, NULL, 0);
++}
++
++static uint16_t
++at_sum(const uint8_t *p, uint32_t n)
++{
++	uint16_t s = 0;
++	while (n--)
++		s = (uint16_t)(s + *p++);
++	return s;
++}
++
++static void
++at_log_frame(const uint8_t *buf, uint32_t len)
++{
++	char line[3 * 64 + 1];
++	uint32_t i, n = len > 64 ? 64 : len;
++
++	for (i = 0; i < n; i++) {
++		line[3 * i] = "0123456789abcdef"[buf[i] >> 4];
++		line[3 * i + 1] = "0123456789abcdef"[buf[i] & 15];
++		line[3 * i + 2] = ' ';
++	}
++	line[3 * n] = 0;
++	printf("A34 TOUCH: frame %s\n", line);
++}
++
++static void
++at_release_all(void)
++{
++	for (int f = 0; f < GT_FINGERS; f++) {
++		if (at_down[f]) {
++			at_down[f] = false;
++			sweet_hid_touch(f, 0, 0, 0);
++		}
++	}
++}
++
++/* Returns true while at least one finger is down. */
++static bool
++at_poll(void)
++{
++	uint8_t buf[8 + GT_FINGERS * GT_REC + 2];
++	uint32_t count, len;
++	bool seen[GT_FINGERS] = { false };
++	bool any = false;
++
++	if (at_read(GT_TOUCH, buf, 8)) {
++		at_errors++;
++		return false;
++	}
++	if (buf[0] == 0)
++		return false;
++	count = buf[2] & 0x0fu;
++	if (count > GT_FINGERS)
++		count = GT_FINGERS;
++	len = 8 + (count ? count * GT_REC + 2 : 0);
++	if (count && at_read(GT_TOUCH + 8, buf + 8, len - 8)) {
++		at_errors++;
++		(void)at_write_byte(GT_TOUCH, 0);
++		return false;
++	}
++	(void)at_write_byte(GT_TOUCH, 0);
++	at_frames++;
++	if (at_log_left) {
++		at_log_left--;
++		at_log_frame(buf, len);
++	}
++	if (at_sum(buf, 6) != (uint16_t)(buf[6] | buf[7] << 8))
++		return false;
++	if (!(buf[0] & 0x80))
++		return false;                   /* status / gesture / request */
++	if (count == 0) {
++		at_release_all();
++		return false;
++	}
++	if (at_sum(buf + 8, count * GT_REC) !=
++	    (uint16_t)(buf[8 + count * GT_REC] | buf[9 + count * GT_REC] << 8)) {
++		at_errors++;
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		const uint8_t *r = buf + 8 + i * GT_REC;
++		uint32_t id = (r[0] >> 2) & 15u, action = r[0] >> 6;
++		int x = (r[1] << 4) | (r[3] >> 4);
++		int y = (r[2] << 4) | (r[3] & 15);
++
++		if ((r[0] & 3u) != 0 || id >= GT_FINGERS)
++			continue;
++		if (action == 3) {
++			if (at_down[id])
++				sweet_hid_touch((int)id, 0, x, y);
++			at_down[id] = false;
++			continue;
++		}
++		seen[id] = true;
++		at_down[id] = true;
++		sweet_hid_touch((int)id, 1, x, y);
++	}
++	for (int f = 0; f < GT_FINGERS; f++) {
++		if (at_down[f] && !seen[f]) {
++			/* not in this frame: the chip lists every finger down */
++			at_down[f] = false;
++			sweet_hid_touch(f, 0, 0, 0);
++		}
++		any |= at_down[f];
++	}
++	return any;
++}
++
++static void
++at_thread(void *arg, wait_result_t result)
++{
++	uint8_t ver[28];
++	uint32_t bad = 0;
++	(void)arg;
++	(void)result;
++
++	at_sleep_ms(250);                       /* firmware start after AVDD on */
++	at_i2c_init();
++	if (at_read(GT_VERSION, ver, sizeof(ver)) == 0) {
++		printf("A34 TOUCH: chip %.6s pid %.4s vid %02x%02x%02x%02x sum %s\n",
++		    (const char *)ver, (const char *)ver + 10, ver[18], ver[19],
++		    ver[20], ver[21],
++		    at_sum(ver, 26) == (uint16_t)(ver[26] | ver[27] << 8) ? "ok" : "BAD");
++	} else {
++		printf("A34 TOUCH: version read failed\n");
++	}
++	for (;;) {
++		uint64_t errors = at_errors;
++		bool down = at_poll();
++
++		if (at_errors != errors) {
++			if (++bad == 5 || bad % 500 == 0)
++				printf("A34 TOUCH: %llu I2C errors (%llu frames)\n",
++				    at_errors, at_frames);
++			if (bad >= 5) {
++				at_release_all();
++				at_sleep_ms(200);
++				continue;
++			}
++		} else {
++			bad = 0;
++		}
++		at_sleep_ms(down ? 8 : 10);
++	}
++}
++
++void
++a34_touch_init(void)
++{
++	int enabled = 0;
++	uint16_t en = 0, mon = 0, vosel = 0;
++	thread_t thread;
++
++	if (at_started)
++		return;
++	at_started = true;
++	if (!PE_parse_boot_argn("a34touch", &enabled, sizeof(enabled)) || enabled != 1) {
++		printf("A34 TOUCH: disabled (a34touch=0)\n");
++		return;
++	}
++	PE_parse_boot_argn("a34touchlog", &at_log_left, sizeof(at_log_left));
++	at_i2c = ml_io_map(AT_I2C_PA, AT_PAGE);
++	at_top = ml_io_map(AT_TOP_PA, AT_PAGE);
++	at_apdma = ml_io_map(AT_APDMA_PA, AT_PAGE);
++	at_pwrap = ml_io_map(AT_PWRAP_PA, 0x1000);
++	if (!at_i2c || !at_top || !at_apdma || !at_pwrap) {
++		printf("A34 TOUCH: MMIO mapping failed\n");
++		return;
++	}
++
++	/* Touch power: vio28 at 3.0 V. Done here, before the key poll thread
++	 * starts using the PMIC wrapper. */
++	if (ruby_pwrap_read(at_pwrap, VIO28_CON0, &en) != 0 ||
++	    ruby_pwrap_read(at_pwrap, VIO28_ANA_CON0, &vosel) != 0) {
++		printf("A34 TOUCH: PMIC read failed\n");
++		return;
++	}
++	if (!(en & 1u)) {
++		if (((vosel >> 8) & 0xfu) != 0xbu)
++			(void)at_pwrap_write(VIO28_ANA_CON0, (uint16_t)((vosel & ~0x0f00u) | 0x0b00u));
++		(void)at_pwrap_write(VIO28_CON0, (uint16_t)(en | 1u));
++		delay(3000);
++	}
++	(void)ruby_pwrap_read(at_pwrap, VIO28_MON, &mon);
++
++	/* Clocks (enable = write the bit to the gate's CLR register). */
++	ruby_wr32(at_top, AT_IFRAO_CLR1, 1u << 18);
++	ruby_wr32(at_top, AT_IFRAO_CLR0, 1u << 11);
++	ruby_wr32(at_i2c, AT_IMPW_CLR, 1u << 0);
++	at_parent = ruby_rd32(at_top, AT_TOP_CFG10) & 3u;
++	printf("A34 TOUCH: vio28 en %04x->%04x mon %04x vosel %04x, i2c_sel %u\n",
++	    en, en | 1u, mon, vosel, at_parent);
++
++	if (kernel_thread_start(at_thread, NULL, &thread) == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("A34 TOUCH: kernel_thread_start failed\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 61498c9..88e58f4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void ruby_keys_init(void);
++extern void a34_touch_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -702,6 +703,9 @@ sweet_ufs_init(void)
+ 	} else {
+ 		printf("SWEET UFS: legacy keys/touch/USB skipped (ruby, sweethw=0)\n");
+ 	}
++	/* A34 (0903): touch first, it powers the chip through the PMIC wrapper
++	 * before the key poll thread starts using it. */
++	a34_touch_init();
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 279b667..f76775c 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -369,6 +369,7 @@ private:
+ 	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;   /* A34 (0903): from the boot framebuffer, not 1080x2400 */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -441,11 +442,16 @@ SweetHIDTouch::start(IOService *provider)
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
++	PE_current_console(&video);
++	fPanelW = video.v_width ? (int)video.v_width : 1080;
++	fPanelH = video.v_height ? (int)video.v_height : 2400;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
++	IOLog("SWEET HID: touch panel %dx%d presented as %dx%d\n", fPanelW, fPanelH, fLogicalW, fLogicalH);
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -567,8 +573,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -581,8 +587,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

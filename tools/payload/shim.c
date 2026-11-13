@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include "a34ufs.h"
+#include "a34touch.h"
 
 #ifndef BCB_WRITE
 #define BCB_WRITE 0     // 0: only read and report the misc bootloader message
@@ -154,7 +155,7 @@ static int find_placeholder(u64 dtb)
 // Command-mode panels only show memory changes when the engine sends a frame:
 // re-enable every display mutex that has modules attached, then start DSI0
 // (MTK LK's ddp_mutex_enable + DSI_Start).
-static void display_trigger(void)
+static void __attribute__((unused)) display_trigger(void)
 {
     if (rd32(DSI0 + 0x14) & 3)          // video mode refreshes by itself
         return;
@@ -217,7 +218,35 @@ u64 shim_main(u64 dtb, u64 load)
     paint();
     int have_out = find_placeholder(dtb);
 
+#ifdef TOUCH_PROBE
+    // v6t: touch bring-up facts instead of the display dump (see a34touch.c).
     if (have_out) {
+        static struct a34touch t;
+        a34touch_probe(&t);
+        put_str("v6t-s"); put_hex(t.stage, 1);
+        put_str("-P"); put_hex(t.pw_sta, 8); put('_'); put_hex(t.pm_err, 2);
+        put('_'); put_hex(t.vio_en, 4); put_hex(t.vio_mon, 4); put_hex(t.vio_vosel, 4);
+        put_hex(t.top, 4); put('_'); put_hex(t.vio_en2, 4); put_hex(t.vio_mon2, 4);
+        put_str("-C"); put_hex(t.impw, 8); put('_'); put_hex(t.ifrao0, 8); put('_');
+        put_hex(t.ifrao1, 8); put('_'); put_hex(t.cfg10, 8);
+        put_str("-c"); put_hex(t.impw2, 8); put('_'); put_hex(t.ifrao02, 8); put('_');
+        put_hex(t.ifrao12, 8); put('_'); put_hex(t.cfg10_2, 8);
+        put_str("-L"); put_hex(t.mainpll, 8); put('_'); put_hex(t.univpll, 8);
+        put_str("-G"); put_hex(t.mode8, 8); put('_'); put_hex(t.mode8_2, 8); put('_');
+        put_hex(t.mode1, 8); put('_'); put_hex(t.dir0, 8); put('_');
+        put_hex(t.din0_before, 8); put('_'); put_hex(t.din0_after, 8);
+        put_str("-I"); put_hex(t.i2c_ctrl, 4); put('_'); put_hex(t.i2c_timing, 4);
+        put('_'); put_hex(t.st_ver, 8); put('_'); put_hex(t.st_info, 8);
+        put('_'); put_hex(t.st_esd, 8); put('_'); put_hex(t.st_hdr, 8);
+        put_str("-V"); for (unsigned i = 0; i < sizeof(t.ver); i++) put_hex(t.ver[i], 2);
+        put_str("-N"); put_hex(t.info_len[0], 2); put_hex(t.info_len[1], 2);
+        put_str("-E"); put_hex(t.esd, 2);
+        put_str("-H"); for (unsigned i = 0; i < sizeof(t.hdr); i++) put_hex(t.hdr[i], 2);
+    }
+    if (0) {
+#else
+    if (have_out) {
+#endif
         put_str("v5");
         put_str("-E"); put_hex(SYSREG(CurrentEL) >> 2, 1);
         put_str("-S"); put_hex(SYSREG(sctlr_el1), 8);
@@ -241,9 +270,11 @@ u64 shim_main(u64 dtb, u64 load)
     if (have_out) {
         put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
         put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
+#ifndef TOUCH_PROBE
         // OVL1_2L last: mutex 0 bit 16 may be it; if reading it hangs, the
         // results above are lost but the recovery note is already cleared.
         dump_ovl('Q', OVL1_2L, 2);
+#endif
     }
 
     // Copy the payload Image to the next 2 MiB boundary after the blob.

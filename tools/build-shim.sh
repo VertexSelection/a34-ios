@@ -16,11 +16,12 @@ BCB_WRITE=${BCB_WRITE:-0}
 $CC $CFLAGS -c -o "$P/shim-start.o" "$P/shim-start.S"
 $CC $CFLAGS -DBCB_WRITE=$BCB_WRITE ${SHIM_DEFS:-} -c -o "$P/shim.o" "$P/shim.c"
 $CC $CFLAGS -c -o "$P/a34ufs.o" "$P/a34ufs.c"
-aarch64-linux-gnu-ld -T "$P/shim.ld" -o "$P/shim.elf" "$P/shim-start.o" "$P/shim.o" "$P/a34ufs.o"
+$CC $CFLAGS -c -o "$P/a34touch.o" "$P/a34touch.c"
+aarch64-linux-gnu-ld -T "$P/shim.ld" -o "$P/shim.elf" "$P/shim-start.o" "$P/shim.o" "$P/a34ufs.o" "$P/a34touch.o"
 echo "BCB_WRITE=$BCB_WRITE"
 
 # The blob is loaded at an address LK picks, so absolute relocations would break it.
-if aarch64-linux-gnu-readelf -r "$P/shim-start.o" "$P/shim.o" "$P/a34ufs.o" | grep -qE "R_AARCH64_(ABS|MOVW_UABS)"; then
+if aarch64-linux-gnu-readelf -r "$P/shim-start.o" "$P/shim.o" "$P/a34ufs.o" "$P/a34touch.o" | grep -qE "R_AARCH64_(ABS|MOVW_UABS)"; then
     echo "absolute relocation found; shim is not position independent" >&2
     exit 1
 fi
