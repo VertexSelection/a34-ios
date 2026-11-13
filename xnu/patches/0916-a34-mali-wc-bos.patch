@@ -1,0 +1,299 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 23a9d9a..472bce1 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -68,6 +68,10 @@
+  * mapped here, and other surfaces at IOSurfaceLock/Unlock (SweetSurface).
+  * The first 16 jobs of a client log a line with their cache upkeep, then a
+  * summary every 200 (at most one per 2 s).
++ *
++ * A34 (0916): programs map their buffers write-combined (A34MaliWCMemory,
++ * physically contiguous pages), as Linux panfrost does: those need no cache
++ * upkeep. Boot-arg a34maliwc=0: all cacheable, as in 0915.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -243,6 +247,7 @@ union a34_request {
+ 
+ struct a34_bo {
+ 	IOBufferMemoryDescriptor *mem;  /* the buffer's own memory (NULL: a surface's, or the handle is free) */
++	IOMemoryDescriptor *wc;         /* A34 (0916): mem's pages for the program, write-combined (A34MaliWCMemory), or NULL */
+ 	SweetSurface *surface;          /* A34 (0914): the IOSurface whose memory this is (0x7e), held */
+ 	uintptr_t kva;                  /* A34 (0914): the surface's memory in the kernel, for cache upkeep */
+ 	uint64_t va;                    /* its GPU address */
+@@ -281,6 +286,8 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_UPKEEP_WINDOW_NS    (2ull * NSEC_PER_SEC)   /* and no more often than this */
+ #define A34_LOGGED_ERRORS       64u
+ #define A34_LOGGED_SURFACES     16u             /* A34 (0914): surfaces taken / refused, logged per client */
++#define A34_LOGGED_WC_FALLBACKS 8u              /* A34 (0916): cacheable for want of contiguous memory, logged per client */
++#define A34_WC_MAX              (64ull << 20)   /* A34 (0916): bigger buffers are not tried contiguous */
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+@@ -288,6 +295,7 @@ static uint64_t gA34MaliWiredMax = 1024ull << 20;
+ static uint64_t gA34MaliHeapBacked = 64ull << 20;
+ static uint32_t gA34MaliClients;
+ static uint32_t gA34MaliSurfaces = 1;           /* A34 (0914): boot-arg a34malisurf=0: request 0x7e refuses every surface */
++static uint32_t gA34MaliWC = 1;                 /* A34 (0916): boot-arg a34maliwc=0: every buffer cacheable, as 0915 */
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+@@ -333,6 +341,7 @@ RedwoodMaliStart(void)
+ 		gA34MaliWiredMax = (uint64_t)mb << 20;
+ 	}
+ 	(void)PE_parse_boot_argn("a34malisurf", &gA34MaliSurfaces, sizeof(gA34MaliSurfaces));
++	(void)PE_parse_boot_argn("a34maliwc", &gA34MaliWC, sizeof(gA34MaliWC));
+ 	gpu = OSTypeAlloc(RedwoodMali);
+ 	if (gA34MaliLock == NULL || platform == NULL || gpu == NULL || !gpu->init()) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -352,13 +361,96 @@ RedwoodMaliStart(void)
+ 	}
+ 	gpu->release();                 /* the registry holds it */
+ 	IOLog("A34 MALI UC: RedwoodMali published (panfrost %d.%d, heaps backed %llu MB, buffers at most %llu MB, "
+-	    "IOSurfaces %s)\n", A34_DRIVER_MAJOR, A34_DRIVER_MINOR, (unsigned long long)(gA34MaliHeapBacked >> 20),
+-	    (unsigned long long)(gA34MaliWiredMax >> 20), gA34MaliSurfaces ? "shared" : "not shared (a34malisurf=0)");
++	    "IOSurfaces %s, buffers %s)\n", A34_DRIVER_MAJOR, A34_DRIVER_MINOR, (unsigned long long)(gA34MaliHeapBacked >> 20),
++	    (unsigned long long)(gA34MaliWiredMax >> 20), gA34MaliSurfaces ? "shared" : "not shared (a34malisurf=0)",
++	    gA34MaliWC ? "write-combined for programs" : "cacheable (a34maliwc=0)");
+ 	return true;
+ }
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * A34 (0916): a buffer's pages as programs map them, write-combined, as
++ * Linux panfrost maps every buffer (Mesa 26.3 at driver 1.5 takes every
++ * mapping for write-combined and does no cache maintenance of its own): no
++ * cache upkeep around jobs for them at all.
++ *
++ * The pages are a physically contiguous IOBufferMemoryDescriptor of the
++ * kernel's (no cache mode: its own VM object, whose attributes nobody
++ * changes). This describes the same pages as physical memory with the
++ * write-combine cache mode of its own (kIOMemoryBufferCacheMask): mapped,
++ * IOKit makes a device pager for it and the VM enters each page
++ * write-combined into the program's pmap, per mapping (pmap_enter with the
++ * object's WIMG), without vm_object_change_wimg_mode() or a cache flush by
++ * physical address -- the path that panicked. The panel's surface is mapped
++ * through the same path (SweetFramebuffer). A program's cache-mode request
++ * cannot turn it cacheable: the default mode of a physical range is the
++ * descriptor's own.
++ *
++ * The kernel's mappings of those pages stay cacheable and are not used
++ * after the buffer was zeroed and cleaned+invalidated in createBo(): no
++ * dirty line of them can exist, so nothing can be written back over what a
++ * program or the GPU wrote; lines the CPU may fetch ahead through them are
++ * clean, the GPU does not look at the CPU's caches, and the program reads
++ * and writes past them, write-combined -- arm64 Linux keeps the same
++ * cacheable linear alias of its non-coherent write-combined DMA buffers.
++ *
++ * The pages live as long as this does (it holds the buffer): a program's
++ * mapping holds it, so they are not freed under a mapping that outlives
++ * GEM_CLOSE. (In a DEVELOPMENT kernel IOKit reports each mapping of
++ * managed pages through a physical descriptor once, with a backtrace.)
++ */
++class A34MaliWCMemory : public IOGeneralMemoryDescriptor
++{
++	OSDeclareDefaultStructors(A34MaliWCMemory);
++
++	IOBufferMemoryDescriptor *fBacking;
++
++public:
++	static A34MaliWCMemory *withBuffer(IOBufferMemoryDescriptor *backing);
++	void free(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(A34MaliWCMemory, IOGeneralMemoryDescriptor);
++
++/* The write-combined view of a physically contiguous buffer, or NULL (not contiguous, no memory). */
++A34MaliWCMemory *
++A34MaliWCMemory::withBuffer(IOBufferMemoryDescriptor *backing)
++{
++	A34MaliWCMemory *me;
++	IOAddressRange range;
++	IOByteCount contiguous = 0;
++	addr64_t pa = backing->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
++
++	if (pa == 0 || (pa & PAGE_MASK) != 0 || contiguous < backing->getLength()) {
++		return NULL;
++	}
++	range.address = (IOVirtualAddress)pa;
++	range.length = backing->getLength();
++	me = OSTypeAlloc(A34MaliWCMemory);
++	if (me == NULL) {
++		return NULL;
++	}
++	if (!me->initWithOptions(&range, 1, 0, TASK_NULL, kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone |
++	    ((IOOptionBits)kIOWriteCombineCache << kIOMemoryBufferCacheShift), NULL)) {
++		me->release();
++		return NULL;
++	}
++	backing->retain();
++	me->fBacking = backing;
++	return me;
++}
++
++/* No mapping of it is left (each held it): the pages may go. */
++void
++A34MaliWCMemory::free(void)
++{
++	OSSafeReleaseNULL(fBacking);
++	IOGeneralMemoryDescriptor::free();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
+ class RedwoodMaliUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodMaliUserClient);
+@@ -369,6 +461,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fBoCount, fBoMade, fSubmits, fFailed, fErrors;
+ 	uint64_t fWired;                        /* bytes of this client's buffers */
+ 	uint32_t fSurfaceBos, fSurfacesTaken, fSurfacesRefused; /* A34 (0914): surfaces among the buffers; taken, refused */
++	uint32_t fWcMade, fWcFallbacks;         /* A34 (0916): buffers made write-combined; that had to be cacheable */
+ 	/* A34 (0915): cache upkeep per job, for the log: this window's jobs, mach time upkeep took (all, most), job ns, bytes */
+ 	uint32_t fWinJobs;
+ 	uint64_t fWinUpkeep, fWinUpkeepMax, fWinJobNs, fWinBytes, fWinStarted;
+@@ -495,7 +588,8 @@ RedwoodMaliUserClient::upkeep(bool before, bool all)
+ 			b->state &= ~A34_BO_LISTED;
+ 		}
+ 		if (b->mem != NULL) {
+-			if ((b->flags & PANFROST_BO_HEAP) != 0 || (b->state & A34_BO_MAPPED) == 0 ||
++			/* (0916: a write-combined one needs nothing: the CPU's caches never hold anything of it) */
++			if (b->wc != NULL || (b->flags & PANFROST_BO_HEAP) != 0 || (b->state & A34_BO_MAPPED) == 0 ||
+ 			    (b->state & A34_BO_DONTNEED) != 0 || (!before && !listed)) {
+ 				continue;
+ 			}
+@@ -592,12 +686,13 @@ RedwoodMaliUserClient::freeBo(struct a34_bo *b)
+ 		OSDecrementAtomic(&b->surface->gpuShared);
+ 		b->surface->release();
+ 	} else {
+-		if ((b->state & A34_BO_MAPPED) != 0 && (b->flags & PANFROST_BO_HEAP) == 0) {
++		if ((b->state & A34_BO_MAPPED) != 0 && (b->flags & PANFROST_BO_HEAP) == 0 && b->wc == NULL) {
+ 			/* A34 (0915): no dirty line of the program's left over its pages for their next owner */
+ 			a34_mali_cpu_flush((uintptr_t)b->mem->getBytesNoCopy(), b->backed);
+ 		}
+ 		gA34MaliWired -= b->backed;
+ 		fWired -= b->backed;
++		OSSafeReleaseNULL(b->wc);       /* A34 (0916): a mapping of it holds it, and it the pages */
+ 		b->mem->release();      /* a program's mapping of it holds it until unmapped */
+ 	}
+ 	bzero(b, sizeof(*b));
+@@ -623,8 +718,9 @@ RedwoodMaliUserClient::releaseAll(void)
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
+ 	if (was) {
+-		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made, %u surfaces taken), %u job chains, %u failed, "
+-		    "%u errors; %u clients left\n", fName, freed, fBoMade, fSurfacesTaken, fSubmits, fFailed, fErrors, clients);
++		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made, %u write-combined, %u cacheable for want of "
++		    "contiguous memory, %u surfaces taken), %u job chains, %u failed, %u errors; %u clients left\n", fName, freed,
++		    fBoMade, fWcMade, fWcFallbacks, fSurfacesTaken, fSubmits, fFailed, fErrors, clients);
+ 	}
+ }
+ 
+@@ -653,7 +749,7 @@ IOReturn
+ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ {
+ 	IOBufferMemoryDescriptor *mem;
+-	IOMemoryDescriptor *md;
++	IOMemoryDescriptor *md, *wc;
+ 	struct a34_bo *b = NULL;
+ 	uint64_t vasize, backed, va, off;
+ 	uint32_t handle = 0;
+@@ -689,22 +785,50 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		return kIOReturnNoResources;
+ 	}
+ 	/*
+-	 * A34 (0911): cacheable, not write-combined. Making the buffer
+-	 * write-combined (vm_object_change_wimg_mode) flushed a page whose
+-	 * physical address is outside the kernel's RAM and panicked
+-	 * (phystokv_range, 0x94a7c000). Instead the CPU's caches are kept
++	 * A34 (0916): what the program maps is write-combined, as Linux
++	 * panfrost maps it (A34MaliWCMemory): physically contiguous pages, the
++	 * program's mapping of them write-combined. Not for the tiler heap (the
++	 * GPU's alone), not when Mesa asks for a cached mapping (WB_MMAP), not
++	 * past A34_WC_MAX, and not when no contiguous memory is to be had: then
++	 * cacheable, as 0911 made every buffer (making an ordinary buffer
++	 * write-combined changes its pages' attributes and cleans them by
++	 * physical address: a page outside the kernel's physical aperture
++	 * panicked, phystokv_range 0x94a7c000), with the CPU's caches kept
+ 	 * around each job (upkeep(), 0915).
+ 	 */
+-	mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)backed, PAGE_SIZE);
++	mem = NULL;
++	wc = NULL;
++	if (gA34MaliWC != 0 && !heap && (req->flags & PANFROST_BO_WB_MMAP) == 0 && backed <= A34_WC_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, (vm_size_t)backed, PAGE_SIZE);
++		wc = mem != NULL ? A34MaliWCMemory::withBuffer(mem) : NULL;
++		if (wc == NULL) {
++			OSSafeReleaseNULL(mem);
++			if (fWcFallbacks++ < A34_LOGGED_WC_FALLBACKS) {
++				IOLog("A34 MALI UC: %s: no contiguous %llu KB for a write-combined buffer: cacheable instead\n", fName,
++				    (unsigned long long)(backed >> 10));
++			}
++		} else {
++			fWcMade++;
++		}
++	}
++	if (mem == NULL) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)backed, PAGE_SIZE);
++	}
+ 	if (mem == NULL) {
+ 		IOLog("A34 MALI UC: %s: no memory for a buffer of %llu KB\n", fName, (unsigned long long)(backed >> 10));
+ 		return kIOReturnNoMemory;
+ 	}
+-	/* Zeroed through the cache: to memory before the GPU sees it. */
++	/*
++	 * Zeroed through the cache: to memory before the GPU sees it. A
++	 * write-combined buffer is not touched through the kernel's cacheable
++	 * mapping again: from here on no dirty line of it exists anywhere.
++	 */
+ 	a34_mali_cpu_flush((uintptr_t)mem->getBytesNoCopy(), backed);
+ 	va = a34_mali_va_alloc(vasize, (req->flags & PANFROST_BO_NOEXEC) == 0);
+ 	if (va == 0) {
++		OSSafeReleaseNULL(wc);
+ 		mem->release();
+ 		IOLog("A34 MALI UC: %s: no GPU addresses left for %llu KB\n", fName, (unsigned long long)(vasize >> 10));
+ 		return kIOReturnNoSpace;
+@@ -722,6 +846,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		if (pa == 0 || len == 0 || !a34_mali_map(va + off, pa, len)) {
+ 			a34_mali_unmap(va, backed);
+ 			a34_mali_va_free(va, vasize);
++			OSSafeReleaseNULL(wc);
+ 			mem->release();
+ 			IOLog("A34 MALI UC: %s: a buffer of %llu KB would not go into the GPU's tables (at 0x%llx: 0x%llx, 0x%llx bytes)\n",
+ 			    fName, (unsigned long long)(backed >> 10), (unsigned long long)off, (unsigned long long)pa,
+@@ -731,6 +856,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		off += len;
+ 	}
+ 	b->mem = mem;
++	b->wc = wc;
+ 	b->va = va;
+ 	b->vasize = vasize;
+ 	b->backed = backed;
+@@ -910,7 +1036,8 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 
+ 	IOLockLock(gA34MaliLock);
+ 	b = lookup(type);
+-	if (b != NULL && (b->surface != NULL || (b->flags & PANFROST_BO_HEAP) == 0) && (b->state & A34_BO_MAPPED) == 0) {
++	if (b != NULL && (b->surface != NULL || (b->flags & PANFROST_BO_HEAP) == 0) && (b->state & A34_BO_MAPPED) == 0 &&
++	    b->wc == NULL) {
+ 		/*
+ 		 * A34 (0915): its first mapping. Until now the CPU never touched it
+ 		 * and no job cleaned it; lines the CPU may have fetched ahead of a
+@@ -925,6 +1052,13 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 		*memory = b->surface->memory;
+ 		*options = 0;
+ 		ret = kIOReturnSuccess;
++	} else if (b != NULL && b->wc != NULL) {
++		/* A34 (0916): its pages, write-combined whatever cache mode the program asks for (A34MaliWCMemory) */
++		b->state |= A34_BO_MAPPED;
++		b->wc->retain();                /* given to the mapping */
++		*memory = b->wc;
++		*options = 0;
++		ret = kIOReturnSuccess;
+ 	} else if (b != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
+ 		b->mem->retain();               /* given to the mapping */
+ 		*memory = b->mem;
