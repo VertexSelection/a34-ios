@@ -1,0 +1,187 @@
+diff --git a/bsd/dev/a34_diag.c b/bsd/dev/a34_diag.c
+index d84e2a9..10ff70a 100644
+--- a/bsd/dev/a34_diag.c
++++ b/bsd/dev/a34_diag.c
+@@ -23,6 +23,7 @@ extern void thread_deallocate(thread_t);
+ extern unsigned int a34_cpu_diag(uint64_t *out, unsigned int max_cpus);
+ extern uint64_t sweet_fb_swap_count;
+ extern uint64_t a34_fb_stats[6];
++extern uint64_t a34_kick_stats[6];
+ void a34_diag_init(void);
+ 
+ #define A34_HB_CPUS 8
+@@ -38,7 +39,7 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 
+-	uint64_t prev[6] = { 0 };
++	uint64_t prev[6] = { 0 }, kprev[6] = { 0 };
+ 
+ 	absolutetime_to_nanoseconds(1000, &tick_ns);    /* ns per 1000 ticks */
+ 	for (;;) {
+@@ -81,6 +82,22 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 		for (int k = 0; k < 6; k++) {
+ 			prev[k] = s[k];
+ 		}
++
++		/* panel kicks (0906): wait for idle, transfer time */
++		uint64_t ks[6], dk;
++		for (int k = 0; k < 6; k++) {
++			ks[k] = a34_kick_stats[k];
++		}
++		dk = ks[0] - kprev[0];
++		if (dk != 0) {
++			printf("A34 KICK %llu: wait %lluus xfer %lluus (max %llu/%lluus) timeouts %llu\n",
++			    dk, (ks[1] - kprev[1]) / dk * tick_ns / 1000000,
++			    (ks[2] - kprev[2]) / dk * tick_ns / 1000000,
++			    ks[3] * tick_ns / 1000000, ks[4] * tick_ns / 1000000, ks[5]);
++		}
++		for (int k = 0; k < 6; k++) {
++			kprev[k] = ks[k];
++		}
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 02db05c..d30d9fc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -197,6 +197,13 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	a34_kick_wl = IOWorkLoop::workLoop();
++	a34_kick_timer = IOTimerEventSource::timerEventSource(this, &a34_kick_action);
++	if (a34_kick_wl == NULL || a34_kick_timer == NULL ||
++	    a34_kick_wl->addEventSource(a34_kick_timer) != kIOReturnSuccess) {
++		IOLog("SWEET FB: no kick work loop, kicking inline\n");
++		OSSafeReleaseNULL(a34_kick_timer);
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -209,6 +216,65 @@ AppleCLCD::start(IOService *provider)
+ 
+ extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
+ 
++/*
++ * A34 (0906): the panel is a command-mode DSI panel; every presented frame
++ * needs a trigger, and a trigger sent while the previous frame is still
++ * being transferred is lost. A frame transfer takes far longer than a vsync
++ * here (0905: always > 23 ms), so the trigger runs on its own work loop: it
++ * waits (up to 1 s) for the DSI to go idle, triggers, and measures how long
++ * the transfer takes. present() only copies and asks for a kick, so the
++ * vsync work loop never waits on the panel.
++ */
++extern "C" int a34_dsi_busy(void);
++extern "C" void a34_dsi_trigger(void);
++extern "C" uint64_t a34_kick_stats[6];   /* kicks, wait, transfer, wait max, transfer max, timeouts */
++uint64_t a34_kick_stats[6];
++static IOWorkLoop *a34_kick_wl;
++static IOTimerEventSource *a34_kick_timer;
++
++static bool
++a34_dsi_wait_idle(uint64_t *ticks)
++{
++	uint64_t t0 = mach_absolute_time(), limit;
++
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &limit);
++	while (a34_dsi_busy()) {
++		if (mach_absolute_time() - t0 > limit) {
++			*ticks = mach_absolute_time() - t0;
++			return false;
++		}
++		IODelay(200);
++	}
++	*ticks = mach_absolute_time() - t0;
++	return true;
++}
++
++static void
++a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
++{
++	uint64_t wait, xfer;
++	(void)owner;
++	(void)sender;
++
++	if (!a34_dsi_wait_idle(&wait)) {
++		a34_kick_stats[5]++;
++	}
++	a34_dsi_trigger();
++	IODelay(50);
++	if (!a34_dsi_wait_idle(&xfer)) {
++		a34_kick_stats[5]++;
++	}
++	a34_kick_stats[0]++;
++	a34_kick_stats[1] += wait;
++	a34_kick_stats[2] += xfer;
++	if (wait > a34_kick_stats[3]) {
++		a34_kick_stats[3] = wait;
++	}
++	if (xfer > a34_kick_stats[4]) {
++		a34_kick_stats[4] = xfer;
++	}
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -442,7 +508,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
+ 	uint64_t t_kick = mach_absolute_time();
+-	a34_display_kick();
++	if (a34_kick_timer != NULL) {
++		a34_kick_timer->setTimeoutUS(1);        /* coalesces while a kick runs */
++	} else {
++		a34_display_kick();
++	}
+ 	t_kick = mach_absolute_time() - t_kick;
+ 	a34_fb_stats[0]++;
+ 	a34_fb_stats[3] += t_kick;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index f3e9702..65a1bdc 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -751,6 +751,41 @@ fbcon_kick(void)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * A34 (0906): split for the GUI's kick work loop (SweetFramebuffer.cpp):
++ * a34_dsi_busy() is true while a command-mode frame transfer is running,
++ * a34_dsi_trigger() starts the next one.
++ */
++int a34_dsi_busy(void);
++int
++a34_dsi_busy(void)
++{
++	if (fbcon_dsi == NULL || (fbcon_dsi[0x14 / 4] & 3)) {
++		return 0;
++	}
++	return (fbcon_dsi[0x0c / 4] & (1u << 31)) != 0;
++}
++
++void a34_dsi_trigger(void);
++void
++a34_dsi_trigger(void)
++{
++	if (fbcon_dsi == NULL || (fbcon_dsi[0x14 / 4] & 3)) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned int n = 0; n < 16; n++) {
++		if (fbcon_mutex[(0x30 + 0x20 * n) / 4]) {
++			fbcon_mutex[(0x20 + 0x20 * n) / 4] = 0;
++			fbcon_mutex[(0x20 + 0x20 * n) / 4] = 1;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	fbcon_dsi[0] = 0;
++	fbcon_dsi[0] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ /* For the GUI framebuffer (SweetFramebuffer.cpp): show a presented frame. */
+ void a34_display_kick(void);
+ void
