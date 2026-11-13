@@ -1,0 +1,332 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index 766d8bd..c208bb8 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -70,6 +70,25 @@
+  * DVFS is started by IPI in Android; if it was not, nothing happens).
+  * The CCI follows the clusters (the firmware's CCI map), as in Android.
+  * Nothing throttles here for heat.
++ *
++ * A34 (0924): boot-arg a34cpudvfs=1 (default 0) starts the firmware's DVFS
++ * as Android's kernel does, before a34cpuopp asks for anything:
++ * init_cpuhvfs_debug_repo() (guards, the rest of the CSRAM from 0x2a0
++ * cleared, both clusters' limits to OPP 0..15), cpuhvfs_pvt_tbl_create()
++ * (FY_6833Tbl and CCI_FYTbl, the tables of CPU_LEVEL_0 that segment code
++ * 3 selects), IPI_DVFS_INIT_PTBL and IPI_DVFS_INIT (level 0) over the CPU
++ * DVFS pin of MCUPM's mailbox 1 (mtk_ipi_send_compl() in polling mode: the
++ * pin's send bit free, four words, its set bit, then its receive bit
++ * polled, cleared, the four answer words read; 2 s), schedule-assist
++ * DVFS off, both clusters marked on (as their cpufreq policies do). The
++ * voltages are the FY table's: what Android writes at that point; its EEM
++ * driver lowers them later from the chip's efuse and sensors, which is not
++ * done here. Before the first IPI each cluster's request is set to the OPP
++ * its PLL is at, so taking over moves nothing (the A55s keep the
++ * preloader's 1.8 GHz); then a34cpuopp asks as above. Any check that
++ * fails, or no answer, stops it there with a line in the log. Afterwards a
++ * thread takes the firmware's notices off that pin every 10 ms, as
++ * Android's mailbox interrupt does.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -77,6 +96,8 @@
+ #include <sys/errno.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+@@ -84,6 +105,8 @@
+ #include "ruby_hal.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
+ 
+ void a34_clocks_init(void);             /* bsd/dev/sweet_ufs.c, at boot */
+ bool a34_clocks_gpu_wanted(void);       /* bsd/dev/a34_mali.c */
+@@ -528,6 +551,273 @@ ck_cpu_ask(unsigned c, uint32_t mhz)
+ 	    khz, ck_cs(CS_CUR_FREQ + 4u * c));
+ }
+ 
++/* ---- A34 (0924): the firmware's DVFS started as Android starts it ---- */
++
++#define CK_MBOX1_PA             0x0c55fba0u     /* MCUPM mailbox 1 (mt6877.dts mbox1_base): 40 slots of 4 bytes */
++#define CK_MBOX1_SIZE           0xa0u
++#define CK_MBOX_REGS_PA         0x0c562000u     /* shared by the mailboxes, a bit per pin */
++#define MB_SEND                 0x00u           /* mbox_send: our pins whose message MCUPM has not taken */
++#define MB_SET                  0x04u           /* mbox_set: raise a pin */
++#define MB_RECV                 0x10u           /* mbox_recv: MCUPM's answers waiting */
++#define MB_CLR                  0x18u           /* mbox_clr: one taken */
++#define MB_PIN_CPU_DVFS         (1u << 1)       /* CH_S_CPU_DVFS: pin 1 both ways (mcupm_ipi_table.h) */
++#define MB_SEND_SLOT            0u              /* PIN_S_OFFSET_CPU_DVFS */
++#define MB_RECV_SLOT            20u             /* PIN_R_OFFSET_CPU_DVFS: after the 20 send slots */
++#define IPI_DVFS_INIT_PTBL      0u              /* enum cpu_dvfs_ipi_type */
++#define IPI_DVFS_INIT           1u
++#define CK_CPU_LEVEL            0u              /* CPU_LEVEL_0, FY: segment code 3 */
++#define CS_DATA                 0x02a0u         /* OFFS_DATA_S */
++#define CS_CCI_TBL              0x0fa0u         /* OFFS_CCI_TBL_S: 32 rows of 16 bytes */
++#define CK_IPI_MS               2000u
++#define CK_GICD_PA              0x0c000000u
++#define GICD_ISENABLER1         0x104u          /* INTIDs 32-63 */
++#define GIC_MBOX_INTIDS         (0xffu << 24)   /* MCUPM mailboxes 0-7 to the processors: SPI 24-31, INTID 56-63 */
++
++static vm_offset_t ck_mbox, ck_mbox_regs;
++static uint32_t ck_notices;
++static int ck_notice_chan;
++
++/* plat_k6877 CCI_FYTbl: the CCI's OPP for each LL OPP (row) and L OPP (column); then its second mode */
++static const uint8_t ck_cci_map[32][16] = {
++	{ 5, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 },
++	{ 5, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 },
++	{ 5, 5, 6, 7, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 11, 11, 11, 11, 11, 11 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 11, 11, 11, 11, 11, 11 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 12, 12, 12, 12, 12 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 13, 13, 13, 13 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 14, 14, 14, 14 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 },
++	{ 0, 0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 },
++	{ 0, 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 13, 13, 13, 13, 13 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 14, 14, 14, 14 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++	{ 0, 0, 1, 2, 3, 4, 5, 6, 11, 11, 12, 14, 15, 15, 15, 15 },
++};
++
++static void
++ck_cs_wr(uint32_t off, uint32_t val)
++{
++	ruby_wr32(ck_csram, off, val);
++}
++
++/* The table OPP of cluster c that kHz is (within 1 %); CK_OPPS if none. */
++static uint32_t
++ck_cpu_opp_of(unsigned c, uint32_t khz)
++{
++	for (uint32_t i = 0; i < CK_OPPS; i++) {
++		uint32_t want = ck_cpu_mhz[c][i] * 1000u;
++
++		if (khz >= want - want / 100u && khz <= want + want / 100u) {
++			return i;
++		}
++	}
++	return CK_OPPS;
++}
++
++/*
++ * mtk_ipi_send_compl(CH_S_CPU_DVFS, IPI_SEND_POLLING, struct cdvfs_data,
++ * 2000 ms) over mtk_rpmsg_trysend()/mtk_mbox_send() and
++ * mtk_mbox_polling(): false if the pin stays busy or nothing answers.
++ */
++static bool
++ck_mcupm_ipi(uint32_t cmd, uint32_t arg0, uint32_t ack[4])
++{
++	uint32_t i;
++
++	for (i = 0; i < CK_IPI_MS * 10u && (ruby_rd32(ck_mbox_regs, MB_SEND) & MB_PIN_CPU_DVFS); i++) {
++		delay(100);
++	}
++	if (ruby_rd32(ck_mbox_regs, MB_SEND) & MB_PIN_CPU_DVFS) {
++		printf("A34 CLOCKS: CPU DVFS: MCUPM has not taken the last message on its CPU DVFS pin (mbox_send 0x%08x)\n",
++		    ruby_rd32(ck_mbox_regs, MB_SEND));
++		return false;
++	}
++	ruby_wr32(ck_mbox, 4u * MB_SEND_SLOT, cmd);
++	ruby_wr32(ck_mbox, 4u * MB_SEND_SLOT + 4u, arg0);
++	ruby_wr32(ck_mbox, 4u * MB_SEND_SLOT + 8u, 0);
++	ruby_wr32(ck_mbox, 4u * MB_SEND_SLOT + 12u, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ruby_wr32(ck_mbox_regs, MB_SET, MB_PIN_CPU_DVFS);
++	for (i = 0; i < CK_IPI_MS * 10u; i++) {
++		if (ruby_rd32(ck_mbox_regs, MB_RECV) & MB_PIN_CPU_DVFS) {
++			ruby_wr32(ck_mbox_regs, MB_CLR, MB_PIN_CPU_DVFS);
++			for (uint32_t k = 0; k < 4; k++) {
++				ack[k] = ruby_rd32(ck_mbox, 4u * (MB_RECV_SLOT + k));
++			}
++			printf("A34 CLOCKS: CPU DVFS: IPI %u (%u) answered after %u us: %08x %08x %08x %08x\n", cmd, arg0, i * 100u,
++			    ack[0], ack[1], ack[2], ack[3]);
++			return true;
++		}
++		delay(100);
++	}
++	printf("A34 CLOCKS: CPU DVFS: IPI %u (%u): no answer in %u ms (mbox_send 0x%08x mbox_recv 0x%08x)\n", cmd, arg0,
++	    CK_IPI_MS, ruby_rd32(ck_mbox_regs, MB_SEND), ruby_rd32(ck_mbox_regs, MB_RECV));
++	return false;
++}
++
++/* After the start: the firmware's notices on the CPU DVFS pin (its log's offsets) taken as the mailbox interrupt would. */
++static void
++ck_notice_thread(__unused void *arg, __unused wait_result_t result)
++{
++	for (;;) {
++		uint64_t deadline;
++
++		if (ruby_rd32(ck_mbox_regs, MB_RECV) & MB_PIN_CPU_DVFS) {
++			/* as mtk_mbox_isr(): the words first, then the pin cleared */
++			uint32_t w0 = ruby_rd32(ck_mbox, 4u * MB_RECV_SLOT), w1 = ruby_rd32(ck_mbox, 4u * MB_RECV_SLOT + 4u);
++
++			ruby_wr32(ck_mbox_regs, MB_CLR, MB_PIN_CPU_DVFS);
++			if (ck_notices++ < 4u) {
++				printf("A34 CLOCKS: CPU DVFS: notice %u from the firmware: %08x %08x\n", ck_notices, w0, w1);
++			}
++		}
++		clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&ck_notice_chan, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* a34cpudvfs=1: false if it stopped before the firmware's DVFS was started. */
++static bool
++ck_dvfs_start(void)
++{
++	uint32_t on = 0, opp[2], khz[2], con0, con1, div, ack[4], i, c, en;
++	vm_offset_t gicd;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a34cpudvfs", &on, (int)sizeof(on)) || on == 0) {
++		return false;
++	}
++	ck_mbox = ml_io_map(CK_MBOX1_PA, CK_MBOX1_SIZE);
++	ck_mbox_regs = ml_io_map(CK_MBOX_REGS_PA, 0x20u);
++	gicd = ml_io_map(CK_GICD_PA, CK_PAGE);
++	if (!ck_mbox || !ck_mbox_regs || !gicd) {
++		printf("A34 CLOCKS: CPU DVFS: MMIO mapping failed; not started\n");
++		return false;
++	}
++	/* its answers raise SPI 25 too: polled here, so that line must not be enabled (nothing would quiet it) */
++	en = ruby_rd32(gicd, GICD_ISENABLER1);
++	if (en & GIC_MBOX_INTIDS) {
++		printf("A34 CLOCKS: CPU DVFS: the MCUPM mailbox interrupts are enabled in the GIC (ISENABLER1 0x%08x); "
++		    "not started\n", en);
++		return false;
++	}
++	for (c = 0; c < 2; c++) {
++		khz[c] = ck_cpu_khz(c, &con0, &con1, &div);
++		opp[c] = ck_cpu_opp_of(c, khz[c]);
++		if (opp[c] == CK_OPPS) {
++			printf("A34 CLOCKS: CPU DVFS: %s runs at %u kHz, no OPP of the table; not started\n", ck_cluster[c].name,
++			    khz[c]);
++			return false;
++		}
++	}
++	printf("A34 CLOCKS: CPU DVFS: starting MCUPM's DVFS as Android does; LL stays at OPP %u (%u kHz), L at OPP %u "
++	    "(%u kHz); mbox_send 0x%08x mbox_recv 0x%08x\n", opp[0], khz[0], opp[1], khz[1], ruby_rd32(ck_mbox_regs, MB_SEND),
++	    ruby_rd32(ck_mbox_regs, MB_RECV));
++	if (ruby_rd32(ck_mbox_regs, MB_SEND) & MB_PIN_CPU_DVFS) {
++		printf("A34 CLOCKS: CPU DVFS: its CPU DVFS pin is busy before anything was sent; not started\n");
++		return false;
++	}
++	if (ruby_rd32(ck_mbox_regs, MB_RECV) & MB_PIN_CPU_DVFS) {
++		ruby_wr32(ck_mbox_regs, MB_CLR, MB_PIN_CPU_DVFS);   /* a stale answer, not ours */
++	}
++
++	/* init_cpuhvfs_debug_repo() */
++	ck_cs_wr(0, CS_GUARD0);
++	ck_cs_wr(4, CS_GUARD1);
++	ck_cs_wr(8, CS_GUARD0);
++	ck_cs_wr(12, CS_GUARD1);
++	for (i = CS_DATA; i < CK_CSRAM_SIZE; i += 4u) {
++		ck_cs_wr(i, 0);
++	}
++	ck_cs_wr(CS_DATA, CS_GUARD0);
++	ck_cs_wr(CS_PPM_LIMIT, CK_OPPS - 1u);           /* (0 << 16) | (NR_FREQ - 1), LL and L */
++	ck_cs_wr(CS_PPM_LIMIT + 4u, CK_OPPS - 1u);
++
++	/* cpuhvfs_pvt_tbl_create() */
++	for (i = CS_TBL; i < CS_TBL + 4u * 144u; i += 4u) {
++		ck_cs_wr(i, 0);
++	}
++	for (c = 0; c < CK_CLUSTERS; c++) {
++		for (i = 0; i < CK_OPPS; i++) {
++			ck_cs_wr(CS_TBL + 4u * (ck_pvt_word[c] + i), ((uint32_t)ck_cpu_step[c][i] << 16) | ck_cpu_mhz[c][i]);
++			ck_cs_wr(CS_TBL + 4u * (ck_pvt_word[c] + CK_OPPS + i), (1u << 16) | ck_cpu_posdiv[c][i]);
++		}
++		ck_cs_wr(CS_TBL + 4u * (ck_pvt_word[c] + 2u * CK_OPPS), 0xffffffffu);
++	}
++	ck_cs_wr(CS_TBL + 4u * (108u + 2u * CK_OPPS), 0xffffffffu);
++	for (i = 0; i < 32u * 16u; i += 4u) {
++		const uint8_t *b = &ck_cci_map[i / 16u][i % 16u];
++
++		ck_cs_wr(CS_CCI_TBL + i, (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
++	}
++	/* (ours: each cluster asked for the OPP it is at, before the firmware looks) */
++	ck_cs_wr(CS_WFI, opp[0]);
++	ck_cs_wr(CS_WFI + 4u, opp[1]);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (c = 0; c < CK_CLUSTERS; c++) {
++		if (ck_pvt_check(c) != 0 || !ck_cs_guarded()) {
++			printf("A34 CLOCKS: CPU DVFS: the CSRAM does not read back as written (%s, entry %u); not started\n",
++			    ck_cluster[c].name, ck_pvt_check(c));
++			return false;
++		}
++	}
++
++	/* cpuhvfs_set_init_ptbl(), cpuhvfs_set_init_sta() */
++	if (!ck_mcupm_ipi(IPI_DVFS_INIT_PTBL, 0, ack)) {
++		printf("A34 CLOCKS: CPU DVFS: not started (IPI_DVFS_INIT_PTBL)\n");
++		return false;
++	}
++	if (!ck_mcupm_ipi(IPI_DVFS_INIT, CK_CPU_LEVEL, ack)) {
++		printf("A34 CLOCKS: CPU DVFS: IPI_DVFS_INIT unanswered: the firmware may or may not run DVFS now\n");
++		return false;
++	}
++	ck_cs_wr(CS_SCHED_DIS, 1);                      /* cpuhvfs_set_sched_dvfs_disable(1) */
++	ck_cs_wr(CS_CLUSTER_ONOFF, CS_CLUSTER_ON);      /* cpuhvfs_set_cluster_on_off(LL, 1), (L, 1) */
++	ck_cs_wr(CS_CLUSTER_ONOFF + 4u, CS_CLUSTER_ON);
++	if (kernel_thread_start(ck_notice_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++
++	/* the firmware takes over: it should say each cluster is where it is, and leave the PLLs */
++	for (i = 0; i < 250u; i++) {
++		delay(2000);
++		if (ck_cs(CS_CUR_FREQ) == opp[0] && ck_cs(CS_CUR_FREQ + 4u) == opp[1]) {
++			break;
++		}
++	}
++	for (c = 0; c < CK_CLUSTERS; c++) {
++		uint32_t now = ck_cpu_khz(c, &con0, &con1, &div);
++
++		printf("A34 CLOCKS: CPU DVFS: %s: the firmware says OPP %u, the PLL %u kHz (CON1 0x%08x)%s\n",
++		    ck_cluster[c].name, ck_cs(CS_CUR_FREQ + 4u * c), now, con1,
++		    (c < 2 && now < khz[c] - khz[c] / 100u) ? ": SLOWER than before" : "");
++	}
++	printf("A34 CLOCKS: CPU DVFS: started%s; Vproc words %u %u %u %u\n",
++	    i < 250u ? "" : " (the firmware did not confirm the OPPs in 500 ms)", ck_cs(CS_CUR_VPROC),
++	    ck_cs(CS_CUR_VPROC + 4u), ck_cs(CS_CUR_VPROC + 8u), ck_cs(CS_CUR_VPROC + 12u));
++	return true;
++}
++
+ /* a34cpuopp=<L MHz>[,<LL MHz>[,<CCI MHz>]] */
+ static void
+ ck_cpu_requests(void)
+@@ -629,6 +919,9 @@ a34_clocks_init(void)
+ 	}
+ 	printf("A34 CLOCKS: the CPU clusters' Vproc (MT6315 bucks on SPMI) are not read\n");
+ 	ck_csram_report();
++	if (ck_dvfs_start()) {
++		ck_csram_report();
++	}
+ 	if (PE_parse_boot_argn("a34cpufreq", &cpu, (int)sizeof(cpu)) && cpu != 0) {
+ 		printf("A34 CLOCKS: a34cpufreq=%u does nothing: a34cpuopp=<L MHz>,<LL MHz> asks MCUPM's firmware, "
+ 		    "never the PLLs or Vproc directly\n", cpu);
