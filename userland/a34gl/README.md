@@ -396,6 +396,16 @@ dark samples (no colour above 0x40) bright (none below 0xc0) gets `^ THE FIRST d
 dark samples bright here` (then `another`). `glvbafter=N,K,H`: only a vrb whose rectangle is at
 least H pixels tall starts a frame followed (default 100: the status bar's is 80, the App
 Library's 238).
+On the screen's picture the rectangle followed is what was drawn there plus 300 pixels below
+(where the App Library's pods begin). Draws there are read on eight rows spread over it, sixteen
+pixels each (`' '` as before, `+` changed, `!` dark to bright). Only draws of 100 x 100 or more
+count for the flag (not icons, glyphs, the battery). The frame after each frame followed is
+followed whole (`glvbframe=0`: not), from its first draw. That covers every draw of 100 x 100
+or more into that rectangle of the screen and every draw that reads the screen's picture, then
+what reads theirs, and so on. That is where the pods' backgrounds are drawn, before the vrb.
+The black check now says, with "is BLACK", the last frame the surface was not black and what
+the frame drew into it: draws (the first and the last, by function and program), clears (with
+colour), and draws elsewhere.
 
 ### Profiling: `glprof=N`
 

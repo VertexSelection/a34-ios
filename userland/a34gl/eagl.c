@@ -319,6 +319,13 @@ struct eagl {
 	} chains[VBLUR_CHAINS];
 	bool vblur_bound;               /* a draw of ours has textures of its own on units 2 to 5 */
 	bool vblur_dump;                /* (glvbdump=1) what that draw left is to be written down after it */
+	struct {                        /* this frame, for picture_note(): the draws into the screen's picture */
+		unsigned draws, other, clears, first_fn, last_fn;
+		GLuint first_prog, last_prog;
+		GLfloat clear[4];
+		bool clear_boxed;
+	} sf;
+	char sf_text[200];              /* ... made into words at the frame's end */
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -1517,6 +1524,7 @@ static pthread_once_t seed_once = PTHREAD_ONCE_INIT;
 static struct seed_bump {
 	IOSurfaceRef surface;
 	unsigned frame;
+	char drawn[200];        /* what the frame drew (frame_end(), for picture_note()) */
 } seed_pending[16];
 static unsigned seed_pending_count;
 static pthread_mutex_t seed_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1533,11 +1541,12 @@ static int black_check = 1;
 static struct {
 	uint32_t id;
 	bool black;
+	unsigned since;         /* the frame it became black, or the last frame it was not */
 } black_seen[16];
 static pthread_mutex_t black_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
-picture_note(IOSurfaceRef surface, unsigned frame)
+picture_note(IOSurfaceRef surface, unsigned frame, const char *drawn)
 {
 	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
@@ -1567,11 +1576,21 @@ picture_note(IOSurfaceRef surface, unsigned frame)
 	if (black_seen[slot].id != id) {
 		black_seen[slot].id = id;
 		black_seen[slot].black = false;
+		black_seen[slot].since = 0;
 	}
 	if (now != black_seen[slot].black) {
 		black_seen[slot].black = now;
-		say("a34gl: frame %u: IOSurface %u (%zu x %zu, %zu bytes a row), drawn here, is %s (%u of 64 samples black)\n", frame, id,
-		    width, height, row, now ? "BLACK" : "not black any more", black);
+		if (now) {
+			say("a34gl: frame %u: IOSurface %u (%zu x %zu), drawn here, is BLACK (%u of 64 samples); last not black: frame %u. "
+			    "This frame:\n", frame, id, width, height, black, black_seen[slot].since);
+			say("a34gl:   %s\n", drawn != NULL && drawn[0] != '\0' ? drawn : "(nothing written down)");
+		} else {
+			say("a34gl: frame %u: IOSurface %u (%zu x %zu), drawn here, is not black any more (%u of 64 samples black), black "
+			    "since frame %u\n", frame, id, width, height, black, black_seen[slot].since);
+		}
+		black_seen[slot].since = frame;
+	} else if (!now) {
+		black_seen[slot].since = frame;
 	}
 	pthread_mutex_unlock(&black_lock);
 }
@@ -1588,7 +1607,7 @@ seed_bump_work(void *context)
 	struct seed_bump *bump = context;
 
 	if (IOSurfaceLock(bump->surface, 0, NULL) == 0) {
-		picture_note(bump->surface, bump->frame);
+		picture_note(bump->surface, bump->frame, bump->drawn);
 		IOSurfaceUnlock(bump->surface, 0, NULL);
 	}
 	CFRelease(bump->surface);
@@ -1596,12 +1615,13 @@ seed_bump_work(void *context)
 }
 
 static void
-seed_bump(IOSurfaceRef surface, unsigned frame)
+seed_bump(IOSurfaceRef surface, unsigned frame, const char *drawn)
 {
 	if (!seed_wait && redwood_drm_queued()) {
 		pthread_mutex_lock(&seed_lock);
 		if (seed_pending_count < sizeof(seed_pending) / sizeof(seed_pending[0])) {
 			seed_pending[seed_pending_count].surface = (IOSurfaceRef)CFRetain(surface);
+			snprintf(seed_pending[seed_pending_count].drawn, sizeof(seed_pending[0].drawn), "%s", drawn);
 			seed_pending[seed_pending_count++].frame = frame;
 			pthread_mutex_unlock(&seed_lock);
 			return;
@@ -1609,7 +1629,7 @@ seed_bump(IOSurfaceRef surface, unsigned frame)
 		pthread_mutex_unlock(&seed_lock);
 	}
 	if (surface_lock(surface, 0) == 0) {
-		picture_note(surface, frame);
+		picture_note(surface, frame, drawn);
 		surface_unlock(surface, 0);
 	}
 }
@@ -1668,12 +1688,12 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		seed_bump(surface, e->frames + 1);
+		seed_bump(surface, e->frames + 1, e->sf_text);
 		return;
 	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
-		seed_bump(surface, e->frames + 1);
+		seed_bump(surface, e->frames + 1, e->sf_text);
 		return;
 	}
 	if (e->reader == 0) {
@@ -1699,7 +1719,7 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		/* (as they were: CoreAnimation has them so, another program has its own) */
 		glPixelStorei(GL_PACK_ROW_LENGTH, render_server ? 0 : row_length);
 		glPixelStorei(GL_PACK_ALIGNMENT, render_server ? 4 : alignment);
-		picture_note(surface, e->frames + 1);
+		picture_note(surface, e->frames + 1, e->sf_text);
 		surface_unlock(surface, 0);
 		/* the textures shown that are filled from this one by the GPU have what the memory now has: the seed is theirs */
 		for (unsigned i = 0; i < e->image_count; i++) {
@@ -1822,6 +1842,7 @@ frame_begin(struct eagl *e)
  */
 static void frame_functions(struct eagl *e);
 static void vbafter_end(struct eagl *e);
+static const char *census_name(unsigned function);
 
 static void
 frame_end(struct eagl *e, bool finished)
@@ -1836,6 +1857,14 @@ frame_end(struct eagl *e, bool finished)
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		shown |= e->images[i].target && e->images[i].drawn && e->images[i].width >= 1000 && e->images[i].height >= 2000;
+	}
+	if (black_check && shown) {
+		snprintf(e->sf_text, sizeof(e->sf_text), "%u draws into it (first function %u \"%s\" program %u, last %u \"%s\" program %u), "
+		    "%u clears (last to %.2g %.2g %.2g %.2g%s), %u draws elsewhere", e->sf.draws, e->sf.first_fn,
+		    census_name(e->sf.first_fn), e->sf.first_prog, e->sf.last_fn, census_name(e->sf.last_fn), e->sf.last_prog, e->sf.clears,
+		    (double)e->sf.clear[0], (double)e->sf.clear[1], (double)e->sf.clear[2], (double)e->sf.clear[3],
+		    e->sf.clear_boxed ? ", scissored" : "", e->sf.other);
+		memset(&e->sf, 0, sizeof(e->sf));
 	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
@@ -2936,6 +2965,7 @@ reads_what_it_writes(struct eagl *e)
 }
 
 static void vbafter_clear(struct eagl *e, GLbitfield what, bool boxed, const GLint scissor[4], const GLfloat colour[4]);
+static struct image *screen_texture(struct eagl *e, GLuint texture);
 
 static void
 clear_now(struct eagl *e)
@@ -2954,6 +2984,11 @@ clear_now(struct eagl *e)
 	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
 	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
 	glClear(e->unclear);
+	if (black_check && (e->unclear & GL_COLOR_BUFFER_BIT) && screen_texture(e, e->colour) != NULL) {
+		e->sf.clears++;
+		memcpy(e->sf.clear, e->unclear_colour, sizeof(e->sf.clear));
+		e->sf.clear_boxed = e->unclear_boxed;
+	}
 	vbafter_clear(e, e->unclear, e->unclear_boxed, e->unclear_box, e->unclear_colour);
 	e->unclear = 0;
 	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
@@ -3690,16 +3725,27 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 
 static unsigned vbafter_frames, vbafter_skip;   /* glvbafter=N,K: frames still to be followed; vrb frames still to be let by */
 static unsigned vbafter_min_height = 100;       /* glvbafter=N,K,H: the least height of a vrb's rectangle that starts a frame followed */
+static int vbafter_whole = 1;                   /* glvbframe=0: not the frame after one followed */
 static struct {
 	struct eagl *e;                 /* the context followed (NULL: none, this frame) */
 	unsigned frame;                 /* ... its frame */
 	unsigned marks, draw, listed, unlisted, seen_frame, brightened;
 	uint8_t before[16][4];          /* the draw at hand: the row before it */
+	bool whole;                     /* the frame followed is the one after a vrb frame, from its first draw (glvbframe) */
+	struct eagl *next_e;            /* ... to come: its context and frame, and the screen's rectangle watched in it */
+	unsigned next_frame;
+	GLint next_roi[4];
+	unsigned small;                 /* (whole) draws into that rectangle smaller than 100 x 100, not written down */
+	bool grid_now;                  /* the draw at hand is read on eight rows of the screen's rectangle */
+	GLint grid[4], grid_y[8];       /* ... over this, at these rows */
+	uint8_t grid_before[8][16][4];
 	bool seen_skip;                 /* (the frame seen_frame is one of those let by) */
 	struct vbafter_mark {
 		GLuint framebuffer, texture;    /* (by the texture where there is one: framebuffers' names are new every frame) */
 		GLint box[4];                   /* x0, y0, x1, y1 in its pixels */
 		unsigned draw;                  /* the draw that left it (0: the vrb) */
+		bool screen;                    /* a picture of the screen's size (any: the display's surfaces take turns); `box`
+		                                   is what was drawn there and 300 pixels below it */
 	} mark[VBAFTER_MARKS];
 	/* the draw at hand */
 	bool vrb, listed_now, reads;
@@ -3725,7 +3771,7 @@ vbafter_keep_program(struct eagl *e, GLuint program)
 	GLuint shaders[4];
 	GLsizei count = 0;
 
-	if (vbafter_frames == 0) {
+	if (vbafter_frames == 0 && vbafter.next_e == NULL && vbafter.e == NULL) {
 		return;
 	}
 	glGetAttachedShaders(program, 4, &count, shaders);
@@ -3893,9 +3939,21 @@ vbafter_units(struct eagl *e)
 	return units;
 }
 
+/* A texture drawn into here for a surface of the screen's size: the display's (or a snapshot of it). */
+static struct image *
+screen_texture(struct eagl *e, GLuint texture)
+{
+	struct image *image = texture != 0 ? image_of(e, texture) : NULL;
+
+	return image != NULL && image->target && image->width >= 1000 && image->height >= 2000 ? image : NULL;
+}
+
 static bool
 vbafter_same(struct eagl *e, const struct vbafter_mark *mark)
 {
+	if (mark->screen) {
+		return screen_texture(e, e->colour) != NULL;
+	}
 	return mark->texture != 0 ? e->colour == mark->texture : e->colour == 0 && e->framebuffer == mark->framebuffer;
 }
 
@@ -3910,10 +3968,20 @@ vbafter_meet(const GLint a[4], const GLint b[4], GLint both[4])
 }
 
 static int
-vbafter_mark(struct eagl *e, const GLint box[4], unsigned draw)
+vbafter_mark(struct eagl *e, const GLint drawn[4], unsigned draw)
 {
 	struct vbafter_mark *mark = NULL;
+	struct image *screen = screen_texture(e, e->colour);
+	GLint box[4] = { drawn[0], drawn[1], drawn[2], drawn[3] };
 
+	if (screen != NULL) {
+		/* (on the screen: what was drawn and 300 pixels below it, where the App Library's pods begin) */
+		if (!screen->invert) {
+			box[3] = box[3] + 300 < screen->height ? box[3] + 300 : screen->height;
+		} else {
+			box[1] = box[1] > 300 ? box[1] - 300 : 0;
+		}
+	}
 	for (unsigned i = 0; i < vbafter.marks; i++) {
 		if (vbafter_same(e, &vbafter.mark[i])) {
 			mark = &vbafter.mark[i];        /* (a second rectangle in the same framebuffer: one round both) */
@@ -3932,7 +4000,96 @@ vbafter_mark(struct eagl *e, const GLint box[4], unsigned draw)
 	mark->texture = e->colour;
 	memcpy(mark->box, box, sizeof(mark->box));
 	mark->draw = draw;
+	mark->screen = screen != NULL;
 	return (int)vbafter.marks++;
+}
+
+/*
+ * Eight rows of `box` (spread over it), sixteen pixels across each, of the framebuffer bound for drawing
+ * (or of `texture` through `framebuffer`, if not 0). false: not readable.
+ */
+static bool
+vbafter_grid(const GLint box[4], GLuint framebuffer, GLuint texture, uint8_t out[8][16][4], GLint ys[8])
+{
+	GLint read = 0, draw = 0, pack = 0, alignment = 4, width = box[2] - box[0], height = box[3] - box[1];
+	uint8_t *line;
+	bool good;
+
+	if (width <= 0 || height <= 0 || (line = malloc((size_t)width * 4)) == NULL) {
+		return false;
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+	if (framebuffer != 0) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	} else if (read != draw) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)draw);
+	}
+	if (pack != 0) {
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	}
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	for (int r = 0; r < 8; r++) {
+		ys[r] = box[1] + (GLint)((2 * r + 1) * (long)height / 16);
+		glReadPixels(box[0], ys[r], width, 1, GL_RGBA, GL_UNSIGNED_BYTE, line);
+		for (int c = 0; c < 16; c++) {
+			memcpy(out[r][c], line + 4 * (size_t)((long)c * (width - 1) / 15), 4);
+		}
+	}
+	good = glGetError() == 0;
+	glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+	if (pack != 0) {
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
+	}
+	if (framebuffer != 0 || read != draw) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	}
+	free(line);
+	return good;
+}
+
+static bool
+vbafter_dark(const uint8_t p[4])
+{
+	return p[0] < 0x40 && p[1] < 0x40 && p[2] < 0x40;
+}
+
+static bool
+vbafter_bright(const uint8_t p[4])
+{
+	return p[0] > 0xc0 && p[1] > 0xc0 && p[2] > 0xc0;
+}
+
+/*
+ * The eight rows written down, a line each: every pixel with a mark, ' ' as before (or no before),
+ * '+' changed, '!' dark before and bright after. Returns how many went from dark to bright.
+ */
+static unsigned
+vbafter_grid_say(const char *what, GLint x0, GLint x1, const GLint ys[8], uint8_t after[8][16][4], uint8_t (*before)[16][4])
+{
+	unsigned brightened = 0;
+
+	say_always("a34gl-vb:   %s, x=%d-%d, eight rows (' ' as before, '+' changed, '!' dark to bright):\n", what, x0, x1);
+	for (int r = 0; r < 8; r++) {
+		char text[200];
+		size_t used = 0;
+
+		for (int c = 0; c < 16; c++) {
+			const uint8_t *a = after[r][c];
+			char how = ' ';
+
+			if (before != NULL && memcmp(before[r][c], a, 4) != 0) {
+				how = vbafter_dark(before[r][c]) && vbafter_bright(a) ? '!' : '+';
+				brightened += how == '!';
+			}
+			used += (size_t)snprintf(text + used, sizeof(text) - used, " %c%02x%02x%02x%02x", how, a[0], a[1], a[2], a[3]);
+		}
+		say_always("a34gl-vb:   y=%4d:%s\n", ys[r], text);
+	}
+	return brightened;
 }
 
 /* At the frame's end (or when another frame is met): each rectangle as it was left. */
@@ -3942,23 +4099,55 @@ vbafter_end(struct eagl *e)
 	if (vbafter.e != e) {
 		return;
 	}
+	struct vbafter_mark *screen = NULL;
+
 	for (unsigned i = 0; i < vbafter.marks; i++) {
 		struct vbafter_mark *mark = &vbafter.mark[i];
 		GLint row[3] = { (mark->box[1] + mark->box[3]) / 2, mark->box[0], mark->box[2] };
 		char text[200] = " (not readable: no texture)";
 
-		if (mark->texture != 0) {
-			if (e->reader == 0) {
-				glGenFramebuffers(1, &e->reader);
+		if (e->reader == 0) {
+			glGenFramebuffers(1, &e->reader);
+		}
+		if (mark->screen) {
+			/* (the screen's picture this frame went into: the last drawn into of that size) */
+			GLuint texture = mark->texture;
+			uint8_t grid[8][16][4];
+			GLint ys[8];
+
+			screen = screen != NULL ? screen : mark;
+			for (unsigned k = 0; k < e->image_count; k++) {
+				if (e->images[k].target && e->images[k].width >= 1000 && e->images[k].height >= 2000 && e->images[k].drawn) {
+					texture = e->images[k].texture;
+				}
 			}
+			say_always("a34gl-vb: %u end: rect %u (the screen's, tex %u, %d,%d-%d,%d, draw %u):\n", vbafter.frame + 1, i, texture,
+			    mark->box[0], mark->box[1], mark->box[2], mark->box[3], mark->draw);
+			if (texture != 0 && vbafter_grid(mark->box, e->reader, texture, grid, ys)) {
+				vbafter_grid_say("as the frame left it", mark->box[0], mark->box[2], ys, grid, NULL);
+			}
+			continue;
+		}
+		if (mark->texture != 0) {
 			vbafter_row(text, sizeof(text), row, e->reader, mark->texture, NULL);
 		}
 		say_always("a34gl-vb: %u end: rect %u (tex %u, %d,%d-%d,%d, draw %u) y=%d:%s\n", vbafter.frame + 1, i,
 		    mark->texture, mark->box[0], mark->box[1], mark->box[2], mark->box[3], mark->draw, row[0], text);
 	}
-	say_always("a34gl-vb: %u end: %u draws after the vrb, %u reached what came of it (%u not written down)\n", vbafter.frame + 1,
-	    vbafter.draw, vbafter.listed + vbafter.unlisted, vbafter.unlisted);
+	say_always("a34gl-vb: %u end: %u draws %s, %u reached what was followed (%u not written down%s)\n", vbafter.frame + 1, vbafter.draw,
+	    vbafter.whole ? "in the frame" : "after the vrb", vbafter.listed + vbafter.unlisted, vbafter.unlisted,
+	    vbafter.whole ? ", and draws smaller than 100 x 100 into the screen's rectangle" : "");
+	if (vbafter.whole) {
+		say_always("a34gl-vb: %u end: %u draws smaller than 100 x 100 into the screen's rectangle were let by\n", vbafter.frame + 1,
+		    vbafter.small);
+	} else if (vbafter_whole && screen != NULL) {
+		/* the next frame, from its first draw: what is drawn into the screen's rectangle before the vrb */
+		vbafter.next_e = e;
+		vbafter.next_frame = vbafter.frame + 1;
+		memcpy(vbafter.next_roi, screen->box, sizeof(vbafter.next_roi));
+	}
 	vbafter.e = NULL;
+	vbafter.whole = false;
 }
 
 /* After a glClear has been made (clear_now()): one over a rectangle being followed is written down. */
@@ -4001,9 +4190,25 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 	size_t used = 0;
 	int known;
 
-	vbafter.listed_now = vbafter.vrb = vbafter.reads = false;
+	vbafter.listed_now = vbafter.vrb = vbafter.reads = vbafter.grid_now = false;
 	if (vbafter.e == e && e->frames != vbafter.frame) {
 		vbafter_end(e);                 /* (a frame that ended unseen) */
+	}
+	if (vbafter.e == NULL && vbafter.next_e == e && e->frames >= vbafter.next_frame) {
+		vbafter.next_e = NULL;
+		if (e->frames == vbafter.next_frame) {
+			vbafter.e = e;
+			vbafter.frame = e->frames;
+			vbafter.whole = true;
+			vbafter.draw = vbafter.listed = vbafter.unlisted = vbafter.brightened = vbafter.small = 0;
+			vbafter.marks = 1;
+			memset(&vbafter.mark[0], 0, sizeof(vbafter.mark[0]));
+			memcpy(vbafter.mark[0].box, vbafter.next_roi, sizeof(vbafter.mark[0].box));
+			vbafter.mark[0].screen = true;
+			say_always("a34gl-vb: %u: the frame after, whole: every draw 100 x 100 or more into the screen's picture at %d,%d-%d,%d "
+			    "(the vrb's band and 300 pixels below), and every draw that reads the screen's picture, and so on\n", e->frames + 1,
+			    vbafter.next_roi[0], vbafter.next_roi[1], vbafter.next_roi[2], vbafter.next_roi[3]);
+		}
 	}
 	if (e->program == 0 && function == FUNCTION_VARIABLE_BLUR && (vbafter.e == e || (vbafter.e == NULL && vbafter_frames != 0))) {
 		vbafter.vrb = true;             /* (after it: vbafter_after()) */
@@ -4025,7 +4230,8 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 			continue;
 		}
 		for (unsigned i = 0; i < vbafter.marks; i++) {
-			if (vbafter.mark[i].texture == e->bound[u]) {
+			if ((vbafter.mark[i].texture == e->bound[u] && !vbafter.mark[i].screen) ||
+			    (vbafter.mark[i].screen && screen_texture(e, e->bound[u]) != NULL)) {
 				marked = true;
 				vbafter.reads = true;
 				why = why == ~0u ? 100 + i : why;
@@ -4048,7 +4254,11 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 	if (why == ~0u) {
 		return;
 	}
-	if (vbafter.listed >= VBAFTER_DRAWS) {
+	if (why < 100 && vbafter.mark[why].screen && vbafter.whole && (box[2] - box[0] < 100 || box[3] - box[1] < 100)) {
+		vbafter.small++;                /* (labels and the like) */
+		return;
+	}
+	if (vbafter.listed >= (vbafter.whole ? 2 * VBAFTER_DRAWS : VBAFTER_DRAWS)) {
 		vbafter.unlisted++;
 		if (vbafter.reads) {
 			vbafter_mark(e, box, vbafter.draw);     /* (still followed, if not written down) */
@@ -4150,10 +4360,18 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 	}
 	snprintf(vbafter.line[1], sizeof(vbafter.line[1]), "a34gl-vb:   reads%s; blending %s; colour %s%s\n", used ? reads : " nothing",
 	    text, colour, e->unclear != 0 ? "; a clear pending (not in before)" : "");
-	memset(vbafter.before, 0xff, sizeof(vbafter.before));
-	vbafter_row(text, sizeof(text), vbafter.row, 0, 0, vbafter.before);
 	say_always("%s", vbafter.line[0]);
 	say_always("%s", vbafter.line[1]);
+	if (why < 100 && vbafter.mark[why].screen) {
+		/* (on the screen: eight rows of where it reached in the rectangle watched, before and after) */
+		memcpy(vbafter.grid, both, sizeof(vbafter.grid));
+		vbafter.grid_now = vbafter_grid(both, 0, 0, vbafter.grid_before, vbafter.grid_y);
+		if (vbafter.grid_now) {
+			return;
+		}
+	}
+	memset(vbafter.before, 0xff, sizeof(vbafter.before));
+	vbafter_row(text, sizeof(text), vbafter.row, 0, 0, vbafter.before);
 	say_always("a34gl-vb:   before, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
 }
 
@@ -4231,20 +4449,53 @@ vbafter_after(struct eagl *e, GLenum type, const void *indices, GLint first, GLs
 		return;
 	}
 	vbafter.listed_now = false;
-	vbafter_row(text, sizeof(text), vbafter.row, 0, 0, after);
-	say_always("a34gl-vb:   after, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
-	/* a sample dark before (no colour above 0x40) and bright after (none below 0xc0) */
-	for (unsigned i = 0; i < 16; i++) {
-		uint8_t *b = vbafter.before[i], *a = after[i];
+	if (vbafter.grid_now) {
+		uint8_t grid[8][16][4];
+		GLint ys[8];
 
-		brightened += b[0] < 0x40 && b[1] < 0x40 && b[2] < 0x40 && a[0] > 0xc0 && a[1] > 0xc0 && a[2] > 0xc0;
+		vbafter.grid_now = false;
+		if (vbafter_grid(vbafter.grid, 0, 0, grid, ys)) {
+			brightened = vbafter_grid_say("after", vbafter.grid[0], vbafter.grid[2], ys, grid, vbafter.grid_before);
+		}
+	} else {
+		vbafter_row(text, sizeof(text), vbafter.row, 0, 0, after);
+		say_always("a34gl-vb:   after, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
+		/* a sample dark before (no colour above 0x40) and bright after (none below 0xc0) */
+		for (unsigned i = 0; i < 16; i++) {
+			brightened += vbafter_dark(vbafter.before[i]) && vbafter_bright(after[i]);
+		}
+	}
+	/* (not icons, glyphs, the battery: what is drawn 100 x 100 or more) */
+	if (vbafter.box[2] - vbafter.box[0] < 100 || vbafter.box[3] - vbafter.box[1] < 100) {
+		brightened = 0;
 	}
 	if (brightened != 0) {
-		say_always("a34gl-vb:   ^ %s draw that made dark samples bright here: %u of 16\n", vbafter.brightened++ == 0 ?
+		say_always("a34gl-vb:   ^ %s draw (100 x 100 or more) that made dark samples bright here: %u\n", vbafter.brightened++ == 0 ?
 		    "THE FIRST" : "another", brightened);
 	}
 	if (vbafter.reads && (marked = vbafter_mark(e, vbafter.box, vbafter.draw)) >= 0) {
 		say_always("a34gl-vb:   what it drew: rectangle %d\n", marked);
+	}
+}
+
+/* (picture_note()) a draw: into the screen's picture or elsewhere */
+static void
+screen_frame_draw(struct eagl *e)
+{
+	if (!black_check) {
+		return;
+	}
+	if (screen_texture(e, e->colour) != NULL) {
+		unsigned function = ca_function();
+
+		if (e->sf.draws++ == 0) {
+			e->sf.first_fn = function;
+			e->sf.first_prog = e->program;
+		}
+		e->sf.last_fn = function;
+		e->sf.last_prog = e->program;
+	} else {
+		e->sf.other++;
 	}
 }
 
@@ -4537,7 +4788,8 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (prof_period) {
 		prof.draws++;
 	}
-	if (vbafter.e != NULL || vbafter_frames != 0) {
+	screen_frame_draw(e);
+	if (vbafter.e != NULL || vbafter_frames != 0 || vbafter.next_e != NULL) {
 		vbafter_before(e, 0, NULL, first, count);
 	}
 	if (group_draw_begin(e, enabled)) {
@@ -4593,7 +4845,8 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (prof_period) {
 		prof.draws++;
 	}
-	if (vbafter.e != NULL || vbafter_frames != 0) {
+	screen_frame_draw(e);
+	if (vbafter.e != NULL || vbafter_frames != 0 || vbafter.next_e != NULL) {
 		vbafter_before(e, type, indices, 0, count);
 	}
 	if (group_draw_begin(e, enabled)) {
@@ -5727,6 +5980,7 @@ install(void)
 			if (*end == ',') {
 				vbafter_min_height = (unsigned)strtoul(end + 1, NULL, 10);
 			}
+			vbafter_whole = strstr(arguments, "glvbframe=0") == NULL;
 			if (vbafter_frames != 0) {
 				say("a34gl: glvbafter: %u frames with a draw of \"vrb\" %u pixels tall or more followed, from the %uth on (lines "
 				    "\"a34gl-vb:\")\n", vbafter_frames, vbafter_min_height, vbafter_skip + 1);
