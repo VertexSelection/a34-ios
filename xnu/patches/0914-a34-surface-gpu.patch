@@ -1,0 +1,1626 @@
+# IOSurfaces for the Mali (CoreAnimation GL path). Ported from ios-topaz (github.com/MakrSas/ios-topaz,
+# patches 0131-0137, 0139, 0901-0947 selected) and HackiOS (APSL 2.0 / MIT).
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f5065b8..05f426e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -401,6 +401,7 @@ bsd/kern/kern_credential.c		standard
+ bsd/kern/kern_crossarch.c		standard
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/sweet_amfi.c			standard
++bsd/kern/a34_inject.c			standard
+ 
+ # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
+ bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
+diff --git a/bsd/kern/a34_inject.c b/bsd/kern/a34_inject.c
+new file mode 100644
+index 0000000..b0e6c0c
+--- /dev/null
++++ b/bsd/kern/a34_inject.c
+@@ -0,0 +1,95 @@
++/*
++ * A34 (0914): DYLD_INSERT_LIBRARIES for named programs, added by the kernel
++ * at exec. After ios-topaz's kern.exec_inject (MakrSas/ios-topaz patch 0919,
++ * from HackiOS's darwin-redwood; Apple Public Source License 2.0).
++ *
++ * launchd passes no DYLD_* variable from a job description to a system
++ * daemon, and a wrapper binary in the daemon's place has to be a validly
++ * signed platform binary (launchd panics on "unexpected exec of non-platform
++ * binary"). So the kernel adds the variable to the environment of the
++ * program itself, backboardd for CoreAnimation's OpenGL ES renderer.
++ *
++ * Boot-arg a34inject=LIBRARY,NAME[,NAME...]: a program whose file name is
++ * one of the NAMEs starts with one more environment string,
++ * DYLD_INSERT_LIBRARIES=LIBRARY, unless its environment has that variable
++ * already. Without the boot-arg nothing changes. dyld honours the variable
++ * only when AMFI's dyld policy allows it (bsd/kern/sweet_amfi.c, a34dyld).
++ * The library must be signed (ad hoc is enough on the root filesystem); one
++ * that does not load is left out, the program starts without it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++
++#define A34_INJECT_VAR          "DYLD_INSERT_LIBRARIES="
++#define A34_INJECT_MAX          256
++
++/* bsd/kern/kern_exec.c, exec_extract_strings() */
++const char *a34_exec_inject(const char *name, int namelen, const char *env, const char *env_end);
++
++static char a34_inject_env[sizeof(A34_INJECT_VAR) + A34_INJECT_MAX];   /* the variable, "" for none */
++static char a34_inject_names[A34_INJECT_MAX];                           /* "NAME,NAME..." */
++
++__startup_func
++static void
++a34_inject_init(void)
++{
++	char conf[A34_INJECT_MAX];
++	char *comma;
++
++	if (!PE_parse_boot_arg_str("a34inject", conf, (int)sizeof(conf))) {
++		return;
++	}
++	comma = strchr(conf, ',');
++	if (conf[0] != '/' || comma == NULL || comma[1] == 0 || comma[1] == ',') {
++		printf("A34 INJECT: boot-arg a34inject=%s ignored (LIBRARY,NAME[,NAME...], LIBRARY a full path)\n", conf);
++		return;
++	}
++	*comma = 0;
++	strlcpy(a34_inject_names, comma + 1, sizeof(a34_inject_names));
++	snprintf(a34_inject_env, sizeof(a34_inject_env), "%s%s", A34_INJECT_VAR, conf);
++	printf("A34 INJECT: %s for %s\n", a34_inject_env, a34_inject_names);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, a34_inject_init);
++
++/*
++ * The environment string to add for the program `name` (namelen bytes, not
++ * NUL-terminated) whose environment strings so far lie in [env, env_end),
++ * or NULL.
++ */
++const char *
++a34_exec_inject(const char *name, int namelen, const char *env, const char *env_end)
++{
++	const char *p = a34_inject_names;
++
++	if (a34_inject_env[0] == 0 || name == NULL || namelen <= 0) {
++		return NULL;
++	}
++	while (*p != 0) {
++		const char *word = p;
++
++		while (*p != 0 && *p != ',') {
++			p++;
++		}
++		if (p - word == namelen && strncmp(word, name, (size_t)namelen) == 0) {
++			/* a variable of the program's own comes first and wins in dyld: nothing to add */
++			while (env != NULL && env < env_end) {
++				size_t len = strnlen(env, (size_t)(env_end - env));
++
++				if (strncmp(env, A34_INJECT_VAR, sizeof(A34_INJECT_VAR) - 1) == 0) {
++					return NULL;
++				}
++				env += len + 1;
++			}
++			printf("A34 INJECT: %.*s starts with %s\n", namelen, name, a34_inject_env);
++			return a34_inject_env;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return NULL;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..92afa1f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,10 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* A34 (0914): bsd/kern/a34_inject.c, DYLD_INSERT_LIBRARIES for named programs (boot-arg a34inject) */
++const char *a34_exec_inject(const char *name, int namelen, const char *env, const char *env_end);
++#endif
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5745,27 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* A34 (0914): one more variable for the programs named in boot-arg a34inject */
++	if (imgp->ip_ndp != NULL) {
++		const char *inject = a34_exec_inject(imgp->ip_ndp->ni_cnd.cn_nameptr, imgp->ip_ndp->ni_cnd.cn_namelen,
++		    imgp->ip_endargv, imgp->ip_strendp);
++
++		if (inject != NULL) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 1750d3a..b49e898 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -2358,6 +2358,11 @@ current_task_can_use_entitled_range()
+  *		non-0	Failure
+  */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* A34 (0914): no jetsam limit for backboardd (see below); boot-arg a34bbdmem=0 keeps its own */
++static TUNABLE(uint32_t, a34_bbd_nolimit, "a34bbdmem", 1);
++#endif
++
+ int
+ memorystatus_update(proc_t p, int priority, uint64_t user_data, boolean_t is_assertion, boolean_t effective, boolean_t update_memlimit,
+     int32_t memlimit_active, boolean_t memlimit_active_is_fatal,
+@@ -2366,6 +2371,20 @@ memorystatus_update(proc_t p, int priority, uint64_t user_data, boolean_t is_ass
+ 	int ret;
+ 	boolean_t head_insert = false;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A34 (0914, from ios-topaz 0915, MakrSas/ios-topaz, APSL 2.0): the
++	 * window server with Mesa in it (CoreAnimation's OpenGL ES renderer)
++	 * needs more than the iPhone X's limit for backboardd; over it, jetsam
++	 * kills it in a loop. No limit for backboardd (boot-arg a34bbdmem=0: its
++	 * own limit, as before).
++	 */
++	if (update_memlimit && a34_bbd_nolimit && strcmp(p->p_name, "backboardd") == 0) {
++		memlimit_active = memlimit_inactive = -1;
++		memlimit_active_is_fatal = memlimit_inactive_is_fatal = FALSE;
++	}
++#endif
++
+ 	memorystatus_log_info("memorystatus_update: changing (%s) pid %d: priority %d, user_data 0x%llx\n",
+ 	    (*p->p_name ? p->p_name : "unknown"), proc_getpid(p), priority, user_data);
+ 
+@@ -7685,6 +7704,13 @@ memorystatus_set_memlimit_properties_internal(proc_t p, memorystatus_memlimit_pr
+ {
+ 	int error = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (a34_bbd_nolimit && strcmp(p->p_name, "backboardd") == 0) {   /* A34 (0914): see memorystatus_update() */
++		p_entry->memlimit_active = p_entry->memlimit_inactive = -1;
++		p_entry->memlimit_active_attr = p_entry->memlimit_inactive_attr = 0;
++	}
++#endif
++
+ 	LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_OWNED);
+ 
+ 	/*
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..baf54c3 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,53 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * A34 (0914), after ios-topaz 0902 and 0147 (MakrSas/ios-topaz, APSL 2.0):
++ * dyld asks the MAC policy named "AMFI" what it may do for the process it
++ * starts: __mac_syscall("AMFI", 0x5a, { u64 flags in, user pointer to u64
++ * flags out }), amfi_check_dyld_policy_self(). With no policy of that name
++ * the call fails and every process runs restricted: dyld ignores DYLD_*
++ * variables and refuses @ paths ("security policy does not allow @ path
++ * expansion"). This policy is named "AMFI" and answers that call with
++ * everything allowed (@ paths, DYLD_* variables, fallback paths,
++ * interposing; a library that cannot be inserted is left out instead of
++ * killing the process). Every other AMFI call answers ENOPOLICY, as when
++ * there was no such policy. Boot-arg a34dyld=0: the old name, no answer.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++
++static TUNABLE(uint32_t, a34_dyld_policy, "a34dyld", 1);
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	static bool said;
++	uint64_t in_out[2] = { 0, 0 };
++	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++	int error;
++
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY || a34_dyld_policy == 0) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, in_out, sizeof(in_out));
++	if (error == 0) {
++		error = copyout(&allow, (user_addr_t)in_out[1], sizeof(allow));
++	}
++	if (!said) {
++		char name[32];
++
++		said = true;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("A34 AMFI: dyld policy of %s (flags 0x%llx in): 0x%llx (%d)\n", name,
++		    (unsigned long long)in_out[0], (unsigned long long)allow, error);
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -373,8 +418,11 @@ void sweet_amfi_policy_register(void);
+ void
+ sweet_amfi_policy_register(void)
+ {
++	if (a34_dyld_policy != 0) {
++		sweet_amfi_mac_conf.mpc_name = "AMFI";  /* A34 (0914): the name dyld asks (see sweet_amfi_syscall) */
++	}
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+-	printf("SWEET AMFI: platform binary policy %s (%d)\n",
++	printf("SWEET AMFI: platform binary policy \"%s\" %s (%d)\n", sweet_amfi_mac_conf.mpc_name,
+ 	    error ? "NOT registered" : "registered", error);
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 8fff864..10a0e88 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -42,6 +42,27 @@
+  * SYNC_BO has nothing to do (no mapping is cached) and the syncobjs Mesa asks
+  * about can all be answered "signalled" in the library. A buffer is freed at
+  * GEM_CLOSE or when the program goes: no job can be using it then.
++ *
++ * A34 (0914): one request is not Linux's, 0x7e, an IOSurface's memory as a
++ * buffer, as ios-topaz's RedwoodGPU (MakrSas/ios-topaz patch 0901, from
++ * HackiOS's darwin-redwood, APSL 2.0) and HackiOS's RedwoodMali have it, with
++ * their structure (struct a34_redwood_surface; the caller is ios-topaz's
++ * userland/mesa/redwood-drm, drmPrimeFDToHandle() and redwood_drm_surface()).
++ * In: the surface's ID, and as handle 0xffffffff to only describe it. Back:
++ * the buffer's size, where the pixels start in it, row bytes, width,
++ * height, pixel format, planes and (unless only described) its handle. The
++ * handle is an ordinary one from then on (GET_BO_OFFSET, MMAP_BO, WAIT_BO,
++ * QUERY_BO_INFO, GEM_CLOSE); a surface that is a buffer of this client's
++ * already gives that buffer's handle again, as Linux's PRIME import does. The
++ * surface's pages go into AS0 as they are (4 KB GPU pages) and the surface is
++ * held until GEM_CLOSE or the client goes. Shared like that, as in ios-topaz:
++ * surfaces of memory of their own (IOSurfaceCreate) or of a program's
++ * writable memory starting at a page, with 32-bit pixels in one plane and
++ * rows a multiple of 64 bytes; anything else answers kIOReturnUnsupported and
++ * the library copies instead. Surfaces are cacheable for every processor:
++ * those a job names (SUBMIT's bo_handles) are cleaned and invalidated around
++ * it like the client's own buffers. 0x7f (ios-topaz's test display) stays
++ * unsupported, as there.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -57,6 +78,8 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
++#include "SweetSurface.h"
++
+ /* bsd/dev/a34_mali.c declares the same (keep them alike). */
+ struct a34_mali_job {
+ 	uint64_t jc;                    /* in: the job chain's GPU address */
+@@ -100,6 +123,7 @@ enum {
+ 	kA34PanfrostJmCtxDestroy = 0x4b,
+ 	kA34PanfrostSyncBO      = 0x4c,
+ 	kA34PanfrostQueryBOInfo = 0x4d,
++	kA34RedwoodSurface      = 0x7e,         /* A34 (0914): ios-topaz's, an IOSurface's memory as a buffer */
+ };
+ 
+ #define A34_DRIVER_MAJOR        1
+@@ -111,6 +135,8 @@ enum {
+ #define PANFROST_JD_REQ_FS      (1u << 0)
+ #define PANFROST_JD_REQ_CYCLE_COUNT (1u << 1)
+ #define PANFROST_JM_CTX_PRIORITY_HIGH 2u
++#define DRM_PANFROST_BO_IS_IMPORTED 1u
++#define A34_REDWOOD_DESCRIBE    0xffffffffu     /* 0x7e's handle in: only describe the surface */
+ 
+ struct a34_drm_version {                /* the start of drm.h's struct drm_version */
+ 	int32_t major, minor, patchlevel;
+@@ -175,6 +201,20 @@ struct a34_query_bo_info {
+ 	uint32_t handle, extra_flags, create_flags, pad;
+ };
+ 
++/*
++ * A34 (0914): request 0x7e, laid out as ios-topaz's struct redwood_surface
++ * (iokit/Kernel/arm/RedwoodGPU.cpp) and struct redwood_drm_surface
++ * (userland/mesa/redwood-drm/xf86drm.h).
++ */
++struct a34_redwood_surface {
++	uint32_t surface;               /* the IOSurface's ID */
++	uint32_t handle;                /* A34_REDWOOD_DESCRIBE: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                  /* how big it is, */
++	uint32_t offset, rowBytes;      /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++static_assert(sizeof(struct a34_redwood_surface) == 40, "ios-topaz's struct redwood_surface is 40 bytes");
++
+ union a34_request {
+ 	struct a34_drm_version version;
+ 	struct a34_gem_close close;
+@@ -189,30 +229,50 @@ union a34_request {
+ 	struct a34_jm_ctx ctx;
+ 	struct a34_sync_bo sync;
+ 	struct a34_query_bo_info info;
++	struct a34_redwood_surface surface;
+ 	uint8_t raw[64];                /* the largest: struct drm_version */
+ };
+ 
+ struct a34_bo {
+-	IOBufferMemoryDescriptor *mem;  /* NULL: the handle is free */
++	IOBufferMemoryDescriptor *mem;  /* the buffer's own memory (NULL: a surface's, or the handle is free) */
++	SweetSurface *surface;          /* A34 (0914): the IOSurface whose memory this is (0x7e), held */
++	uintptr_t kva;                  /* A34 (0914): the surface's memory in the kernel, for cache upkeep */
+ 	uint64_t va;                    /* its GPU address */
+ 	uint64_t vasize;                /* GPU addresses it holds (a heap: all it asked for) */
+ 	uint64_t backed;                /* bytes of memory, mapped from va on */
+ 	uint32_t flags;                 /* the PANFROST_BO_* it was made with */
+-	uint32_t pad;
++	uint32_t round;                 /* A34 (0914): the last cache upkeep that took this surface */
+ };
+ 
++/* A34 (0914): a handle that is a buffer, of its own memory or a surface's. */
++static inline bool
++a34_bo_used(const struct a34_bo *b)
++{
++	return b->mem != NULL || b->surface != NULL;
++}
++
+ #define A34_BOS                 4096u           /* handles of a client: 1..A34_BOS */
++#define A34_SUBMIT_BOS_MAX      16384u          /* A34 (0914): longer SUBMIT lists are not read (every surface is flushed) */
++#define A34_SUBMIT_BOS_CHUNK    64u
++/*
++ * A34 (0914): GPU addresses after a surface's pages that stay unmapped, so
++ * that a GPU writing whole tiles past the last row (ios-topaz 0932/0940 saw
++ * the Adreno do so) faults instead of writing into the next buffer.
++ */
++#define A34_SURFACE_GUARD       (256ull << 10)
+ #define A34_UNIT                0x4000ull       /* buffers in kernel pages */
+ #define A34_BO_MAX              (512ull << 20)
+ #define A34_HEAP_VA_MAX         (1024ull << 20)
+ #define A34_LOGGED_SUBMITS      8u
+ #define A34_LOGGED_ERRORS       64u
++#define A34_LOGGED_SURFACES     16u             /* A34 (0914): surfaces taken / refused, logged per client */
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+ static uint64_t gA34MaliWiredMax = 1024ull << 20;
+ static uint64_t gA34MaliHeapBacked = 64ull << 20;
+ static uint32_t gA34MaliClients;
++static uint32_t gA34MaliSurfaces = 1;           /* A34 (0914): boot-arg a34malisurf=0: request 0x7e refuses every surface */
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+@@ -257,6 +317,7 @@ RedwoodMaliStart(void)
+ 	if (PE_parse_boot_argn("a34malimem", &mb, sizeof(mb)) && mb >= 64 && mb <= 4096) {
+ 		gA34MaliWiredMax = (uint64_t)mb << 20;
+ 	}
++	(void)PE_parse_boot_argn("a34malisurf", &gA34MaliSurfaces, sizeof(gA34MaliSurfaces));
+ 	gpu = OSTypeAlloc(RedwoodMali);
+ 	if (gA34MaliLock == NULL || platform == NULL || gpu == NULL || !gpu->init()) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -275,9 +336,9 @@ RedwoodMaliStart(void)
+ 		return false;
+ 	}
+ 	gpu->release();                 /* the registry holds it */
+-	IOLog("A34 MALI UC: RedwoodMali published (panfrost %d.%d, heaps backed %llu MB, buffers at most %llu MB)\n",
+-	    A34_DRIVER_MAJOR, A34_DRIVER_MINOR, (unsigned long long)(gA34MaliHeapBacked >> 20),
+-	    (unsigned long long)(gA34MaliWiredMax >> 20));
++	IOLog("A34 MALI UC: RedwoodMali published (panfrost %d.%d, heaps backed %llu MB, buffers at most %llu MB, "
++	    "IOSurfaces %s)\n", A34_DRIVER_MAJOR, A34_DRIVER_MINOR, (unsigned long long)(gA34MaliHeapBacked >> 20),
++	    (unsigned long long)(gA34MaliWiredMax >> 20), gA34MaliSurfaces ? "shared" : "not shared (a34malisurf=0)");
+ 	return true;
+ }
+ 
+@@ -292,15 +353,19 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fNextCtx;
+ 	uint32_t fBoCount, fBoMade, fSubmits, fFailed, fErrors;
+ 	uint64_t fWired;                        /* bytes of this client's buffers */
++	uint32_t fSurfaceBos, fSurfacesTaken, fSurfacesRefused; /* A34 (0914): surfaces among the buffers; taken, refused */
++	uint32_t fFlushRound;                   /* A34 (0914): cache upkeep rounds (struct a34_bo round) */
+ 	bool fOpen, fClosed;
+ 	char fName[32];
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+ 	void freeBo(struct a34_bo *b);
+ 	void flushBuffers(void);
++	void flushSurfaces(user_addr_t list, uint32_t count);
+ 	void releaseAll(void);
+ 	void describeFault(uint64_t va);
+ 	IOReturn createBo(struct a34_create_bo *req);
++	IOReturn surfaceBo(struct a34_redwood_surface *req);
+ 	IOReturn request(uint32_t selector, union a34_request *r);
+ 
+ public:
+@@ -358,10 +423,60 @@ RedwoodMaliUserClient::flushBuffers(void)
+ 	}
+ }
+ 
++/*
++ * With the lock held. A34 (0914): the surfaces among the buffers a job
++ * names (SUBMIT's bo_handles, a user address; Mesa lists every buffer a
++ * batch reads or writes), cleaned and invalidated like the client's own
++ * buffers: a surface is cacheable memory for every processor and program,
++ * and the GPU is not coherent. Each surface once per call; a list that
++ * cannot be read, or none: every surface of the client.
++ */
++void
++RedwoodMaliUserClient::flushSurfaces(user_addr_t list, uint32_t count)
++{
++	uint32_t chunk[A34_SUBMIT_BOS_CHUNK], round, done = 0;
++	bool all = list == 0 || count == 0 || count > A34_SUBMIT_BOS_MAX;
++
++	if (fBos == NULL || fSurfaceBos == 0) {
++		return;
++	}
++	if (++fFlushRound == 0) {
++		fFlushRound = 1;
++	}
++	round = fFlushRound;
++	while (!all && done < count) {
++		uint32_t n = count - done < A34_SUBMIT_BOS_CHUNK ? count - done : A34_SUBMIT_BOS_CHUNK;
++
++		if (copyin(list + (user_addr_t)done * sizeof(uint32_t), chunk, n * sizeof(uint32_t)) != 0) {
++			all = true;
++			break;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			struct a34_bo *b = lookup(chunk[i]);
++
++			if (b != NULL && b->surface != NULL && b->round != round) {
++				b->round = round;
++				a34_mali_cpu_flush(b->kva, b->backed);
++			}
++		}
++		done += n;
++	}
++	if (all) {
++		for (uint32_t i = 0; i < A34_BOS; i++) {
++			struct a34_bo *b = &fBos[i];
++
++			if (b->surface != NULL && b->round != round) {
++				b->round = round;
++				a34_mali_cpu_flush(b->kva, b->backed);
++			}
++		}
++	}
++}
++
+ struct a34_bo *
+ RedwoodMaliUserClient::lookup(uint32_t handle)
+ {
+-	if (fBos == NULL || fClosed || handle == 0 || handle > A34_BOS || fBos[handle - 1].mem == NULL) {
++	if (fBos == NULL || fClosed || handle == 0 || handle > A34_BOS || !a34_bo_used(&fBos[handle - 1])) {
+ 		return NULL;
+ 	}
+ 	return &fBos[handle - 1];
+@@ -373,10 +488,17 @@ RedwoodMaliUserClient::freeBo(struct a34_bo *b)
+ {
+ 	a34_mali_unmap(b->va, b->backed);
+ 	a34_mali_va_free(b->va, b->vasize);
+-	gA34MaliWired -= b->backed;
+-	fWired -= b->backed;
+ 	fBoCount--;
+-	b->mem->release();              /* a program's mapping of it holds it until unmapped */
++	if (b->surface != NULL) {
++		/* A34 (0914): out of the GPU's tables first, then the surface may go */
++		fSurfaceBos--;
++		OSDecrementAtomic(&b->surface->gpuShared);
++		b->surface->release();
++	} else {
++		gA34MaliWired -= b->backed;
++		fWired -= b->backed;
++		b->mem->release();      /* a program's mapping of it holds it until unmapped */
++	}
+ 	bzero(b, sizeof(*b));
+ }
+ 
+@@ -390,7 +512,7 @@ RedwoodMaliUserClient::releaseAll(void)
+ 	if (fOpen && !fClosed) {
+ 		was = true;
+ 		for (uint32_t i = 0; i < A34_BOS; i++) {
+-			if (fBos[i].mem != NULL) {
++			if (a34_bo_used(&fBos[i])) {
+ 				freeBo(&fBos[i]);
+ 				freed++;
+ 			}
+@@ -400,8 +522,8 @@ RedwoodMaliUserClient::releaseAll(void)
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
+ 	if (was) {
+-		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made), %u job chains, %u failed, %u errors; %u clients left\n",
+-		    fName, freed, fBoMade, fSubmits, fFailed, fErrors, clients);
++		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made, %u surfaces taken), %u job chains, %u failed, "
++		    "%u errors; %u clients left\n", fName, freed, fBoMade, fSurfacesTaken, fSubmits, fFailed, fErrors, clients);
+ 	}
+ }
+ 
+@@ -412,10 +534,12 @@ RedwoodMaliUserClient::describeFault(uint64_t va)
+ 	for (uint32_t i = 0; i < A34_BOS; i++) {
+ 		struct a34_bo *b = &fBos[i];
+ 
+-		if (b->mem != NULL && va >= b->va && va < b->va + b->vasize) {
++		if (a34_bo_used(b) && va >= b->va && va < b->va + b->vasize) {
+ 			IOLog("A34 MALI UC: %s: the fault at 0x%llx is 0x%llx into buffer %u (0x%llx bytes at 0x%llx, 0x%llx backed, flags 0x%x)%s\n",
+ 			    fName, (unsigned long long)va, (unsigned long long)(va - b->va), i + 1,
+ 			    (unsigned long long)b->vasize, (unsigned long long)b->va, (unsigned long long)b->backed, b->flags,
++			    b->surface != NULL ? (va - b->va >= b->backed ? ": past an IOSurface's pages, in the guard after them" :
++			    ": an IOSurface's memory") :
+ 			    va - b->va >= b->backed ? ": past its memory, the tiler heap is full (boot-arg a34maliheap)" : "");
+ 			return;
+ 		}
+@@ -453,7 +577,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	for (uint32_t n = 0; n < A34_BOS; n++) {
+ 		uint32_t i = (fNextBo + n) % A34_BOS;
+ 
+-		if (fBos[i].mem == NULL) {
++		if (!a34_bo_used(&fBos[i])) {
+ 			b = &fBos[i];
+ 			handle = i + 1;
+ 			break;
+@@ -520,6 +644,151 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * A34 (0914): request 0x7e (see the top of the file), ios-topaz's
++ * RedwoodGPUUserClient::surfaceBuffer() for AS0. Takes the lock itself: the
++ * surface is looked up, checked and mapped into the kernel first.
++ */
++IOReturn
++RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
++{
++	SweetSurface *s = sweet_surface_copy(req->surface);
++	IOMemoryDescriptor *md;
++	struct a34_bo *b = NULL;
++	const char *why = NULL;
++	uint64_t size = 0, need, va, off;
++	uintptr_t kva = 0;
++	uint32_t handle = 0;
++	IOReturn ret;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	md = s->memory;
++	if (gA34MaliSurfaces == 0) {
++		why = "boot-arg a34malisurf=0";
++	} else if (md == NULL || (OSDynamicCast(IOBufferMemoryDescriptor, md) == NULL && !s->wrapped)) {
++		why = "no memory of its own (the panel's)";
++	} else if (s->wrapped && (s->wrapDelta != 0 || (md->getDirection() & kIODirectionIn) == 0)) {
++		why = "a program's memory not from a page start, or read-only";
++	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount > 1 ||
++	    (s->bytesPerRow & 63) != 0 || s->width == 0 || s->height == 0) {
++		/* ios-topaz 0938/0940: the GPU stopped after sharing text masks with 640- and 480-byte rows */
++		why = "not 32-bit pixels in one plane with 64-byte aligned rows";
++	} else {
++		size = md->getLength() & ~0xfffull;
++		need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height;
++		if (s->planeCount == 1 && (uint64_t)s->planes[0].offset + s->planes[0].size > need) {
++			need = (uint64_t)s->planes[0].offset + s->planes[0].size;
++		}
++		if (size == 0 || need > size || size > A34_BO_MAX) {
++			why = "pixels past its memory, or too big";
++		} else if ((kva = s->kernelAddress()) == 0) {
++			why = "not mapped into the kernel";
++		}
++	}
++	if (why != NULL) {
++		if (fSurfacesRefused++ < A34_LOGGED_SURFACES) {
++			IOLog("A34 MALI UC: %s: surface %u (%ux%u fmt 0x%x bpe %u bpr %u planes %u, %u bytes) not shared: %s\n", fName,
++			    req->surface, s->width, s->height, s->pixelFormat, s->bytesPerElement, s->bytesPerRow, s->planeCount,
++			    s->allocSize, why);
++		}
++		s->release();
++		return kIOReturnUnsupported;    /* (the library then copies the surface instead) */
++	}
++	req->size = size;
++	req->offset = s->offset;
++	req->rowBytes = s->bytesPerRow;
++	req->width = s->width;
++	req->height = s->height;
++	req->pixelFormat = s->pixelFormat;
++	req->planes = s->planeCount;
++	if (req->handle == A34_REDWOOD_DESCRIBE) {
++		req->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gA34MaliLock);
++	if (fBos == NULL || !fOpen || fClosed) {
++		ret = kIOReturnNotOpen;
++		goto out;
++	}
++	/* the same surface again: the same buffer (freedreno/panfrost look their buffers up by handle) */
++	for (uint32_t i = 0; i < A34_BOS; i++) {
++		if (fBos[i].surface == s) {
++			req->handle = i + 1;
++			ret = kIOReturnSuccess;
++			goto out;
++		}
++	}
++	for (uint32_t n = 0; n < A34_BOS; n++) {
++		uint32_t i = (fNextBo + n) % A34_BOS;
++
++		if (!a34_bo_used(&fBos[i])) {
++			b = &fBos[i];
++			handle = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("A34 MALI UC: %s: all %u handles in use\n", fName, A34_BOS);
++		ret = kIOReturnNoResources;
++		goto out;
++	}
++	va = a34_mali_va_alloc(size + A34_SURFACE_GUARD, false);
++	if (va == 0) {
++		IOLog("A34 MALI UC: %s: no GPU addresses left for surface %u (%llu KB)\n", fName, req->surface,
++		    (unsigned long long)(size >> 10));
++		ret = kIOReturnNoSpace;
++		goto out;
++	}
++	/* the surface's pages as they are (wired: a buffer's own, or a program's prepared range) */
++	for (off = 0; off < size;) {
++		IOByteCount seglen = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++		uint64_t len = seglen;
++
++		if (len > size - off) {
++			len = size - off;
++		}
++		len &= ~0xfffull;
++		if (pa == 0 || (pa & 0xfffull) != 0 || len == 0 || !a34_mali_map(va + off, pa, len)) {
++			a34_mali_unmap(va, size);
++			a34_mali_va_free(va, size + A34_SURFACE_GUARD);
++			IOLog("A34 MALI UC: %s: surface %u (%llu KB) would not go into the GPU's tables (at 0x%llx: 0x%llx, 0x%llx bytes)\n",
++			    fName, req->surface, (unsigned long long)(size >> 10), (unsigned long long)off, (unsigned long long)pa,
++			    (unsigned long long)seglen);
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++		off += len;
++	}
++	b->surface = s;                 /* the reference sweet_surface_copy() gave, until freeBo() */
++	OSIncrementAtomic(&s->gpuShared);
++	s = NULL;
++	b->kva = kva;
++	b->va = va;
++	b->vasize = size + A34_SURFACE_GUARD;   /* the guard is freed with it (freeBo) */
++	b->backed = size;
++	b->flags = PANFROST_BO_NOEXEC;
++	b->round = 0;
++	fNextBo = handle % A34_BOS;
++	fBoCount++;
++	fSurfaceBos++;
++	if (fSurfacesTaken++ < A34_LOGGED_SURFACES) {
++		IOLog("A34 MALI UC: %s: surface %u (%ux%u fmt 0x%x bpr %u, %llu KB%s) is buffer %u at 0x%llx\n", fName,
++		    req->surface, req->width, req->height, req->pixelFormat, req->rowBytes, (unsigned long long)(size >> 10),
++		    b->surface->wrapped ? ", a program's memory" : "", handle, (unsigned long long)va);
++	}
++	req->handle = handle;
++	ret = kIOReturnSuccess;
++out:
++	IOLockUnlock(gA34MaliLock);
++	OSSafeReleaseNULL(s);
++	return ret;
++}
++
+ IOReturn
+ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+ {
+@@ -528,7 +797,13 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 
+ 	IOLockLock(gA34MaliLock);
+ 	b = lookup(type);
+-	if (b != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
++	if (b != NULL && b->surface != NULL) {
++		/* A34 (0914): the surface's memory, as every program that has the surface maps it (cacheable) */
++		b->surface->memory->retain();   /* given to the mapping */
++		*memory = b->surface->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	} else if (b != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
+ 		b->mem->retain();               /* given to the mapping */
+ 		*memory = b->mem;
+ 		*options = 0;                   /* the buffer's own cache mode: cacheable (0911) */
+@@ -609,7 +884,7 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		if (b == NULL) {
+ 			ret = kIOReturnNotFound;
+ 		} else {
+-			r->info.extra_flags = 0;
++			r->info.extra_flags = b->surface != NULL ? DRM_PANFROST_BO_IS_IMPORTED : 0;
+ 			r->info.create_flags = b->flags;
+ 			r->info.pad = 0;
+ 		}
+@@ -644,8 +919,10 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		job.requirements = r->submit.requirements;
+ 		n = ++fSubmits;
+ 		flushBuffers();                 /* the program's writes to memory for the GPU */
++		flushSurfaces(r->submit.bo_handles, r->submit.bo_handle_count);        /* A34 (0914): everybody's, of the surfaces it names */
+ 		bool done = a34_mali_submit(&job);
+ 		flushBuffers();                 /* and no stale lines over what the GPU wrote */
++		flushSurfaces(r->submit.bo_handles, r->submit.bo_handle_count);
+ 		if (!done) {
+ 			fFailed++;
+ 			IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s) failed after %llu us: JOB_INT 0x%08x JS_STATUS 0x%08x MMU_INT 0x%08x\n",
+@@ -687,20 +964,28 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		if (insize != 0) {
+ 			memcpy(&r, args->structureInput, insize);
+ 		}
+-		if (selector == kA34PanfrostWaitBO && r.wait.timeout_ns <= 0) {
+-			/* only a look: a job of another thread or program still running is "busy" */
+-			if (!IOLockTryLock(gA34MaliLock)) {
+-				return kIOReturnBusy;
++		if (selector == kA34RedwoodSurface) {
++			/* A34 (0914): looks the surface up and maps it before it takes the lock */
++			ret = surfaceBo(&r.surface);
++			if (ret != kIOReturnSuccess && ret != kIOReturnUnsupported && fErrors++ < A34_LOGGED_ERRORS) {
++				IOLog("A34 MALI UC: %s: request 0x%02x for surface %u -> 0x%x\n", fName, selector, r.surface.surface, ret);
+ 			}
+ 		} else {
+-			IOLockLock(gA34MaliLock);
+-		}
+-		ret = request(selector, &r);
+-		if (ret != kIOReturnSuccess && fErrors++ < A34_LOGGED_ERRORS) {
+-			IOLog("A34 MALI UC: %s: request 0x%02x (%u bytes) -> 0x%x%s\n", fName, selector, insize, ret,
+-			    fErrors == A34_LOGGED_ERRORS ? " (no more errors logged for this client)" : "");
++			if (selector == kA34PanfrostWaitBO && r.wait.timeout_ns <= 0) {
++				/* only a look: a job of another thread or program still running is "busy" */
++				if (!IOLockTryLock(gA34MaliLock)) {
++					return kIOReturnBusy;
++				}
++			} else {
++				IOLockLock(gA34MaliLock);
++			}
++			ret = request(selector, &r);
++			if (ret != kIOReturnSuccess && fErrors++ < A34_LOGGED_ERRORS) {
++				IOLog("A34 MALI UC: %s: request 0x%02x (%u bytes) -> 0x%x%s\n", fName, selector, insize, ret,
++				    fErrors == A34_LOGGED_ERRORS ? " (no more errors logged for this client)" : "");
++			}
++			IOLockUnlock(gA34MaliLock);
+ 		}
+-		IOLockUnlock(gA34MaliLock);
+ 		if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+ 			outsize = args->structureOutputSize < sizeof(r) ? args->structureOutputSize : (uint32_t)sizeof(r);
+ 			memcpy(args->structureOutput, &r, outsize);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bd1826c..e21fc79 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -492,6 +492,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ 
+ /* A34: command-mode DSI panel, see pexpert/arm/pe_serial.c fbcon_kick(). */
+ extern "C" void a34_display_kick(void);
++/* A34 (0914): bsd/dev/a34_mali.c, dc civac over a kernel range (no state: no lock needed) */
++extern "C" void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ 
+ void
+ AppleCLCD::present(const uint8_t *rec)
+@@ -534,6 +536,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		/* A34 (0914): a program's memory as a surface starts wrapDelta into its first page */
++		if (src != 0) {
++			src += s->wrapDelta;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -569,7 +575,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		uint64_t last = (uint64_t)s->wrapDelta + (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+@@ -582,6 +588,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 			const uint32_t *srccp = (const uint32_t *)(src + s->offset +
+ 			    (uint64_t)(s->height / 2) * s->bytesPerRow + (uint64_t)(s->width / 2) * 4);
+ 			uint64_t t_copy = mach_absolute_time();
++			/*
++			 * A34 (0914): a surface the GPU draws into (RedwoodMali request
++			 * 0x7e): nothing this processor's caches hold of the rows is
++			 * older than what the GPU wrote. Every job that names the
++			 * surface is bracketed by a clean+invalidate already; this one
++			 * covers a job that did not name it. (flush_dcache64() is no
++			 * help: "fully coherent", a no-op on this Apple-SoC config.)
++			 */
++			if (s->gpuShared > 0) {
++				/* from the first row copied to the last pixel copied: inside the memory (`last` above) */
++				a34_mali_cpu_flush(src + s->offset + (uint64_t)sy * s->bytesPerRow,
++				    (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..1a8c703 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -22,8 +22,18 @@
+  * into each task that creates or looks it up; mappings are counted per
+  * client and dropped on release or close.
+  *
+- * Values, notifications, accelerators and shared events are accepted and
+- * ignored (logged once per selector).
++ * A34 (0914), from ios-topaz (MakrSas/ios-topaz, APSL 2.0) 0131-0137 and
++ * 0139, what CoreAnimation's OpenGL ES renderer needs: values (9/10/11) live
++ * in a dictionary per surface, their seed and size in the state page
++ * (+0x20/+0x28); bulk attachments (27: colour space, transfer function...)
++ * are kept at +0x30 of the state page, where the framework reads them;
++ * purgeability (20), accelerator binding (12) and the YCbCr matrix (5) are
++ * remembered. Surfaces of a task's own memory: IOSurfaceWrapClientImage /
++ * WrapClientMemory (6/7) and creation with IOSurfaceAddress. Other calls that
++ * answer with a lock result are refused (a zeroed client crashed the
++ * renderer). Trap 4 only detaches a view, trap 5 releases it; a released
++ * view keeps its state page mapped for a while. Notifications, ownership
++ * and timestamps are accepted and ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
+ 
+@@ -38,11 +48,22 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceSetYCbCrMatrix     = 5,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
++	kSweetSurfaceSetValue           = 9,
++	kSweetSurfaceCopyValue          = 10,
++	kSweetSurfaceRemoveValue        = 11,
++	kSweetSurfaceBindAccel          = 12,
++	kSweetSurfaceSetPurgeable       = 20,
++	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -65,6 +86,13 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_ACCEL       0x8     /* u16 accelerator id, u16 sub id */
++#define SWEET_SURFACE_STATE_VSEED       0x20    /* u32 values seed */
++#define SWEET_SURFACE_STATE_YCBCR       0x24    /* u32 */
++#define SWEET_SURFACE_STATE_VSIZE       0x28    /* u32 room the values need when fetched, 0: none */
++#define SWEET_SURFACE_STATE_BULK        0x30    /* 0x70 bytes of bulk attachments */
++#define SWEET_SURFACE_BULK_SIZE         0x70
++#define SWEET_SURFACE_ZOMBIES           256     /* released views whose state page stays mapped */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -84,6 +112,10 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	OSSafeReleaseNULL(values);
++	if (wrapped && memory != NULL) {
++		memory->complete();     /* the task's pages were wired for the surface's life */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +130,8 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* a task's memory is ordinary cached memory: mapped as it is everywhere else */
++		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -263,6 +296,41 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ 	return n != NULL ? n->unsigned32BitValue() : def;
+ }
+ 
++/*
++ * A34 (0914, topaz 0134/0135): make s's pixels the memory a task has already
++ * at address (size bytes): the range is prepared (wired) for as long as the
++ * surface lives, and every task that looks the surface up maps those same
++ * pages. Writable if it can be; a picture that is only shown may be
++ * read-only memory.
++ */
++static IOReturn
++sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size)
++{
++	IOMemoryDescriptor *md = NULL;
++	IOReturn held = kIOReturnNoMemory;
++
++	if (address == 0 || size == 0 || size > SWEET_SURFACE_MAX_ALLOC || address + size < address) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t first = trunc_page_64(address);
++	uint64_t length = round_page_64(address + size) - first;
++	for (int attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++		OSSafeReleaseNULL(md);
++		md = IOMemoryDescriptor::withAddressRange(first, length,
++		    attempt == 0 ? kIODirectionInOut : kIODirectionOut, task);
++		held = md != NULL ? md->prepare() : kIOReturnNoMemory;
++	}
++	if (held != kIOReturnSuccess) {
++		OSSafeReleaseNULL(md);
++		return kIOReturnVMError;
++	}
++	s->memory = md;
++	s->wrapped = true;
++	s->wrapDelta = (uint32_t)(address - first);
++	s->mapCache = kIOMapDefaultCache;
++	return kIOReturnSuccess;
++}
++
+ static uint32_t
+ sweet_div_up(uint32_t a, uint32_t b)
+ {
+@@ -357,8 +425,10 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	bool          detached;     /* A34 (0914, topaz 0136): trap 4 seen, the framework is releasing this view */
++	bool          released;     /* A34 (0914, topaz 0137): released, only its state page stays mapped (fZombies) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; released = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -370,7 +440,9 @@ SweetSurfaceRef::free()
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
+-		sweet_surface_put(surface);
++		if (!released) {
++			sweet_surface_put(surface);
++		}
+ 		surface->release();
+ 		surface = NULL;
+ 	}
+@@ -405,11 +477,15 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	task_t   fTask;
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
++	OSArray *fZombies;      /* released views whose state page is still mapped, oldest first */
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index, bool detached = false);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClient(uint32_t selector, IOExternalMethodArguments *args);
++	IOReturn valueCall(uint32_t selector, IOExternalMethodArguments *args);
++	IOReturn bulkAttachments(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -424,6 +500,7 @@ public:
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -452,6 +529,7 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
++	fZombies = OSArray::withCapacity(16);
+ 	return fLock != NULL && fRefs != NULL;
+ }
+ 
+@@ -459,6 +537,7 @@ void
+ IOSurfaceRootUserClient::free()
+ {
+ 	OSSafeReleaseNULL(fRefs);
++	OSSafeReleaseNULL(fZombies);
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+@@ -471,18 +550,21 @@ IOSurfaceRootUserClient::clientClose(void)
+ {
+ 	IOLockLock(fLock);
+ 	fRefs->flushCollection();
++	if (fZombies != NULL) {
++		fZombies->flushCollection();
++	}
+ 	IOLockUnlock(fLock);
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Lock held. */
++/* Lock held. A34 (0914, topaz 0136): the view in the given detach state. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index, bool detached)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -567,7 +649,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);      /* (a task's memory: where it starts in its page) */
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -684,7 +766,37 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	/*
++	 * A34 (0914, topaz 0134/0135/0139): IOSurfaceAddress, a surface around
++	 * memory the creator has already. CoreAnimation's GL renderer makes its
++	 * pictures (applications' icons, layers' contents) into surfaces so;
++	 * given fresh memory instead, every icon was a transparent square. The
++	 * memory is as big as its owner says (IOSurfaceAllocSize), else what the
++	 * geometry needs. Published here: unpublished, every such surface had id
++	 * 0 and releasing one unmapped the views of the others.
++	 */
++	OSNumber *client_address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && client_address != NULL) {
++		uint64_t used = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			if ((uint64_t)s->planes[i].offset + s->planes[i].size > used) {
++				used = (uint64_t)s->planes[i].offset + s->planes[i].size;
++			}
++		}
++		uint64_t owned = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		if (owned != 0) {
++			used = owned;
++		}
++		ret = sweet_surface_use_task_memory(s, fTask, client_address->unsigned64BitValue(), used);
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++		static uint32_t told;
++		if (told++ < 6) {
++			IOLog("SWEET SURF: create around client memory %#llx (%llu bytes) %ux%u fmt 0x%x -> 0x%x\n",
++			    client_address->unsigned64BitValue(), (unsigned long long)used, s->width, s->height, s->pixelFormat, ret);
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -721,6 +833,318 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * A34 (0914, topaz 0133): the structure input of a call, wherever it came
++ * (inline or a descriptor), copied. Free with IOFreeData(copy, *len).
++ */
++static uint8_t *
++sweet_struct_in(IOExternalMethodArguments *args, uint32_t *len)
++{
++	uint8_t *copy;
++
++	if (args->structureInputDescriptor != NULL) {
++		*len = (uint32_t)args->structureInputDescriptor->getLength();
++	} else {
++		*len = args->structureInputSize;
++	}
++	if (*len == 0 || *len > SWEET_SURFACE_MAX_PROPS || (copy = (uint8_t *)IOMallocData(*len)) == NULL) {
++		return NULL;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->readBytes(0, copy, *len) != *len) {
++			IOFreeData(copy, *len);
++			return NULL;
++		}
++	} else if (args->structureInput != NULL) {
++		memcpy(copy, args->structureInput, *len);
++	} else {
++		IOFreeData(copy, *len);
++		return NULL;
++	}
++	return copy;
++}
++
++static uint32_t *
++sweet_state32(SweetSurface *s, uint32_t offset)
++{
++	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + offset);
++}
++
++/* After a change of the values: a new (odd) seed and the room a fetch of all of them needs. Lock held. */
++static void
++sweet_values_changed(SweetSurface *s)
++{
++	uint32_t size = 0;
++
++	if (s->values != NULL && s->values->getCount() != 0) {
++		OSSerialize *ser = OSSerialize::binaryWithCapacity(4096);
++		if (ser != NULL && s->values->serialize(ser)) {
++			size = ser->getLength() + 8;
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	*sweet_state32(s, SWEET_SURFACE_STATE_VSEED) = (*sweet_state32(s, SWEET_SURFACE_STATE_VSEED) + 2) | 1;
++	*sweet_state32(s, SWEET_SURFACE_STATE_VSIZE) = size;
++}
++
++static void
++sweet_reply_seed(IOExternalMethodArguments *args, uint32_t seed)
++{
++	if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(seed)) {
++		memcpy(args->structureOutput, &seed, sizeof(seed));
++		args->structureOutputSize = sizeof(seed);
++	}
++}
++
++/*
++ * A34 (0914, topaz 0133): values. Requests start with the surface id (8
++ * bytes). SetValue: then a serialized array, [value, key] or [dictionary of
++ * them all]. RemoveValue and CopyValue: then a key, NUL-terminated (empty:
++ * all). Changes answer the new seed; CopyValue answers 4 unused bytes, the
++ * seed, the serialized value.
++ */
++IOReturn
++IOSurfaceRootUserClient::valueCall(uint32_t selector, IOExternalMethodArguments *args)
++{
++	uint32_t len = 0, id, seed = 0, length = 0;
++	uint8_t *in = sweet_struct_in(args, &len);
++	IOReturn ret = kIOReturnBadArgument;
++	OSSerialize *ser = NULL;
++	OSObject *obj = NULL;
++	SweetSurface *s;
++
++	if (in == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (len < 9 || (selector != kSweetSurfaceSetValue && in[len - 1] != 0)) {
++		IOFreeData(in, len);
++		return kIOReturnBadArgument;
++	}
++	memcpy(&id, in, sizeof(id));
++	s = sweet_surface_copy(id);
++	if (s == NULL) {
++		IOFreeData(in, len);
++		return kIOReturnNotFound;
++	}
++	if (selector == kSweetSurfaceSetValue) {
++		obj = OSUnserializeXML((const char *)in + 8, len - 8);
++	}
++	IOLockLock(sweet_surface_lock);
++	if (s->values == NULL) {
++		s->values = OSDictionary::withCapacity(4);
++	}
++	if (s->values == NULL) {
++		ret = kIOReturnNoMemory;
++	} else if (selector == kSweetSurfaceSetValue) {
++		OSArray *array = OSDynamicCast(OSArray, obj);
++		OSString *key = array != NULL ? OSDynamicCast(OSString, array->getObject(1)) : NULL;
++		OSDictionary *all = array != NULL ? OSDynamicCast(OSDictionary, array->getObject(0)) : NULL;
++		if (array != NULL && array->getCount() == 2 && key != NULL && array->getObject(0) != NULL) {
++			s->values->setObject(key, array->getObject(0));
++			ret = kIOReturnSuccess;
++		} else if (array != NULL && array->getCount() == 1 && all != NULL) {
++			s->values->merge(all);
++			ret = kIOReturnSuccess;
++		}
++		if (ret == kIOReturnSuccess) {
++			sweet_values_changed(s);
++		}
++	} else if (selector == kSweetSurfaceRemoveValue) {
++		const char *key = (const char *)in + 8;
++		if (key[0] == 0) {
++			s->values->flushCollection();
++		} else {
++			s->values->removeObject(key);
++		}
++		sweet_values_changed(s);
++		ret = kIOReturnSuccess;
++	} else {
++		const char *key = (const char *)in + 8;
++		OSObject *value = key[0] != 0 ? s->values->getObject(key) : s->values;
++		ret = kIOReturnSuccess;
++		if (value != NULL && (key[0] != 0 || s->values->getCount() != 0)) {
++			ser = OSSerialize::binaryWithCapacity(4096);
++			if (ser == NULL || !value->serialize(ser)) {
++				ret = kIOReturnNoMemory;
++			} else {
++				length = ser->getLength();
++			}
++		}
++	}
++	seed = *sweet_state32(s, SWEET_SURFACE_STATE_VSEED);
++	IOLockUnlock(sweet_surface_lock);
++	OSSafeReleaseNULL(obj);
++	IOFreeData(in, len);
++
++	if (ret == kIOReturnSuccess && selector == kSweetSurfaceCopyValue) {
++		uint32_t header[2] = { 0, seed }, total = (uint32_t)sizeof(header) + length;
++		if (args->structureOutputDescriptor != NULL) {
++			IOMemoryDescriptor *out = args->structureOutputDescriptor;
++			if (out->getLength() < total) {
++				ret = kIOReturnNoSpace;
++			} else if ((ret = out->prepare()) == kIOReturnSuccess) {
++				out->writeBytes(0, header, sizeof(header));
++				if (length != 0) {
++					out->writeBytes(sizeof(header), ser->text(), length);
++				}
++				out->complete();
++				args->structureOutputDescriptorSize = total;
++			}
++		} else if (args->structureOutput == NULL || args->structureOutputSize < total) {
++			ret = kIOReturnNoSpace;
++		} else {
++			memcpy(args->structureOutput, header, sizeof(header));
++			if (length != 0) {
++				memcpy((uint8_t *)args->structureOutput + sizeof(header), ser->text(), length);
++			}
++			args->structureOutputSize = total;
++		}
++	} else if (ret == kIOReturnSuccess) {
++		sweet_reply_seed(args, seed);
++	}
++	OSSafeReleaseNULL(ser);
++	s->release();
++	return ret;
++}
++
++/*
++ * A34 (0914, topaz 0133): bulk attachments (colour space, transfer function,
++ * ...): 0x70 bytes, then at +0x70 their size, +0x78 a mask of the fields
++ * that changed, +0x80 the surface id. The fields, by their bit, are these
++ * byte ranges of the 0x70; kept at +0x30 of the state page.
++ */
++IOReturn
++IOSurfaceRootUserClient::bulkAttachments(IOExternalMethodArguments *args)
++{
++	static const uint8_t field[15][2] = {
++		{ 0x00, 0x20 }, { 0x20, 0x30 }, { 0x30, 0x38 }, { 0x38, 0x39 }, { 0x39, 0x3a }, { 0x3a, 0x3b }, { 0x3b, 0x3c },
++		{ 0x3c, 0x3d }, { 0x3d, 0x3e }, { 0x3e, 0x3f }, { 0x3f, 0x40 }, { 0x40, 0x58 }, { 0x58, 0x5c }, { 0x5c, 0x64 },
++		{ 0x64, 0x65 },
++	};
++	uint32_t len = 0, id;
++	uint64_t size, mask;
++	uint8_t *in = sweet_struct_in(args, &len);
++	SweetSurface *s;
++
++	if (in == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (len < 0x84) {
++		IOFreeData(in, len);
++		return kIOReturnBadArgument;
++	}
++	memcpy(&size, in + 0x70, 8);
++	memcpy(&mask, in + 0x78, 8);
++	memcpy(&id, in + 0x80, 4);
++	if (size > SWEET_SURFACE_BULK_SIZE) {
++		IOFreeData(in, len);
++		return kIOReturnBadArgument;
++	}
++	s = sweet_surface_copy(id);
++	if (s == NULL) {
++		IOFreeData(in, len);
++		return kIOReturnNotFound;
++	}
++	uint8_t *bulk = (uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_BULK;
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < 15; i++) {
++		if ((mask & (1ull << i)) && field[i][1] <= size) {
++			memcpy(bulk + field[i][0], in + field[i][0], field[i][1] - field[i][0]);
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	IOFreeData(in, len);
++	s->release();
++	return kIOReturnSuccess;
++}
++
++/*
++ * A34 (0914, topaz 0132/0134): IOSurfaceWrapClientImage (6: struct of 0x20
++ * bytes: +0 address, +8 width, +0xc height, +0x10 pixel format, +0x14 bytes
++ * per element, +0x18 bytes per row) and IOSurfaceWrapClientMemory (7:
++ * scalars address, size): a surface made of the caller's own memory
++ * (CoreAnimation's GL renderer wraps the shared memory of images, icons and
++ * wallpapers so). The range is prepared (wired) for as long as the surface
++ * lives; every task maps it as usual.
++ */
++IOReturn
++IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments *args)
++{
++	uint64_t address, size;
++	uint32_t width, height, format = 0, bpe, bpr;
++
++	if (selector == kSweetSurfaceWrapClientImage) {
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (in == NULL || args->structureInputDescriptor != NULL || args->structureInputSize < 0x1c) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&address, in, 8);
++		memcpy(&width, in + 0x08, 4);
++		memcpy(&height, in + 0x0c, 4);
++		memcpy(&format, in + 0x10, 4);
++		memcpy(&bpe, in + 0x14, 4);
++		memcpy(&bpr, in + 0x18, 4);
++		if (width == 0 || height == 0 || width > SWEET_SURFACE_MAX_DIM || height > SWEET_SURFACE_MAX_DIM ||
++		    bpe == 0 || bpe > 16 || bpr < (uint64_t)width * bpe) {
++			static uint32_t told;
++			if (told++ < 6) {
++				IOLog("SWEET SURF: wrap image refused: %ux%u bpe %u bpr %u (%u bytes)\n", width, height, bpe, bpr,
++				    args->structureInputSize);
++			}
++			return kIOReturnBadArgument;
++		}
++		size = (uint64_t)bpr * height;
++	} else {
++		if (args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		address = args->scalarInput[0];
++		size = args->scalarInput[1];
++		if (size > SWEET_SURFACE_MAX_ALLOC) {
++			return kIOReturnBadArgument;
++		}
++		width = (uint32_t)size;
++		height = 1;
++		bpe = 1;
++		bpr = (uint32_t)size;
++	}
++	if (address == 0 || size == 0 || size > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOReturn wret = sweet_surface_use_task_memory(s, fTask, address, size);
++	if (wret != kIOReturnSuccess) {
++		s->release();
++		return wret;
++	}
++	s->width = width;
++	s->height = height;
++	s->pixelFormat = format;
++	s->bytesPerElement = (uint16_t)bpe;
++	s->elementWidth = 1;
++	s->elementHeight = 1;
++	s->bytesPerRow = bpr;
++	s->allocSize = (uint32_t)size;
++	s->planeCount = 0;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return kIOReturnNoResources;
++	}
++	static uint32_t logged;
++	if (logged < 8) {
++		logged++;
++		IOLog("SWEET SURF: wrap %s id %u %ux%u fmt 0x%x bpe %u bpr %u size %llu at +0x%x\n",
++		    selector == kSweetSurfaceWrapClientImage ? "image" : "memory", s->id, width, height, format, bpe, bpr,
++		    (unsigned long long)size, s->wrapDelta);
++	}
++	IOReturn ret = returnSurface(s, args);  /* takes the creator's user count */
++	s->release();
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -739,6 +1163,49 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case kSweetSurfaceSetValue:
++	case kSweetSurfaceCopyValue:
++	case kSweetSurfaceRemoveValue:
++		sweet_surf_log_once("sel", selector);
++		return valueCall(selector, args);
++	case kSweetSurfaceSetBulkAttachments:
++		sweet_surf_log_once("sel", selector);
++		return bulkAttachments(args);
++	case kSweetSurfaceSetPurgeable:
++	case kSweetSurfaceBindAccel:
++	case kSweetSurfaceSetYCbCrMatrix: {
++		/*
++		 * A34 (0914, topaz 0133). In: surface, state (out: the old one) /
++		 * surface, accelerator, sub id / surface, matrix.
++		 */
++		SweetSurface *s = args->scalarInputCount >= 2 ? sweet_surface_copy((uint32_t)arg0) : NULL;
++		sweet_surf_log_once("sel", selector);
++		if (s == NULL) {
++			return args->scalarInputCount >= 2 ? kIOReturnNotFound : kIOReturnBadArgument;
++		}
++		IOLockLock(sweet_surface_lock);
++		if (selector == kSweetSurfaceSetPurgeable) {
++			if (args->scalarOutputCount >= 1) {
++				args->scalarOutput[0] = s->purgeable;
++				args->scalarOutputCount = 1;
++			}
++			if (args->scalarInput[1] != 3) {        /* 3: only ask */
++				s->purgeable = (uint32_t)args->scalarInput[1];
++			}
++		} else if (selector == kSweetSurfaceBindAccel && args->scalarInputCount >= 3) {
++			uint16_t accel[2] = { (uint16_t)args->scalarInput[1], (uint16_t)args->scalarInput[2] };
++			memcpy((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_ACCEL, accel, sizeof(accel));
++		} else if (selector == kSweetSurfaceSetYCbCrMatrix) {
++			*sweet_state32(s, SWEET_SURFACE_STATE_YCBCR) = (uint32_t)args->scalarInput[1];
++		}
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		return kIOReturnSuccess;
++	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory:
++		sweet_surf_log_once("sel", selector);
++		return wrapClient(selector, args);
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+@@ -773,7 +1240,20 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
++		/*
++		 * A34 (0914, topaz 0131): a call that answers with a lock result
++		 * (child surfaces, ...) would hand IOSurface.framework a client made
++		 * of zeroes: no shared state (CoreAnimation's GL renderer reads its
++		 * EDR factor there and crashed at 0x30). Refused, the framework
++		 * returns NULL and its callers take their other path.
++		 */
++		if ((args->structureOutputDescriptor != NULL &&
++		    args->structureOutputDescriptor->getLength() >= SWEET_SURFACE_RESULT_SIZE) ||
++		    (args->structureOutput != NULL && args->structureOutputSize >= SWEET_SURFACE_RESULT_SIZE)) {
++			sweet_surf_log_once("sel (refused: lock result)", selector);
++			return kIOReturnUnsupported;
++		}
++		/* Notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+ 		}
+@@ -848,14 +1328,58 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	return ret;
+ }
+ 
++/*
++ * A34 (0914, topaz 0135/0136): the framework drops a surface in two steps:
++ * trap 4 under its cache lock, trap 5 after it. Trap 4 only marks the view
++ * detached; a lookup in between gets a view of its own (not "you have it
++ * already"), and trap 5 then takes the detached view away, not that one.
++ * Releasing at both dropped two references and unmapped surfaces still in
++ * use; a lookup racing a release lost its state page (backboardd:
++ * IOSurfaceClientGetSeed on unmapped memory).
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index, true);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, &index);
++	}
+ 	if (ref != NULL && --ref->count == 0) {
+-		fRefs->removeObject(index);     /* unmaps and drops the user count */
++		/*
++		 * A34 (0914, topaz 0137): the pixels are unmapped now; the state
++		 * page (read-only) stays mapped a while. In backboardd another
++		 * IOSurface object can still hold a framework client of the same
++		 * surface after this one is released: reading its seed from an
++		 * unmapped page crashed backboardd in IOSurfaceClientGetSeed. The
++		 * last SWEET_SURFACE_ZOMBIES released views keep their page (the
++		 * mapping holds the page; the surface and its pixels are let go
++		 * now, not when the view leaves the list).
++		 */
++		OSSafeReleaseNULL(ref->data);
++		sweet_surface_put(ref->surface);
++		OSSafeReleaseNULL(ref->surface);
++		ref->released = true;
++		ref->detached = false;
++		if (fZombies != NULL && fZombies->setObject(ref)) {
++			if (fZombies->getCount() > SWEET_SURFACE_ZOMBIES) {
++				fZombies->removeObject(0);
++			}
++		}
++		fRefs->removeObject(index);
+ 	}
+ 	IOLockUnlock(fLock);
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+@@ -866,7 +1390,7 @@ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+-	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..6d781e8 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -3,7 +3,8 @@
+  *
+  * Shared with SweetFramebuffer.cpp: the framebuffer looks surfaces up by
+  * id when a swap names them and publishes the panel memory itself as the
+- * default framebuffer surface.
++ * default framebuffer surface. A34 (0914): and with A34Mali.cpp, which maps
++ * a surface's memory into the GPU's address space (RedwoodMali request 0x7e).
+  */
+ #ifndef _SWEET_SURFACE_H
+ #define _SWEET_SURFACE_H
+@@ -14,6 +15,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
++#include <libkern/c++/OSDictionary.h>
+ #include <mach/mach_types.h>
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
+@@ -35,12 +37,19 @@ public:
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+-	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	IOMemoryDescriptor       *memory;       /* pixels (buffer, physical, or a task's prepared range) */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	/* A34 (0914, from ios-topaz 0132/0133): */
++	OSDictionary             *values;       /* IOSurfaceSetValue & co. */
++	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
++	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
++	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*, IOSurfaceAddress) */
++	/* A34 (0914): GPU buffers made of this surface (A34Mali.cpp, request 0x7e); OSIncrementAtomic/OSDecrementAtomic */
++	SInt32                    gpuShared;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
