@@ -409,7 +409,10 @@ sums, CPU uploads, GPU copies in, copies out, EGLImages made, IOSurfaceLock/Unlo
 `eglMakeCurrent`, `glGetError` checks, shader compiles and program links. Then the requests to
 the kernel, counted by redwood-drm by selector (`submit` -- synchronous, so its time is the
 GPU's --, `create_bo`, `gem_close`, `madvise`, `bo_offset`, `iosurface` (0x7e), client memory
-maps), and the threads that called GL with their calls a frame. Off, it costs a test per call.
+maps), and the threads that called GL with their calls a frame. Off, it costs a test per call. A "frame" there is a glFlush or glFinish with draws before it. A line `for the display:` gives
+how many of them drew into a surface of the screen's size (what is handed to the display), how
+many a second, and how far apart (average, longest). The kernel's `A34 FB N presents M vsyncs`
+lines are the display's own count.
 
 ## Checked against our iOS 16.7.16 cache
 

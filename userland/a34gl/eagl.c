@@ -463,6 +463,7 @@ static struct {
 	uint64_t kind_us[PK_COUNT], kind_calls[PK_COUNT];
 	uint64_t work_us[PW_COUNT], work_n[PW_COUNT], work_bytes[PW_COUNT];
 	uint64_t frames, frame_us, frame_cpu_us, gl_us, calls, draws;
+	uint64_t shown, shown_gap_us, shown_gaps, shown_gap_most, last_shown_us;      /* frames drawn into the screen's picture */
 	uint64_t since_us, since_cpu_us;        /* when the period began; backboardd's CPU time then */
 	struct redwood_drm_stats drm;           /* the kernel's counts then */
 	struct {
@@ -575,9 +576,11 @@ static void
 prof_start_period(unsigned frame)
 {
 	unsigned period = prof_period;
+	uint64_t last_shown = prof.last_shown_us;
 
 	memset(&prof, 0, sizeof(prof));
 	prof_period = period;
+	prof.last_shown_us = last_shown;        /* (the gap to the first frame of the next period counts) */
 	prof.first_frame = frame;
 	prof.since_us = now_us();
 	prof.since_cpu_us = cpu_us(CLOCK_PROCESS_CPUTIME_ID);
@@ -627,6 +630,15 @@ prof_report(unsigned frame)
 		used += (size_t)snprintf(text + used, sizeof(text) - used, " %s %.0f (%.0f)", prof_kind_names[k],
 		    (double)prof.kind_us[k] / n, (double)prof.kind_calls[k] / n);
 	}
+	/*
+	 * A "frame" above is a glFlush or glFinish with draws before it. Those that drew into a
+	 * surface of the screen's size are what is handed to the display: how many a second, how far
+	 * apart. (The kernel's own count: its "A34 FB N presents M vsyncs" lines.)
+	 */
+	say_always("a34gl-prof:   for the display: %llu frames drew into a surface of the screen's size, %.1f a second, %.1f ms apart on "
+	    "average, %.1f ms the longest; %llu frames drew into other targets only\n", (unsigned long long)prof.shown,
+	    (double)prof.shown * 1e6 / (double)(wall ? wall : 1), prof.shown_gaps ? (double)prof.shown_gap_us / (double)prof.shown_gaps / 1e3 : 0,
+	    (double)prof.shown_gap_most / 1e3, (unsigned long long)(prof.frames - prof.shown));
 	say_always("a34gl-prof:   in GL entries, us a frame (calls):%s\n", text);
 	used = 0;
 	for (unsigned w = 0; w < PW_COUNT; w++) {
@@ -1817,10 +1829,14 @@ frame_end(struct eagl *e, bool finished)
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	bool shown = false;
 
 	clear_now(e);
 	vbafter_end(e);                 /* (glvbafter=N: the rectangles followed, as this frame left them) */
 	before = now_us();
+	for (unsigned i = 0; i < e->image_count; i++) {
+		shown |= e->images[i].target && e->images[i].drawn && e->images[i].width >= 1000 && e->images[i].height >= 2000;
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
@@ -1887,6 +1903,17 @@ frame_end(struct eagl *e, bool finished)
 	if (prof_period) {
 		prof.frames++;
 		prof.frame_us += after - e->began;
+		if (shown) {
+			if (prof.last_shown_us != 0) {
+				uint64_t gap = after - prof.last_shown_us;
+
+				prof.shown_gap_us += gap;
+				prof.shown_gaps++;
+				prof.shown_gap_most = gap > prof.shown_gap_most ? gap : prof.shown_gap_most;
+			}
+			prof.last_shown_us = after;
+			prof.shown++;
+		}
 		if (prof_frame_cpu0 != 0) {
 			prof.frame_cpu_us += cpu_us(CLOCK_THREAD_CPUTIME_ID) - prof_frame_cpu0;
 			prof_frame_cpu0 = 0;
