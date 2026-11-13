@@ -23,8 +23,14 @@
  * and the kernel makes a GEM handle of the surface's memory: selector 0x7e, ios-topaz's
  * "surface" request (struct redwood_drm_surface in redwood_drm.h). Export is not supported.
  *
+ * Also answered here, when that is sure to be the kernel's answer (redwood_drm.h,
+ * REDWOOD_DRM_LOCAL): WAIT_BO for a buffer of the process's own while none of its SUBMITs
+ * is running, and MADVISE for the buffers the kernel has said it keeps no upkeep of.
+ *
  * Environment: REDWOOD_DRM_SERVICE (default "RedwoodMali"), REDWOOD_DRM_MINOR (default
- * 1), REDWOOD_DRM_DEBUG=1 (every call on stderr), REDWOOD_DRM_NODE (default /dev/null).
+ * 1), REDWOOD_DRM_DEBUG=1 (every call on stderr), REDWOOD_DRM_NODE (default /dev/null),
+ * REDWOOD_DRM_LOCAL (default 1; 0: every WAIT_BO and MADVISE goes to the kernel; 2: see
+ * redwood_drm.h).
  *
  * Adapted from ios-topaz's userland/mesa/redwood-drm (MIT, which is based on HackiOS's
  * user space, MIT, Copyright (c) 2026 OOSEX GANG): see ../README.md.
@@ -110,6 +116,35 @@ node_path(void)
 static pthread_once_t connection_once = PTHREAD_ONCE_INIT;
 static io_connect_t connection;
 static kern_return_t connection_result = kIOReturnNotFound;
+static bool queued;                     /* this client's SUBMITs are queued (kernel 0919: redwood_drm.h) */
+
+/*
+ * The queued mode, asked for when the connection is made: when the kernel offers it (GET_PARAM
+ * REDWOOD_DRM_PARAM_ASYNC = 1) and REDWOOD_DRM_ASYNC is not 0. One line on stderr says which.
+ */
+static void
+ask_queued(const char *service)
+{
+	struct drm_panfrost_get_param param = { .param = REDWOOD_DRM_PARAM_ASYNC };
+	struct redwood_drm_set_mode mode = { .async = 1 };
+	size_t size = sizeof(param);
+	const char *why;
+
+	if (strcmp(setting("REDWOOD_DRM_ASYNC", "1"), "0") == 0) {
+		why = "REDWOOD_DRM_ASYNC=0";
+	} else if (IOConnectCallStructMethod(connection, DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param), &param,
+	    &size) != kIOReturnSuccess || param.value != 1) {
+		why = "the kernel does not queue";
+	} else if (size = sizeof(mode), IOConnectCallStructMethod(connection, REDWOOD_DRM_SET_MODE, &mode, sizeof(mode), &mode,
+	    &size) != kIOReturnSuccess) {
+		why = "SET_MODE refused";
+	} else {
+		queued = true;
+		why = NULL;
+	}
+	fprintf(stderr, "redwood-drm: %s[%d]: %s: GPU jobs %s%s%s\n", getprogname(), (int)getpid(), service,
+	    queued ? "queued (SUBMIT returns at once)" : "synchronous", why ? " -- " : "", why ? why : "");
+}
 
 static void
 open_connection(void)
@@ -125,6 +160,16 @@ open_connection(void)
 	connection_result = IOServiceOpen(service, mach_task_self(), 0, &connection);
 	IOObjectRelease(service);
 	note("IOServiceOpen(\"%s\") = %#x", name, connection_result);
+	if (connection_result == kIOReturnSuccess) {
+		ask_queued(name);
+	}
+}
+
+EXPORT int
+redwood_drm_queued(void)
+{
+	pthread_once(&connection_once, open_connection);
+	return queued;
 }
 
 static bool
@@ -154,6 +199,8 @@ errno_of(kern_return_t result)
 		return EBUSY;
 	case kIOReturnNotReady:
 		return EAGAIN;
+	case kIOReturnAborted:
+		return EINTR;
 	case kIOReturnUnsupported:
 		return ENOTTY;
 	case kIOReturnNotPermitted:
@@ -189,6 +236,10 @@ redwood_drm_stats(struct redwood_drm_stats *out)
 	out->map_ticks = __atomic_load_n(&stats.map_ticks, __ATOMIC_RELAXED);
 	out->unmaps = __atomic_load_n(&stats.unmaps, __ATOMIC_RELAXED);
 	out->unmap_ticks = __atomic_load_n(&stats.unmap_ticks, __ATOMIC_RELAXED);
+	out->local_waits = __atomic_load_n(&stats.local_waits, __ATOMIC_RELAXED);
+	out->local_madvises = __atomic_load_n(&stats.local_madvises, __ATOMIC_RELAXED);
+	out->queued_jobs = __atomic_load_n(&stats.queued_jobs, __ATOMIC_RELAXED);
+	out->failed_jobs = __atomic_load_n(&stats.failed_jobs, __ATOMIC_RELAXED);
 }
 
 /* A request to the kernel driver: 0, or -1 with errno set. */
@@ -215,17 +266,28 @@ call(unsigned selector, void *data, size_t size)
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-/* synchronisation objects: here, not in the kernel (jobs have finished when SUBMIT returns) */
+/*
+ * Synchronisation objects: here, not in the kernel. A syncobj holds a fence or not; the fence
+ * is the number of the job whose end signals it (seq), 0 for one that is signalled already.
+ * Synchronous (every job has ended when its SUBMIT returns), every fence is 0. Queued (kernel
+ * 0919), a SUBMIT's out_sync gets the job's number, and a fence is signalled once the kernel
+ * has said that every job of this client up to its number is done: WAIT_SEQ, which also
+ * waits. `known_done` is the highest such number. The kernel runs a client's jobs one at a
+ * time in the order they were queued and says "done up to" only for an unbroken run of them,
+ * so a job done before one ahead of it (should that ever be) does not count before that one.
+ */
 
 struct syncobj {
 	bool used;
-	bool signaled;
+	bool has_fence;
+	uint64_t seq;
 };
 
 static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sync_changed = PTHREAD_COND_INITIALIZER;
 static struct syncobj *syncobjs;        /* handle n is syncobjs[n - 1] */
 static uint32_t syncobj_count;
+static uint64_t known_done;             /* (sync_lock) every job of ours up to this number is done */
 
 /* With sync_lock held. */
 static struct syncobj *
@@ -235,6 +297,13 @@ syncobj(uint32_t handle)
 		return NULL;
 	}
 	return &syncobjs[handle - 1];
+}
+
+/* With sync_lock held. */
+static bool
+fence_signaled(const struct syncobj *s)
+{
+	return s->has_fence && s->seq <= known_done;
 }
 
 static int
@@ -258,16 +327,18 @@ syncobj_create(bool signaled, uint32_t *handle)
 		syncobjs = grown;
 		syncobj_count = count;
 	}
-	syncobjs[i].used = true;
-	syncobjs[i].signaled = signaled;
+	syncobjs[i] = (struct syncobj){ .used = true, .has_fence = signaled, .seq = 0 };
 	*handle = i + 1;
 	pthread_mutex_unlock(&sync_lock);
 	return 0;
 }
 
-/* Signal (or reset) every valid handle of `handles`: 0, or -1 and ENOENT if one is not a syncobj. */
+/*
+ * Give every valid handle of `handles` the fence `seq` (has_fence) or none: 0, or -1 and ENOENT
+ * if one is not a syncobj.
+ */
 static int
-syncobj_set(const uint32_t *handles, uint32_t count, bool signaled)
+syncobj_set_fence(const uint32_t *handles, uint32_t count, bool has_fence, uint64_t seq)
 {
 	int ret = 0;
 
@@ -278,10 +349,11 @@ syncobj_set(const uint32_t *handles, uint32_t count, bool signaled)
 		if (s == NULL) {
 			ret = -1;
 		} else {
-			s->signaled = signaled;
+			s->has_fence = has_fence;
+			s->seq = has_fence ? seq : 0;
 		}
 	}
-	if (signaled) {
+	if (has_fence) {
 		pthread_cond_broadcast(&sync_changed);
 	}
 	pthread_mutex_unlock(&sync_lock);
@@ -289,6 +361,12 @@ syncobj_set(const uint32_t *handles, uint32_t count, bool signaled)
 		errno = ENOENT;
 	}
 	return ret;
+}
+
+static int
+syncobj_set(const uint32_t *handles, uint32_t count, bool signaled)
+{
+	return syncobj_set_fence(handles, count, signaled, 0);
 }
 
 static int64_t
@@ -301,19 +379,67 @@ monotonic_ns(void)
 }
 
 /*
+ * WAIT_SEQ (0x7b): until every job of this client up to `seq` is done, at most until the absolute
+ * CLOCK_MONOTONIC `deadline` (<= now: only asked; INT64_MAX: no limit). 0 and known_done raised;
+ * -1 with errno ETIME (not done in time) or another. A failed job is said once on stderr.
+ * Called without sync_lock (it may sleep in the kernel); takes it to note what it learnt.
+ */
+static int
+wait_seq(uint64_t seq, int64_t deadline)
+{
+	struct redwood_drm_wait_seq request = { .seq = seq };
+	int64_t left;
+	int ret;
+
+	for (;;) {
+		left = deadline == INT64_MAX ? -1 : deadline - monotonic_ns();
+		request.seq = seq;
+		request.timeout_ns = deadline == INT64_MAX ? UINT64_MAX : left > 0 ? (uint64_t)left : 0;
+		request.status = 0;
+		ret = call(REDWOOD_DRM_WAIT_SEQ, &request, sizeof(request));
+		if (ret == 0 || errno != EINTR) {
+			break;
+		}
+		/* (interrupted: asked again) */
+	}
+	if (ret != 0) {
+		if (errno == ETIMEDOUT) {
+			errno = ETIME;
+		}
+		return -1;
+	}
+	if (request.status != 0) {
+		__atomic_fetch_add(&stats.failed_jobs, 1, __ATOMIC_RELAXED);
+		fprintf(stderr, "redwood-drm: %s[%d]: a GPU job up to number %llu failed (the kernel recovered; its picture may be "
+		    "wrong)\n", getprogname(), (int)getpid(), (unsigned long long)seq);
+	}
+	pthread_mutex_lock(&sync_lock);
+	if (seq > known_done) {
+		known_done = seq;
+		pthread_cond_broadcast(&sync_changed);
+	}
+	pthread_mutex_unlock(&sync_lock);
+	return 0;
+}
+
+/*
  * Linux's DRM_IOCTL_SYNCOBJ_WAIT: `deadline` is absolute, on CLOCK_MONOTONIC. A syncobj
- * nothing was submitted to is an error unless WAIT_FOR_SUBMIT asks to wait for one.
+ * nothing was submitted to is an error unless WAIT_FOR_SUBMIT asks to wait for one. A fence of
+ * a queued job is waited for in the kernel (WAIT_SEQ): for all of them, the last; for any one,
+ * the first -- jobs end in the order they were queued.
  */
 static int
 syncobj_wait(const uint32_t *handles, unsigned count, int64_t deadline, unsigned flags, uint32_t *first)
 {
 	bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
 	bool for_submit = flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE);
+	bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
 	int error = 0;
 
 	pthread_mutex_lock(&sync_lock);
 	for (;;) {
-		unsigned done = 0, first_done = count;
+		unsigned done = 0, first_done = count, unsubmitted = 0;
+		uint64_t lowest = UINT64_MAX, highest = 0;
 
 		for (unsigned i = 0; i < count; i++) {
 			struct syncobj *s = syncobj(handles[i]);
@@ -322,12 +448,17 @@ syncobj_wait(const uint32_t *handles, unsigned count, int64_t deadline, unsigned
 				error = ENOENT;
 				break;
 			}
-			if (s->signaled) {
+			if (fence_signaled(s) || (available && s->has_fence)) {
 				done++;
 				first_done = first_done < i ? first_done : i;
+			} else if (s->has_fence) {
+				lowest = s->seq < lowest ? s->seq : lowest;
+				highest = s->seq > highest ? s->seq : highest;
 			} else if (!for_submit) {
 				error = EINVAL;
 				break;
+			} else {
+				unsubmitted++;
 			}
 		}
 		if (error != 0) {
@@ -339,7 +470,21 @@ syncobj_wait(const uint32_t *handles, unsigned count, int64_t deadline, unsigned
 			}
 			break;
 		}
+		if (highest != 0 && (!all || unsubmitted == 0)) {
+			/* queued jobs to wait for, in the kernel */
+			uint64_t target = all ? highest : lowest;
 
+			pthread_mutex_unlock(&sync_lock);
+			if (wait_seq(target, deadline) != 0) {
+				error = errno;
+				pthread_mutex_lock(&sync_lock);
+				break;
+			}
+			pthread_mutex_lock(&sync_lock);
+			continue;
+		}
+
+		/* a syncobj nothing has been submitted to yet (WAIT_FOR_SUBMIT): until one is */
 		int64_t left = deadline - monotonic_ns();
 
 		if (left <= 0) {
@@ -361,20 +506,118 @@ syncobj_wait(const uint32_t *handles, unsigned count, int64_t deadline, unsigned
 	return 0;
 }
 
-/* A sync_file that has signalled: a pipe whose read end is readable (poll(POLLIN) returns at once). */
+/*
+ * Sync files: pipes. One of a fence that has signalled is readable at once (poll(POLLIN)); one
+ * of a queued job's fence is not written to (its write end is closed: a poll() sees the end of
+ * the file, not the job's -- nothing here polls them). Which fence a pipe stands for is kept by
+ * the pipe's inode, so that importing it again (Mesa's fences go through a sync file: a
+ * syncobj exported and imported into another) gives the same fence.
+ */
+#define SYNC_FILES      64
+
+static struct {
+	dev_t dev;
+	ino_t ino;
+	uint64_t seq;
+} sync_files[SYNC_FILES];               /* (sync_lock) */
+static unsigned sync_file_next;
+
 static int
-signaled_sync_file(void)
+fence_sync_file(uint64_t seq)
 {
+	struct stat st;
 	int ends[2];
 	char byte = 0;
+	bool signaled;
 
 	if (pipe(ends) != 0) {
 		return -1;
 	}
-	(void)write(ends[1], &byte, 1);
+	pthread_mutex_lock(&sync_lock);
+	signaled = seq <= known_done;
+	if (!signaled && fstat(ends[0], &st) == 0) {
+		unsigned i = sync_file_next++ % SYNC_FILES;
+
+		sync_files[i].dev = st.st_dev;
+		sync_files[i].ino = st.st_ino;
+		sync_files[i].seq = seq;
+	}
+	pthread_mutex_unlock(&sync_lock);
+	if (signaled) {
+		(void)write(ends[1], &byte, 1);
+	}
 	close(ends[1]);
 	fcntl(ends[0], F_SETFD, FD_CLOEXEC);
 	return ends[0];
+}
+
+/* The fence a sync file stands for (0: signalled, or not one of ours). */
+static uint64_t
+sync_file_seq(int fd)
+{
+	struct stat st;
+	uint64_t seq = 0;
+
+	if (fd < 0 || fstat(fd, &st) != 0) {
+		return 0;
+	}
+	pthread_mutex_lock(&sync_lock);
+	for (unsigned i = 0; i < SYNC_FILES; i++) {
+		if (sync_files[i].seq != 0 && sync_files[i].dev == st.st_dev && sync_files[i].ino == st.st_ino) {
+			seq = sync_files[i].seq;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&sync_lock);
+	return seq;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*
+ * What is known of a GEM handle, for the requests answered here: HANDLE_SURFACE, an IOSurface's
+ * memory (0x7e); HANDLE_WC, a buffer the kernel keeps no CPU cache upkeep of; and (queued) the
+ * number of the last job of ours that named it. Forgotten at GEM_CLOSE. Handles past the table
+ * are unknown (0): everything about them goes to the kernel.
+ */
+#define HANDLE_SURFACE  1u
+#define HANDLE_WC       2u
+#define HANDLES         65536u
+#define HANDLE_SEQS     8192u           /* (the kernel gives a client handles 1..4096) */
+
+static uint8_t handle_kinds[HANDLES];
+static uint64_t handle_seqs[HANDLE_SEQS];
+static int submits_running;             /* threads of this process inside a SUBMIT */
+
+static unsigned
+handle_kind(uint32_t handle)
+{
+	return handle < HANDLES ? __atomic_load_n(&handle_kinds[handle], __ATOMIC_RELAXED) : 0;
+}
+
+static void
+set_handle_kind(uint32_t handle, unsigned kind)
+{
+	if (handle < HANDLES) {
+		__atomic_store_n(&handle_kinds[handle], (uint8_t)kind, __ATOMIC_RELAXED);
+	}
+	if (handle < HANDLE_SEQS) {
+		__atomic_store_n(&handle_seqs[handle], 0, __ATOMIC_RELAXED);
+	}
+}
+
+/* (queued) the last job of ours that named the handle; UINT64_MAX: not known */
+static uint64_t
+handle_seq(uint32_t handle)
+{
+	return handle < HANDLE_SEQS ? __atomic_load_n(&handle_seqs[handle], __ATOMIC_RELAXED) : UINT64_MAX;
+}
+
+static void
+note_handle_seq(uint32_t handle, uint64_t seq)
+{
+	if (handle < HANDLE_SEQS) {
+		__atomic_store_n(&handle_seqs[handle], seq, __ATOMIC_RELAXED);
+	}
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -422,7 +665,26 @@ get_cap(uint64_t capability, uint64_t *value)
 	}
 }
 
-/* DRM_IOCTL_PANFROST_SUBMIT: the kernel is given no syncobjs (they are this file's), and runs the chain to its end. */
+/* REDWOOD_DRM_LOCAL: 0 nothing is answered here; 1 (default); 2 every buffer made here taken to be write-combined */
+static int
+local_answers(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		mode = atoi(setting("REDWOOD_DRM_LOCAL", "1"));
+	}
+	return mode;
+}
+
+/*
+ * DRM_IOCTL_PANFROST_SUBMIT. The kernel is given no syncobjs: they are this file's.
+ *   synchronous  the chain has run to its end when the call returns: out_sync is signalled.
+ *   queued       the call returns at once with the job's number in in_syncs; out_sync gets it
+ *                as its fence, and every buffer the job names notes it (WAIT_BO). in_syncs need
+ *                no wait: the kernel runs this client's jobs one at a time in the order they
+ *                were queued, so a job queued before this one ends before it starts.
+ */
 static int
 submit(unsigned selector, void *data, size_t size)
 {
@@ -437,7 +699,7 @@ submit(unsigned selector, void *data, size_t size)
 	}
 	memset(&request, 0, sizeof(request));
 	memcpy(&request, data, size);
-	if (request.in_sync_count != 0) {
+	if (request.in_sync_count != 0 && !queued) {
 		/* every in-sync was signalled when the job that made it returned; check they exist */
 		const uint32_t *in = (const uint32_t *)(uintptr_t)request.in_syncs;
 
@@ -449,11 +711,118 @@ submit(unsigned selector, void *data, size_t size)
 	request.in_syncs = 0;
 	request.in_sync_count = 0;
 	request.out_sync = 0;
+	__atomic_fetch_add(&submits_running, 1, __ATOMIC_SEQ_CST);
 	ret = call(selector, &request, size);
-	if (ret == 0 && out_sync != 0) {
+	__atomic_fetch_sub(&submits_running, 1, __ATOMIC_SEQ_CST);
+	if (ret != 0) {
+		return ret;
+	}
+	if (queued) {
+		uint64_t seq = request.in_syncs;
+		const uint32_t *bos = (const uint32_t *)(uintptr_t)request.bo_handles;
+
+		__atomic_fetch_add(&stats.queued_jobs, 1, __ATOMIC_RELAXED);
+		for (uint32_t i = 0; bos != NULL && i < request.bo_handle_count; i++) {
+			note_handle_seq(bos[i], seq);
+		}
+		if (out_sync != 0) {
+			syncobj_set_fence(&out_sync, 1, true, seq);
+		}
+		note("submit: job %llu queued", (unsigned long long)seq);
+	} else if (out_sync != 0) {
 		syncobj_set(&out_sync, 1, true);
 	}
+	return 0;
+}
+
+/*
+ * WAIT_BO when this client's jobs are queued: a buffer the jobs name is idle once the last of
+ * them is done. Known here (it is not an IOSurface's, which other programs' jobs may name, and
+ * its handle is in the table): answered without the kernel when that job is known to be done,
+ * else by WAIT_SEQ for it (which teaches known_done as well). Otherwise the kernel's WAIT_BO.
+ * timeout_ns is Linux's: absolute on CLOCK_MONOTONIC, <= 0 only asking (EBUSY while busy).
+ */
+static int
+wait_bo_queued(unsigned nr, struct drm_panfrost_wait_bo *request, size_t size)
+{
+	uint64_t seq = handle_kind(request->handle) & HANDLE_SURFACE ? UINT64_MAX : handle_seq(request->handle);
+	uint64_t done;
+	int ret;
+
+	if (seq == UINT64_MAX) {
+		return call(nr, request, size);
+	}
+	pthread_mutex_lock(&sync_lock);
+	done = known_done;
+	pthread_mutex_unlock(&sync_lock);
+	if (seq <= done) {
+		__atomic_fetch_add(&stats.local_waits, 1, __ATOMIC_RELAXED);
+		return 0;
+	}
+	ret = wait_seq(seq, request->timeout_ns <= 0 ? 0 : request->timeout_ns);
+	if (ret != 0 && errno == ETIME) {
+		errno = request->timeout_ns <= 0 ? EBUSY : ETIMEDOUT;
+	}
 	return ret;
+}
+
+/*
+ * A request of the driver's own (0x40 + n): SUBMIT as above; WAIT_BO and MADVISE answered here
+ * where that is the kernel's answer (redwood_drm.h); CREATE_BO noted. 0, or -1 with errno.
+ */
+static int
+driver_request(unsigned nr, void *data, size_t size)
+{
+	int ret;
+
+	switch (nr - DRM_COMMAND_BASE) {
+	case DRM_PANFROST_SUBMIT:
+		return submit(nr, data, size);
+	case DRM_PANFROST_WAIT_BO: {
+		struct drm_panfrost_wait_bo *request = data;
+
+		if (size < sizeof(*request) || local_answers() < 1) {
+			break;
+		}
+		if (queued) {
+			return wait_bo_queued(nr, request, size);
+		}
+		/* synchronous: no job of this process is running, and no other program's job uses this buffer: idle */
+		if (!(handle_kind(request->handle) & HANDLE_SURFACE) && __atomic_load_n(&submits_running, __ATOMIC_SEQ_CST) == 0) {
+			__atomic_fetch_add(&stats.local_waits, 1, __ATOMIC_RELAXED);
+			return 0;
+		}
+		break;
+	}
+	case DRM_PANFROST_MADVISE: {
+		struct drm_panfrost_madvise *madvise = data;
+		unsigned kind = size >= sizeof(*madvise) ? handle_kind(madvise->handle) : 0;
+
+		/* a buffer without cache upkeep: nothing for the kernel to note, nothing is ever purged */
+		if ((kind & HANDLE_WC) && madvise->madv <= PANFROST_MADV_DONTNEED) {
+			madvise->retained = 1;
+			__atomic_fetch_add(&stats.local_madvises, 1, __ATOMIC_RELAXED);
+			return 0;
+		}
+		break;
+	}
+	case DRM_PANFROST_CREATE_BO: {
+		struct drm_panfrost_create_bo *create = data;
+
+		ret = call(nr, data, size);
+		if (ret == 0 && size >= sizeof(*create)) {
+			bool wc = (create->pad & REDWOOD_DRM_CREATE_BO_WC) != 0 ||
+			    (local_answers() >= 2 && !(create->flags & PANFROST_BO_HEAP));
+
+			set_handle_kind(create->handle, local_answers() >= 1 && wc ? HANDLE_WC : 0);
+			create->pad = 0;        /* (as Linux leaves it) */
+		}
+		return ret;
+	}
+	default:
+		break;
+	}
+	return call(nr, data, size);
 }
 
 EXPORT int
@@ -464,13 +833,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
 
 	(void)fd;
 	if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
-		if (nr == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT) {
-			return submit(nr, arg, size);
-		}
-		return call(nr, arg, size);
+		return driver_request(nr, arg, size);
 	}
 	switch (request) {
 	case DRM_IOCTL_GEM_CLOSE:
+		set_handle_kind(((const struct drm_gem_close *)arg)->handle, 0);
 		return call(nr, arg, size);
 	case DRM_IOCTL_VERSION: {
 		struct drm_version *v = arg;
@@ -506,7 +873,7 @@ command(unsigned long index, void *data, unsigned long size)
 	if (nr >= DRM_COMMAND_END) {
 		return -EINVAL;
 	}
-	if (nr == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT ? submit(nr, data, size) : call(nr, data, size)) {
+	if (driver_request(nr, data, size)) {
 		return -errno;
 	}
 	return 0;
@@ -907,6 +1274,7 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 		errno = EIO;
 		return -1;
 	}
+	set_handle_kind(request.handle, HANDLE_SURFACE);
 	*handle = request.handle;
 	return 0;
 }
@@ -1039,7 +1407,8 @@ drmSyncobjDestroy(int fd, uint32_t handle)
 	s = syncobj(handle);
 	if (s != NULL) {
 		s->used = false;
-		s->signaled = false;
+		s->has_fence = false;
+		s->seq = 0;
 	}
 	pthread_mutex_unlock(&sync_lock);
 	if (s == NULL) {
@@ -1047,6 +1416,20 @@ drmSyncobjDestroy(int fd, uint32_t handle)
 		return -1;
 	}
 	return 0;
+}
+
+/* A syncobj's state: whether it exists, has a fence, and the fence. */
+static bool
+syncobj_state(uint32_t handle, bool *has_fence, uint64_t *seq)
+{
+	struct syncobj *s;
+
+	pthread_mutex_lock(&sync_lock);
+	s = syncobj(handle);
+	*has_fence = s != NULL && s->has_fence;
+	*seq = s != NULL ? s->seq : 0;
+	pthread_mutex_unlock(&sync_lock);
+	return s != NULL;
 }
 
 static bool
@@ -1058,24 +1441,32 @@ signaled(uint32_t handle, bool *exists)
 	pthread_mutex_lock(&sync_lock);
 	s = syncobj(handle);
 	*exists = s != NULL;
-	result = s != NULL && s->signaled;
+	result = s != NULL && fence_signaled(s);
 	pthread_mutex_unlock(&sync_lock);
 	return result;
 }
 
-/* A sync file of a syncobj: one that has signalled, as every job has by the time anyone asks. */
+/*
+ * A sync file of a syncobj's fence (Mesa makes every pipe_fence so: the context's syncobj
+ * exported, imported into a new one). Linux: a syncobj without a fence cannot be exported.
+ */
 EXPORT int
 drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 {
-	bool exists;
+	bool has_fence;
+	uint64_t seq;
 
 	(void)fd;
 	*sync_file_fd = -1;
-	if (!signaled(handle, &exists)) {
-		errno = exists ? EINVAL : ENOENT;       /* Linux: a syncobj without a fence cannot be exported */
+	if (!syncobj_state(handle, &has_fence, &seq)) {
+		errno = ENOENT;
 		return -1;
 	}
-	*sync_file_fd = signaled_sync_file();
+	if (!has_fence) {
+		errno = EINVAL;
+		return -1;
+	}
+	*sync_file_fd = fence_sync_file(seq);
 	return *sync_file_fd >= 0 ? 0 : -1;
 }
 
@@ -1083,33 +1474,36 @@ EXPORT int
 drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 {
 	(void)fd;
-	(void)sync_file_fd;     /* every sync file there is here has signalled */
-	return syncobj_set(&handle, 1, true);
+	return syncobj_set_fence(&handle, 1, true, sync_file_seq(sync_file_fd));
 }
 
-/* The syncobj itself as a file: here a sync file, imported again as a new syncobj in its state. */
+/* The syncobj itself as a file: here a sync file of its fence, imported again as a new syncobj in its state. */
 EXPORT int
 drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
 {
-	bool exists;
+	bool has_fence;
+	uint64_t seq;
 
 	(void)fd;
 	*obj_fd = -1;
-	(void)signaled(handle, &exists);
-	if (!exists) {
+	if (!syncobj_state(handle, &has_fence, &seq)) {
 		errno = ENOENT;
 		return -1;
 	}
-	*obj_fd = signaled_sync_file();
+	*obj_fd = fence_sync_file(has_fence ? seq : 0);
 	return *obj_fd >= 0 ? 0 : -1;
 }
 
 EXPORT int
 drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 {
+	uint64_t seq = sync_file_seq(obj_fd);
+
 	(void)fd;
-	(void)obj_fd;
-	return syncobj_create(true, handle);
+	if (syncobj_create(true, handle) != 0) {
+		return -1;
+	}
+	return syncobj_set_fence(handle, 1, true, seq);
 }
 
 EXPORT int
@@ -1194,8 +1588,8 @@ EXPORT int
 drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
     uint32_t flags)
 {
-	bool exists;
-	bool state;
+	bool has_fence;
+	uint64_t seq;
 
 	(void)fd;
 	(void)flags;
@@ -1203,12 +1597,11 @@ drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src
 		errno = EINVAL;
 		return -1;
 	}
-	state = signaled(src_handle, &exists);
-	if (!exists) {
+	if (!syncobj_state(src_handle, &has_fence, &seq)) {
 		errno = ENOENT;
 		return -1;
 	}
-	return syncobj_set(&dst_handle, 1, state);
+	return syncobj_set_fence(&dst_handle, 1, has_fence, seq);
 }
 
 EXPORT int

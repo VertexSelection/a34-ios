@@ -1,0 +1,44 @@
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -123,11 +123,18 @@
+    return NULL;
+ }
+ 
++static void panfrost_bo_munmap(struct panfrost_bo *bo);
++
+ static void
+ panfrost_bo_free(struct panfrost_bo *bo)
+ {
+    PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
+ 
++   /* A BO may come here mapped: on Darwin its CPU mapping is kept while it sits in
++    * the BO cache (panfrost_bo_unreference). Unmapped before the handle is closed.
++    */
++   panfrost_bo_munmap(bo);
++
+    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
+    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
+    uint64_t gpu_va = bo->ptr.gpu;
+@@ -453,7 +460,22 @@
+     */
+    if (bo->dev && p_atomic_read(&bo->refcnt) == 0) {
+       /* When the reference count goes to zero, we need to cleanup */
++#ifndef __APPLE__
+       panfrost_bo_munmap(bo);
++#else
++      /* a34-ios: the CPU mapping stays with the BO while it is in the BO cache, and the
++       * next owner uses it as it is (panfrost_bo_mmap() returns at once for a mapped BO;
++       * a BO comes out of the cache only for the flags it went in with). It goes when the
++       * BO is freed: panfrost_bo_free(), from the cache's eviction or right below.
++       *
++       * Linux unmaps here because its kernel may purge a BO that is MADV_DONTNEED, which
++       * a BO in the cache is, and a mapping of purged pages faults. The kernel driver
++       * here (RedwoodMali) never purges anything -- MADVISE always answers "retained" --
++       * so a kept mapping of a cached BO maps what it always did. And a mapping costs a
++       * call into the kernel each way (IOConnectMapMemory64 / IOConnectUnmapMemory64):
++       * the per-batch pools alone were some twenty of each a frame under CoreAnimation.
++       */
++#endif
+ 
+       if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+          pandecode_inject_free(dev->decode_ctx, bo->ptr.gpu,

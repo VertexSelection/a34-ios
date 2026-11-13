@@ -48,15 +48,33 @@ a34gl_log_fd(void)
 	return log_fd;
 }
 
+/* "NAME[PID] " ahead of every line of a program that is not the window server (whose lines stay as they were) */
+static char prefix[64];
+static pthread_once_t prefix_once = PTHREAD_ONCE_INIT;
+
+static void
+make_prefix(void)
+{
+	const char *name = getprogname();
+
+	if (name != NULL && strcmp(name, "backboardd") != 0) {
+		snprintf(prefix, sizeof(prefix), "%.40s[%d] ", name, (int)getpid());
+	}
+}
+
 static void
 write_line(const char *format, va_list ap, const char *note)
 {
 	char line[1024];
-	int n = vsnprintf(line, sizeof(line), format, ap);
+	int n, head;
 
+	pthread_once(&prefix_once, make_prefix);
+	head = snprintf(line, sizeof(line), "%s", prefix);
+	n = vsnprintf(line + head, sizeof(line) - (size_t)head, format, ap);
 	if (n < 0) {
 		return;
 	}
+	n += head;
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}

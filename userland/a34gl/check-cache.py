@@ -15,6 +15,11 @@
    storage and jumps through the entry at that offset (plus the table's place in the context):
    for each named slot whose function OpenGLES exports, the stub's loads must include it.
 
+3. For programs that use EAGL's public API (CoreImage in SpringBoard, ...), eagl.c lays its
+   context out as iOS's OpenGLES lays out the structure behind an EAGLContext, so that iOS's own
+   +setCurrentContext: and gl* stubs reach our function table: the stubs' thread slot and the
+   table's place in that structure are checked.
+
 Prints the cache's UUID. Exit status 0 when everything matches. Reads only.
 """
 import os
@@ -193,6 +198,19 @@ def main():
     print('dispatch table: %d slots checked against OpenGLES\'s stubs (table at +%s in the context), %d different' % (
         checked, '%#x' % base if base is not None else '?', differ))
     bad += differ != 0 or checked == 0
+
+    # 3. what struct eagl is laid out after (eagl.c): a gl* stub loads the thread's OpenGL slot
+    #    (pthread key 30: [TPIDRRO_EL0 + 0xf0]); EAGLGetCurrentMacroContextPrivate() answers
+    #    _private + 0x20; EAGLContext's ivar _private is the object's second word
+    stub = struct.unpack('<II', cache.read(exported['_glClear'], 8))
+    slot_ok = stub == (0xd53bd068, 0xf9407908)          # mrs x8, tpidrro_el0; ldr x8, [x8, #0xf0]
+    macro = cache.read(exported['_EAGLGetCurrentMacroContextPrivate'], 64)
+    macro_ok = struct.pack('<I', 0x91008109) in macro   # add x9, x8, #0x20
+    ivar = struct.unpack('<I', cache.read(exported['_OBJC_IVAR_$_EAGLContext._private'], 4))[0]
+    print('public API: gl* stubs read the thread slot at 0xf0: %s; the macro context is _private + 0x20: %s; _private at %d of '
+          'an EAGLContext: %s' % ('ok' if slot_ok else 'DIFFERENT', 'ok' if macro_ok else 'DIFFERENT', ivar,
+                                  'ok' if ivar == 8 else 'not 8 (found at run time, fine)'))
+    bad += not slot_ok or not macro_ok
     sys.exit(1 if bad else 0)
 
 

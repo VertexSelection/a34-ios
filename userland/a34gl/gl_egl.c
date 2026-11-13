@@ -152,7 +152,7 @@ display_start(void)
 }
 
 struct a34gl *
-a34gl_create(int version)
+a34gl_create(int version, struct a34gl *share)
 {
 	struct a34gl *gl;
 	const EGLint window[] = { EGL_WIDTH, WINDOW, EGL_HEIGHT, WINDOW, EGL_NONE };
@@ -166,7 +166,8 @@ a34gl_create(int version)
 	for (gl->version = config_apis; gl->version >= 2; gl->version--) {
 		const EGLint attributes[] = { EGL_CONTEXT_MAJOR_VERSION, gl->version, EGL_NONE };
 
-		if ((gl->context = eglCreateContext(display, config, EGL_NO_CONTEXT, attributes)) != EGL_NO_CONTEXT) {
+		if ((gl->context = eglCreateContext(display, config, share != NULL ? share->context : EGL_NO_CONTEXT, attributes)) !=
+		    EGL_NO_CONTEXT) {
 			break;
 		}
 		a34gl_say("a34gl: no OpenGL ES %d context: %s\n", gl->version, egl_error(eglGetError()));
