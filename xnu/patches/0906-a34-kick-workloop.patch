@@ -43,26 +43,12 @@ index d84e2a9..10ff70a 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 02db05c..d30d9fc 100644
+index 02db05c..22ff58a 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -197,6 +197,13 @@ AppleCLCD::start(IOService *provider)
- 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
- 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
- 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-+	a34_kick_wl = IOWorkLoop::workLoop();
-+	a34_kick_timer = IOTimerEventSource::timerEventSource(this, &a34_kick_action);
-+	if (a34_kick_wl == NULL || a34_kick_timer == NULL ||
-+	    a34_kick_wl->addEventSource(a34_kick_timer) != kIOReturnSuccess) {
-+		IOLog("SWEET FB: no kick work loop, kicking inline\n");
-+		OSSafeReleaseNULL(a34_kick_timer);
-+	}
+@@ -150,6 +150,65 @@ public:
  
- 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
- 	setProperty("external", false);
-@@ -209,6 +216,65 @@ AppleCLCD::start(IOService *provider)
- 
- extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
  
 +/*
 + * A34 (0906): the panel is a command-mode DSI panel; every presented frame
@@ -123,10 +109,32 @@ index 02db05c..d30d9fc 100644
 +	}
 +}
 +
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -197,6 +256,13 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	a34_kick_wl = IOWorkLoop::workLoop();
++	a34_kick_timer = IOTimerEventSource::timerEventSource(this, &a34_kick_action);
++	if (a34_kick_wl == NULL || a34_kick_timer == NULL ||
++	    a34_kick_wl->addEventSource(a34_kick_timer) != kIOReturnSuccess) {
++		IOLog("SWEET FB: no kick work loop, kicking inline\n");
++		OSSafeReleaseNULL(a34_kick_timer);
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -209,6 +275,7 @@ AppleCLCD::start(IOService *provider)
+ 
+ extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
+ 
++
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -442,7 +508,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -442,7 +509,11 @@ AppleCLCD::present(const uint8_t *rec)
  	}
  	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
  	uint64_t t_kick = mach_absolute_time();
