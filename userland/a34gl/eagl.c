@@ -68,7 +68,8 @@
  * "where a frame's time goes"), glsum=0 (copied IOSurfaces refilled by their seed only, see
  * surface_changed(); glsum=2: as often as before), glerrors=0|1 (glGetError after every call never |
  * always; default: the first 120 frames), glasync=0 (GPU jobs synchronous: REDWOOD_DRM_ASYNC=0),
- * glseedwait=1 (see seed_bump()), gltarget=0 (see target_of()), glblack=0 (see picture_note()).
+ * glseedwait=1 (see seed_bump()), gltarget=0 (see target_of()), glblack=0 (see picture_note()), glseedbump=0
+ * (see seed_bump_mirrors), glsrcblack=0 and glsrccheck=0 (see source_check()), glvcmalpha=1 (see vcm_keep_alpha).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -248,6 +249,11 @@ struct image {
 	unsigned copies, told, silent;  /* copies made; of them, after its seed moved; after a sum alone said it changed */
 	unsigned draws;                 /* (drawn into) draws made into it so far */
 	unsigned made;                  /* when it was made (image_new()): the later the newer */
+	unsigned checked;               /* (shown) the frame it was last looked at when a draw read it (source_check()) */
+	uint16_t black_mask;            /* ... which of 16 points of its memory were opaque black then */
+	bool black_known;
+	unsigned black_frame;
+	uint32_t draw_seed;             /* (shown, its memory) its seed at the frame's first draw that read it */
 	GLuint source;                  /* (shown) the texture of ours drawn into for the same surface, filled from by the GPU */
 	unsigned source_draws;          /* ... the draws into that when this was last filled from it */
 	bool sub_ok;                    /* ... refilled with glTexSubImage2D (until that fails) */
@@ -1367,6 +1373,22 @@ surface_empty_note(struct eagl *e, struct image *image)
 	    image->copies + 1, image->told, image->silent);
 }
 
+/* The surface's name (its creator's IOSurfaceName), if it has one, as ' "name"'. */
+static void
+surface_name(IOSurfaceRef surface, char *text, size_t size)
+{
+	char name[64] = "";
+	CFTypeRef value;
+
+	if ((value = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceName"))) != NULL) {
+		if (CFGetTypeID(value) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)value, name, sizeof(name), kCFStringEncodingUTF8);
+		}
+		CFRelease(value);
+	}
+	snprintf(text, size, name[0] ? " \"%s\"" : "", name);
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -1519,6 +1541,15 @@ surface_to_texture(struct eagl *e, struct image *image)
  * glseedwait=1, or synchronous jobs: on the drawing thread, at once, as before.
  */
 static int seed_wait;                   /* boot-arg glseedwait=1 */
+static int source_black = 1, source_seed_check = 1;    /* boot-args glsrcblack=0, glsrccheck=0: see source_check() */
+/*
+ * Boot-arg glseedbump=0: a surface the frame is copied into by the GPU (the display's two) gets no
+ * lock and unlock at all. Those are write locks (options 0) on surfaces the display holds: the
+ * kernel's IOSurfaceLock counts them (0927: "IOSurfaceLocks of one 406" in 10 s), and its
+ * lock/unlock keep the CPU's caches of all 11 MB. Nobody is known to read their seeds; the
+ * black check (picture_note()) is then not made either.
+ */
+static int seed_bump_mirrors = 1;
 static dispatch_queue_t seed_queue;
 static pthread_once_t seed_once = PTHREAD_ONCE_INIT;
 static struct seed_bump {
@@ -1688,7 +1719,9 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		seed_bump(surface, e->frames + 1, e->sf_text);
+		if (seed_bump_mirrors) {
+			seed_bump(surface, e->frames + 1, e->sf_text);
+		}
 		return;
 	}
 	if (image->shared) {
@@ -1843,6 +1876,7 @@ frame_begin(struct eagl *e)
 static void frame_functions(struct eagl *e);
 static void vbafter_end(struct eagl *e);
 static const char *census_name(unsigned function);
+static void source_seeds_send(struct eagl *e);
 
 static void
 frame_end(struct eagl *e, bool finished)
@@ -1922,6 +1956,10 @@ frame_end(struct eagl *e, bool finished)
 	if (seed_pending_count != 0) {
 		glFlush();              /* (the copies above go to the kernel before the seeds move after them) */
 		seed_bumps_send();
+	}
+	if (source_seed_check && e->in_frame) {
+		glFlush();              /* (the frame's jobs with the kernel: the checks wait for them) */
+		source_seeds_send(e);
 	}
 	if (!e->in_frame) {
 		return;
@@ -4495,6 +4533,142 @@ vbafter_after(struct eagl *e, GLenum type, const void *indices, GLint first, GLs
 	}
 }
 
+/*
+ * Where black comes from in part of the picture (boot 45: black lines, the clock a black box, while
+ * animations play; whole frames are not black). For every IOSurface a draw reads (once a frame
+ * each), sixteen points of its memory: opaque black where, when last looked at, there was none
+ * is written down, with the surface and the draw (boot-arg glsrcblack=0: not looked at). And for
+ * a surface whose memory is the texture (shared): its seed at the frame's first draw that reads
+ * it, compared, on the seed queue, with its seed once the jobs naming it are done (a read-only
+ * IOSurfaceLock waits for them in the kernel): moved means its owner wrote it while a job of ours
+ * that reads it was queued or running -- a half-made picture (boot-arg glsrccheck=0: not).
+ */
+static void
+source_black_note(struct eagl *e, struct image *image, unsigned function)
+{
+	IOSurfaceRef surface = image->surface;
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	uint32_t pixels = IOSurfaceGetPixelFormat(surface), shown = __builtin_bswap32(pixels);
+	uint16_t mask = 0;
+
+	if (base == NULL || (pixels != 0x42475241 && pixels != 0) || IOSurfaceGetPlaneCount(surface) > 0 ||
+	    IOSurfaceGetBytesPerElement(surface) != 4 || width < 4 || height < 4) {
+		return;
+	}
+	for (unsigned y = 0; y < 4; y++) {
+		for (unsigned x = 0; x < 4; x++) {
+			const uint8_t *p = base + row * ((2 * y + 1) * height / 8) + 4 * ((2 * x + 1) * width / 8);
+			const uint8_t *c = image->alpha_first ? p + 1 : p;
+			uint8_t a = image->alpha_first ? p[0] : p[3];
+
+			mask |= (uint16_t)((c[0] <= 8 && c[1] <= 8 && c[2] <= 8 && a >= 0xf0) << (4 * y + x));
+		}
+	}
+	if (image->black_known && (mask & ~image->black_mask) != 0) {
+		char name[80];
+
+		surface_name(surface, name, sizeof(name));
+		say("a34gl: frame %u: IOSurface %u%s ('%.4s' %zu x %zu, %s, texture %u, seed %u) has opaque black at %d of 16 points "
+		    "where at frame %u it had not (%#06x -> %#06x)\n", e->frames + 1, IOSurfaceGetID(surface), name,
+		    (const char *)&shown, width, height, image->shared ? "its memory is the texture" : "copied", image->texture,
+		    IOSurfaceGetSeed(surface), __builtin_popcount((unsigned)(mask & ~image->black_mask)), image->black_frame,
+		    image->black_mask, mask);
+		say("a34gl:   read by a draw of function %u (\"%s\"), program %u, into framebuffer %u (texture %u)\n", function,
+		    census_name(function), e->program, e->framebuffer, e->colour);
+	}
+	image->black_mask = mask;
+	image->black_known = true;
+	image->black_frame = e->frames + 1;
+}
+
+/* Before a draw: the IOSurfaces it reads (the first four units: CoreAnimation's are there). */
+static void
+source_check(struct eagl *e)
+{
+	unsigned function = 90;
+
+	if (!source_black && !source_seed_check) {
+		return;
+	}
+	for (unsigned u = 0; u < 4; u++) {
+		struct image *image;
+
+		if (e->bound[u] == 0 || (image = image_of(e, e->bound[u])) == NULL || image->target || image->checked == e->frames + 1) {
+			continue;
+		}
+		image->checked = e->frames + 1;
+		if (image->shared) {
+			image->draw_seed = IOSurfaceGetSeed(image->surface);
+		}
+		if (source_black) {
+			function = function == 90 ? ca_function() : function;
+			source_black_note(e, image, function);
+		}
+	}
+}
+
+struct source_seed {
+	IOSurfaceRef surface;
+	uint32_t seed;
+	unsigned frame;
+	GLuint texture;
+};
+
+static void
+source_seed_work(void *context)
+{
+	struct source_seed *check = context;
+	uint32_t seed;
+
+	if (IOSurfaceLock(check->surface, kIOSurfaceLockReadOnly, NULL) == 0) {
+		seed = IOSurfaceGetSeed(check->surface);
+		IOSurfaceUnlock(check->surface, kIOSurfaceLockReadOnly, NULL);
+		if (seed != check->seed) {
+			char name[80];
+
+			surface_name(check->surface, name, sizeof(name));
+			say("a34gl: frame %u: IOSurface %u%s (%zu x %zu, texture %u, its memory) was written by its owner while a job of "
+			    "ours that reads it was queued or running (seed %u at the draw, %u when the jobs were done)\n", check->frame,
+			    IOSurfaceGetID(check->surface), name, IOSurfaceGetWidth(check->surface), IOSurfaceGetHeight(check->surface),
+			    check->texture, check->seed, seed);
+		}
+	}
+	CFRelease(check->surface);
+	free(check);
+}
+
+/* At the frame's end, once its jobs have gone to the kernel: the shared surfaces this frame read, checked on the seed queue. */
+static void
+source_seeds_send(struct eagl *e)
+{
+	unsigned sent = 0;
+
+	if (!source_seed_check) {
+		return;
+	}
+	for (unsigned i = 0; i < e->image_count && sent < 16; i++) {
+		struct image *image = &e->images[i];
+		struct source_seed *check;
+
+		if (!image->shared || image->target || image->checked != e->frames + 1 || (check = malloc(sizeof(*check))) == NULL) {
+			continue;
+		}
+		check->surface = (IOSurfaceRef)CFRetain(image->surface);
+		check->seed = image->draw_seed;
+		check->frame = e->frames + 1;
+		check->texture = image->texture;
+		pthread_once(&seed_once, seed_queue_make);
+		if (seed_queue != NULL) {
+			dispatch_async_f(seed_queue, check, source_seed_work);
+		} else {
+			CFRelease(check->surface);
+			free(check);
+		}
+		sent++;
+	}
+}
+
 /* (picture_note()) a draw: into the screen's picture or elsewhere */
 static void
 screen_frame_draw(struct eagl *e)
@@ -4810,6 +4984,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		prof.draws++;
 	}
 	screen_frame_draw(e);
+	source_check(e);
 	if (vbafter.e != NULL || vbafter_frames != 0 || vbafter.next_e != NULL) {
 		vbafter_before(e, 0, NULL, first, count);
 	}
@@ -4867,6 +5042,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		prof.draws++;
 	}
 	screen_frame_draw(e);
+	source_check(e);
 	if (vbafter.e != NULL || vbafter_frames != 0 || vbafter.next_e != NULL) {
 		vbafter_before(e, type, indices, 0, count);
 	}
@@ -6029,6 +6205,9 @@ install(void)
 		}
 		sum_surfaces = strstr(arguments, "glsum=0") != NULL ? 0 : strstr(arguments, "glsum=2") != NULL ? 2 : 1;
 		seed_wait = strstr(arguments, "glseedwait=1") != NULL;
+		seed_bump_mirrors = strstr(arguments, "glseedbump=0") == NULL;
+		source_black = strstr(arguments, "glsrcblack=0") == NULL;
+		source_seed_check = strstr(arguments, "glsrccheck=0") == NULL;
 		vcm_keep_alpha = strstr(arguments, "glvcmalpha=1") == NULL;
 		black_check = strstr(arguments, "glblack=0") == NULL;
 		from_targets = strstr(arguments, "gltarget=0") == NULL;
