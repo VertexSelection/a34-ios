@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5e1759b..3cf3caa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -422,36 +422,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
+-	/* ruby debug: 64x64 magenta marker at panel (0,0), then clean to DRAM. */
+-	for (uint32_t my = 0; my < 64; my++) {
+-		uint32_t *row = (uint32_t *)(fPixels + (uint64_t)my * fRowBytes);
+-		for (uint32_t mx = 0; mx < 64; mx++) {
+-			row[mx] = 0xFFFF00FF;
+-		}
+-	}
+-	flush_dcache64((addr64_t)fPixels, (uint32_t)(64 * fRowBytes), FALSE);
+-	__asm__ __volatile__("dsb sy" ::: "memory");
+-	/* ruby debug: 64x64 green marker at the panel centre. */
+-	{
+-		uint32_t cy = fHeight / 2 - 32, cx = fWidth / 2 - 32;
+-		for (uint32_t gy = 0; gy < 64; gy++) {
+-			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)(cy + gy) * fRowBytes);
+-			for (uint32_t gx = 0; gx < 64; gx++) {
+-				row[cx + gx] = 0xFF00FF00;
+-			}
+-		}
+-		flush_dcache64((addr64_t)(fPixels + (uint64_t)cy * fRowBytes), (uint32_t)(64 * fRowBytes), FALSE);
+-		__asm__ __volatile__("dsb sy" ::: "memory");
+-		IOLog("SWEET FB DBG: center va=%p pa=0x%llx px=%08x\n",
+-		    (void *)(fPixels + (uint64_t)cy * fRowBytes + (uint64_t)cx * 4),
+-		    (uint64_t)fPhys + (uint64_t)cy * fRowBytes + (uint64_t)cx * 4,
+-		    *(const uint32_t *)(fPixels + (uint64_t)(fHeight / 2) * fRowBytes + (uint64_t)(fWidth / 2) * 4));
+-	}
+-	if (sweet_fb_dbg_logged < 12) {
+-		sweet_fb_dbg_logged++;
+-		IOLog("SWEET FB DBG: marker va=%p pa=0x%llx fPhys=0x%llx fPixels=0x%llx rows=64\n",
+-		    (void *)fPixels, fPhys, fPhys, (uint64_t)fPixels);
+-	}
++	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
+ 	a34_display_kick();
+ }
+ 

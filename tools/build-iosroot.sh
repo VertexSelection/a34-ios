@@ -46,6 +46,9 @@ bash "$SWEET/mkiosroot.sh" "$X/$(get OS)" "$X/$(get SystemOS)" "$X/$(get AppOS)"
 M=$(mktemp -d)
 sudo mount -t hfsplus -o loop,force "$OUT" "$M"
 sudo python3 -I "$SWEET/sweet-root-tweaks.py" "$M" || { sudo umount "$M"; exit 1; }
+# First-boot lsd/SpringBoard deadlock bypass (see tools/icl-nop.py).
+sudo python3 -I "$ROOT/tools/icl-nop.py" cache \
+    "$M/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.15" || { sudo umount "$M"; exit 1; }
 df -h "$M"
 sudo umount "$M"
 rmdir "$M"

@@ -23,3 +23,4 @@ __pycache__/
 # Apple firmware and anything extracted from it
 /research/
 /ipsw/
+/tools/bin/
