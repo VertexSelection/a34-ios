@@ -16,7 +16,12 @@
  * What is answered here and never reaches the kernel: DRM_IOCTL_VERSION (panfrost 1.1,
  * or 1.$REDWOOD_DRM_MINOR), DRM_IOCTL_GET_CAP, device enumeration (one platform device
  * whose render node is /dev/null: any descriptor in the process means the one GPU) and
- * every syncobj call. PRIME (dma-buf) sharing is not supported.
+ * every syncobj call.
+ *
+ * PRIME: import only, and what is imported is an IOSurface. The "dma-buf file descriptor"
+ * Mesa hands drmPrimeFDToHandle() is an IOSurface ID (EGL_IOSURFACE_A34, patches/0003-*),
+ * and the kernel makes a GEM handle of the surface's memory: selector 0x7e, ios-topaz's
+ * "surface" request (struct redwood_drm_surface in redwood_drm.h). Export is not supported.
  *
  * Environment: REDWOOD_DRM_SERVICE (default "RedwoodMali"), REDWOOD_DRM_MINOR (default
  * 1), REDWOOD_DRM_DEBUG=1 (every call on stderr), REDWOOD_DRM_NODE (default /dev/null).
@@ -375,8 +380,10 @@ get_cap(uint64_t capability, uint64_t *value)
 		*value = 1;
 		return 0;
 	case DRM_CAP_SYNCOBJ_TIMELINE:
-	case DRM_CAP_PRIME:
 		*value = 0;
+		return 0;
+	case DRM_CAP_PRIME:             /* IOSurfaces in (drmPrimeFDToHandle), nothing out */
+		*value = DRM_PRIME_CAP_IMPORT;
 		return 0;
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
 		*value = 1;
@@ -832,15 +839,65 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 	return -1;
 }
 
+/*
+ * Selector 0x7e (redwood_drm.h). `prime_fd` is an IOSurface ID: the GEM handle of its memory
+ * (the same handle again for a surface this client has already), or with
+ * REDWOOD_DRM_SURFACE_DESCRIBE in `handle` only what the surface is like.
+ */
+static int
+surface_request(struct redwood_drm_surface *request)
+{
+	bool describe = request->handle == REDWOOD_DRM_SURFACE_DESCRIBE;
+	int ret = call(REDWOOD_DRM_SURFACE, request, sizeof(*request));
+	int error = errno;
+
+	note("surface %u (%s): %s; handle %u, %llu bytes, %ux%u '%c%c%c%c' (%#x), %u planes, %u bytes a row from %u",
+	    request->surface, describe ? "describe" : "import", ret == 0 ? "ok" : strerror(error),
+	    request->handle, (unsigned long long)request->size, request->width, request->height,
+	    (int)(request->pixel_format >> 24 & 0xff), (int)(request->pixel_format >> 16 & 0xff),
+	    (int)(request->pixel_format >> 8 & 0xff), (int)(request->pixel_format & 0xff), request->pixel_format,
+	    request->planes, request->row_bytes, request->offset);
+	errno = error;
+	return ret;
+}
+
 EXPORT int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
+	struct redwood_drm_surface request = { .surface = (uint32_t)prime_fd, .handle = 0 };
+
 	(void)fd;
-	(void)prime_fd;
 	*handle = 0;
-	note("drmPrimeFDToHandle: not supported");
-	errno = EOPNOTSUPP;
-	return -1;
+	if (prime_fd <= 0) {
+		errno = EBADF;
+		return -1;
+	}
+	if (surface_request(&request) != 0) {
+		return -1;
+	}
+	if (request.handle == 0 || request.handle == REDWOOD_DRM_SURFACE_DESCRIBE) {
+		note("surface %u: the kernel gave no handle", request.surface);
+		errno = EIO;
+		return -1;
+	}
+	*handle = request.handle;
+	return 0;
+}
+
+EXPORT int
+redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
+{
+	uint32_t id = surface->surface;
+
+	(void)fd;
+	memset(surface, 0, sizeof(*surface));
+	surface->surface = id;
+	surface->handle = REDWOOD_DRM_SURFACE_DESCRIBE;
+	if (id == 0) {
+		errno = EBADF;
+		return -1;
+	}
+	return surface_request(surface);
 }
 
 struct mapping {

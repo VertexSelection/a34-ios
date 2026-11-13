@@ -10,9 +10,11 @@
 #    compile panfrost's OpenCL C helpers at build time; a cross build cannot make them);
 # 2. libdrm.2.dylib for iOS: redwood-drm/, against libdrm's own xf86drm.h;
 # 3. Mesa for iOS: libgallium (panfrost), libEGL, libGLESv2;
-# 4. mali-tri, the test program;
-# 5. out/: the dylibs and mali-tri (install names @rpath, ad-hoc signed), headers,
-#    BUILD_INFO.txt.
+# 4. out/: the dylibs, with absolute install names $INSTALL_DIR/<name> (default /a34: iOS's
+#    dyld refuses @rpath and other "@" paths for our binaries), headers;
+# 5. mali-tri, the test program, linked against those;
+# 6. everything ad-hoc signed, last (a load command changed after signing breaks the
+#    signature, and launchd panics on such a program), checked, BUILD_INFO.txt.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -21,6 +23,7 @@ MESA_SHA256=${MESA_SHA256:-91d729aa68bb89e4ec857841300bbe922bcb3e52b1f97566ca839
 LIBDRM_VERSION=${LIBDRM_VERSION:-2.4.134}
 LIBDRM_SHA256=${LIBDRM_SHA256:-ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95}
 IOS_MIN=${IOS_MIN:-16.0}
+INSTALL_DIR=${INSTALL_DIR:-/a34}         # where the dylibs live on the phone: their install names
 WORK=${WORK:-$HERE/work}
 OUT=${OUT:-$WORK/out}
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
@@ -151,7 +154,7 @@ ios_libdrm() {
 	# the branch for SDKs without IOKit headers must build too
 	"$CLANG" "${IOS_TARGET[@]}" -fsyntax-only -Wall -Wextra -DREDWOOD_OWN_IOKIT -I"$WORK/libdrm-$LIBDRM_VERSION" \
 		-I"$SRC/include" -I"$SRC/include/drm-uapi" -I"$HERE/redwood-drm" "$HERE/redwood-drm/redwood_drm.c"
-	libdrm_standin "$IOS_DRM" "@rpath/libdrm.2.dylib" "$CLANG" "${IOS_TARGET[@]}"
+	libdrm_standin "$IOS_DRM" "$INSTALL_DIR/libdrm.2.dylib" "$CLANG" "${IOS_TARGET[@]}"
 }
 
 ios_mesa() {
@@ -209,41 +212,54 @@ ios_mesa() {
 	)
 }
 
-mali_tri() {
-	log "mali-tri"
-	mkdir -p "$WORK/mali-tri"
-	"$CLANG" "${IOS_TARGET[@]}" -std=gnu11 -O2 -g -Wall -Wextra \
-		-I"$STAGE$PREFIX/include" -o "$WORK/mali-tri/mali-tri" "$HERE/mali-tri/mali-tri.c" \
-		-L"$STAGE$PREFIX/lib" -lEGL -lGLESv2 -Wl,-rpath,@executable_path -Wl,-rpath,@executable_path/../lib
-}
-
+# The libraries into out/, each named $INSTALL_DIR/<file> (LC_ID_DYLIB) and naming the others
+# so (meson links them by @rpath/..., meson install by $PREFIX/lib/...), with no LC_RPATH.
+# Signed later, by sign().
 package() {
-	log "package"
-	local lib=$STAGE$PREFIX/lib f dep
+	log "package (install names $INSTALL_DIR/...)"
+	local lib=$STAGE$PREFIX/lib f dep rpath
 	rm -rf "$OUT"
 	mkdir -p "$OUT/include"
 	cp "$IOS_DRM/lib/libdrm.2.dylib" "$OUT/"
 	for f in "$lib"/libgallium*.dylib "$lib"/libEGL.*.dylib "$lib"/libGLESv2.*.dylib; do
 		[ -L "$f" ] || cp "$f" "$OUT/"
 	done
-	cp "$WORK/mali-tri/mali-tri" "$OUT/"
 	cp -R "$STAGE$PREFIX/include/EGL" "$STAGE$PREFIX/include/GLES2" "$STAGE$PREFIX/include/GLES3" \
 		"$STAGE$PREFIX/include/KHR" "$OUT/include/" 2>/dev/null || true
+	cp "$HERE/redwood-drm/redwood_drm.h" "$OUT/include/"
 	(
 		cd "$OUT"
-		for f in *.dylib mali-tri; do
-			[ "$f" = mali-tri ] || install_name_tool -id "@rpath/$f" "$f"
-			# meson install wrote $PREFIX/lib/... into the libraries that use another: @rpath/...
-			for dep in $(otool -L "$f" | awk -v p="$PREFIX/lib/" 'NR > 1 && index($1, p) == 1 { print $1 }'); do
-				install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$f"
+		for f in *.dylib; do
+			install_name_tool -id "$INSTALL_DIR/$f" "$f" 2>/dev/null
+			for dep in $(otool -L "$f" | awk 'NR > 1 { print $1 }'); do
+				case "$dep" in
+				@rpath/* | @loader_path/* | @executable_path/* | "$PREFIX"/lib/*)
+					install_name_tool -change "$dep" "$INSTALL_DIR/$(basename "$dep")" "$f" 2>/dev/null ;;
+				esac
 			done
-			# and @rpath is first of all the library's own directory
-			if [ "$f" != mali-tri ] && ! otool -l "$f" | grep 'path @loader_path ' >/dev/null; then
-				install_name_tool -add_rpath @loader_path "$f"
-			fi
-			codesign -f -s - "$f"
+			for rpath in $(otool -l "$f" | awk '/cmd LC_RPATH/ { r = 1 } r && $1 == "path" { print $2; r = 0 }'); do
+				install_name_tool -delete_rpath "$rpath" "$f" 2>/dev/null
+			done
 		done
 	)
+}
+
+# mali-tri, linked against out/'s libraries: it names them $INSTALL_DIR/<file> from the start.
+mali_tri() {
+	log "mali-tri"
+	mkdir -p "$WORK/mali-tri"
+	"$CLANG" "${IOS_TARGET[@]}" -std=gnu11 -O2 -g -Wall -Wextra \
+		-I"$OUT/include" -o "$OUT/mali-tri" "$HERE/mali-tri/mali-tri.c" \
+		"$OUT/libEGL.1.dylib" "$OUT/libGLESv2.2.dylib"
+}
+
+# Ad-hoc signatures, after the last change to any load command.
+sign() {
+	log "sign"
+	local f
+	for f in "$OUT"/*.dylib "$OUT/mali-tri"; do
+		codesign -f -s - "$f"
+	done
 	check
 	build_info >"$OUT/BUILD_INFO.txt"
 	cat "$OUT/BUILD_INFO.txt"
@@ -254,8 +270,16 @@ check() {
 	local f sym bad=0
 	log "check"
 	for f in "$OUT"/*.dylib "$OUT/mali-tri"; do
-		if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E '^(@rpath/|/usr/lib/|/System/Library/)'; then
-			echo "error: $(basename "$f") refers to a library outside @rpath and the system"
+		if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
+			echo "error: $(basename "$f") refers to a library outside $INSTALL_DIR and the system"
+			bad=1
+		fi
+		if [ "$f" != "$OUT/mali-tri" ] && [ "$(otool -D "$f" | tail -n 1)" != "$INSTALL_DIR/$(basename "$f")" ]; then
+			echo "error: $(basename "$f") is named $(otool -D "$f" | tail -n 1), not $INSTALL_DIR/$(basename "$f")"
+			bad=1
+		fi
+		if otool -l "$f" | grep -E '^ *cmd LC_RPATH$' >/dev/null || otool -l "$f" | grep -E '^ *name @' >/dev/null; then
+			echo "error: $(basename "$f") has an LC_RPATH or an @ path"
 			bad=1
 		fi
 		if [ "$(lipo -archs "$f")" != arm64 ]; then
@@ -270,13 +294,17 @@ check() {
 	for sym in glClear glDrawArrays glReadPixels glCreateShader glGetString; do
 		nm -gU "$OUT/libGLESv2.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libGLESv2 lacks $sym"; bad=1; }
 	done
-	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait redwood_drm_mmap redwood_drm_munmap; do
+	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait drmPrimeFDToHandle redwood_drm_mmap redwood_drm_munmap \
+		redwood_drm_surface; do
 		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
 	done
-	# panfrost maps BOs through the user client (patch 0002)
-	for sym in redwood_drm_mmap redwood_drm_munmap; do
+	# panfrost maps BOs through the user client (patch 0002) and sizes IOSurface imports by it (0003)
+	for sym in redwood_drm_mmap redwood_drm_munmap redwood_drm_surface; do
 		nm -u "$OUT/libgallium-$MESA_VERSION.dylib" | grep "^_$sym\$" >/dev/null || { echo "error: libgallium does not call $sym"; bad=1; }
 	done
+	# EGL_IOSURFACE_A34 (0003)
+	nm -u "$OUT/libEGL.1.dylib" | grep "^_redwood_drm_surface\$" >/dev/null || { echo "error: libEGL does not call redwood_drm_surface"; bad=1; }
+	grep -q 'EGL_IOSURFACE_A34' "$OUT/include/EGL/eglmesaext.h" || { echo "error: eglmesaext.h lacks EGL_IOSURFACE_A34"; bad=1; }
 	[ "$bad" = 0 ] && echo "ok"
 	return "$bad"
 }
@@ -299,6 +327,7 @@ build_info() {
 	echo "iPhoneOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version) ($IOS_SDK)"
 	echo "clang:         $("$CLANG" --version | head -n 1)"
 	echo "target:        arm64-apple-ios$IOS_MIN (arm64, not arm64e)"
+	echo "installed in:  $INSTALL_DIR (absolute install names; no LC_RPATH)"
 	echo "host LLVM:     $("$LLVM_PREFIX/bin/llvm-config" --version 2>/dev/null) (mesa_clc, build time only)"
 	echo "meson:         $(meson --version)"
 	echo "meson options: -Dgallium-drivers=panfrost -Dplatforms= -Degl=enabled (surfaceless) -Dgles2=enabled"
@@ -326,5 +355,6 @@ sources
 host_tools
 ios_libdrm
 ios_mesa
-mali_tri
 package
+mali_tri
+sign
