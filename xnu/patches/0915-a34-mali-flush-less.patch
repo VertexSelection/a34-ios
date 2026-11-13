@@ -1,0 +1,649 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index d3fbe54..fce9552 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -101,6 +101,7 @@ bool a34_mali_map(uint64_t va, uint64_t pa, uint64_t size);
+ void a34_mali_unmap(uint64_t va, uint64_t size);
+ bool a34_mali_submit(struct a34_mali_job *job);
+ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
++void a34_mali_cpu_clean(uintptr_t va, uint64_t size);
+ bool RedwoodMaliStart(void);            /* iokit/Kernel/arm/A34Mali.cpp */
+ 
+ /* ---- where things are ---- */
+@@ -1409,6 +1410,26 @@ a34_mali_cpu_flush(uintptr_t va, uint64_t size)
+ 	am_flush((vm_offset_t)va, (vm_size_t)size);
+ }
+ 
++/*
++ * A34 (0915): clean only (dc cvac): what the processor wrote goes to memory,
++ * lines stay valid. For memory the GPU is about to read but not write. No
++ * state: callable without the lock (SweetSurface's unlock).
++ */
++void
++a34_mali_cpu_clean(uintptr_t va, uint64_t size)
++{
++	uint64_t ctr;
++	vm_offset_t line, p, end = (vm_offset_t)va + (vm_size_t)size;
++
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	line = (vm_offset_t)4 << ((ctr >> 16) & 0xf);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (p = (vm_offset_t)va & ~(line - 1); p < end; p += line) {
++		__asm__ volatile ("dc cvac, %0" : : "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /*
+  * One job chain, run to its end: fragment jobs (PANFROST_JD_REQ_FS) on slot
+  * 0, the rest on slot 1 (panfrost_job_get_slot()), through AS0 with the
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 10a0e88..23a9d9a 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -59,10 +59,15 @@
+  * surfaces of memory of their own (IOSurfaceCreate) or of a program's
+  * writable memory starting at a page, with 32-bit pixels in one plane and
+  * rows a multiple of 64 bytes; anything else answers kIOReturnUnsupported and
+- * the library copies instead. Surfaces are cacheable for every processor:
+- * those a job names (SUBMIT's bo_handles) are cleaned and invalidated around
+- * it like the client's own buffers. 0x7f (ios-topaz's test display) stays
++ * the library copies instead. Surfaces are cacheable for every processor
++ * (cache upkeep: upkeep(), 0915). 0x7f (ios-topaz's test display) stays
+  * unsupported, as there.
++ *
++ * A34 (0915): the CPU's caches are kept only for what the CPU and a job can
++ * both touch (upkeep()): mapped buffers, surfaces of a program's memory or
++ * mapped here, and other surfaces at IOSurfaceLock/Unlock (SweetSurface).
++ * The first 16 jobs of a client log a line with their cache upkeep, then a
++ * summary every 200 (at most one per 2 s).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -76,6 +81,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+ #include "SweetSurface.h"
+@@ -101,6 +107,7 @@ bool a34_mali_map(uint64_t va, uint64_t pa, uint64_t size);
+ void a34_mali_unmap(uint64_t va, uint64_t size);
+ bool a34_mali_submit(struct a34_mali_job *job);
+ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
++void a34_mali_cpu_clean(uintptr_t va, uint64_t size);     /* A34 (0915): dc cvac */
+ 
+ bool RedwoodMaliStart(void);
+ }
+@@ -135,6 +142,7 @@ enum {
+ #define PANFROST_JD_REQ_FS      (1u << 0)
+ #define PANFROST_JD_REQ_CYCLE_COUNT (1u << 1)
+ #define PANFROST_JM_CTX_PRIORITY_HIGH 2u
++#define PANFROST_MADV_DONTNEED  1u              /* (PANFROST_MADV_WILLNEED 0) */
+ #define DRM_PANFROST_BO_IS_IMPORTED 1u
+ #define A34_REDWOOD_DESCRIBE    0xffffffffu     /* 0x7e's handle in: only describe the surface */
+ 
+@@ -241,9 +249,14 @@ struct a34_bo {
+ 	uint64_t vasize;                /* GPU addresses it holds (a heap: all it asked for) */
+ 	uint64_t backed;                /* bytes of memory, mapped from va on */
+ 	uint32_t flags;                 /* the PANFROST_BO_* it was made with */
+-	uint32_t round;                 /* A34 (0914): the last cache upkeep that took this surface */
++	uint32_t state;                 /* A34 (0915): A34_BO_* */
+ };
+ 
++/* A34 (0915): struct a34_bo state */
++#define A34_BO_MAPPED           1u      /* the program has had it mapped: the CPU may write and read it */
++#define A34_BO_DONTNEED         2u      /* MADVISE DONTNEED: in Mesa's cache, no job uses it */
++#define A34_BO_LISTED           4u      /* named by the SUBMIT being run */
++
+ /* A34 (0914): a handle that is a buffer, of its own memory or a surface's. */
+ static inline bool
+ a34_bo_used(const struct a34_bo *b)
+@@ -263,7 +276,9 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_UNIT                0x4000ull       /* buffers in kernel pages */
+ #define A34_BO_MAX              (512ull << 20)
+ #define A34_HEAP_VA_MAX         (1024ull << 20)
+-#define A34_LOGGED_SUBMITS      8u
++#define A34_LOGGED_SUBMITS      16u             /* A34 (0915): a line each, with its cache upkeep */
++#define A34_UPKEEP_WINDOW       200u            /* A34 (0915): then a summary per this many jobs, */
++#define A34_UPKEEP_WINDOW_NS    (2ull * NSEC_PER_SEC)   /* and no more often than this */
+ #define A34_LOGGED_ERRORS       64u
+ #define A34_LOGGED_SURFACES     16u             /* A34 (0914): surfaces taken / refused, logged per client */
+ 
+@@ -354,14 +369,17 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fBoCount, fBoMade, fSubmits, fFailed, fErrors;
+ 	uint64_t fWired;                        /* bytes of this client's buffers */
+ 	uint32_t fSurfaceBos, fSurfacesTaken, fSurfacesRefused; /* A34 (0914): surfaces among the buffers; taken, refused */
+-	uint32_t fFlushRound;                   /* A34 (0914): cache upkeep rounds (struct a34_bo round) */
++	/* A34 (0915): cache upkeep per job, for the log: this window's jobs, mach time upkeep took (all, most), job ns, bytes */
++	uint32_t fWinJobs;
++	uint64_t fWinUpkeep, fWinUpkeepMax, fWinJobNs, fWinBytes, fWinStarted;
+ 	bool fOpen, fClosed;
+ 	char fName[32];
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+ 	void freeBo(struct a34_bo *b);
+-	void flushBuffers(void);
+-	void flushSurfaces(user_addr_t list, uint32_t count);
++	bool markListed(user_addr_t list, uint32_t count);
++	uint64_t upkeep(bool before, bool all);
++	void upkeepLog(uint32_t n, uint32_t requirements, uint64_t before, uint64_t after, uint64_t ticks, uint64_t jobNs);
+ 	void releaseAll(void);
+ 	void describeFault(uint64_t va);
+ 	IOReturn createBo(struct a34_create_bo *req);
+@@ -403,73 +421,152 @@ RedwoodMaliUserClient::start(IOService *provider)
+ 	return true;
+ }
+ 
+-/* With the lock held. */
+-/*
+- * A34 (0911): buffers are cacheable for the CPU and the GPU is not coherent:
+- * clean+invalidate every buffer of this client (the tiler heap is the
+- * GPU's alone) around each job.
+- */
+-void
+-RedwoodMaliUserClient::flushBuffers(void)
+-{
+-	if (fBos == NULL) {
+-		return;
+-	}
+-	for (uint32_t i = 0; i < A34_BOS; i++) {
+-		struct a34_bo *b = &fBos[i];
+-		if (b->mem != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
+-			a34_mali_cpu_flush((uintptr_t)b->mem->getBytesNoCopy(), b->backed);
+-		}
+-	}
+-}
+-
+ /*
+- * With the lock held. A34 (0914): the surfaces among the buffers a job
+- * names (SUBMIT's bo_handles, a user address; Mesa lists every buffer a
+- * batch reads or writes), cleaned and invalidated like the client's own
+- * buffers: a surface is cacheable memory for every processor and program,
+- * and the GPU is not coherent. Each surface once per call; a list that
+- * cannot be read, or none: every surface of the client.
++ * With the lock held. A34 (0915): mark the buffers SUBMIT's bo_handles names
++ * (a user address; Mesa lists every buffer a job writes and those it reads
++ * that are not long-lived pools). False: the list could not be read (too
++ * long, none, a fault): treat every buffer as named.
+  */
+-void
+-RedwoodMaliUserClient::flushSurfaces(user_addr_t list, uint32_t count)
++bool
++RedwoodMaliUserClient::markListed(user_addr_t list, uint32_t count)
+ {
+-	uint32_t chunk[A34_SUBMIT_BOS_CHUNK], round, done = 0;
+-	bool all = list == 0 || count == 0 || count > A34_SUBMIT_BOS_MAX;
++	uint32_t chunk[A34_SUBMIT_BOS_CHUNK], done = 0;
+ 
+-	if (fBos == NULL || fSurfaceBos == 0) {
+-		return;
+-	}
+-	if (++fFlushRound == 0) {
+-		fFlushRound = 1;
++	if (list == 0 || count == 0 || count > A34_SUBMIT_BOS_MAX) {
++		return false;
+ 	}
+-	round = fFlushRound;
+-	while (!all && done < count) {
++	while (done < count) {
+ 		uint32_t n = count - done < A34_SUBMIT_BOS_CHUNK ? count - done : A34_SUBMIT_BOS_CHUNK;
+ 
+ 		if (copyin(list + (user_addr_t)done * sizeof(uint32_t), chunk, n * sizeof(uint32_t)) != 0) {
+-			all = true;
+-			break;
++			return false;
+ 		}
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			struct a34_bo *b = lookup(chunk[i]);
+ 
+-			if (b != NULL && b->surface != NULL && b->round != round) {
+-				b->round = round;
+-				a34_mali_cpu_flush(b->kva, b->backed);
++			if (b != NULL) {
++				b->state |= A34_BO_LISTED;
+ 			}
+ 		}
+ 		done += n;
+ 	}
+-	if (all) {
+-		for (uint32_t i = 0; i < A34_BOS; i++) {
+-			struct a34_bo *b = &fBos[i];
++	return true;
++}
+ 
+-			if (b->surface != NULL && b->round != round) {
+-				b->round = round;
+-				a34_mali_cpu_flush(b->kva, b->backed);
++/*
++ * With the lock held. A34 (0915, replacing 0911's and 0914's flush of every
++ * buffer and every named surface around every job): the CPU's caches and
++ * this client's buffers around a job, `before` it or after it; the bytes
++ * taken. The GPU is not coherent and the CPU's mappings are cacheable, so:
++ *
++ *   - a buffer of the program's own that it has never mapped (render
++ *     targets, varyings, scratch) was cleaned when it was made and the CPU
++ *     never touches it: nothing (on its first mapping it is
++ *     clean+invalidated once, clientMemoryForType());
++ *   - a mapped one (command and descriptor pools, uploads, read-backs):
++ *     cleaned before every job, named or not, because Mesa's screen-wide
++ *     pools of blend, preload and precompiled shaders and their descriptors
++ *     are used by address and never named (pan_blend_cso.c, pan_fb_preload.c,
++ *     pan_precomp.c); clean+invalidated after a job that names it, since the
++ *     GPU writes only what the job names; none of it while it sits in
++ *     Mesa's cache (MADVISE DONTNEED: no job uses it);
++ *   - the tiler heap: never (the GPU's alone);
++ *   - a surface (0x7e) that is a program's memory (wrapped: its owner writes
++ *     it without a lock) or that this client has mapped (Mesa's own CPU
++ *     access, no lock either): clean before and clean+invalidate after a
++ *     job that names it;
++ *   - any other surface: nothing here; a named one only counts the job
++ *     (gpuWrites, after it ended), and SweetSurface keeps the CPU's side at
++ *     IOSurfaceLock/Unlock, AppleCLCD before its copy.
++ *
++ * `all`: the list could not be read, every buffer counts as named.
++ */
++uint64_t
++RedwoodMaliUserClient::upkeep(bool before, bool all)
++{
++	uint64_t bytes = 0;
++
++	for (uint32_t i = 0; i < A34_BOS; i++) {
++		struct a34_bo *b = &fBos[i];
++		bool listed = all || (b->state & A34_BO_LISTED) != 0;
++		uintptr_t va;
++
++		if (!before) {
++			b->state &= ~A34_BO_LISTED;
++		}
++		if (b->mem != NULL) {
++			if ((b->flags & PANFROST_BO_HEAP) != 0 || (b->state & A34_BO_MAPPED) == 0 ||
++			    (b->state & A34_BO_DONTNEED) != 0 || (!before && !listed)) {
++				continue;
++			}
++			va = (uintptr_t)b->mem->getBytesNoCopy();
++		} else if (b->surface != NULL && listed) {
++			if (!before) {
++				OSIncrementAtomic(&b->surface->gpuWrites);
+ 			}
++			if (!b->surface->wrapped && (b->state & A34_BO_MAPPED) == 0) {
++				continue;
++			}
++			va = b->kva;
++		} else {
++			continue;
++		}
++		if (before) {
++			a34_mali_cpu_clean(va, b->backed);
++		} else {
++			a34_mali_cpu_flush(va, b->backed);
+ 		}
++		bytes += b->backed;
++	}
++	return bytes;
++}
++
++/*
++ * With the lock held. A34 (0915): job n's cache upkeep for the log: a line
++ * for each of the first A34_LOGGED_SUBMITS jobs, then a summary per
++ * A34_UPKEEP_WINDOW jobs (no more than one per A34_UPKEEP_WINDOW_NS), with
++ * what SweetSurface did at IOSurfaceLock/Unlock so far.
++ */
++void
++RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t before, uint64_t after, uint64_t ticks,
++    uint64_t jobNs)
++{
++	uint64_t ns, now = mach_absolute_time(), window;
++
++	absolutetime_to_nanoseconds(ticks, &ns);
++	if (n <= A34_LOGGED_SUBMITS) {
++		IOLog("A34 MALI UC: %s: job chain %u (%s, %u buffers): %llu KB cleaned before, %llu KB flushed after, "
++		    "%llu us of cache upkeep, job %llu us\n", fName, n,
++		    (requirements & PANFROST_JD_REQ_FS) ? "fragment" : "vertex/tiler/compute", fBoCount,
++		    (unsigned long long)(before >> 10), (unsigned long long)(after >> 10), (unsigned long long)(ns / 1000),
++		    (unsigned long long)(jobNs / 1000));
++	}
++	if (fWinJobs == 0) {
++		fWinStarted = now;
++	}
++	fWinJobs++;
++	fWinUpkeep += ticks;
++	if (ticks > fWinUpkeepMax) {
++		fWinUpkeepMax = ticks;
++	}
++	fWinJobNs += jobNs;
++	fWinBytes += before + after;
++	absolutetime_to_nanoseconds(now - fWinStarted, &window);
++	if (fWinJobs >= A34_UPKEEP_WINDOW && window >= A34_UPKEEP_WINDOW_NS) {
++		uint64_t all, most, surf;
++
++		absolutetime_to_nanoseconds(fWinUpkeep, &all);
++		absolutetime_to_nanoseconds(fWinUpkeepMax, &most);
++		absolutetime_to_nanoseconds((uint64_t)sweet_surface_sync_stats[3], &surf);
++		IOLog("A34 MALI UC: %s: %u jobs in %llu ms: cache upkeep %llu us a job (most %llu us), %llu KB a job; "
++		    "jobs %llu us each; surfaces at lock/unlock so far: %lld invalidated, %lld cleaned, %lld MB, %llu ms\n",
++		    fName, fWinJobs, (unsigned long long)(window / NSEC_PER_MSEC), (unsigned long long)(all / 1000 / fWinJobs),
++		    (unsigned long long)(most / 1000), (unsigned long long)((fWinBytes >> 10) / fWinJobs),
++		    (unsigned long long)(fWinJobNs / 1000 / fWinJobs), (long long)sweet_surface_sync_stats[0],
++		    (long long)sweet_surface_sync_stats[1], (long long)(sweet_surface_sync_stats[2] >> 20),
++		    (unsigned long long)(surf / NSEC_PER_MSEC));
++		fWinJobs = 0;
++		fWinUpkeep = fWinUpkeepMax = fWinJobNs = fWinBytes = 0;
+ 	}
+ }
+ 
+@@ -495,6 +592,10 @@ RedwoodMaliUserClient::freeBo(struct a34_bo *b)
+ 		OSDecrementAtomic(&b->surface->gpuShared);
+ 		b->surface->release();
+ 	} else {
++		if ((b->state & A34_BO_MAPPED) != 0 && (b->flags & PANFROST_BO_HEAP) == 0) {
++			/* A34 (0915): no dirty line of the program's left over its pages for their next owner */
++			a34_mali_cpu_flush((uintptr_t)b->mem->getBytesNoCopy(), b->backed);
++		}
+ 		gA34MaliWired -= b->backed;
+ 		fWired -= b->backed;
+ 		b->mem->release();      /* a program's mapping of it holds it until unmapped */
+@@ -591,8 +692,8 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	 * A34 (0911): cacheable, not write-combined. Making the buffer
+ 	 * write-combined (vm_object_change_wimg_mode) flushed a page whose
+ 	 * physical address is outside the kernel's RAM and panicked
+-	 * (phystokv_range, 0x94a7c000). Instead every job is bracketed by a
+-	 * clean+invalidate of the client's buffers (flushBuffers()).
++	 * (phystokv_range, 0x94a7c000). Instead the CPU's caches are kept
++	 * around each job (upkeep(), 0915).
+ 	 */
+ 	mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)backed, PAGE_SIZE);
+@@ -660,6 +761,7 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	uintptr_t kva = 0;
+ 	uint32_t handle = 0;
+ 	IOReturn ret;
++	bool counted = false;
+ 
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+@@ -736,6 +838,15 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 		ret = kIOReturnNoResources;
+ 		goto out;
+ 	}
++	/*
++	 * A34 (0915): GPU-shared before its caches are made clean, so that every
++	 * IOSurfaceUnlock from now on cleans what the CPU wrote
++	 * (sweet_surface_cpu_end()); then all of it clean+invalidated once: the
++	 * kernel zeroed it when it was made, programs wrote it with no GPU about.
++	 */
++	OSIncrementAtomic(&s->gpuShared);
++	counted = true;
++	sweet_surface_cpu_whole(s);
+ 	va = a34_mali_va_alloc(size + A34_SURFACE_GUARD, false);
+ 	if (va == 0) {
+ 		IOLog("A34 MALI UC: %s: no GPU addresses left for surface %u (%llu KB)\n", fName, req->surface,
+@@ -764,15 +875,14 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 		}
+ 		off += len;
+ 	}
+-	b->surface = s;                 /* the reference sweet_surface_copy() gave, until freeBo() */
+-	OSIncrementAtomic(&s->gpuShared);
++	b->surface = s;                 /* the reference sweet_surface_copy() gave, and gpuShared, until freeBo() */
+ 	s = NULL;
+ 	b->kva = kva;
+ 	b->va = va;
+ 	b->vasize = size + A34_SURFACE_GUARD;   /* the guard is freed with it (freeBo) */
+ 	b->backed = size;
+ 	b->flags = PANFROST_BO_NOEXEC;
+-	b->round = 0;
++	b->state = 0;
+ 	fNextBo = handle % A34_BOS;
+ 	fBoCount++;
+ 	fSurfaceBos++;
+@@ -784,6 +894,9 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	req->handle = handle;
+ 	ret = kIOReturnSuccess;
+ out:
++	if (s != NULL && counted) {
++		OSDecrementAtomic(&s->gpuShared);       /* no buffer made of it */
++	}
+ 	IOLockUnlock(gA34MaliLock);
+ 	OSSafeReleaseNULL(s);
+ 	return ret;
+@@ -797,6 +910,15 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 
+ 	IOLockLock(gA34MaliLock);
+ 	b = lookup(type);
++	if (b != NULL && (b->surface != NULL || (b->flags & PANFROST_BO_HEAP) == 0) && (b->state & A34_BO_MAPPED) == 0) {
++		/*
++		 * A34 (0915): its first mapping. Until now the CPU never touched it
++		 * and no job cleaned it; lines the CPU may have fetched ahead of a
++		 * job that wrote it go, and from now on it is kept around every job.
++		 */
++		a34_mali_cpu_flush(b->surface != NULL ? b->kva : (uintptr_t)b->mem->getBytesNoCopy(), b->backed);
++		b->state |= A34_BO_MAPPED;
++	}
+ 	if (b != NULL && b->surface != NULL) {
+ 		/* A34 (0914): the surface's memory, as every program that has the surface maps it (cacheable) */
+ 		b->surface->memory->retain();   /* given to the mapping */
+@@ -871,11 +993,18 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		ret = lookup(r->wait.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+ 		break;
+ 	case kA34PanfrostMadvise:       /* nothing is ever purged */
+-		if (lookup(r->madvise.handle) == NULL) {
++		b = lookup(r->madvise.handle);
++		if (b == NULL) {
+ 			ret = kIOReturnNotFound;
+-		} else if (r->madvise.madv > 1) {
++		} else if (r->madvise.madv > PANFROST_MADV_DONTNEED) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
++			/* A34 (0915): DONTNEED: in Mesa's cache, no job uses it, no cache upkeep for it until WILLNEED */
++			if (r->madvise.madv == PANFROST_MADV_DONTNEED) {
++				b->state |= A34_BO_DONTNEED;
++			} else {
++				b->state &= ~A34_BO_DONTNEED;
++			}
+ 			r->madvise.retained = 1;
+ 		}
+ 		break;
+@@ -908,7 +1037,9 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		break;
+ 	case kA34PanfrostSubmit: {
+ 		struct a34_mali_job job;
++		uint64_t t0, ticks, cleaned, flushed;
+ 		uint32_t n;
++		bool listed;
+ 
+ 		if (r->submit.jc == 0 || (r->submit.requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
+ 			ret = kIOReturnBadArgument;
+@@ -918,11 +1049,16 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		job.jc = r->submit.jc;
+ 		job.requirements = r->submit.requirements;
+ 		n = ++fSubmits;
+-		flushBuffers();                 /* the program's writes to memory for the GPU */
+-		flushSurfaces(r->submit.bo_handles, r->submit.bo_handle_count);        /* A34 (0914): everybody's, of the surfaces it names */
++		/* A34 (0915): only what the CPU and this job can both touch (upkeep()) */
++		t0 = mach_absolute_time();
++		listed = markListed(r->submit.bo_handles, r->submit.bo_handle_count);
++		cleaned = upkeep(true, !listed);        /* the program's writes to memory for the GPU */
++		ticks = mach_absolute_time() - t0;
+ 		bool done = a34_mali_submit(&job);
+-		flushBuffers();                 /* and no stale lines over what the GPU wrote */
+-		flushSurfaces(r->submit.bo_handles, r->submit.bo_handle_count);
++		t0 = mach_absolute_time();
++		flushed = upkeep(false, !listed);       /* and no stale lines over what the GPU wrote */
++		ticks += mach_absolute_time() - t0;
++		upkeepLog(n, job.requirements, cleaned, flushed, ticks, job.ns);
+ 		if (!done) {
+ 			fFailed++;
+ 			IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s) failed after %llu us: JOB_INT 0x%08x JS_STATUS 0x%08x MMU_INT 0x%08x\n",
+@@ -932,10 +1068,6 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 				describeFault(job.fault_va);
+ 			}
+ 			ret = a34_mali_ready() ? kIOReturnIOError : kIOReturnNotReady;
+-		} else if (n <= A34_LOGGED_SUBMITS) {
+-			IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s, %u buffers) done in %llu us\n", fName, n,
+-			    (unsigned long long)job.jc, (job.requirements & PANFROST_JD_REQ_FS) ? "fragment" : "vertex/tiler/compute",
+-			    fBoCount, (unsigned long long)(job.ns / 1000));
+ 		}
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1a8c703..2fa5c19 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -50,6 +50,7 @@
+ #include <libkern/c++/OSUnserialize.h>
+ #include <libkern/c++/OSSerialize.h>
+ #include <libkern/c++/OSString.h>
++#include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -289,6 +290,89 @@ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ 	return name;
+ }
+ 
++/*
++ * A34 (0915): a surface the GPU uses (RedwoodMali request 0x7e) is
++ * cacheable memory for every processor and the GPU is not coherent. No job
++ * cleans or invalidates it any more (that cost seconds a frame); the CPU's
++ * side of it is kept right where the CPU uses it instead, the way
++ * IOSurface asks programs to: IOSurfaceLock before CPU access
++ * (sweet_surface_cpu_begin: forget the caches' lines if a job has named the
++ * surface since they last did), IOSurfaceUnlock after it, unless read-only
++ * (sweet_surface_cpu_end: what the CPU wrote, to memory). AppleCLCD's copy
++ * to the panel clean+invalidates the rows it reads (SweetFramebuffer.cpp),
++ * and a new GPU buffer of a surface starts with all of it clean
++ * (sweet_surface_cpu_whole). A program's own memory as a surface
++ * (wrapped) is written by its owner without a lock: RedwoodMali keeps
++ * cleaning and invalidating those around every job that names them.
++ */
++extern "C" void a34_mali_cpu_flush(uintptr_t va, uint64_t size);       /* bsd/dev/a34_mali.c: dc civac */
++extern "C" void a34_mali_cpu_clean(uintptr_t va, uint64_t size);       /* bsd/dev/a34_mali.c: dc cvac */
++
++SInt64 sweet_surface_sync_stats[4];
++
++/* The kernel range of a surface the GPU uses whose CPU side is kept at lock and unlock, or false. */
++static bool
++sweet_surface_gpu_range(SweetSurface *s, uintptr_t *va, uint64_t *size)
++{
++	if (s->gpuShared <= 0 || s->wrapped || s->memory == NULL) {
++		return false;
++	}
++	*size = s->memory->getLength();
++	*va = s->kernelAddress();
++	return *va != 0 && *size != 0;
++}
++
++static void
++sweet_surface_sync_count(unsigned which, uint64_t bytes, uint64_t began)
++{
++	OSAddAtomic64(1, &sweet_surface_sync_stats[which]);
++	OSAddAtomic64((SInt64)bytes, &sweet_surface_sync_stats[2]);
++	OSAddAtomic64((SInt64)(mach_absolute_time() - began), &sweet_surface_sync_stats[3]);
++}
++
++void
++sweet_surface_cpu_begin(SweetSurface *s)
++{
++	SInt32 writes = s->gpuWrites;   /* (counted after a job ended: a later one makes this differ again) */
++	uintptr_t va;
++	uint64_t size, began;
++
++	if (writes == s->cpuSeen || !sweet_surface_gpu_range(s, &va, &size)) {
++		return;
++	}
++	began = mach_absolute_time();
++	a34_mali_cpu_flush(va, size);
++	s->cpuSeen = writes;
++	sweet_surface_sync_count(0, size, began);
++}
++
++void
++sweet_surface_cpu_end(SweetSurface *s)
++{
++	uintptr_t va;
++	uint64_t size, began;
++
++	if (!sweet_surface_gpu_range(s, &va, &size)) {
++		return;
++	}
++	began = mach_absolute_time();
++	a34_mali_cpu_clean(va, size);
++	sweet_surface_sync_count(1, size, began);
++}
++
++void
++sweet_surface_cpu_whole(SweetSurface *s)
++{
++	SInt32 writes = s->gpuWrites;
++	uintptr_t va = s->kernelAddress();
++	uint64_t size = s->memory != NULL ? s->memory->getLength() : 0;
++
++	if (va != 0 && size != 0) {
++		a34_mali_cpu_flush(va, size);
++		s->cpuSeen = writes;
++	}
++}
++
+ static uint32_t
+ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ {
+@@ -1309,6 +1393,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	sweet_surface_cpu_begin(s);     /* A34 (0915): what the GPU wrote, visible to the CPU */
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -1322,6 +1407,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		sweet_surface_cpu_end(s);       /* A34 (0915): what the CPU wrote, visible to the GPU */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 6d781e8..d1ecb72 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -48,8 +48,15 @@ public:
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*, IOSurfaceAddress) */
+ 	/* A34 (0914): GPU buffers made of this surface (A34Mali.cpp, request 0x7e); OSIncrementAtomic/OSDecrementAtomic */
+ 	SInt32                    gpuShared;
++	/*
++	 * A34 (0915): jobs that named the surface, counted after each ended
++	 * (A34Mali.cpp), and that count when the processors' caches last
++	 * forgot the whole surface (sweet_surface_cpu_begin()).
++	 */
++	SInt32                    gpuWrites;
++	SInt32                    cpuSeen;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -70,5 +77,19 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++/*
++ * A34 (0915): the processors' caches and a surface the GPU uses (see
++ * SweetSurface.cpp). Begin: before the CPU reads it (IOSurfaceLock), forget
++ * what the caches hold of it if a job has named it since they last did.
++ * End: after the CPU may have written it (IOSurfaceUnlock without
++ * read-only), clean it to memory. Whole: unconditionally clean+invalidate
++ * all of it (a new GPU buffer of the surface, RedwoodMali 0x7e). Counters:
++ * begins that invalidated, ends that cleaned, bytes, mach time spent.
++ */
++void sweet_surface_cpu_begin(SweetSurface *surface);
++void sweet_surface_cpu_end(SweetSurface *surface);
++void sweet_surface_cpu_whole(SweetSurface *surface);
++extern SInt64 sweet_surface_sync_stats[4];
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
