@@ -23,6 +23,7 @@
 	X(kIOReturnNotReady,            0xe00002d8) \
 	X(kIOReturnNotPermitted,        0xe00002e2) \
 	X(kIOReturnNotFound,            0xe00002f0) \
+	X(kIOReturnAborted,             0xe00002eb) \
 	X(kIOMapAnywhere,               0x00000001) \
 	X(kIOMapReadOnly,               0x00001000)
 

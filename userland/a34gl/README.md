@@ -215,6 +215,126 @@ static mac_policy_handle_t a34_amfi_mac_handle;
 
 Without it nothing is injected and backboardd runs as before (the wrapper is harmless).
 
+## Programs other than backboardd
+
+Any program that makes an `EAGLContext` gets one of iOS's OpenGLES with no driver behind it
+(the kernel publishes an empty IOAcceleratorES): a function table of nothing, and the first GL
+call jumps to 0. That is the SpringBoard crash with Bold Text on (CoreUI -> `+[CIContext
+contextWithOptions:]` -> `CI::GLContext::init`). The loader therefore works in every program it
+is inserted into (the kernel's `a34inject` list), and each gets **one line on the console**,
+whatever its stderr is: `a34gl-inject: NAME[PID]: loaded, mode ...`.
+
+- **backboardd**: as before -- liba34gl at once, CoreAnimation's two hooks.
+- **any other program**: lazily. The loader swaps `-initWithAPI:properties:` and
+  `-commonInitWithAPI:properties:` (every initializer ends in one of the two) for a stub. At the
+  program's first EAGLContext the stub loads liba34gl (announced on the console too), which
+  takes the methods over; the library's own context (Mesa, the GPU) is made only at that
+  EAGLContext's first GL call. A program that never makes one pays a `dlopen` of OpenGLES and
+  two method swaps; no Mesa, no GPU client. No CoreAnimation hooks (`A34GL_HOOKS=1` forces).
+- `A34GL_MODE` per program, in `/a34/NAME.env` (`/a34/SpringBoard.env`, ...; read by the loader
+  like `/a34/backboardd.env`): `mesa` (default), `none` (an EAGLContext cannot be made: `-init...`
+  answers nil, for a program that does better without GL), `off` (nothing touched).
+
+What makes a context of ours work for a program that is not CoreAnimation (read off the
+16.7.16 cache's OpenGLES): an EAGLContext's ivar `_private` points to a structure with the
+object at +0, the sharegroup at +8, the API at +0x10, flags at +0x18 and the function table at
++0x20. `+setCurrentContext:` stores `_private` in the thread's OpenGL slot (pthread key 30) and
+retains the object; `+currentContext` reads it back; `EAGLGetCurrentMacroContextPrivate()` and
+`-getMacroContextPrivate` answer `_private + 0x20`; and every `gl*` function OpenGLES exports is
+a stub that loads the slot and jumps through the table. `struct eagl` now begins exactly so and
+`_private` is set to it, so all of that reaches our entries with iOS's own code unreplaced --
+whether the program takes the table (CoreAnimation, CoreImage) or calls `glClear()`.
+
+Also for such programs: sharegroups (`-initWithAPI:sharegroup:`; a token of ours, the library's
+contexts share objects); `-setBlockFence:onQueue:` (the block goes to its queue after a flush);
+`glMapBufferOES` (Mesa advertises it and does not export it); shaders handed on as they are
+unless they use `sampler2DRect`; no `glGetError` after every call; what is drawn into a
+`-texImageIOSurface:` texture reaches the surface (its memory when shared, else read back at
+`glFlush`/`glFinish`, BGRA only). Not done: `-renderbufferStorage:fromDrawable:` and
+`-presentRenderbuffer:` (a CAEAGLLayer shows nothing).
+
+**Every process**: the userland side is ready for a wildcard in the kernel's `a34inject` (the
+cost per program is above); keep launchd out, and `A34GL_MODE=off` in `/a34/NAME.env` excepts
+one. Each program that really draws is one more client of the GPU with Mesa's own buffers.
+
+## Queued GPU jobs (kernel 0919)
+
+With a kernel that queues (redwood-drm asks at open; `REDWOOD_DRM_ASYNC=0` declines), Mesa's
+SUBMIT returns at once and the job runs in the kernel's worker; redwood-drm turns the job
+numbers into Mesa's syncobjs, fences and WAIT_BO (see `../mesa/README.md`). Where the CPU reads
+what the GPU wrote, it waits for the right job: `glFinish` and `glClientWaitSync` through the
+fence (WAIT_SEQ); `glReadPixels` (and so eagl.c's copies out, `glshow`, `gltrace`), texture and
+buffer maps through Mesa's WAIT_BO before it maps a busy BO; IOSurfaceLock in the kernel, for
+the jobs that name the surface (eagl.c's CPU uploads lock the surface). The frame: backboardd
+no longer waits for it (`glFinish` at the frame's end) but hands it on once its jobs are queued
+(`glFlush`): the **panel's copy of the surface waits in the kernel** for the jobs that name it,
+at most 500 ms -- that is what is relied on. `glwait=1` waits here as before. Other programs
+still wait at the end of a frame drawn into a surface. glprof's kernel line gives the jobs
+queued a frame, the time in `wait_seq` and `wait_bo`, and failed jobs. `glasync=0` (boot-arg
+or `A34GL`) makes the jobs synchronous in every program a34gl is in, as `REDWOOD_DRM_ASYNC=0`
+does. `glwait=1` is not the same: a frame's jobs still run after their SUBMIT, only the frame's
+end waits. (`glenv=` is now applied before the connection to the kernel is made, so
+`glenv=REDWOOD_DRM_ASYNC=0` works too.)
+
+The seed of a surface the GPU has drawn into moves by an IOSurfaceLock and unlock. That lock
+waits in the kernel for the jobs naming the surface: at the frame's end, the frame's own copy
+into the display's surface, 1-1.5 ms of the drawing thread. With queued jobs it is done on a
+dispatch queue after the frame's jobs have gone to the kernel, so the seed moves once the picture
+is whole. `glseedwait=1`: on the drawing thread, as before.
+
+### Copied surfaces: when they are copied
+
+A surface that cannot be the texture's memory ('A008', 'LA08', 'RGhA', no format, 'BGRA' that
+the kernel or Mesa does not take) is copied: when -texImageIOSurface:/-attachImage: makes the
+texture, and again when its seed has moved or its memory adds up to something else when it is
+bound. HackiOS (hakios-mtk `eagl.c`) does the same as topaz and as here (the same functions,
+the same read-only lock, seed taken after the copy). The one difference is that it gives the
+texture new storage on every copy (`glTexImage2D`), where 'BGRA' copies here go into the storage
+the texture has (`glTexSubImage2D`: an 11 MB surface took 120-145 ms with new storage). Mesa
+keeps that safe with queued jobs: panfrost replaces or waits for a BO that a job still reads.
+
+Changed: the seed is taken **before** the memory is read. An owner that changes the surface
+while it is being copied (a read-only lock keeps nobody out) then moves the seed past it, and the
+next look copies again. Before, the half-made picture stayed until the next change. A status
+bar's backing store cleared for its next text is all zero, and under a layer drawn opaque that
+is a black box. Also, what is copied is added up first. The next look compares with what was
+copied, where before every copy for a seed was made twice (the sum was the old one). A copy made
+of memory that is all zero is logged ("copied ALL ZERO", with the surface's ID, name, format,
+size and seed; the kernel's `SWEET SURF ... create id N` line names its maker), and so is the
+next copy that is not. Sums: every look until 30 alike, then every 2nd frame, after 240 every
+4th; a surface whose owner has told every change by its seed (twice or more), every 8th.
+`glsum=2`: as before, `glsum=0`: none.
+
+A surface that is drawn into here (-attachImage:) into a texture that is not its memory (rows
+the kernel or Mesa do not take, e.g. 'BGRA' 1125 x 2436 at 4512 bytes a row: Mesa wants 64-byte
+rows for linear RGBA on Valhall, `pan_linear_or_tiled_row_align_req()`) has what was drawn only
+after the frame's end reads it back. Shown here as well (-texImageIOSurface:), it is now filled
+by the GPU from the texture drawn into: when it is made, and whenever that has been drawn into
+since. Its memory is used only for others' changes. `gltarget=0`: from the memory, as before.
+
+Black pictures: at the lock that moves the seed of a full-screen surface drawn here (frame end;
+with queued jobs on the seed queue, after the jobs), 64 pixels of a grid are read from its
+memory. A picture that becomes (nearly) all black is logged ("is BLACK", with frame and surface),
+and so is the next one that is not. A black flash on the screen that never shows up here is
+made after a34gl, in the display's copy. `glblack=0`: not looked at.
+
+Black in parts of the picture (boot 45: black lines, the clock a black box, during animations;
+no whole frame black, and the kernel's display copy is ruled out):
+- For every IOSurface a draw reads, once a frame, 16 points of its memory are looked at.
+  'BGRA' or no format, opaque black where there was none the last time it was looked at is
+  logged with the surface, its name, whether its memory is the texture or a copy, its seed, and
+  the draw (`glsrcblack=0`: off).
+- A surface whose memory is the texture has its seed taken at the frame's first draw that reads
+  it. On the seed queue, after a read-only IOSurfaceLock has waited for the jobs naming it, the
+  seed is compared again. Moved means its owner wrote it while a job of ours that reads it was
+  queued or running: a half-made picture in that frame (`glsrccheck=0`: off).
+- `glseedbump=0`: no seed lock/unlock on the display's two surfaces. Those were the kernel's
+  "IOSurfaceLocks of one the display holds": write locks (options 0), one per frame, whose
+  lock/unlock keep the CPU caches of all 11 MB. The black check goes with them.
+- Mesa's own switches, for backboardd (and anything a34gl is in): `glenv=PAN_MESA_DEBUG=nocrc`
+  (no transaction elimination), `glenv=PAN_MESA_DEBUG=noafbc` (no AFBC), both:
+  `glenv=PAN_MESA_DEBUG=nocrc,noafbc`. `glasync=0`: synchronous jobs.
+
 ## The log
 
 Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
@@ -242,11 +362,77 @@ driver sets `RedwoodWaitsForGPU`), `glrelease=1` (let the context go at every fr
 `glshaders=1`, `gltrace=FIRST-LAST`, `gltrace_at=`, `gltrace_draws=`, `gltrace_function=N[,K]`,
 `gltrace_frames=`, `gltrace_place=X0,Y0,X1,Y1`, `gltrace_look=1`, `gltrace_lit=1`, `glslow=US`,
 `glshow=TEXTURE`, `glplain=0|2|3`, `glfetch=0`, `glgroup=0`, `glprecision=0`, `vblur=0|2`,
-`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`); a34gl's own: `glprof=N` (below),
+`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`); `vblur=3` (the variable blur's
+edges normalized by the picture's opacity, topaz's way: see below), `gltable=1` (every draw
+with no program and a one-row table goes through the home indicator's arithmetic, topaz's way;
+default: only function 53; `gltable=0`: none), `glskip=N[,N...]` (CoreAnimation's draws of
+those functions with no program are not drawn: to find the one that paints wrongly);
+a34gl's own: `glprof=N` (below),
 `glsum=0` (an IOSurface that is copied into a texture is refilled when its seed moves, never
-because its memory adds up differently -- that check reads the whole surface every frame),
+because its memory adds up differently -- that check reads the whole surface; `glsum=2`: as often
+as before, see "Copied surfaces"), `glasync=0` (GPU jobs synchronous), `glseedwait=1` (a drawn
+surface's seed moved on the drawing thread), `glvbafter=N[,K[,H]]` (the draws after the variable blur; H:
+the least height of the vrb's rectangle that starts a frame, default 100, which leaves out the status
+bar's), `gltarget=0`, `glblack=0` (see "Copied surfaces"),
 `glerrors=0|1` (`glGetError` after every call never | always; default the first 120 frames).
 The log: see "The log".
+
+### Draws with no program, and the variable blur
+
+The App Library's pods (boot 44, the frame after a vrb, followed whole): their backgrounds are
+function 45, "vcm" (a colour matrix over what is behind), drawn with our program before the vrb.
+The matrix's fourth row makes opacity of luminance, and our program wrote it into the screen's
+picture: 0x35-0xd3 there, 0xff everywhere else. CoreAnimation reads that opacity. The fade
+under the search field adds a copy of the band with `ONE_MINUS_DST_ALPHA, ONE`, so a pod that is
+not opaque gets brighter. The finished picture also goes to the display with that opacity in it.
+The vcm program, and the group program that does the same, now keep the opacity that was there
+(the colour as before). `glvcmalpha=1`: the matrix's opacity, as before. `glskip=45` (the pods'
+backgrounds not drawn) shows whether the white is theirs.
+
+CoreAnimation's GL renderer draws the functions it has no shader for with no program at all;
+eagl.c draws them with programs of its own. The first draw of each function in each way now
+gets a line without `glcensus=1`: `a34gl: no program: function N ("xxx"), <how it is drawn>:
+... framebuffer, textures (size, format, a surface's memory or a copy), blending, colour, its
+numbers`. A surface that is copied instead of shared says why (`... is copied, not the
+texture's memory: <reason>`).
+
+The blur whose radius varies ("vrb") with its edges "normalized": topaz divided by the
+picture's opacity. The picture is what is on the screen behind the strip, and its opacity is
+whatever the draws before left there (nobody needs it for the display): in the App Library the
+pods' material leaves less than 1 over undarkened colours, and inside the strip under the
+search field the pods came out white (icons and gaps, opaque, were right). Now the first level
+of the blur counts which of its sixteen pixels are picture at all (opacity not 0, inside the
+texture), the further levels carry that, and the reading divides by it: edges still do not
+darken, and the picture's colours are taken as they are. `vblur=3` is topaz's division,
+`vblur=0` no variable blur, `vblur=2` the mask painted, `glvbdump=N` writes down for the first N
+"vrb" draws sixteen pixels across the middle row of the picture read and of what was left.
+HackiOS's variable blur (hakios-mtk `eagl.c`: `vblur_level()`, `vblur_draw_begin()`, the four
+shaders, 8 levels, 6 chains) is byte for byte topaz's: `vblur=3`. The App Library's white pods
+stayed with the coverage division (boot 32), so the white is not made by the division alone.
+`glvbdump=3` (boot 34) showed the blur innocent: dark in, dark out, opaque. The white comes after
+it. `glvbafter=N[,K]` follows what becomes of the strip: for N frames that have a "vrb" draw (from
+the Kth such frame on), each draw after the vrb that lands on the rectangle the vrb drew, or reads
+a texture holding it (where that draw lands is followed in turn), gets lines `a34gl-vb:`. They give
+CoreAnimation's function, its program (with that program's fragment shader the first time) or which
+of ours drew it, the framebuffer and the box in pixels, the textures read (`*`: one followed), the
+blending, the first corner's colour, and sixteen pixels across the middle row of the box, before and
+after the draw (hex RGBA as the framebuffer holds them). Clears over a followed rectangle are listed
+too, and at the frame's end every followed rectangle is read once more. At most 64 draws a frame are
+written down, and the pixel reads wait for the GPU, so those frames are slow. A draw that makes
+dark samples (no colour above 0x40) bright (none below 0xc0) gets `^ THE FIRST draw that made
+dark samples bright here` (then `another`). `glvbafter=N,K,H`: only a vrb whose rectangle is at
+least H pixels tall starts a frame followed (default 100: the status bar's is 80, the App
+Library's 238).
+On the screen's picture the rectangle followed is what was drawn there plus 300 pixels below
+(where the App Library's pods begin). Draws there are read on eight rows spread over it, sixteen
+pixels each (`' '` as before, `+` changed, `!` dark to bright). Only draws of 100 x 100 or more
+count for the flag (not icons, glyphs, the battery). The frame after each frame followed is
+followed whole (`glvbframe=0`: not), from its first draw. That covers every draw of 100 x 100
+or more into that rectangle of the screen and every draw that reads the screen's picture, then
+what reads theirs, and so on. That is where the pods' backgrounds are drawn, before the vrb.
+The black check now says, with "is BLACK", the last frame the surface was not black and what
+the frame drew into it: draws (the first and the last, by function and program), clears (with
+colour), and draws elsewhere.
 
 ### Profiling: `glprof=N`
 
@@ -260,7 +446,10 @@ sums, CPU uploads, GPU copies in, copies out, EGLImages made, IOSurfaceLock/Unlo
 `eglMakeCurrent`, `glGetError` checks, shader compiles and program links. Then the requests to
 the kernel, counted by redwood-drm by selector (`submit` -- synchronous, so its time is the
 GPU's --, `create_bo`, `gem_close`, `madvise`, `bo_offset`, `iosurface` (0x7e), client memory
-maps), and the threads that called GL with their calls a frame. Off, it costs a test per call.
+maps), and the threads that called GL with their calls a frame. Off, it costs a test per call. A "frame" there is a glFlush or glFinish with draws before it. A line `for the display:` gives
+how many of them drew into a surface of the screen's size (what is handed to the display), how
+many a second, and how far apart (average, longest). The kernel's `A34 FB N presents M vsyncs`
+lines are the display's own count.
 
 ## Checked against our iOS 16.7.16 cache
 

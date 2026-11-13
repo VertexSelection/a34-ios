@@ -11,6 +11,7 @@ client speaks Linux's panfrost DRM uAPI. Built by `.github/workflows/mesa-ios.ym
 | `build.sh` | the whole build: host tools, libdrm stand-in, Mesa, `mali-tri`, packaging |
 | `patches/0001-meson-darwin-drm.patch` | Darwin + panfrost builds as a DRM system (drm DRI platform, EGL, libdrm via pkg-config) |
 | `patches/0002-panfrost-darwin-bo-map.patch` | BO mmap/munmap through the user client; no `sched_setscheduler` on Darwin |
+| `patches/0005-darwin-panfrost-keep-cached-bo-mappings.patch` | a BO keeps its CPU mapping while it sits in panfrost's BO cache (Linux unmaps it there because its kernel may purge a cached BO; RedwoodMali never purges): no `IOConnectMapMemory64`/`UnmapMemory64` pair every time a pool or texture BO is reused |
 | `patches/0004-darwin-egl-context-takeover.patch` | EAGL's thread semantics for EGL contexts: the last thread to make a context current has it, instead of `EGL_BAD_ACCESS` (see `../a34gl/README.md`, "Threads") |
 | `patches/0003-darwin-iosurface-egl-image.patch` | IOSurfaces as EGLImages: target `EGL_IOSURFACE_A34` (buffer = IOSurface ID), imported as a dma-buf whose "fd" is the ID; `DRM_CAP_PRIME` asked on Darwin; the BO size of an import from selector `0x7e` (see `../a34gl/README.md`) |
 | `redwood-drm/` | `libdrm.2.dylib`: the libdrm functions Mesa calls, carried to `RedwoodMali` |
@@ -64,6 +65,9 @@ headers (`iokit_check.c`) and compiles that branch for iOS as well.
 | `drmGetCap` | answered here: `SYNCOBJ` 1, `SYNCOBJ_TIMELINE` 0, `PRIME` `IMPORT` (IOSurfaces only), `TIMESTAMP_MONOTONIC` 1 |
 | `drmGetDevices2`, `drmGetDevice2`, ... | one platform-bus device, render node `/dev/null` (no service: no device) |
 | `drmOpen*`, the EGL loader's `open()` | `/dev/null`: any descriptor in the process means the one GPU |
+| `PANFROST_WAIT_BO` | answered here ("ready") when none of the process's threads is inside a SUBMIT and the BO is not an IOSurface's: the kernel runs a job to its end inside SUBMIT, so the process's own BOs are idle then. Otherwise the kernel is asked |
+| `PANFROST_MADVISE` | answered here (`retained` 1) for BOs the kernel has declared write-combined (`REDWOOD_DRM_CREATE_BO_WC`, bit 0 of the `pad` that comes back from `CREATE_BO`): it does no CPU cache upkeep for them, so `DONTNEED` tells it nothing. For all others the kernel is asked: `DONTNEED` is what keeps a cacheable BO out of its per-job upkeep while Mesa has no use for it |
+| queued jobs (kernel 0919) | asked for at open (GET_PARAM `0x1000` = 1, then SET_MODE `0x7a` `{async = 1}`; `REDWOOD_DRM_ASYNC=0` stays synchronous; one stderr line says which). A queued SUBMIT returns at once with the job's number in `in_syncs`: `out_sync` gets that number as its fence, and every BO in `bo_handles` notes it. A fence is signalled once WAIT_SEQ (`0x7b`) has said every job up to its number is done (`drmSyncobjWait`: for all, the last; for any, the first -- a client's jobs end in the order queued). `in_syncs` need no wait (same order). WAIT_BO: answered here when the last job naming the BO is known done, else WAIT_SEQ for it, and the kernel's WAIT_BO for IOSurface BOs (other programs' jobs). Sync files carry the fence (pipe inode -> number); a failed job is said once on stderr. Host-tested against a fake kernel: out-of-order ends, a failed job, blocking waits, WAIT_FOR_SUBMIT, sync files |
 | `drmSyncobj*` | user space only: create/destroy/reset/signal/wait (`WAIT_FOR_SUBMIT` blocks until a SUBMIT signals), sync files are signalled pipes |
 | BO mmap / munmap (patched in Mesa) | `redwood_drm_mmap` = `IOConnectMapMemory64(type = GEM handle, kIOMapAnywhere)`, `redwood_drm_munmap` = `IOConnectUnmapMemory64` |
 | `drmPrimeFDToHandle(fd, IOSurfaceID)` | selector `0x7e` (ios-topaz's IOSurface request, 40 bytes, `handle` = 0): the GEM handle of the surface's memory |
@@ -71,7 +75,16 @@ headers (`iokit_check.c`) and compiles that branch for iOS as well.
 | `drmPrimeHandleToFD` | `EOPNOTSUPP` (no export) |
 
 Environment: `REDWOOD_DRM_DEBUG=1` logs every request; `REDWOOD_DRM_SERVICE`,
-`REDWOOD_DRM_NODE`, `REDWOOD_DRM_MINOR`.
+`REDWOOD_DRM_NODE`, `REDWOOD_DRM_MINOR`. `REDWOOD_DRM_ASYNC=0`: synchronous SUBMITs even
+where the kernel queues. `REDWOOD_DRM_LOCAL` (default 1): 0 sends
+every `WAIT_BO` and `MADVISE` to the kernel; 2 takes every BO made here to be write-combined
+(all `MADVISE` answered here -- to measure, with a kernel that does not say: a BO the kernel
+made cacheable then stays in its per-job cache upkeep while cached, slower but never wrong).
+The kernel makes a program's BOs write-combined (0918, `a34maliwc` not 0) but does not report it in
+CREATE_BO's `pad`, so every `MADVISE` went to the kernel: about 110 a frame in Control Center,
+1.7 ms of backboardd's drawing thread. With a kernel that queues and no `a34maliwc=0` in the
+boot-args, redwood-drm now takes every BO that is neither a heap nor `PANFROST_BO_WB_MMAP` to be
+write-combined. Its `MADVISE` is then answered here; the line at open says so.
 
 ### What the kernel user client must implement
 
@@ -81,8 +94,8 @@ Selectors and structure sizes (Mesa 26.3's `panfrost_drm.h`, all little-endian, 
 | --- | --- | --- | --- |
 | `0x09` | `GEM_CLOSE` `{u32 handle, pad}` | 8 | yes |
 | `0x40` | `PANFROST_SUBMIT` | **48** (`jm_ctx_handle`, `pad` after `requirements`) | yes; `jc` = first job, `bo_handles` = user pointer to `bo_handle_count` u32s, `requirements` bit 0 `FS`; syncobj fields always 0 |
-| `0x41` | `PANFROST_WAIT_BO` `{u32 handle, pad; s64 timeout_ns}` | 16 | yes (answer at once: jobs are synchronous) |
-| `0x42` | `PANFROST_CREATE_BO` `{u32 size, flags, handle, pad; u64 offset}` | 24 | yes; flags `NOEXEC` 1, `HEAP` 2 (the tiler heap, one 128 MiB BO per screen: grow on fault, or back it all); `offset` = GPU VA, which Mesa expects in [0x2000000, 4 GiB) as on Linux |
+| `0x41` | `PANFROST_WAIT_BO` `{u32 handle, pad; s64 timeout_ns}` | 16 | yes (answer at once: jobs are synchronous); redwood-drm sends it only for IOSurface BOs and while another thread's SUBMIT runs |
+| `0x42` | `PANFROST_CREATE_BO` `{u32 size, flags, handle, pad; u64 offset}` | 24 | yes; flags `NOEXEC` 1, `HEAP` 2 (the tiler heap, one 128 MiB BO per screen: grow on fault, or back it all); `offset` = GPU VA, which Mesa expects in [0x2000000, 4 GiB) as on Linux; `pad` back: bit 0 set = the BO is write-combined for the CPU and needs no `MADVISE` (optional: 0 = unknown, every `MADVISE` is sent) |
 | `0x44` | `PANFROST_GET_PARAM` `{u32 param, pad; u64 value}` | 16 | yes, params below |
 | `0x45` | `PANFROST_GET_BO_OFFSET` `{u32 handle, pad; u64 offset}` | 16 | only for imported BOs (IOSurfaces, `0x7e`) |
 | `0x7e` | IOSurface -> GEM handle, or describe (ios-topaz's layout) | 40 | `EGL_IOSURFACE_A34` images: `../a34gl/README.md` |

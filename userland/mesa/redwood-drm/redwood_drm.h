@@ -80,6 +80,26 @@ REDWOOD_DRM_ASSERT(offsetof(struct redwood_drm_surface, planes) == 36, "0x7e lay
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
 
 /*
+ * Requests answered here instead of by the kernel (REDWOOD_DRM_LOCAL, default 1; 0: none):
+ *
+ *   WAIT_BO   The kernel runs a job chain to its end inside SUBMIT, so a buffer of this
+ *             process's own is idle whenever none of the process's threads is inside a
+ *             SUBMIT: then the answer is "ready" at once. With a SUBMIT in flight, and for
+ *             an IOSurface's buffer (0x7e: other programs' jobs may use it), the kernel is
+ *             asked as before.
+ *   MADVISE   The kernel never purges; DONTNEED only tells it to leave a cacheable buffer
+ *             out of its per-job CPU cache upkeep while Mesa has no use for it. A buffer the
+ *             CPU maps write-combined gets no upkeep at all, and for it MADVISE means
+ *             nothing: answered here ("retained") -- for the buffers the kernel has said are
+ *             such, with REDWOOD_DRM_CREATE_BO_WC in the `pad` that comes back from
+ *             CREATE_BO (0x42). A kernel that does not say so (pad 0, as Linux leaves it)
+ *             gets every MADVISE, as before. REDWOOD_DRM_LOCAL=2, for a measurement: every
+ *             buffer made here is taken to be write-combined (a cacheable one then stays in
+ *             the kernel's upkeep while it sits in Mesa's cache: slower, never wrong).
+ */
+#define REDWOOD_DRM_CREATE_BO_WC        0x1u
+
+/*
  * The requests made of the kernel so far, for profiling (liba34gl's glprof): calls and time
  * (mach_absolute_time units) by selector -- 0x40 SUBMIT, whose time is the GPU's, the job chain
  * running to its end before it returns; 0x42 CREATE_BO; 0x09 GEM_CLOSE; ... -- and the client
@@ -90,9 +110,40 @@ struct redwood_drm_stats {
 	uint64_t ticks[256];
 	uint64_t maps, map_ticks;
 	uint64_t unmaps, unmap_ticks;
+	uint64_t local_waits, local_madvises;   /* WAIT_BO and MADVISE answered here, without the kernel */
+	uint64_t queued_jobs, failed_jobs;      /* SUBMITs queued (kernel 0919); jobs WAIT_SEQ said failed */
 };
 
 void redwood_drm_stats(struct redwood_drm_stats *stats);
+
+/*
+ * Queued GPU jobs (kernel 0919, A34Mali.cpp "queued jobs"). GET_PARAM REDWOOD_DRM_PARAM_ASYNC
+ * answers 1 when the kernel can queue. SET_MODE (0x7a) { async = 1 }: from then on this client's
+ * SUBMITs return at once, the job's number (this client's own count, from 1) in the SUBMIT's
+ * in_syncs; the jobs of every client run one at a time in the order they were queued. WAIT_SEQ
+ * (0x7b): until every job of this client up to `seq` is done (0: all so far), at most
+ * timeout_ns (0: only asked; ~0: no limit): kIOReturnTimeout if not, kIOReturnAborted if the
+ * thread was interrupted (ask again); status 1 if one of them failed (said once a failure).
+ * WAIT_BO waits for the queued jobs that name the buffer, GEM_CLOSE for them before the buffer
+ * goes, and a surface's CPU side (IOSurfaceLock, the panel's copy) for the jobs naming it.
+ *
+ * redwood-drm asks for it when it opens the connection unless REDWOOD_DRM_ASYNC=0, and says on
+ * stderr which it got. redwood_drm_queued(): 1 if this process's jobs are queued.
+ */
+#define REDWOOD_DRM_PARAM_ASYNC         0x1000
+#define REDWOOD_DRM_SET_MODE            0x7a
+#define REDWOOD_DRM_WAIT_SEQ            0x7b
+
+struct redwood_drm_set_mode {
+	uint32_t async, pad;
+};
+
+struct redwood_drm_wait_seq {
+	uint64_t seq, timeout_ns;
+	uint32_t status, pad;
+};
+
+int redwood_drm_queued(void);
 
 #ifdef __cplusplus
 }
