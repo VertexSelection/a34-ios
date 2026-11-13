@@ -62,7 +62,10 @@
  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: PAN_MESA_DEBUG=sync, say), vblur=0 blurs nothing whose radius varies and
  * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
- * every frame (see frame_end()).
+ * every frame (see frame_end()). a34gl's: glprof=N (where the time of every N frames went: see
+ * "where a frame's time goes"), glsum=0 (copied IOSurfaces refilled by their seed only, see
+ * surface_changed()), glerrors=0|1 (glGetError after every call never | always; default: the
+ * first 120 frames).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -77,8 +80,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
+
+#include <redwood_drm.h>                /* (redwood_drm_stats(): the requests to the kernel, for glprof) */
 
 #include "a34gl.h"
 #include "a34gl_iokit.h"
@@ -139,6 +146,9 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_FRAMEBUFFER                  0x8d40
 #define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
+#define GL_TEXTURE_WIDTH                0x1000
+#define GL_TEXTURE_HEIGHT               0x1001
+#define GL_TEXTURE_INTERNAL_FORMAT      0x1003
 
 #define VBLUR_LEVELS    8               /* levels of a blur whose radius varies, the picture itself included */
 #define VBLUR_CHAINS    6               /* ... such blurs kept track of at a time */
@@ -329,7 +339,7 @@ static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* time spent in each entry */
-static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+static int check_errors = 1;            /* ask the library for an error after every call (the first frames; 2: always) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
@@ -373,6 +383,245 @@ static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+
+/* ---- where a frame's time goes (boot-arg or A34GL glprof=N) ------------------------------------- */
+
+/*
+ * glprof=N: every N frames (glprof=1: every 60) a few lines "a34gl-prof:" say where the time of
+ * those frames went, a frame's worth on average:
+ *   - the frame's wall time from its first draw to its end, the CPU time of the thread that
+ *     drew it in that span, and backboardd's CPU time (all threads) over the N frames;
+ *   - the time inside our GL entries by kind (what CoreAnimation calls: draw, uniform, texture,
+ *     framebuffer, program, flush, query, state; with the number of calls), the rest being
+ *     CoreAnimation's own between the calls. An entry's time is Mesa's plus what eagl.c does
+ *     around it, and that is given apart: Mesa's draws alone, IOSurface sums (looking for
+ *     changes by reading the memory), uploads of IOSurfaces into textures, frames copied out,
+ *     EGLImages made, IOSurfaceLock/Unlock, eglMakeCurrent, glGetError checks, shader compiles
+ *     and program links;
+ *   - the requests to the kernel (redwood-drm counts them by selector): SUBMITs -- each runs
+ *     its job chain to the end before it returns, so their time is the GPU's --, buffers made,
+ *     mapped, closed, ...;
+ *   - the threads that called GL, with their calls a frame.
+ * Off (0) costs nothing but a test per call.
+ */
+enum prof_kind { PK_DRAW, PK_UNIFORM, PK_TEXTURE, PK_FRAMEBUFFER, PK_PROGRAM, PK_FLUSH, PK_QUERY, PK_STATE, PK_COUNT };
+static const char *const prof_kind_names[PK_COUNT] = {
+	"draw", "uniform", "texture", "framebuffer", "program", "flush", "query", "state",
+};
+enum prof_work {
+	PW_MESA_DRAW, PW_SUM, PW_UPLOAD, PW_COPY_IN, PW_OUT, PW_IMAGE, PW_LOCK, PW_CURRENT, PW_ERRORS, PW_COMPILE, PW_LINK,
+	PW_COUNT
+};
+static const char *const prof_work_names[PW_COUNT] = {
+	"Mesa's draws", "IOSurface sums", "IOSurface uploads (CPU)", "IOSurface copies in (GPU)", "copies out",
+	"EGLImages made", "IOSurface locks", "eglMakeCurrent", "glGetError checks", "shader compiles", "program links",
+};
+static unsigned prof_period;            /* frames a summary (0: off) */
+static struct {
+	uint64_t kind_us[PK_COUNT], kind_calls[PK_COUNT];
+	uint64_t work_us[PW_COUNT], work_n[PW_COUNT], work_bytes[PW_COUNT];
+	uint64_t frames, frame_us, frame_cpu_us, gl_us, calls, draws;
+	uint64_t since_us, since_cpu_us;        /* when the period began; backboardd's CPU time then */
+	struct redwood_drm_stats drm;           /* the kernel's counts then */
+	struct {
+		uint64_t tid, calls;
+	} threads[8];
+	unsigned first_frame;
+} prof;
+static uint8_t slot_kind[0x2200 / 8];  /* PK_* + 1, worked out from the entry's name when first needed */
+static __thread pthread_t prof_thread;
+static __thread unsigned prof_thread_index;
+static __thread uint64_t prof_frame_cpu0;
+
+static uint64_t
+prof_begin(void)
+{
+	return prof_period ? now_us() : 0;
+}
+
+static void
+prof_end(enum prof_work work, uint64_t began, uint64_t bytes)
+{
+	if (prof_period) {
+		prof.work_us[work] += now_us() - began;
+		prof.work_n[work]++;
+		prof.work_bytes[work] += bytes;
+	}
+}
+
+static enum prof_kind
+prof_kind_of(unsigned offset)
+{
+	static const struct {
+		const char *prefix;
+		enum prof_kind kind;
+	} rules[] = {
+		{ "glDrawArrays", PK_DRAW }, { "glDrawElements", PK_DRAW }, { "glDrawRangeElements", PK_DRAW },
+		{ "glClearBuffer", PK_DRAW }, { "glFlush", PK_FLUSH }, { "glFinish", PK_FLUSH }, { "glFenceSync", PK_FLUSH },
+		{ "glClientWaitSync", PK_FLUSH }, { "glWaitSync", PK_FLUSH }, { "glUniform", PK_UNIFORM },
+		{ "glProgramUniform", PK_UNIFORM }, { "glGetUniformLocation", PK_PROGRAM }, { "glGetAttribLocation", PK_PROGRAM },
+		{ "glBindAttribLocation", PK_PROGRAM }, { "glGet", PK_QUERY }, { "glIs", PK_QUERY }, { "glCheck", PK_QUERY },
+	};
+	const char *name;
+	unsigned slot = offset / 8, kind = PK_STATE;
+
+	if (slot >= sizeof(slot_kind)) {
+		return PK_STATE;
+	}
+	if (slot_kind[slot] != 0) {
+		return (enum prof_kind)(slot_kind[slot] - 1);
+	}
+	name = eagl_slot_name(offset);
+	if (strcmp(name, "glClear") == 0) {
+		kind = PK_DRAW;
+	} else {
+		unsigned i;
+
+		for (i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+			if (strncmp(name, rules[i].prefix, strlen(rules[i].prefix)) == 0) {
+				kind = rules[i].kind;
+				break;
+			}
+		}
+		if (i == sizeof(rules) / sizeof(rules[0])) {
+			kind = strstr(name, "Shader") || strstr(name, "Program") ? PK_PROGRAM :
+			    strstr(name, "Framebuffer") || strstr(name, "Renderbuffer") || strstr(name, "ReadPixels") ||
+			    strstr(name, "DrawBuffers") || strstr(name, "ReadBuffer") ? PK_FRAMEBUFFER :
+			    strstr(name, "Tex") || strstr(name, "Mipmap") || strstr(name, "PixelStore") || strstr(name, "Sampler") ?
+			    PK_TEXTURE : PK_STATE;
+		}
+	}
+	slot_kind[slot] = (uint8_t)(kind + 1);
+	return (enum prof_kind)kind;
+}
+
+static uint64_t
+cpu_us(clockid_t clock)
+{
+	struct timespec t;
+
+	if (clock_gettime(clock, &t) != 0) {
+		return 0;
+	}
+	return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+
+/* (eagl_enter, profiling) a call from this thread */
+static void
+prof_call(void)
+{
+	pthread_t self = pthread_self();
+
+	if (!pthread_equal(self, prof_thread)) {
+		uint64_t tid = 0;
+		unsigned i;
+
+		pthread_threadid_np(NULL, &tid);
+		for (i = 0; i < 8 && prof.threads[i].tid != 0 && prof.threads[i].tid != tid; i++) {
+		}
+		prof_thread = self;
+		prof_thread_index = i < 8 ? i : 7;
+		if (i < 8) {
+			prof.threads[i].tid = tid;
+		}
+	}
+	prof.threads[prof_thread_index].calls++;
+	prof.calls++;
+}
+
+static void
+prof_start_period(unsigned frame)
+{
+	unsigned period = prof_period;
+
+	memset(&prof, 0, sizeof(prof));
+	prof_period = period;
+	prof.first_frame = frame;
+	prof.since_us = now_us();
+	prof.since_cpu_us = cpu_us(CLOCK_PROCESS_CPUTIME_ID);
+	redwood_drm_stats(&prof.drm);
+	prof_thread = (pthread_t)0;
+}
+
+static double
+ticks_us(uint64_t ticks)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return (double)ticks * base.numer / base.denom / 1000.0;
+}
+
+/* (frame_end, profiling) the summary of the frames since the last, every prof_period frames */
+static void
+prof_report(unsigned frame)
+{
+	struct redwood_drm_stats drm;
+	char text[900];
+	size_t used = 0;
+	double n;
+	uint64_t wall = now_us() - prof.since_us, cpu = cpu_us(CLOCK_PROCESS_CPUTIME_ID) - prof.since_cpu_us;
+	static const struct {
+		unsigned selector;
+		const char *name;
+	} requests[] = {
+		{ 0x40, "submit" }, { 0x41, "wait_bo" }, { 0x42, "create_bo" }, { 0x44, "get_param" }, { 0x45, "bo_offset" },
+		{ 0x48, "madvise" }, { 0x09, "gem_close" }, { 0x7e, "iosurface" },
+	};
+
+	if (prof.frames == 0) {
+		return;
+	}
+	n = (double)prof.frames;
+	say_always("a34gl-prof: frames %u-%u: %llu in %.1f s (%.2f a second); a frame: %.0f GL calls, %.0f draws; %.0f us from "
+	    "its first draw to its end, of which %.0f us CPU of the drawing thread and %.0f us in GL entries (the rest: "
+	    "CoreAnimation between calls); backboardd's CPU %.0f us a frame (all its threads)\n", prof.first_frame, frame,
+	    (unsigned long long)prof.frames, (double)wall / 1e6, n * 1e6 / (double)(wall ? wall : 1), (double)prof.calls / n,
+	    (double)prof.draws / n, (double)prof.frame_us / n, (double)prof.frame_cpu_us / n, (double)prof.gl_us / n,
+	    (double)cpu / n);
+	for (unsigned k = 0; k < PK_COUNT; k++) {
+		used += (size_t)snprintf(text + used, sizeof(text) - used, " %s %.0f (%.0f)", prof_kind_names[k],
+		    (double)prof.kind_us[k] / n, (double)prof.kind_calls[k] / n);
+	}
+	say_always("a34gl-prof:   in GL entries, us a frame (calls):%s\n", text);
+	used = 0;
+	for (unsigned w = 0; w < PW_COUNT; w++) {
+		if (prof.work_n[w] == 0) {
+			continue;
+		}
+		used += (size_t)snprintf(text + used, sizeof(text) - used, "; %s %.0f us (%.1f", prof_work_names[w],
+		    (double)prof.work_us[w] / n, (double)prof.work_n[w] / n);
+		if (prof.work_bytes[w] != 0) {
+			used += (size_t)snprintf(text + used, sizeof(text) - used, ", %.0f KB", (double)prof.work_bytes[w] / n / 1024);
+		}
+		used += (size_t)snprintf(text + used, sizeof(text) - used, ")");
+	}
+	say_always("a34gl-prof:   within them, a frame (times)%s\n", used ? text : ": nothing");
+	redwood_drm_stats(&drm);
+	used = 0;
+	for (unsigned r = 0; r < sizeof(requests) / sizeof(requests[0]); r++) {
+		unsigned sel = requests[r].selector;
+		uint64_t calls = drm.calls[sel] - prof.drm.calls[sel];
+
+		if (calls != 0) {
+			used += (size_t)snprintf(text + used, sizeof(text) - used, " %s %.1f (%.0f us)", requests[r].name,
+			    (double)calls / n, ticks_us(drm.ticks[sel] - prof.drm.ticks[sel]) / n);
+		}
+	}
+	used += (size_t)snprintf(text + used, sizeof(text) - used, " map %.1f (%.0f us) unmap %.1f (%.0f us)",
+	    (double)(drm.maps - prof.drm.maps) / n, ticks_us(drm.map_ticks - prof.drm.map_ticks) / n,
+	    (double)(drm.unmaps - prof.drm.unmaps) / n, ticks_us(drm.unmap_ticks - prof.drm.unmap_ticks) / n);
+	say_always("a34gl-prof:   kernel requests a frame (redwood-drm):%s\n", text);
+	used = 0;
+	for (unsigned i = 0; i < 8 && prof.threads[i].tid != 0; i++) {
+		used += (size_t)snprintf(text + used, sizeof(text) - used, " %#llx (%.0f calls)",
+		    (unsigned long long)prof.threads[i].tid, (double)prof.threads[i].calls / n);
+	}
+	say_always("a34gl-prof:   threads calling GL, a frame:%s\n", used ? text : " none");
+	prof_start_period(frame + 1);
+}
 static void clear_now(struct eagl *e);
 
 /*
@@ -398,12 +647,18 @@ eagl_enter(struct eagl *e, unsigned offset)
 	 * when this thread's own note says it is current here already.
 	 */
 	if (current != e || !pthread_equal(__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE), self)) {
+		uint64_t began = prof_begin();
+
 		if (a34gl_make_current(e->gl)) {
 			current = e;
 			__atomic_store_n(&e->owner, self, __ATOMIC_RELEASE);
 		} else if (lost_calls++ < 16) {
 			say("a34gl: the context cannot be made this thread's: entry %#x goes nowhere\n", offset);
 		}
+		prof_end(PW_CURRENT, began, 0);
+	}
+	if (prof_period) {
+		prof_call();
 	}
 	slot_calls[offset / 8]++;
 	e->calls++;
@@ -417,18 +672,28 @@ static void
 eagl_leave(struct eagl *e, unsigned offset)
 {
 	GLenum error;
+	uint64_t dt = now_us() - e->gl_t0;
 
-	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
-		if (e->errors++ < 60) {
-			say("a34gl: %s: error %#x\n", eagl_slot_name(offset), error);
+	if (e->in_frame) {
+		e->gl_us += dt;
+	}
+	slot_us[offset / 8] += dt;
+	if (prof_period) {
+		enum prof_kind kind = prof_kind_of(offset);
+
+		prof.kind_us[kind] += dt;
+		prof.kind_calls[kind]++;
+		if (e->in_frame) {
+			prof.gl_us += dt;
 		}
 	}
-	{
-		uint64_t dt = now_us() - e->gl_t0;
-		if (e->in_frame) {
-			e->gl_us += dt;
+	if (check_errors && offset != 0x338) {
+		uint64_t began = prof_begin();
+
+		if ((error = glGetError()) != 0 && e->errors++ < 60) {
+			say("a34gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
-		slot_us[offset / 8] += dt;
+		prof_end(PW_ERRORS, began, 0);
 	}
 	if (slow_calls_us != 0) {
 		uint64_t now = now_us();
@@ -565,6 +830,32 @@ summary(struct eagl *e)
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
 
+/* IOSurfaceLock/Unlock (calls into the kernel), counted and timed for glprof */
+static int
+surface_lock(IOSurfaceRef surface, IOSurfaceLockOptions options)
+{
+	uint64_t began = prof_begin();
+	int ret = IOSurfaceLock(surface, options, NULL);
+
+	prof_end(PW_LOCK, began, 0);
+	return ret;
+}
+
+static void
+surface_unlock(IOSurfaceRef surface, IOSurfaceLockOptions options)
+{
+	uint64_t began = prof_begin();
+
+	IOSurfaceUnlock(surface, options, NULL);
+	prof_end(PW_LOCK, began, 0);
+}
+
+/*
+ * boot-arg glsum=0: a texture copied from an IOSurface is filled again only when the surface's
+ * seed has moved, never because its memory adds up to something else (see surface_changed()).
+ */
+static int sum_surfaces = 1;
+
 static struct image *
 image_of(struct eagl *e, GLuint texture)
 {
@@ -641,6 +932,17 @@ bytes_a_pixel(GLenum format, GLenum type)
 	}
 }
 
+/* a34gl_surface_texture(), timed for glprof */
+static bool
+surface_texture(struct eagl *e, IOSurfaceRef surface)
+{
+	uint64_t began = prof_begin();
+	bool made = a34gl_surface_texture(e->gl, IOSurfaceGetID(surface));
+
+	prof_end(PW_IMAGE, began, 0);
+	return made;
+}
+
 /*
  * For a surface drawn into (blit_targets): a second texture that is the surface's memory, for the
  * frame to be copied into by the GPU; the texture CoreAnimation draws into stays the library's own.
@@ -660,7 +962,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 	glGenTextures(1, &image->mirror);
 	glBindTexture(GL_TEXTURE_2D, image->mirror);
-	if (!a34gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	if (!surface_texture(e, surface)) {
 		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 		glDeleteTextures(1, &image->mirror);
 		image->mirror = 0;
@@ -669,6 +971,52 @@ surface_mirrored(struct eagl *e, struct image *image)
 	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 	e->shared++;
 	return true;
+}
+
+/*
+ * A frame drawn into a texture of ours (blit_targets) starts with what its surface holds:
+ * CoreAnimation draws only what has changed. The GPU copies the surface's memory (the mirror)
+ * into the texture, which is bound. (topaz had the CPU do it, surface_to_texture(): an
+ * IOSurfaceLock and the whole picture through glTexSubImage2D at every -attachImage, 11 MB for
+ * the display's, read from memory the CPU does not cache.) false: not done.
+ */
+static bool
+mirror_to_texture(struct eagl *e, struct image *image)
+{
+	GLint read = 0, draw = 0, width = 0, height = 0, format = 0;
+	uint64_t began = prof_begin();
+	bool done;
+
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+	if (width != image->width || height != image->height || format != GL_BGRA) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, image->width, image->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	done = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+	    glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	if (done) {
+		/* (upside down if it is drawn so: as target_to_surface() copies it out) */
+		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
+		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	done = done && glGetError() == 0;
+	prof_end(PW_COPY_IN, began, done ? (uint64_t)image->width * (uint64_t)image->height * 4 : 0);
+	return done;
 }
 
 /*
@@ -682,8 +1030,7 @@ surface_shared(struct eagl *e, struct image *image)
 
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !a34gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	    (size_t)image->height != IOSurfaceGetHeight(surface) || !surface_texture(e, surface)) {
 		e->refused++;
 		return false;
 	}
@@ -709,7 +1056,9 @@ surface_changed(struct eagl *e, struct image *image)
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
 	uint64_t sum = size, word;
 
-	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
+	uint64_t began;
+
+	if (!sum_surfaces || image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
 	/*
@@ -720,11 +1069,13 @@ surface_changed(struct eagl *e, struct image *image)
 		return false;
 	}
 	image->looked = e->frames + 1;
+	began = prof_begin();
 	for (size_t at = 0; at + 8 <= size; at += 8) {
 		memcpy(&word, base + at, 8);
 		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
 		sum ^= sum >> 29;
 	}
+	prof_end(PW_SUM, began, size);
 	if (sum == image->sum) {
 		image->quiet++;
 		return false;
@@ -746,10 +1097,13 @@ surface_to_texture(struct eagl *e, struct image *image)
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
 
+	uint64_t began;
+
 	if (image->shared) {
 		return;
 	}
-	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+	began = prof_begin();
+	if (surface_lock(surface, kIOSurfaceLockReadOnly) != 0) {
 		say("a34gl: an IOSurface cannot be locked\n");
 		return;
 	}
@@ -838,16 +1192,17 @@ surface_to_texture(struct eagl *e, struct image *image)
 			say_always("gl-at:     a table; sixteen of its entries, first to last:%s\n", entries);
 		}
 	}
-	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	surface_unlock(surface, kIOSurfaceLockReadOnly);
 	free(flipped);
 	image->seed = IOSurfaceGetSeed(surface);
+	prof_end(PW_UPLOAD, began, row * (size_t)image->height);
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
 
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
 static void
-target_to_surface(struct eagl *e, struct image *image)
+target_to_surface_work(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	size_t row = IOSurfaceGetBytesPerRow(surface);
@@ -874,15 +1229,15 @@ target_to_surface(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		if (surface_lock(surface, 0) == 0) {
+			surface_unlock(surface, 0);
 		}
 		return;
 	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		if (surface_lock(surface, 0) == 0) {
+			surface_unlock(surface, 0);
 		}
 		return;
 	}
@@ -891,7 +1246,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-	if (IOSurfaceLock(surface, 0, NULL) == 0) {
+	if (surface_lock(surface, 0) == 0) {
 		base = IOSurfaceGetBaseAddress(surface);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -903,9 +1258,19 @@ target_to_surface(struct eagl *e, struct image *image)
 			}
 		}
 		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-		IOSurfaceUnlock(surface, 0, NULL);
+		surface_unlock(surface, 0);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+}
+
+/* (timed for glprof) */
+static void
+target_to_surface(struct eagl *e, struct image *image)
+{
+	uint64_t began = prof_begin();
+
+	target_to_surface_work(e, image);
+	prof_end(PW_OUT, began, 0);
 }
 
 /*
@@ -938,13 +1303,13 @@ show_texture(struct eagl *e, struct image *image)
 	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
-	if (glGetError() == 0 && IOSurfaceLock(image->surface, 0, NULL) == 0) {
+	if (glGetError() == 0 && surface_lock(image->surface, 0) == 0) {
 		base = IOSurfaceGetBaseAddress(image->surface);
 		for (GLint y = 0; y < height && y < image->height; y++) {
 			memcpy(base + row * (size_t)y, pixels + (size_t)y * (size_t)width * 4,
 			    (size_t)(width < image->width ? width : image->width) * 4);
 		}
-		IOSurfaceUnlock(image->surface, 0, NULL);
+		surface_unlock(image->surface, 0);
 	}
 	free(pixels);
 }
@@ -961,6 +1326,9 @@ frame_begin(struct eagl *e)
 	}
 	e->in_frame = true;
 	e->began = now_us();
+	if (prof_period) {
+		prof_frame_cpu0 = cpu_us(CLOCK_THREAD_CPUTIME_ID);
+	}
 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
 	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws) || trace_function_met) {
 		trace_left = trace_frames;      /* (once) */
@@ -1058,6 +1426,17 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	if (prof_period) {
+		prof.frames++;
+		prof.frame_us += after - e->began;
+		if (prof_frame_cpu0 != 0) {
+			prof.frame_cpu_us += cpu_us(CLOCK_THREAD_CPUTIME_ID) - prof_frame_cpu0;
+			prof_frame_cpu0 = 0;
+		}
+		if (prof.frames >= prof_period) {
+			prof_report(e->frames);
+		}
+	}
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say_always("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -1122,8 +1501,8 @@ frame_end(struct eagl *e, bool finished)
 		summary(e);
 	}
 	census_report();
-	if (e->frames == 600 && e->errors == 0) {
-		check_errors = 0;
+	if (e->frames == 120 && e->errors == 0 && check_errors == 1) {
+		check_errors = 0;               /* (topaz: after 600 frames; glerrors=1 always, glerrors=0 never) */
 	}
 	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
@@ -2893,12 +3272,22 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (trace_placing) {
 		trace_placed_draw(e, mode, 0, NULL, first, count);
 	}
+	if (prof_period) {
+		prof.draws++;
+	}
 	if (group_draw_begin(e, enabled)) {
+		uint64_t began = prof_begin();
+
 		glDrawArrays(mode, first, count);
+		prof_end(PW_MESA_DRAW, began, 0);
 		group_draw_end(e, enabled);
 	} else {
+		uint64_t began;
+
 		plain = plain_draw_begin(e, enabled);
+		began = prof_begin();
 		glDrawArrays(mode, first, count);
+		prof_end(PW_MESA_DRAW, began, 0);
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -2931,12 +3320,22 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (trace_placing) {
 		trace_placed_draw(e, mode, type, indices, 0, count);
 	}
+	if (prof_period) {
+		prof.draws++;
+	}
 	if (group_draw_begin(e, enabled)) {
+		uint64_t began = prof_begin();
+
 		glDrawElements(mode, count, type, indices);
+		prof_end(PW_MESA_DRAW, began, 0);
 		group_draw_end(e, enabled);
 	} else {
+		uint64_t began;
+
 		plain = plain_draw_begin(e, enabled);
+		began = prof_begin();
 		glDrawElements(mode, count, type, indices);
+		prof_end(PW_MESA_DRAW, began, 0);
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -3407,9 +3806,13 @@ my_glCompileShader(void *context, GLuint shader)
 	GLint good = 0;
 	char said[1024] = "";
 
+	uint64_t began;
+
 	EAGL_ENTER(e, 0x12a8);
+	began = prof_begin();
 	glCompileShader(shader);
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &good);
+	prof_end(PW_COMPILE, began, 0);
 	e->shaders++;
 	if (!good) {
 		glGetShaderInfoLog(shader, sizeof(said), NULL, said);
@@ -3431,9 +3834,13 @@ my_glLinkProgram(void *context, GLuint program)
 	GLint good = 0;
 	char said[1024] = "";
 
+	uint64_t began;
+
 	EAGL_ENTER(e, 0x12c0);
+	began = prof_begin();
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
+	prof_end(PW_LINK, began, 0);
 	e->programs++;
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
@@ -3626,8 +4033,14 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
-		surface_changed(e, image);              /* (what it adds up to now) */
+	if (surface_mirrored(e, image)) {
+		if (!mirror_to_texture(e, image)) {
+			surface_to_texture(e, image);
+		}
+	} else if (!surface_shared(e, image)) {
+		if (image->wrapped) {
+			surface_changed(e, image);      /* (what it adds up to now: of a target, only a wrapped one is looked at again) */
+		}
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
@@ -3765,6 +4178,20 @@ install(void)
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		release_frames = strstr(arguments, "glrelease=1") != NULL;
+		sum_surfaces = strstr(arguments, "glsum=0") == NULL;
+		if (strstr(arguments, "glerrors=0") != NULL) {
+			check_errors = 0;
+		} else if (strstr(arguments, "glerrors=1") != NULL) {
+			check_errors = 2;
+		}
+		if ((argument = strstr(arguments, "glprof=")) != NULL) {
+			prof_period = (unsigned)strtoul(argument + 7, NULL, 10);
+			prof_period = prof_period == 1 ? 60 : prof_period;
+			if (prof_period != 0) {
+				prof_start_period(1);
+				say("a34gl: glprof: a summary every %u frames (lines \"a34gl-prof:\")\n", prof_period);
+			}
+		}
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);

@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 
 #include <xf86drm.h>
 
@@ -167,18 +168,44 @@ errno_of(kern_return_t result)
 	}
 }
 
+/* the requests so far (redwood_drm_stats()) */
+static struct redwood_drm_stats stats;
+
+static void
+count(uint64_t *calls, uint64_t *ticks, uint64_t began)
+{
+	__atomic_fetch_add(calls, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(ticks, mach_absolute_time() - began, __ATOMIC_RELAXED);
+}
+
+EXPORT void
+redwood_drm_stats(struct redwood_drm_stats *out)
+{
+	for (unsigned i = 0; i < 256; i++) {
+		out->calls[i] = __atomic_load_n(&stats.calls[i], __ATOMIC_RELAXED);
+		out->ticks[i] = __atomic_load_n(&stats.ticks[i], __ATOMIC_RELAXED);
+	}
+	out->maps = __atomic_load_n(&stats.maps, __ATOMIC_RELAXED);
+	out->map_ticks = __atomic_load_n(&stats.map_ticks, __ATOMIC_RELAXED);
+	out->unmaps = __atomic_load_n(&stats.unmaps, __ATOMIC_RELAXED);
+	out->unmap_ticks = __atomic_load_n(&stats.unmap_ticks, __ATOMIC_RELAXED);
+}
+
 /* A request to the kernel driver: 0, or -1 with errno set. */
 static int
 call(unsigned selector, void *data, size_t size)
 {
 	size_t returned = size;
 	kern_return_t result;
+	uint64_t began;
 
 	if (!connected()) {
 		errno = ENODEV;
 		return -1;
 	}
+	began = mach_absolute_time();
 	result = IOConnectCallStructMethod(connection, selector, data, size, data, &returned);
+	count(&stats.calls[selector & 0xff], &stats.ticks[selector & 0xff], began);
 	note("call %#04x (%zu bytes) = %#x", selector, size, result);
 	if (result != kIOReturnSuccess) {
 		errno = errno_of(result);
@@ -927,7 +954,10 @@ redwood_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, uint32_
 		errno = ENODEV;
 		return MAP_FAILED;
 	}
+	uint64_t began = mach_absolute_time();
+
 	result = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &size, options);
+	count(&stats.maps, &stats.map_ticks, began);
 	note("map handle %u (%zu bytes) = %#x at %#llx, %llu bytes", handle, length, result,
 	    (unsigned long long)address, (unsigned long long)size);
 	if (result != kIOReturnSuccess) {
@@ -976,7 +1006,10 @@ redwood_drm_munmap(void *addr, size_t length)
 	if (found.address == 0) {
 		return munmap(addr, length);    /* not one of ours */
 	}
+	uint64_t began = mach_absolute_time();
 	kern_return_t result = IOConnectUnmapMemory64(connection, found.handle, mach_task_self(), found.address);
+
+	count(&stats.unmaps, &stats.unmap_ticks, began);
 
 	note("unmap handle %u at %#lx = %#x", found.handle, (unsigned long)found.address, result);
 	if (result != kIOReturnSuccess) {
