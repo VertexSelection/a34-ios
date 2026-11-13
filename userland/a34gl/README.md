@@ -332,6 +332,16 @@ darken, and the picture's colours are taken as they are. `vblur=3` is topaz's di
 HackiOS's variable blur (hakios-mtk `eagl.c`: `vblur_level()`, `vblur_draw_begin()`, the four
 shaders, 8 levels, 6 chains) is byte for byte topaz's: `vblur=3`. The App Library's white pods
 stayed with the coverage division (boot 32), so the white is not made by the division alone.
+`glvbdump=3` (boot 34) showed the blur innocent: dark in, dark out, opaque. The white comes after
+it. `glvbafter=N[,K]` follows what becomes of the strip: for N frames that have a "vrb" draw (from
+the Kth such frame on), each draw after the vrb that lands on the rectangle the vrb drew, or reads
+a texture holding it (where that draw lands is followed in turn), gets lines `a34gl-vb:`. They give
+CoreAnimation's function, its program (with that program's fragment shader the first time) or which
+of ours drew it, the framebuffer and the box in pixels, the textures read (`*`: one followed), the
+blending, the first corner's colour, and sixteen pixels across the middle row of the box, before and
+after the draw (hex RGBA as the framebuffer holds them). Clears over a followed rectangle are listed
+too, and at the frame's end every followed rectangle is read once more. At most 64 draws a frame are
+written down, and the pixel reads wait for the GPU, so those frames are slow.
 
 ### Profiling: `glprof=N`
 
