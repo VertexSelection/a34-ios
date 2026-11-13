@@ -66,8 +66,9 @@
  * topaz did (see cover_fragment). gltable=1|0 and glskip=N[,N...]: see table_draws and
  * skipped_functions. glvbafter=N[,K]: what becomes of the variable blur's strip (see vbafter_before()). a34gl's: glprof=N (where the time of every N frames went: see
  * "where a frame's time goes"), glsum=0 (copied IOSurfaces refilled by their seed only, see
- * surface_changed()), glerrors=0|1 (glGetError after every call never | always; default: the
- * first 120 frames).
+ * surface_changed(); glsum=2: as often as before), glerrors=0|1 (glGetError after every call never |
+ * always; default: the first 120 frames), glasync=0 (GPU jobs synchronous: REDWOOD_DRM_ASYNC=0),
+ * glseedwait=1 (see seed_bump()).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -243,6 +244,8 @@ struct image {
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
 	unsigned quiet;                 /* ... how many sums in a row came out the same */
+	bool summed, empty, said_empty; /* ... a sum has been made; that memory was all zero; which was written down */
+	unsigned copies, told, silent;  /* copies made; of them, after its seed moved; after a sum alone said it changed */
 	bool sub_ok;                    /* ... refilled with glTexSubImage2D (until that fails) */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
@@ -937,6 +940,7 @@ surface_unlock(IOSurfaceRef surface, IOSurfaceLockOptions options)
 /*
  * boot-arg glsum=0: a texture copied from an IOSurface is filled again only when the surface's
  * seed has moved, never because its memory adds up to something else (see surface_changed()).
+ * glsum=2: added up as before (every look; every 2nd frame after 30 sums alike).
  */
 static int sum_surfaces = 1;
 
@@ -1140,42 +1144,106 @@ surface_shared(struct eagl *e, struct image *image)
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
  */
+/* What a copied surface's memory adds up to; `nonzero`: whether any of it is not zero. */
+static uint64_t
+surface_sum(const uint8_t *base, size_t size, bool *nonzero)
+{
+	uint64_t sum = size, word, any = 0;
+	uint64_t began = prof_begin();
+
+	for (size_t at = 0; at + 8 <= size; at += 8) {
+		memcpy(&word, base + at, 8);
+		any |= word;
+		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+		sum ^= sum >> 29;
+	}
+	prof_end(PW_SUM, began, size);
+	*nonzero = any != 0;
+	return sum;
+}
+
+static size_t
+surface_sum_size(struct image *image)
+{
+	return IOSurfaceGetBytesPerRow(image->surface) * (size_t)(image->height - 1) +
+	       (size_t)image->width * bytes_a_pixel(image->format, image->type);
+}
+
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
-	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
-	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
-
-	uint64_t began;
+	unsigned every = 1;
+	uint64_t sum;
+	bool nonzero;
 
 	if (!sum_surfaces || image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
 	/*
 	 * Adding up 11 MB was 3-4 ms a frame (glBindTexture). A memory whose sum has stayed the
-	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made app launches lag).
+	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made
+	 * app launches lag); after 240, every 4th. One whose owner has said every change so far by
+	 * its seed (twice or more, and no change found by a sum alone): every 8th, in case.
 	 */
-	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
+	if (sum_surfaces == 2) {
+		every = image->quiet >= 30 ? 2 : 1;
+	} else if (image->told >= 2 && image->silent == 0) {
+		every = 8;
+	} else {
+		every = image->quiet >= 240 ? 4 : image->quiet >= 30 ? 2 : 1;
+	}
+	if (every > 1 && image->looked != 0 && e->frames + 1 - image->looked < every) {
 		return false;
 	}
 	image->looked = e->frames + 1;
-	began = prof_begin();
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
-	}
-	prof_end(PW_SUM, began, size);
+	sum = surface_sum(base, surface_sum_size(image), &nonzero);
 	if (sum == image->sum) {
 		image->quiet++;
 		return false;
 	}
+	image->silent += image->summed;         /* (a change no seed said; not the first sum) */
+	image->summed = true;
 	image->sum = sum;
+	image->empty = !nonzero;
 	image->quiet = 0;
 	return true;
+}
+
+/*
+ * A copy made of memory that is all zero (glsum=0 never knows): written down when it becomes so
+ * (rate-limited), and when it is not any more. Under a layer drawn opaque that is a black box.
+ * The kernel's "SWEET SURF ... create id N" line names the surface's maker.
+ */
+static void
+surface_empty_note(struct eagl *e, struct image *image)
+{
+	IOSurfaceRef surface = image->surface;
+	uint32_t pixels = __builtin_bswap32(IOSurfaceGetPixelFormat(surface));
+	char name[64] = "";
+	CFTypeRef value;
+
+	if (!image->summed || image->empty == image->said_empty) {
+		return;
+	}
+	image->said_empty = image->empty;
+	if (!image->empty) {
+		say("a34gl: IOSurface %u (texture %u) is not all zero any more: frame %u, seed %u\n", IOSurfaceGetID(surface),
+		    image->texture, e->frames + 1, image->seed);
+		return;
+	}
+	if ((value = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceName"))) != NULL) {
+		if (CFGetTypeID(value) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)value, name, sizeof(name), kCFStringEncodingUTF8);
+		}
+		CFRelease(value);
+	}
+	say("a34gl: IOSurface %u%s%s%s ('%.4s' %zu x %zu, %zu bytes a row; texture %u, %s) copied ALL ZERO: frame %u, seed %u, "
+	    "copy %u (%u after its seed moved, %u found by a sum)\n", IOSurfaceGetID(surface), name[0] ? " \"" : "", name,
+	    name[0] ? "\"" : "", (const char *)&pixels, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+	    IOSurfaceGetBytesPerRow(surface), image->texture, image->target ? "drawn into" : "shown", e->frames + 1, image->seed,
+	    image->copies + 1, image->told, image->silent);
 }
 
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
@@ -1189,6 +1257,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
+	uint32_t seed;
 
 	uint64_t began;
 
@@ -1200,7 +1269,27 @@ surface_to_texture(struct eagl *e, struct image *image)
 		say("a34gl: an IOSurface cannot be locked\n");
 		return;
 	}
+	/*
+	 * The seed is taken before the memory is read, not after: an owner that changes the surface
+	 * while it is being copied (a read-only lock keeps nobody out) moves the seed, and then the
+	 * next look copies it again. Taken after, the half-made picture (a status bar's backing store
+	 * cleared for its next text: all zero, a black box under a layer drawn opaque) stayed until
+	 * the owner changed the surface once more. And what is copied is added up first: the next
+	 * look compares with what was copied (the sum used to be the one from before the seed moved,
+	 * and every copy for a seed was made twice).
+	 */
+	seed = IOSurfaceGetSeed(surface);
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	if (!planar && base != NULL && sum_surfaces && image->looked != e->frames + 1) {
+		bool nonzero;
+
+		image->looked = e->frames + 1;
+		image->sum = surface_sum(base, surface_sum_size(image), &nonzero);
+		image->summed = true;
+		image->empty = !nonzero;
+		image->quiet = 0;
+	}
+	image->told += image->copies != 0 && seed != image->seed;
 	if ((image->invert || alpha_first) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
 		for (GLsizei y = 0; y < image->height; y++) {
 			const uint8_t *from = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
@@ -1287,10 +1376,84 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	surface_unlock(surface, kIOSurfaceLockReadOnly);
 	free(flipped);
-	image->seed = IOSurfaceGetSeed(surface);
+	image->seed = seed;
+	if (IOSurfaceGetSeed(surface) != seed) {
+		say("a34gl: IOSurface %u changed while it was copied (seed %u, then %u): copied again at its next look\n",
+		    IOSurfaceGetID(surface), seed, IOSurfaceGetSeed(surface));
+	}
+	surface_empty_note(e, image);
+	image->copies++;
 	prof_end(PW_UPLOAD, began, row * (size_t)image->height);
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
+}
+
+/*
+ * A surface drawn into by the GPU gets a lock and an unlock so that its seed moves: whoever looks
+ * at the seed is to see that it has changed. With queued GPU jobs IOSurfaceLock waits in the
+ * kernel for the jobs that name the surface (sweet_surface_cpu_begin(), kernel 0919): at a frame's
+ * end that was the frame's own copy into the display's surface, 1-1.5 ms of the drawing thread's
+ * a frame. So it is done on a queue of its own, after the frame's jobs have gone to the kernel
+ * (seed_bumps_send(), from frame_end()): the seed moves when the picture is whole. Boot-arg
+ * glseedwait=1, or synchronous jobs: on the drawing thread, at once, as before.
+ */
+static int seed_wait;                   /* boot-arg glseedwait=1 */
+static dispatch_queue_t seed_queue;
+static pthread_once_t seed_once = PTHREAD_ONCE_INIT;
+static IOSurfaceRef seed_pending[16];
+static unsigned seed_pending_count;
+static pthread_mutex_t seed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+seed_queue_make(void)
+{
+	seed_queue = dispatch_queue_create("a34gl.seed", NULL);
+}
+
+static void
+seed_bump_work(void *context)
+{
+	IOSurfaceRef surface = context;
+
+	if (IOSurfaceLock(surface, 0, NULL) == 0) {
+		IOSurfaceUnlock(surface, 0, NULL);
+	}
+	CFRelease(surface);
+}
+
+static void
+seed_bump(IOSurfaceRef surface)
+{
+	if (!seed_wait && redwood_drm_queued()) {
+		pthread_mutex_lock(&seed_lock);
+		if (seed_pending_count < sizeof(seed_pending) / sizeof(seed_pending[0])) {
+			seed_pending[seed_pending_count++] = (IOSurfaceRef)CFRetain(surface);
+			pthread_mutex_unlock(&seed_lock);
+			return;
+		}
+		pthread_mutex_unlock(&seed_lock);
+	}
+	if (surface_lock(surface, 0) == 0) {
+		surface_unlock(surface, 0);
+	}
+}
+
+static void
+seed_bumps_send(void)
+{
+	pthread_mutex_lock(&seed_lock);
+	if (seed_pending_count != 0) {
+		pthread_once(&seed_once, seed_queue_make);
+		for (unsigned i = 0; i < seed_pending_count; i++) {
+			if (seed_queue != NULL) {
+				dispatch_async_f(seed_queue, (void *)seed_pending[i], seed_bump_work);
+			} else {
+				seed_bump_work((void *)seed_pending[i]);
+			}
+		}
+		seed_pending_count = 0;
+	}
+	pthread_mutex_unlock(&seed_lock);
 }
 
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
@@ -1322,16 +1485,12 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (surface_lock(surface, 0) == 0) {
-			surface_unlock(surface, 0);
-		}
+		seed_bump(surface);
 		return;
 	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
-		if (surface_lock(surface, 0) == 0) {
-			surface_unlock(surface, 0);
-		}
+		seed_bump(surface);
 		return;
 	}
 	if (e->reader == 0) {
@@ -1536,6 +1695,10 @@ frame_end(struct eagl *e, bool finished)
 				    "that is read back\n", image->texture, IOSurfaceGetID(image->surface), image->format, image->type);
 			}
 		}
+	}
+	if (seed_pending_count != 0) {
+		glFlush();              /* (the copies above go to the kernel before the seeds move after them) */
+		seed_bumps_send();
 	}
 	if (!e->in_frame) {
 		return;
@@ -5342,7 +5505,8 @@ install(void)
 				end++;
 			}
 		}
-		sum_surfaces = strstr(arguments, "glsum=0") == NULL;
+		sum_surfaces = strstr(arguments, "glsum=0") != NULL ? 0 : strstr(arguments, "glsum=2") != NULL ? 2 : 1;
+		seed_wait = strstr(arguments, "glseedwait=1") != NULL;
 		if (strstr(arguments, "glerrors=0") != NULL) {
 			check_errors = 0;
 		} else if (strstr(arguments, "glerrors=1") != NULL) {
@@ -5368,18 +5532,14 @@ install(void)
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		/*
-		 * With queued GPU jobs (kernel 0919, redwood_drm_queued()) the window server hands a frame
-		 * on as soon as its jobs are queued: the panel's copy of a surface waits for the jobs that
-		 * name it (at most 500 ms), IOSurfaceLock too. Not waiting here lets the next frame be
-		 * prepared while the GPU draws this one. glwait=1: waited for here all the same.
+		 * glasync=0: GPU jobs synchronous (REDWOOD_DRM_ASYNC=0), and glenv=: both into the
+		 * environment before redwood_drm_queued() below makes the connection to the kernel,
+		 * where redwood-drm reads them.
 		 */
-		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL &&
-		    (display_waits() || (render_server && redwood_drm_queued())))) {
-			wait_for_frames = 0;
+		if (strstr(arguments, "glasync=0") != NULL) {
+			setenv("REDWOOD_DRM_ASYNC", "0", 1);
+			say("a34gl: glasync=0: GPU jobs synchronous (REDWOOD_DRM_ASYNC=0)\n");
 		}
-		say("a34gl: GPU jobs %s; a frame is waited for %s\n", redwood_drm_queued() ? "queued" : "synchronous",
-		    wait_for_frames ? "here, before it is handed to the display" :
-		    "by the display's driver (the panel's copy waits for the jobs that name the surface), not here");
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");
@@ -5395,6 +5555,19 @@ install(void)
 				}
 			}
 		}
+		/*
+		 * With queued GPU jobs (kernel 0919, redwood_drm_queued()) the window server hands a frame
+		 * on as soon as its jobs are queued: the panel's copy of a surface waits for the jobs that
+		 * name it (at most 500 ms), IOSurfaceLock too. Not waiting here lets the next frame be
+		 * prepared while the GPU draws this one. glwait=1: waited for here all the same.
+		 */
+		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL &&
+		    (display_waits() || (render_server && redwood_drm_queued())))) {
+			wait_for_frames = 0;
+		}
+		say("a34gl: GPU jobs %s; a frame is waited for %s\n", redwood_drm_queued() ? "queued" : "synchronous",
+		    wait_for_frames ? "here, before it is handed to the display" :
+		    "by the display's driver (the panel's copy waits for the jobs that name the surface), not here");
 	}
 
 	/* (CoreAnimation may not have loaded iOS's OpenGL ES yet: the class is in it) */

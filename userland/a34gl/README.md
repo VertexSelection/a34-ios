@@ -270,7 +270,40 @@ no longer waits for it (`glFinish` at the frame's end) but hands it on once its 
 (`glFlush`): the **panel's copy of the surface waits in the kernel** for the jobs that name it,
 at most 500 ms -- that is what is relied on. `glwait=1` waits here as before. Other programs
 still wait at the end of a frame drawn into a surface. glprof's kernel line gives the jobs
-queued a frame, the time in `wait_seq` and `wait_bo`, and failed jobs.
+queued a frame, the time in `wait_seq` and `wait_bo`, and failed jobs. `glasync=0` (boot-arg
+or `A34GL`) makes the jobs synchronous in every program a34gl is in, as `REDWOOD_DRM_ASYNC=0`
+does. `glwait=1` is not the same: a frame's jobs still run after their SUBMIT, only the frame's
+end waits. (`glenv=` is now applied before the connection to the kernel is made, so
+`glenv=REDWOOD_DRM_ASYNC=0` works too.)
+
+The seed of a surface the GPU has drawn into moves by an IOSurfaceLock and unlock. That lock
+waits in the kernel for the jobs naming the surface: at the frame's end, the frame's own copy
+into the display's surface, 1-1.5 ms of the drawing thread. With queued jobs it is done on a
+dispatch queue after the frame's jobs have gone to the kernel, so the seed moves once the picture
+is whole. `glseedwait=1`: on the drawing thread, as before.
+
+### Copied surfaces: when they are copied
+
+A surface that cannot be the texture's memory ('A008', 'LA08', 'RGhA', no format, 'BGRA' that
+the kernel or Mesa does not take) is copied: when -texImageIOSurface:/-attachImage: makes the
+texture, and again when its seed has moved or its memory adds up to something else when it is
+bound. HackiOS (hakios-mtk `eagl.c`) does the same as topaz and as here (the same functions,
+the same read-only lock, seed taken after the copy). The one difference is that it gives the
+texture new storage on every copy (`glTexImage2D`), where 'BGRA' copies here go into the storage
+the texture has (`glTexSubImage2D`: an 11 MB surface took 120-145 ms with new storage). Mesa
+keeps that safe with queued jobs: panfrost replaces or waits for a BO that a job still reads.
+
+Changed: the seed is taken **before** the memory is read. An owner that changes the surface
+while it is being copied (a read-only lock keeps nobody out) then moves the seed past it, and the
+next look copies again. Before, the half-made picture stayed until the next change. A status
+bar's backing store cleared for its next text is all zero, and under a layer drawn opaque that
+is a black box. Also, what is copied is added up first. The next look compares with what was
+copied, where before every copy for a seed was made twice (the sum was the old one). A copy made
+of memory that is all zero is logged ("copied ALL ZERO", with the surface's ID, name, format,
+size and seed; the kernel's `SWEET SURF ... create id N` line names its maker), and so is the
+next copy that is not. Sums: every look until 30 alike, then every 2nd frame, after 240 every
+4th; a surface whose owner has told every change by its seed (twice or more), every 8th.
+`glsum=2`: as before, `glsum=0`: none.
 
 ## The log
 
@@ -306,7 +339,9 @@ default: only function 53; `gltable=0`: none), `glskip=N[,N...]` (CoreAnimation'
 those functions with no program are not drawn: to find the one that paints wrongly);
 a34gl's own: `glprof=N` (below),
 `glsum=0` (an IOSurface that is copied into a texture is refilled when its seed moves, never
-because its memory adds up differently -- that check reads the whole surface every frame),
+because its memory adds up differently -- that check reads the whole surface; `glsum=2`: as often
+as before, see "Copied surfaces"), `glasync=0` (GPU jobs synchronous), `glseedwait=1` (a drawn
+surface's seed moved on the drawing thread), `glvbafter=N[,K]` (the draws after the variable blur),
 `glerrors=0|1` (`glGetError` after every call never | always; default the first 120 frames).
 The log: see "The log".
 
