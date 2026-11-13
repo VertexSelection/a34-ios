@@ -13,7 +13,8 @@
 
 struct a34gl;
 
-struct a34gl *a34gl_create(int version);        /* a context of OpenGL ES 2 or 3 (or newer); NULL: none to be had */
+/* a context of OpenGL ES 2 or 3 (or newer), sharing its objects with `share` if that is not NULL; NULL: none to be had */
+struct a34gl *a34gl_create(int version, struct a34gl *share);
 int a34gl_make_current(struct a34gl *gl);       /* ... the calling thread's (NULL: none); 0 on failure */
 int a34gl_contended(void);                      /* a context was wanted by a thread while another had it */
 void a34gl_destroy(struct a34gl *gl);

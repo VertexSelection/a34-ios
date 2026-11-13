@@ -35,8 +35,10 @@ maintenance of surface memory?); 2 no EGL/GLES at all.
 ## 2. backboardd
 
 Either the kernel (patch 0914) inserts the loader -- boot-arg
-`a34inject=/a34/liba34gl-inject.dylib,backboardd`, nothing else to do; environment for
-backboardd then goes into `/a34/backboardd.env` -- or the launchd job runs a wrapper:
+`a34inject=/a34/liba34gl-inject.dylib,backboardd,SpringBoard`, nothing else to do; environment
+for a program then goes into `/a34/NAME.env` (`/a34/backboardd.env`, `/a34/SpringBoard.env`),
+and every program it is inserted into says so on the console (`a34gl-inject: NAME[PID]: loaded,
+mode ...`) -- or backboardd's launchd job runs a wrapper:
 
     python3 -I tools/root-add-job.py --wrap /mnt com.apple.backboardd /a34/a34gl-bbd
 

@@ -62,13 +62,16 @@
  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: PAN_MESA_DEBUG=sync, say), vblur=0 blurs nothing whose radius varies and
  * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
- * every frame (see frame_end()). a34gl's: glprof=N (where the time of every N frames went: see
+ * every frame (see frame_end()). vblur=3: that blur's edges normalized by the picture's opacity, as
+ * topaz did (see cover_fragment). gltable=1|0 and glskip=N[,N...]: see table_draws and
+ * skipped_functions. a34gl's: glprof=N (where the time of every N frames went: see
  * "where a frame's time goes"), glsum=0 (copied IOSurfaces refilled by their seed only, see
  * surface_changed()), glerrors=0|1 (glGetError after every call never | always; default: the
  * first 120 frames).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
@@ -246,12 +249,29 @@ struct image {
 	GLsizei width, height;
 };
 
+/*
+ * A context. It begins as the structure iOS's OpenGLES keeps behind an EAGLContext does (the
+ * object's ivar _private points to it; read off the 16.7.16 cache's code): the object, its
+ * sharegroup, the API, a byte of flags, and at 0x20 the function table. With _private pointing
+ * here, what iOS's own code does with a context of ours comes out right without being replaced:
+ * +[EAGLContext setCurrentContext:] puts _private into the thread's OpenGL slot (pthread key 30)
+ * and retains the object it finds at +0; +currentContext answers that object; -sharegroup and
+ * -API read +8 and +0x10; EAGLGetCurrentMacroContextPrivate() and -getMacroContextPrivate answer
+ * _private + 0x20; and every gl* function OpenGLES exports loads the slot and jumps through the
+ * table at 0x20 + its offset with the table's first word as first argument: our entries. So a
+ * program that makes a context current and calls gl* (CoreImage) is served as CoreAnimation is,
+ * which takes the table and calls through it.
+ */
 struct eagl {
-	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
-	id object;                      /* the EAGLContext */
-	struct a34gl *gl;
+	id object;                      /* +0x00 the EAGLContext */
+	id sharegroup;                  /* +0x08 what -sharegroup answers: a token of ours (my_initWithAPI()) */
+	unsigned long api;              /* +0x10 what -API answers */
+	uint64_t flags;                 /* +0x18 (bit 0: iOS does not retain the object while it is a thread's) */
+	void *table[SLOTS];             /* +0x20 [0] is the context itself: what every entry gets as its first argument */
+	uint8_t beyond[4096];           /* (where iOS's structure goes on: nothing of that is ours to be read as) */
+	struct a34gl *gl;               /* the library's context: made at the first call (eagl_start()) */
+	bool failed, greeted;           /* ... which could not be made; ... which has been written down */
 	pthread_t owner;                /* the thread that made it current last (eagl_enter()) */
-	unsigned long api;
 	struct image images[256];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
@@ -278,7 +298,8 @@ struct eagl {
 	GLint group_blend_func[4];
 	GLuint box;                     /* and one that makes a picture eight times smaller */
 	GLint box_matrix, box_places;
-	GLuint halve, vblur;            /* and two for the blur whose radius varies (vblur_level(), vblur_draw_begin()) */
+	GLuint halve, vblur, cover;     /* and three for the blur whose radius varies (vblur_level(), vblur_draw_begin()) */
+	bool no_cover;                  /* ... the third could not be made */
 	GLint halve_texel, vblur_matrix, vblur_radius, vblur_levels, vblur_normalize, vblur_paint;
 	struct vblur_chain {
 		GLuint picture;         /* CoreAnimation's texture, the first level (0: unused) */
@@ -286,6 +307,7 @@ struct eagl {
 		GLuint level[VBLUR_LEVELS], framebuffer[VBLUR_LEVELS];  /* ours, from the second on (index 1 up) */
 		GLsizei level_width[VBLUR_LEVELS], level_height[VBLUR_LEVELS];
 		int made;               /* how many levels are made of the present picture, the first included */
+		bool cover;             /* the levels' fourth channel is how much of the picture they cover, not its opacity */
 		unsigned used;          /* the frame it was last used in */
 	} chains[VBLUR_CHAINS];
 	bool vblur_bound;               /* a draw of ours has textures of its own on units 2 to 5 */
@@ -336,7 +358,18 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
-static struct eagl *contexts[8];
+static struct eagl *contexts[32];
+static pthread_mutex_t contexts_lock = PTHREAD_MUTEX_INITIALIZER;
+_Static_assert(offsetof(struct eagl, table) == 0x20, "iOS's OpenGLES has the function table at 0x20 of a context");
+/*
+ * The window server (backboardd), whose CoreAnimation is the one client there, or any other
+ * program that makes EAGLContexts (CoreImage in SpringBoard, ...): A34GL_ROLE=render|client, by
+ * default by the program's name. What differs outside the window server: the library's context
+ * is made at the first GL call, not with the EAGLContext; shaders are handed on as they are unless
+ * they use Apple's sampler2DRect; no glGetError after every call (the program's own would find
+ * nothing); what is drawn into a texture made of an IOSurface is copied into the surface.
+ */
+static int render_server = 1;
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* time spent in each entry */
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames; 2: always) */
@@ -383,6 +416,7 @@ static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+static bool eagl_start(struct eagl *e);
 
 /* ---- where a frame's time goes (boot-arg or A34GL glprof=N) ------------------------------------- */
 
@@ -651,9 +685,15 @@ eagl_enter(struct eagl *e, unsigned offset)
 	if (current != e || !pthread_equal(__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE), self)) {
 		uint64_t began = prof_begin();
 
-		if (a34gl_make_current(e->gl)) {
+		if (eagl_start(e) && a34gl_make_current(e->gl)) {
 			current = e;
 			__atomic_store_n(&e->owner, self, __ATOMIC_RELEASE);
+			if (!e->greeted) {
+				e->greeted = true;
+				say("a34gl: an OpenGL ES %lu context for %s, by %s: %s; %s; shaders %s\n", e->api,
+				    render_server ? "CoreAnimation" : getprogname(), a34gl_library(), (const char *)glGetString(GL_VERSION),
+				    (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+			}
 		} else if (lost_calls++ < 16) {
 			say("a34gl: the context cannot be made this thread's: entry %#x goes nowhere\n", offset);
 		}
@@ -734,12 +774,50 @@ eagl_missing(void *context, unsigned offset)
 static struct eagl *
 context_of(id object)
 {
+	struct eagl *e = NULL;
+
+	pthread_mutex_lock(&contexts_lock);
 	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
 		if (contexts[i] != NULL && contexts[i]->object == object) {
-			return contexts[i];
+			e = contexts[i];
+			break;
 		}
 	}
-	return NULL;
+	pthread_mutex_unlock(&contexts_lock);
+	return e;
+}
+
+/*
+ * The library's context for an EAGLContext: made with it in the window server, elsewhere at the
+ * first call that needs it (a program may make EAGLContexts it never draws with). One of a
+ * sharegroup shares the library's objects with the others of the group made before it.
+ */
+static bool
+eagl_start(struct eagl *e)
+{
+	struct a34gl *share = NULL;
+
+	if (e->gl != NULL) {
+		return true;
+	}
+	if (e->failed) {
+		return false;
+	}
+	pthread_mutex_lock(&contexts_lock);
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i] != e && contexts[i]->gl != NULL && e->sharegroup != nil &&
+		    contexts[i]->sharegroup == e->sharegroup) {
+			share = contexts[i]->gl;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&contexts_lock);
+	if ((e->gl = a34gl_create((int)e->api, share)) == NULL) {
+		e->failed = true;
+		say("a34gl: %s gives no OpenGL ES %lu context\n", a34gl_library(), e->api);
+		return false;
+	}
+	return true;
 }
 
 /* ---- what CoreAnimation asks for: kept for the summary ------------------------------------------- */
@@ -1029,10 +1107,19 @@ static bool
 surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
+	const char *why = !share_surfaces ? "glcopy=1" : image->invert ? "it is shown the other way up" :
+	    image->alpha_first ? "it has no pixel format (opacity first)" :
+	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ? "not blue-first bytes" : image->plane != 0 ? "a plane of it" :
+	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface) ?
+	    "not the whole of it" : !surface_texture(e, surface) ? "the kernel or Mesa does not take it (its rows, its memory)" : NULL;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) || !surface_texture(e, surface)) {
+	if (why != NULL) {
+		uint32_t pixels = __builtin_bswap32(IOSurfaceGetPixelFormat(surface));
+
+		/* (a copy is read whole whenever it is looked at for changes, and filled again when it has changed) */
+		say("a34gl: IOSurface %u ('%.4s' %zu x %zu, %zu bytes a row; as a texture: format %#x, type %#x) is copied, not "
+		    "the texture's memory: %s\n", IOSurfaceGetID(surface), (const char *)&pixels, IOSurfaceGetWidth(surface),
+		    IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface), image->format, image->type, why);
 		e->refused++;
 		return false;
 	}
@@ -1249,7 +1336,11 @@ target_to_surface_work(struct eagl *e, struct image *image)
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 	if (surface_lock(surface, 0) == 0) {
+		GLint row_length = 0, alignment = 4;
+
 		base = IOSurfaceGetBaseAddress(surface);
+		glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+		glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (!image->invert) {
@@ -1259,7 +1350,9 @@ target_to_surface_work(struct eagl *e, struct image *image)
 				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, base + row * (size_t)(image->height - 1 - y));
 			}
 		}
-		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		/* (as they were: CoreAnimation has them so, another program has its own) */
+		glPixelStorei(GL_PACK_ROW_LENGTH, render_server ? 0 : row_length);
+		glPixelStorei(GL_PACK_ALIGNMENT, render_server ? 4 : alignment);
 		surface_unlock(surface, 0);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
@@ -1390,7 +1483,7 @@ frame_end(struct eagl *e, bool finished)
 			in_place++;
 			glFlush();                              /* (also after a glFinish: the copy is new since) */
 		}
-		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+		if ((e->images[i].target || !render_server) && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
 		}
 	}
@@ -1419,6 +1512,21 @@ frame_end(struct eagl *e, bool finished)
 			target_to_surface(e, &e->images[i]);
 			if (shown_texture != 0) {
 				show_texture(e, &e->images[i]);
+			}
+		} else if (!render_server && e->images[i].drawn) {
+			/* (another program's: the whole of a surface of blue-first bytes can be read back into it) */
+			struct image *image = &e->images[i];
+
+			if (image->shared || (image->format == GL_BGRA && image->type == GL_UNSIGNED_BYTE && image->plane == 0 &&
+			    (size_t)image->width == IOSurfaceGetWidth(image->surface) &&
+			    (size_t)image->height == IOSurfaceGetHeight(image->surface))) {
+				copied += !image->shared;
+				target_to_surface(e, image);
+				image->seed = IOSurfaceGetSeed(image->surface);
+			} else {
+				image->drawn = false;
+				say("a34gl: what was drawn into texture %u stays out of its IOSurface %u (format %#x, type %#x): not a kind "
+				    "that is read back\n", image->texture, IOSurfaceGetID(image->surface), image->format, image->type);
 			}
 		}
 	}
@@ -1545,7 +1653,12 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
-	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+	/*
+	 * (a texture CoreAnimation attaches to a surface; and, in another program, any texture made of
+	 * an IOSurface: -texImageIOSurface: is how such a program gets its picture out, where the
+	 * window server only ever shows what it gets so)
+	 */
+	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && (image->target || !render_server)) {
 		image->drawn = image->painted = true;
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
@@ -1940,6 +2053,7 @@ static const char table_fragment[] =
 #define FUNCTION_VARIABLE_DOWNSAMPLE    38
 #define FUNCTION_VARIABLE_BLUR          39
 #define FUNCTION_VIBRANT_MATRIX         45
+#define FUNCTION_HOME_AFFORDANCE        53
 
 static const char vibrant_fragment[] =
     "#version 300 es\n"
@@ -2021,6 +2135,15 @@ a34gl_function_values(void *context, unsigned function, unsigned index, size_t c
 
 /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture; 3: the two with a colour matrix drawn plainly too */
 static int plain_draws = 1;
+/*
+ * The home indicator's arithmetic (table_fragment: its own three numbers, an opaque result) is for
+ * the home indicator, function 53 ("hom"): topaz drew every draw with no program that has a table
+ * of one row on the second unit through it. Another function with such a table is drawn as the
+ * picture it is given. Boot-arg gltable=1: topaz's way; gltable=0: no draw goes through the table.
+ */
+static int table_draws = 2;
+/* boot-arg glskip=N[,N...]: the draws CoreAnimation makes of those functions with no program are not drawn (to find one that paints wrongly) */
+static uint8_t skipped_functions[90];
 
 /*
  * The blur whose radius varies over the picture (the filter variableBlur with a mask: the strip
@@ -2058,7 +2181,7 @@ static int plain_draws = 1;
  * Boot-arg vblur=0: the stand-in. vblur=2, for checking: the strip painted by its mask instead of
  * blurred, red where the radius is whole, blue where there is none, and the mask's pixels in the log.
  */
-static int vblur_on = 1;
+static int vblur_on = 1;                /* (3: the edges normalized by the picture's opacity, as topaz did) */
 
 /*
  * Halving: a pixel of the level made is the average of the sixteen of the level it is made of
@@ -2082,6 +2205,40 @@ static const char halve_fragment[] =
     "      texture(source, at + texel * vec2(-1.0, 1.0)) + texture(source, at + texel * vec2(1.0, 1.0)));\n"
     "}\n";
 /*
+ * The first level when the blur's edges are to be "normalized" (the function's second number): the
+ * same sixteen pixels of the picture, but only those that are picture, and with them how many
+ * those were, in the fourth channel -- which the further levels halve like the colours, and by
+ * which the reading divides: what lies outside the picture (past the texture's edge, or left
+ * clear around it: opacity 0) then takes no part, and the edges do not darken.
+ *
+ * topaz divided by the picture's opacity for that, taking the picture to be opaque wherever it
+ * is picture. It is not: what is read is what has been drawn on the screen so far, whose opacity
+ * nobody keeps (the display has no use for it). In the App Library the pods' material leaves less
+ * than 1 there over colours that are not darkened to match, and the division made the pods white
+ * inside the strip under the search field, where the icons on them (opaque) and the gaps between
+ * them (opaque) were right. So the picture's opacity is asked only whether it is 0, and its
+ * colours are taken as they are. Boot-arg vblur=3: topaz's division.
+ */
+static const char cover_fragment[] =
+    "#version 300 es\n"
+    "uniform highp sampler2D source;\n"
+    "out highp vec4 result;\n"
+    "void main() {\n"
+    "  ivec2 size = textureSize(source, 0);\n"
+    "  ivec2 first = 2 * ivec2(gl_FragCoord.xy) - 1;\n"
+    "  highp vec4 sum = vec4(0.0);\n"
+    "  for (int y = 0; y < 4; y++) {\n"
+    "    for (int x = 0; x < 4; x++) {\n"
+    "      ivec2 p = first + ivec2(x, y);\n"
+    "      if (p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y) {\n"
+    "        highp vec4 t = texelFetch(source, p, 0);\n"
+    "        if (t.a >= 0.002) sum += vec4(t.rgb, 1.0);\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  result = sum * 0.0625;\n"
+    "}\n";
+/*
  * Reading the chain: the mask (its opacity, on the second unit, at CoreAnimation's second texture
  * coordinates) says how much of the radius (the function's first number, in pixels of the
  * picture) is wanted at each pixel; a radius of r is read at level log2(r), between two levels
@@ -2089,8 +2246,9 @@ static const char halve_fragment[] =
  * the texture repeats: unheld, the last row of the strip read the mask's first, the whole radius,
  * and came out a line blurred darker than what it lay on. They are held to the mask's ends.
  * With the function's second number set (inputNormalizeEdges, it seems), what the blur drew in
- * from outside the picture -- nothing, transparent -- is made up for by dividing by the opacity,
- * as the edges of an ordinary blur are.
+ * from outside the picture -- nothing, transparent -- is made up for by dividing by how much of
+ * what was read is picture (normalize_edges 1: the levels' fourth channel, see cover_fragment;
+ * 2, topaz's: by the opacity), as the edges of an ordinary blur are.
  * The colour's opacity is the blurring layer's (Spotlight's strip fades so while the gesture that
  * dismisses Search is under way), and CoreAnimation puts what this draws on the screen as it is,
  * without blending: so the opacity is how much of the blur is shown over the picture itself, not a
@@ -2132,7 +2290,10 @@ static const char vblur_fragment[] =
     "in highp vec2 maskcoord;\n"
     "out highp vec4 result;\n"
     "highp vec4 level(int k, highp vec2 at) {\n"
-    "  if (k <= 0) return texture(level0, at);\n"
+    "  if (k <= 0) {\n"
+    "    highp vec4 t = texture(level0, at);\n"
+    "    return normalize_edges > 0.5 && normalize_edges < 1.5 ? vec4(t.rgb, step(0.002, t.a)) : t;\n"
+    "  }\n"
     "  if (k == 1) return texture(level1, at);\n"
     "  if (k == 2) return texture(level2, at);\n"
     "  if (k == 3) return texture(level3, at);\n"
@@ -2149,7 +2310,7 @@ static const char vblur_fragment[] =
     "  highp vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
     "  if (normalize_edges > 0.5) {\n"
     "    c = c.a > 0.004 ? vec4(c.rgb / c.a, 1.0) : vec4(0.0);\n"
-    "    highp vec4 sharp = texture(level0, at);\n"
+    "    highp vec4 sharp = level(0, at);\n"
     "    sharp = sharp.a > 0.004 ? vec4(sharp.rgb / sharp.a, 1.0) : c;\n"
     "    result = vec4(mix(sharp.rgb, c.rgb, color.a), 1.0);\n"
     "  } else {\n"
@@ -2231,6 +2392,20 @@ vblur_forget(struct eagl *e, GLuint picture)
  * A draw of "vrd" (function 38) that reads level `from`: level from + 1 is made of it, in a
  * texture of ours. Every bit of state touched is put back as CoreAnimation had it.
  */
+static int vblur_cover_forced = -1;     /* (vblur_draw_begin() making a chain again the other way) */
+
+/* Are the levels to hold how much of the picture they cover (cover_fragment) rather than its opacity? */
+static bool
+vblur_cover_wanted(struct eagl *e)
+{
+	if (vblur_cover_forced >= 0) {
+		return vblur_cover_forced != 0;
+	}
+	/* (the function's numbers are the last blur's: the first of all is taken to normalize its edges, as those seen do) */
+	return !e->no_cover && vblur_on != 3 &&
+	       (function_given[FUNCTION_VARIABLE_BLUR] < 2 || function_values[FUNCTION_VARIABLE_BLUR][1] > 0.5f);
+}
+
 static void
 vblur_level(struct eagl *e, int from)
 {
@@ -2242,6 +2417,15 @@ vblur_level(struct eagl *e, int from)
 
 	if (from < 0 || to >= VBLUR_LEVELS || picture == 0) {
 		return;
+	}
+	if (e->cover == 0 && !e->no_cover) {
+		e->cover = vblur_program(vblur_vertex, cover_fragment, "the first level, with how much of the picture it covers");
+		e->no_cover = e->cover == 0;
+		if (e->cover != 0) {
+			glUseProgram(e->cover);
+			glUniform1i(glGetUniformLocation(e->cover, "source"), 0);
+			glUseProgram(0);
+		}
 	}
 	if (e->halve == 0) {
 		e->halve = vblur_program(vblur_vertex, halve_fragment, "halving");
@@ -2270,6 +2454,7 @@ vblur_level(struct eagl *e, int from)
 	}
 	if (from == 0) {
 		chain->made = 1;                        /* (the picture is new: the levels made of the one before are not of it) */
+		chain->cover = vblur_cover_wanted(e);
 	}
 	if (from >= chain->made) {
 		glActiveTexture(GL_TEXTURE0 + e->unit);
@@ -2306,10 +2491,14 @@ vblur_level(struct eagl *e, int from)
 	glViewport(0, 0, chain->level_width[to], chain->level_height[to]);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
-	glUseProgram(e->halve);
 	glBindTexture(GL_TEXTURE_2D, source);
-	glUniform2f(e->halve_texel, 1.0f / (float)(from == 0 ? chain->width : chain->level_width[from]),
-	    1.0f / (float)(from == 0 ? chain->height : chain->level_height[from]));
+	if (from == 0 && chain->cover) {
+		glUseProgram(e->cover);
+	} else {
+		glUseProgram(e->halve);
+		glUniform2f(e->halve_texel, 1.0f / (float)(from == 0 ? chain->width : chain->level_width[from]),
+		    1.0f / (float)(from == 0 ? chain->height : chain->level_height[from]));
+	}
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	chain->made = to + 1;
 	/* back as it was */
@@ -2436,19 +2625,23 @@ a34gl_function_refused(unsigned function)
 static void
 census_draw(struct eagl *e, unsigned function, unsigned kind)
 {
-	char textures[200] = "", numbers[200] = "";
+	char textures[280] = "", numbers[200] = "";
 	GLint source = 0, destination = 0, viewport[4] = { 0, 0, 0, 0 };
-	float low[2] = { 0, 0 }, high[2] = { 0, 0 };
+	float low[2] = { 0, 0 }, high[2] = { 0, 0 }, colour[4] = { 0, 0, 0, 0 };
+	struct image *target;
 	size_t used = 0;
 
 	if (frame_lines && function < 90) {
 		frame_noprog[function][kind]++;
 	}
-	if (!census_on || function >= 90) {
+	if (function >= 90) {
 		return;
 	}
-	census[function].draws[kind]++;
-	census[function].lately[kind]++;
+	if (census_on) {
+		census[function].draws[kind]++;
+		census[function].lately[kind]++;
+	}
+	/* (the first draw of each function in each way gets its line with or without glcensus=1: a few dozen at most) */
 	if (census[function].said & (1u << kind)) {
 		return;
 	}
@@ -2463,8 +2656,12 @@ census_draw(struct eagl *e, unsigned function, unsigned kind)
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
-		used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] %d x %d (%#x)", unit, width, height,
-		    (unsigned)format);
+		target = image_of(e, e->bound[unit]);
+		used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] %u: %d x %d (%#x%s)", unit, e->bound[unit],
+		    width, height, (unsigned)format, target == NULL ? "" : target->shared ? ", a surface's memory" : ", a copy of a surface");
+		if (used >= sizeof(textures)) {
+			used = sizeof(textures) - 1;
+		}
 	}
 	glActiveTexture(GL_TEXTURE0 + e->unit);
 	for (unsigned i = 0; i < 4 && e->arrays[0].pointer != NULL && e->arrays[0].type == GL_FLOAT && e->arrays[0].size >= 2; i++) {
@@ -2484,10 +2681,21 @@ census_draw(struct eagl *e, unsigned function, unsigned kind)
 	glGetIntegerv(GL_BLEND_SRC_RGB, &source);
 	glGetIntegerv(GL_BLEND_DST_RGB, &destination);
 	glGetIntegerv(GL_VIEWPORT, viewport);
-	say("a34gl: census: function %u (\"%s\") with no program, %s: first at %g,%g to %g,%g of framebuffer %u (%d x %d); "
-	    "textures%s; blending %s (%#x, %#x); its numbers:%s\n", function, census_name(function), census_kinds[kind], (double)low[0],
-	    (double)low[1], (double)high[0], (double)high[1], e->framebuffer, viewport[2], viewport[3], textures[0] ? textures : " none",
-	    glIsEnabled(GL_BLEND) ? "on" : "off", (unsigned)source, (unsigned)destination, numbers[0] ? numbers : " none");
+	if (e->arrays[1].pointer != NULL && e->arrays[1].type == GL_HALF_FLOAT && e->arrays[1].size >= 4) {
+		uint16_t halves[4];
+
+		memcpy(halves, e->arrays[1].pointer, sizeof(halves));
+		for (unsigned part = 0; part < 4; part++) {
+			colour[part] = half_float(halves[part]);
+		}
+	}
+	target = e->colour != 0 ? image_of(e, e->colour) : NULL;
+	say_always("a34gl: no program: function %u (\"%s\"), %s: first at %g,%g to %g,%g of framebuffer %u (%d x %d, texture %u%s); "
+	    "textures%s; blending %s (%#x, %#x); colour %g %g %g %g; its numbers:%s\n", function, census_name(function),
+	    census_kinds[kind], (double)low[0], (double)low[1], (double)high[0], (double)high[1], e->framebuffer, viewport[2],
+	    viewport[3], e->colour, target == NULL ? "" : target->target ? ", a surface's" : ", of a surface", textures[0] ? textures :
+	    " none", glIsEnabled(GL_BLEND) ? "on" : "off", (unsigned)source, (unsigned)destination, (double)colour[0],
+	    (double)colour[1], (double)colour[2], (double)colour[3], numbers[0] ? numbers : " none");
 }
 
 /* Every ten seconds: what there was since the last time, and in all. */
@@ -2578,7 +2786,20 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	static unsigned told;
 	int levels = chain->made < 5 ? chain->made : 5;
+	/* how the edges are normalized: 0 not at all, 1 by what the levels cover, 2 by the picture's opacity (topaz; vblur=3) */
+	int normalize = function_values[FUNCTION_VARIABLE_BLUR][1] <= 0.5f ? 0 : e->no_cover || vblur_on == 3 ? 2 : 1;
 
+	if ((normalize == 1) != chain->cover) {
+		/* (the levels were made the other way, before this blur's numbers were known: once more) */
+		int made = chain->made;
+
+		vblur_cover_forced = normalize == 1;
+		for (int from = 0; from + 1 < made; from++) {
+			vblur_level(e, from);
+		}
+		vblur_cover_forced = -1;
+		levels = chain->made < 5 ? chain->made : 5;
+	}
 	if (e->vblur == 0) {
 		e->vblur = vblur_program(vblur_draw_vertex, vblur_fragment, "reading the levels by the mask");
 		if (e->vblur == 0) {
@@ -2604,7 +2825,7 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 	glUniformMatrix4fv(e->vblur_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 	glUniform1f(e->vblur_radius, function_values[FUNCTION_VARIABLE_BLUR][0]);
 	glUniform1i(e->vblur_levels, levels);
-	glUniform1f(e->vblur_normalize, function_values[FUNCTION_VARIABLE_BLUR][1]);
+	glUniform1f(e->vblur_normalize, (GLfloat)normalize);
 	glUniform1i(e->vblur_paint, vblur_on == 2);
 	for (int k = 1; k < 5; k++) {
 		glActiveTexture(GL_TEXTURE0 + k + 1);
@@ -2625,8 +2846,9 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 		if (at != NULL && e->arrays[3].type == GL_FLOAT) {
 			memcpy(first, at, sizeof(first));
 		}
-		say("a34gl: a blur whose radius varies, read by its mask: %d levels of texture %u (%d x %d), radius %g, numbers %g %g "
-		    "%g; the mask's coordinates at the first corner %g %g\n", levels, chain->picture, chain->width, chain->height,
+		say("a34gl: a blur whose radius varies, read by its mask: %d levels of texture %u (%d x %d; edges %s), radius %g, "
+		    "numbers %g %g %g; the mask's coordinates at the first corner %g %g\n", levels, chain->picture, chain->width,
+		    chain->height, normalize == 0 ? "as they are" : normalize == 1 ? "by what the levels cover" : "by the opacity",
 		    (double)function_values[FUNCTION_VARIABLE_BLUR][0], (double)function_values[FUNCTION_VARIABLE_BLUR][1],
 		    (double)function_values[FUNCTION_VARIABLE_BLUR][2], (double)function_values[FUNCTION_VARIABLE_BLUR][3],
 		    (double)first[0], (double)first[1]);
@@ -3026,6 +3248,10 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	if (e->program != 0) {
 		return false;
 	}
+	if (function < 90 && skipped_functions[function]) {
+		census_draw(e, function, CENSUS_NOT_DRAWN);
+		return false;
+	}
 	if (vblur_on && reads_what_it_writes(e) && function_given[FUNCTION_VARIABLE_DOWNSAMPLE] != 0) {
 		static unsigned told;
 
@@ -3127,6 +3353,9 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		glActiveTexture(GL_TEXTURE0 + 1);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &rows);
 		glActiveTexture(GL_TEXTURE0 + e->unit);
+	}
+	if (rows == 1 && table_draws != 1 && (table_draws == 0 || (function != FUNCTION_HOME_AFFORDANCE && function < 90))) {
+		rows = 0;                       /* (not the home indicator: as the picture it is given) */
 	}
 	if (rows == 1) {
 		if (e->lookup == 0) {
@@ -3641,6 +3870,42 @@ my_glFramebufferParameteriAPPLE(void *context, GLenum target, GLenum name, GLint
 	}
 }
 
+/* EXT_debug_label: a name for an object, for a debugger. */
+static void
+my_glLabelObjectEXT(void *context, GLenum type, GLuint object, GLsizei length, const GLchar *label)
+{
+	(void)type;
+	(void)object;
+	(void)length;
+	(void)label;
+	EAGL_ENTER(context, 0x1978);
+}
+
+/*
+ * OES_mapbuffer, which Mesa says it has (the name is in its list of extensions) but whose function
+ * its OpenGL ES library does not export: the whole buffer, to be written, by the function of
+ * OpenGL ES 3 that does the same.
+ */
+#define GL_BUFFER_SIZE                  0x8764
+#define GL_MAP_WRITE_BIT                0x0002
+
+static void *
+my_glMapBufferOES(void *context, GLenum target, GLenum access)
+{
+	struct eagl *e = context;
+	GLint size = 0;
+	void *memory = NULL;
+
+	(void)access;                   /* (GL_WRITE_ONLY_OES is all there is) */
+	EAGL_ENTER(e, 0x1450);
+	glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+	if (size > 0) {
+		memory = glMapBufferRange(target, 0, size, GL_MAP_WRITE_BIT);
+	}
+	EAGL_LEAVE(e, 0x1450);
+	return memory;
+}
+
 /* EXT_debug_marker: names for a debugger's list of calls. */
 static void
 my_glInsertEventMarkerEXT(void *context, GLsizei length, const GLchar *marker)
@@ -3767,6 +4032,18 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	for (GLsizei i = 0; i < count; i++) {
 		strncat(text, strings[i], lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]));
 	}
+	/*
+	 * Another program's shaders (CoreImage's) are OpenGL ES's own and go as they are: all but
+	 * one of the first version that reads a texture by its pixels, Apple's sampler2DRect, which
+	 * is made a 3.00 one like CoreAnimation's.
+	 */
+	if (!render_server && (strstr(text, "#version") != NULL || strstr(text, "2DRect") == NULL)) {
+		free((void *)e->sources[shader % 64]);
+		e->sources[shader % 64] = text;
+		glShaderSource(shader, count, strings, lengths);
+		EAGL_LEAVE(e, 0x12a0);
+		return;
+	}
 	/* "#extension" lines must stay ahead of everything that is not the preprocessor's: they move to the top */
 	head = text + size;
 	strcpy(head, parts[0]);
@@ -3874,37 +4151,104 @@ _Static_assert(EAGL_TABLE_SIZE <= SLOTS * 8, "the table has grown");
 
 /* ---- EAGLContext ---------------------------------------------------------------------------------- */
 
+/*
+ * What iOS's own methods were, for an EAGLContext that is not one of ours (none is expected: every
+ * way to make one ends in -initWithAPI:properties: or -commonInitWithAPI:properties:, both ours).
+ */
+static IMP original_API, original_setParameter, original_getParameter, original_getMacroContextPrivate,
+    original_texImageIOSurface, original_texImageIOSurfacePlane, original_attachImage, original_dealloc,
+    original_renderbufferStorage, original_presentRenderbuffer, original_presentRenderbufferAtTime,
+    original_presentRenderbufferAfter;
+static ptrdiff_t private_offset = -1;           /* of EAGLContext's ivar _private (see struct eagl) */
+
+/* The sharegroup a context is asked to be of (kEAGLContextPropertySharegroup of its properties), or nil. */
+static id
+sharegroup_asked(id properties)
+{
+	static id *key;
+
+	if (properties == nil) {
+		return nil;
+	}
+	if (key == NULL) {
+		key = (id *)dlsym(RTLD_DEFAULT, "kEAGLContextPropertySharegroup");
+	}
+	if (key == NULL || *key == nil) {
+		return nil;
+	}
+	return ((id (*)(id, SEL, id))objc_msgSend)(properties, sel_registerName("objectForKey:"), *key);
+}
+
+/*
+ * -initWithAPI:properties: and -commonInitWithAPI:properties: (-initWithAPI: and
+ * -initWithAPI:sharedWithCompute: go to the first, -initWithAPI:sharegroup: to the second, with the
+ * sharegroup among the properties). A sharegroup is a token of ours here, an NSObject: -sharegroup
+ * answers it (iOS's own method, reading our structure), and a context made with the token of
+ * another shares the library's objects with it.
+ */
 static id
 my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 {
+	id group = sharegroup_asked(properties);
 	struct eagl *e;
 	unsigned place;
+	bool shared = false;
 
 	(void)selector;
-	(void)properties;
-	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
-	}
-	if (api < 2 || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) || (e = calloc(1, sizeof(*e))) == NULL) {
+	if (api < 2 || api > 3 || (e = calloc(1, sizeof(*e))) == NULL) {
 		say("a34gl: no context of API %lu\n", api);
 		return nil;
 	}
-	if ((e->gl = a34gl_create((int)api)) == NULL || !a34gl_make_current(e->gl)) {
-		say("a34gl: %s gives no OpenGL ES %lu context\n", a34gl_library(), api);
-		free(e);
-		return nil;
-	}
-	current = e;
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
 	eagl_fill_table(e->table);
-	contexts[place] = e;
-	say("a34gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, a34gl_library(),
-	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
-	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
-	/* (the thread that makes the context need not be the one that draws with it: EGL wants it let go) */
-	a34gl_make_current(NULL);
-	current = NULL;
+	pthread_mutex_lock(&contexts_lock);
+	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
+	}
+	for (unsigned i = 0; group != nil && i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		shared = shared || (contexts[i] != NULL && contexts[i]->sharegroup == group);
+	}
+	if (place < sizeof(contexts) / sizeof(contexts[0])) {
+		contexts[place] = e;
+	}
+	pthread_mutex_unlock(&contexts_lock);
+	if (place == sizeof(contexts) / sizeof(contexts[0])) {
+		say("a34gl: more contexts than there is room for\n");
+		free(e);
+		return nil;
+	}
+	e->sharegroup = shared ? (id)CFRetain((CFTypeRef)group) :
+	    ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSObject"), sel_registerName("new"));
+	if (render_server) {
+		/* (as ever: the context is made now, and a window server without one keeps its software renderer) */
+		if (!eagl_start(e) || !a34gl_make_current(e->gl)) {
+			pthread_mutex_lock(&contexts_lock);
+			contexts[place] = NULL;
+			pthread_mutex_unlock(&contexts_lock);
+			if (e->gl != NULL) {
+				a34gl_destroy(e->gl);
+			}
+			if (e->sharegroup != nil) {
+				CFRelease((CFTypeRef)e->sharegroup);
+			}
+			free(e);
+			return nil;
+		}
+		e->greeted = true;
+		say("a34gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, a34gl_library(),
+		    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
+		    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+		/* (the thread that makes the context need not be the one that draws with it: EGL wants it let go) */
+		a34gl_make_current(NULL);
+		current = NULL;
+	} else {
+		say("a34gl: an EAGLContext of API %lu%s: its OpenGL ES context is made at its first call\n", api,
+		    shared ? ", of the sharegroup of another" : "");
+	}
+	if (private_offset > 0) {
+		*(void **)((char *)self + private_offset) = e;  /* iOS's own code finds the context there */
+	}
 	return self;
 }
 
@@ -3913,16 +4257,63 @@ my_API(id self, SEL selector)
 {
 	struct eagl *e = context_of(self);
 
-	(void)selector;
+	if (e == NULL && original_API != NULL) {
+		return ((unsigned long (*)(id, SEL))original_API)(self, selector);
+	}
 	return e ? e->api : 0;
 }
+
+/*
+ * -setParameter:to:. Two parameters are -setBlockFence:onQueue:, which iOS's method makes of them:
+ * 611 a block, 612 the queue to call it on once everything drawn so far is done. Here everything
+ * handed on is done when the hand-over returns (the kernel runs a job to its end): what is held
+ * back is handed on, and the block goes to its queue.
+ */
+#define EAGL_FENCE_BLOCK        611
+#define EAGL_FENCE_QUEUE        612
+static __thread const void *fence_block;
 
 static unsigned long
 my_setParameter(id self, SEL selector, unsigned parameter, const int32_t *values)
 {
-	(void)self;
-	(void)selector;
+	struct eagl *e = context_of(self);
+
+	if (e == NULL && original_setParameter != NULL) {
+		return ((unsigned long (*)(id, SEL, unsigned, const int32_t *))original_setParameter)(self, selector, parameter, values);
+	}
+	if (parameter == EAGL_FENCE_BLOCK) {
+		fence_block = values;
+		return 0;
+	}
+	if (parameter == EAGL_FENCE_QUEUE) {
+		const void *block = fence_block;
+
+		fence_block = NULL;
+		say("a34gl: -setBlockFence:onQueue: %s\n", block != NULL && values != NULL ? "the block goes to its queue" : "nothing to call");
+		if (block != NULL && values != NULL) {
+			if (e != NULL) {
+				eagl_enter(e, 0);
+				glFlush();
+				eagl_leave(e, 0x2d8);
+			}
+			dispatch_async((dispatch_queue_t)(void *)(uintptr_t)values, (dispatch_block_t)(void *)(uintptr_t)block);
+		}
+		return 0;
+	}
 	say("a34gl: -setParameter:%#x to:%d: noted\n", parameter, values ? values[0] : 0);
+	return 0;
+}
+
+static unsigned long
+my_getParameter(id self, SEL selector, unsigned parameter, int32_t *values)
+{
+	if (context_of(self) == NULL && original_getParameter != NULL) {
+		return ((unsigned long (*)(id, SEL, unsigned, int32_t *))original_getParameter)(self, selector, parameter, values);
+	}
+	if (values != NULL) {
+		values[0] = 0;
+	}
+	say("a34gl: -getParameter:%#x to: answered 0\n", parameter);
 	return 0;
 }
 
@@ -3931,8 +4322,47 @@ my_getMacroContextPrivate(id self, SEL selector)
 {
 	struct eagl *e = context_of(self);
 
-	(void)selector;
+	if (e == NULL && original_getMacroContextPrivate != NULL) {
+		return ((void *(*)(id, SEL))original_getMacroContextPrivate)(self, selector);
+	}
 	return e ? e->table : NULL;
+}
+
+/*
+ * A CAEAGLLayer's storage as a renderbuffer, and its presentation: not done here (what a
+ * program draws so is not shown). For a program that draws off screen (CoreImage) nothing is missed.
+ */
+static BOOL
+my_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+{
+	if (context_of(self) == NULL && original_renderbufferStorage != NULL) {
+		return ((BOOL (*)(id, SEL, unsigned long, id))original_renderbufferStorage)(self, selector, target, drawable);
+	}
+	say("a34gl: -renderbufferStorage:%#lx fromDrawable: a layer's storage is not done here\n", target);
+	return NO;
+}
+
+static BOOL
+my_presentRenderbuffer(id self, SEL selector, unsigned long target)
+{
+	if (context_of(self) == NULL && original_presentRenderbuffer != NULL) {
+		return ((BOOL (*)(id, SEL, unsigned long))original_presentRenderbuffer)(self, selector, target);
+	}
+	say("a34gl: -presentRenderbuffer:%#lx: not done here\n", target);
+	return NO;
+}
+
+static BOOL
+my_presentRenderbufferAtTime(id self, SEL selector, unsigned long target, double when)
+{
+	IMP original = selector == sel_registerName("presentRenderbuffer:atTime:") ? original_presentRenderbufferAtTime :
+	    original_presentRenderbufferAfter;
+
+	if (context_of(self) == NULL && original != NULL) {
+		return ((BOOL (*)(id, SEL, unsigned long, double))original)(self, selector, target, when);
+	}
+	say("a34gl: -presentRenderbuffer:%#lx at a time: not done here\n", target);
+	return NO;
 }
 
 /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
@@ -3946,7 +4376,11 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	GLint texture = 0;
 	uint64_t began;
 
-	(void)selector;
+	if (e == NULL && original_texImageIOSurface != NULL) {
+		return ((BOOL (*)(id, SEL, IOSurfaceRef, unsigned long, unsigned long, GLsizei, GLsizei, unsigned long, unsigned long,
+		    uint32_t, BOOL))original_texImageIOSurface)(self, selector, surface, target, internal, width, height, format, type,
+		    plane, invert);
+	}
 	if (e == NULL || surface == NULL) {
 		return NO;
 	}
@@ -3984,6 +4418,19 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	return YES;
 }
 
+/* (the same without "invert:": the same way up) */
+static BOOL
+my_texImageIOSurfacePlane(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
+    GLsizei width, GLsizei height, unsigned long format, unsigned long type, uint32_t plane)
+{
+	if (context_of(self) == NULL && original_texImageIOSurfacePlane != NULL) {
+		return ((BOOL (*)(id, SEL, IOSurfaceRef, unsigned long, unsigned long, GLsizei, GLsizei, unsigned long, unsigned long,
+		    uint32_t))original_texImageIOSurfacePlane)(self, selector, surface, target, internal, width, height, format, type,
+		    plane);
+	}
+	return my_texImageIOSurface(self, selector, surface, target, internal, width, height, format, type, plane, NO);
+}
+
 /* (the "image" is the target, GL_TEXTURE_2D, and means the texture bound to it) */
 static BOOL
 my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface, BOOL inverted)
@@ -3995,7 +4442,10 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	uint32_t pixels;
 	uint64_t began;
 
-	(void)selector;
+	if (e == NULL && original_attachImage != NULL) {
+		return ((BOOL (*)(id, SEL, unsigned long, IOSurfaceRef, BOOL))original_attachImage)(self, selector, target, surface,
+		    inverted);
+	}
 	if (e == NULL || surface == NULL) {
 		return NO;
 	}
@@ -4062,19 +4512,37 @@ my_dealloc(id self, SEL selector)
 	struct objc_super super = { self, class_getSuperclass(objc_getClass("EAGLContext")) };
 	struct eagl *e = context_of(self);
 
+	if (e == NULL && original_dealloc != NULL) {
+		((void (*)(id, SEL))original_dealloc)(self, selector);  /* (one of iOS's own) */
+		return;
+	}
 	if (e != NULL) {
 		say("a34gl: the context goes\n");
-		summary(e);
+		if (e->gl != NULL) {
+			summary(e);
+		}
+		pthread_mutex_lock(&contexts_lock);
 		for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
 			if (contexts[i] == e) {
 				contexts[i] = NULL;
 			}
 		}
+		pthread_mutex_unlock(&contexts_lock);
 		if (current == e) {
-			a34gl_make_current(NULL);
+			if (e->gl != NULL) {
+				a34gl_make_current(NULL);
+			}
 			current = NULL;
 		}
-		a34gl_destroy(e->gl);
+		if (private_offset > 0) {
+			*(void **)((char *)self + private_offset) = NULL;
+		}
+		if (e->gl != NULL) {
+			a34gl_destroy(e->gl);
+		}
+		if (e->sharegroup != nil) {
+			CFRelease((CFTypeRef)e->sharegroup);
+		}
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
@@ -4109,22 +4577,37 @@ install(void)
 {
 	static const struct {
 		const char *name;
-		IMP ours;
+		IMP ours, *original;
 	} methods[] = {
-		{ "initWithAPI:properties:", (IMP)my_initWithAPI },
-		{ "API", (IMP)my_API },
-		{ "setParameter:to:", (IMP)my_setParameter },
-		{ "getMacroContextPrivate", (IMP)my_getMacroContextPrivate },
-		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface },
-		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage },
-		{ "dealloc", (IMP)my_dealloc },
+		{ "initWithAPI:properties:", (IMP)my_initWithAPI, NULL },
+		{ "commonInitWithAPI:properties:", (IMP)my_initWithAPI, NULL },
+		{ "API", (IMP)my_API, &original_API },
+		{ "setParameter:to:", (IMP)my_setParameter, &original_setParameter },
+		{ "getParameter:to:", (IMP)my_getParameter, &original_getParameter },
+		{ "getMacroContextPrivate", (IMP)my_getMacroContextPrivate, &original_getMacroContextPrivate },
+		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface,
+		  &original_texImageIOSurface },
+		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:", (IMP)my_texImageIOSurfacePlane,
+		  &original_texImageIOSurfacePlane },
+		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage, &original_attachImage },
+		{ "renderbufferStorage:fromDrawable:", (IMP)my_renderbufferStorage, &original_renderbufferStorage },
+		{ "presentRenderbuffer:", (IMP)my_presentRenderbuffer, &original_presentRenderbuffer },
+		{ "presentRenderbuffer:atTime:", (IMP)my_presentRenderbufferAtTime, &original_presentRenderbufferAtTime },
+		{ "presentRenderbuffer:afterMinimumDuration:", (IMP)my_presentRenderbufferAtTime, &original_presentRenderbufferAfter },
+		{ "dealloc", (IMP)my_dealloc, &original_dealloc },
 	};
+	const char *role = getenv("A34GL_ROLE"), *program = getprogname();
+	Ivar private;
 	Class class;
 	unsigned replaced = 0;
 	char arguments[2048] = "";
 	size_t size = sizeof(arguments) / 2 - 1;
 	const char *argument, *environment = getenv("A34GL");
 
+	render_server = role != NULL ? strcmp(role, "render") == 0 : program != NULL && strcmp(program, "backboardd") == 0;
+	if (!render_server) {
+		check_errors = 0;               /* (the program's own glGetError is to find its errors: glerrors=1 all the same) */
+	}
 	/*
 	 * the kernel's boot-args are where a run is told things, and the environment variable A34GL
 	 * (the launchd job's EnvironmentVariables, or /a34/backboardd.env read by a34gl-bbd) with the
@@ -4180,6 +4663,26 @@ install(void)
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		release_frames = strstr(arguments, "glrelease=1") != NULL;
+		if ((argument = strstr(arguments, "gltable=")) != NULL) {
+			table_draws = (int)strtoul(argument + 8, NULL, 10);
+		}
+		if ((argument = strstr(arguments, "glskip=")) != NULL) {
+			char *end = (char *)argument + 7;
+
+			for (;;) {
+				unsigned long function = strtoul(end, &end, 10);
+
+				if (function < 90) {
+					skipped_functions[function] = 1;
+					say("a34gl: glskip: CoreAnimation's function %lu (\"%s\") is not drawn when it comes with no program\n",
+					    function, census_name((unsigned)function));
+				}
+				if (*end != ',') {
+					break;
+				}
+				end++;
+			}
+		}
 		sum_surfaces = strstr(arguments, "glsum=0") == NULL;
 		if (strstr(arguments, "glerrors=0") != NULL) {
 			check_errors = 0;
@@ -4194,7 +4697,8 @@ install(void)
 				say("a34gl: glprof: a summary every %u frames (lines \"a34gl-prof:\")\n", prof_period);
 			}
 		}
-		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
+		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 :
+		    strstr(arguments, "vblur=3") != NULL ? 3 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
@@ -4243,15 +4747,20 @@ install(void)
 			say("a34gl: EAGLContext has no -%s\n", methods[i].name);
 			continue;
 		}
-		say("a34gl: -[EAGLContext %s] (%s) replaced\n", methods[i].name, method_getTypeEncoding(method));
 		if (method == class_getInstanceMethod(class_getSuperclass(class), selector)) {
 			/* inherited: the class gets one of its own, the one it inherits is everybody's */
 			class_addMethod(class, selector, methods[i].ours, method_getTypeEncoding(method));
 		} else {
-			method_setImplementation(method, methods[i].ours);
+			IMP was = method_setImplementation(method, methods[i].ours);
+
+			if (methods[i].original != NULL) {
+				*methods[i].original = was;
+			}
 		}
 		replaced++;
 	}
-	say("a34gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
-	    sizeof(methods) / sizeof(methods[0]), a34gl_library());
+	private = class_getInstanceVariable(class, "_private");
+	private_offset = private != NULL ? ivar_getOffset(private) : -1;
+	say("a34gl: %u of %zu methods of EAGLContext are ours (%s); _private at %td; OpenGL ES by %s\n", replaced,
+	    sizeof(methods) / sizeof(methods[0]), render_server ? "the window server" : "a client", private_offset, a34gl_library());
 }

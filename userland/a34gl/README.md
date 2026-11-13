@@ -215,6 +215,48 @@ static mac_policy_handle_t a34_amfi_mac_handle;
 
 Without it nothing is injected and backboardd runs as before (the wrapper is harmless).
 
+## Programs other than backboardd
+
+Any program that makes an `EAGLContext` gets one of iOS's OpenGLES with no driver behind it
+(the kernel publishes an empty IOAcceleratorES): a function table of nothing, and the first GL
+call jumps to 0. That is the SpringBoard crash with Bold Text on (CoreUI -> `+[CIContext
+contextWithOptions:]` -> `CI::GLContext::init`). The loader therefore works in every program it
+is inserted into (the kernel's `a34inject` list), and each gets **one line on the console**,
+whatever its stderr is: `a34gl-inject: NAME[PID]: loaded, mode ...`.
+
+- **backboardd**: as before -- liba34gl at once, CoreAnimation's two hooks.
+- **any other program**: lazily. The loader swaps `-initWithAPI:properties:` and
+  `-commonInitWithAPI:properties:` (every initializer ends in one of the two) for a stub. At the
+  program's first EAGLContext the stub loads liba34gl (announced on the console too), which
+  takes the methods over; the library's own context (Mesa, the GPU) is made only at that
+  EAGLContext's first GL call. A program that never makes one pays a `dlopen` of OpenGLES and
+  two method swaps; no Mesa, no GPU client. No CoreAnimation hooks (`A34GL_HOOKS=1` forces).
+- `A34GL_MODE` per program, in `/a34/NAME.env` (`/a34/SpringBoard.env`, ...; read by the loader
+  like `/a34/backboardd.env`): `mesa` (default), `none` (an EAGLContext cannot be made: `-init...`
+  answers nil, for a program that does better without GL), `off` (nothing touched).
+
+What makes a context of ours work for a program that is not CoreAnimation (read off the
+16.7.16 cache's OpenGLES): an EAGLContext's ivar `_private` points to a structure with the
+object at +0, the sharegroup at +8, the API at +0x10, flags at +0x18 and the function table at
++0x20. `+setCurrentContext:` stores `_private` in the thread's OpenGL slot (pthread key 30) and
+retains the object; `+currentContext` reads it back; `EAGLGetCurrentMacroContextPrivate()` and
+`-getMacroContextPrivate` answer `_private + 0x20`; and every `gl*` function OpenGLES exports is
+a stub that loads the slot and jumps through the table. `struct eagl` now begins exactly so and
+`_private` is set to it, so all of that reaches our entries with iOS's own code unreplaced --
+whether the program takes the table (CoreAnimation, CoreImage) or calls `glClear()`.
+
+Also for such programs: sharegroups (`-initWithAPI:sharegroup:`; a token of ours, the library's
+contexts share objects); `-setBlockFence:onQueue:` (the block goes to its queue after a flush);
+`glMapBufferOES` (Mesa advertises it and does not export it); shaders handed on as they are
+unless they use `sampler2DRect`; no `glGetError` after every call; what is drawn into a
+`-texImageIOSurface:` texture reaches the surface (its memory when shared, else read back at
+`glFlush`/`glFinish`, BGRA only). Not done: `-renderbufferStorage:fromDrawable:` and
+`-presentRenderbuffer:` (a CAEAGLLayer shows nothing).
+
+**Every process**: the userland side is ready for a wildcard in the kernel's `a34inject` (the
+cost per program is above); keep launchd out, and `A34GL_MODE=off` in `/a34/NAME.env` excepts
+one. Each program that really draws is one more client of the GPU with Mesa's own buffers.
+
 ## The log
 
 Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
@@ -242,11 +284,35 @@ driver sets `RedwoodWaitsForGPU`), `glrelease=1` (let the context go at every fr
 `glshaders=1`, `gltrace=FIRST-LAST`, `gltrace_at=`, `gltrace_draws=`, `gltrace_function=N[,K]`,
 `gltrace_frames=`, `gltrace_place=X0,Y0,X1,Y1`, `gltrace_look=1`, `gltrace_lit=1`, `glslow=US`,
 `glshow=TEXTURE`, `glplain=0|2|3`, `glfetch=0`, `glgroup=0`, `glprecision=0`, `vblur=0|2`,
-`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`); a34gl's own: `glprof=N` (below),
+`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`); `vblur=3` (the variable blur's
+edges normalized by the picture's opacity, topaz's way: see below), `gltable=1` (every draw
+with no program and a one-row table goes through the home indicator's arithmetic, topaz's way;
+default: only function 53; `gltable=0`: none), `glskip=N[,N...]` (CoreAnimation's draws of
+those functions with no program are not drawn: to find the one that paints wrongly);
+a34gl's own: `glprof=N` (below),
 `glsum=0` (an IOSurface that is copied into a texture is refilled when its seed moves, never
 because its memory adds up differently -- that check reads the whole surface every frame),
 `glerrors=0|1` (`glGetError` after every call never | always; default the first 120 frames).
 The log: see "The log".
+
+### Draws with no program, and the variable blur
+
+CoreAnimation's GL renderer draws the functions it has no shader for with no program at all;
+eagl.c draws them with programs of its own. The first draw of each function in each way now
+gets a line without `glcensus=1`: `a34gl: no program: function N ("xxx"), <how it is drawn>:
+... framebuffer, textures (size, format, a surface's memory or a copy), blending, colour, its
+numbers`. A surface that is copied instead of shared says why (`... is copied, not the
+texture's memory: <reason>`).
+
+The blur whose radius varies ("vrb") with its edges "normalized": topaz divided by the
+picture's opacity. The picture is what is on the screen behind the strip, and its opacity is
+whatever the draws before left there (nobody needs it for the display): in the App Library the
+pods' material leaves less than 1 over undarkened colours, and inside the strip under the
+search field the pods came out white (icons and gaps, opaque, were right). Now the first level
+of the blur counts which of its sixteen pixels are picture at all (opacity not 0, inside the
+texture), the further levels carry that, and the reading divides by it: edges still do not
+darken, and the picture's colours are taken as they are. `vblur=3` is topaz's division,
+`vblur=0` no variable blur, `vblur=2` the mask painted.
 
 ### Profiling: `glprof=N`
 
