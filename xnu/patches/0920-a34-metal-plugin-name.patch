@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 32e06d5..aec1026 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -362,9 +362,26 @@ AppleCLCD::start(IOService *provider)
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		/*
++		 * A34 (0920): boot-arg a34metal names the Metal plug-in. Metal
++		 * (MTLRegisterDevices) reads the strings MetalPluginName and
++		 * MetalPluginClassName off every IOAcceleratorES, loads
++		 * /System/Library/Extensions/A34Metal.bundle and makes its class
++		 * (userland/a34metal). Which programs the plug-in shows a device to
++		 * is its own decision (a34metal=1: its tests and
++		 * /a34/A34Metal.clients; 2: all but backboardd; 3: all). Without
++		 * the boot-arg nothing changes.
++		 */
++		uint32_t metalOn = 0;
++		(void)PE_parse_boot_argn("a34metal", &metalOn, sizeof(metalOn));
++		if (metalOn != 0) {
++			accel->setProperty("MetalPluginName", "A34Metal");
++			accel->setProperty("MetalPluginClassName", "A34MetalDevice");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+-			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++			IOLog("SWEET FB: IOAcceleratorES published%s (no 30 s wait in CAMetalContextCreate)\n",
++			    metalOn != 0 ? ", Metal plug-in A34Metal (a34metal)" : ", no Metal plug-in");
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
