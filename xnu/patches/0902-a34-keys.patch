@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/ruby_keys.c b/bsd/dev/ruby_keys.c
+index fe16fc7..9b48293 100644
+--- a/bsd/dev/ruby_keys.c
++++ b/bsd/dev/ruby_keys.c
+@@ -1,9 +1,14 @@
+ /*
+  * RUBY: the board's buttons, polled.
+  *
+- *   volume down  the SoC keypad controller, KP_MEM1 bit 0 (clear while down)
+- *   volume up    MT6359 TOPSTATUS bit 3 (HOMEKEY_DEB, clear while down)
+- *   power        MT6359 TOPSTATUS bit 1 (PWRKEY_DEB, clear while down)
++ * A34 (0902): the Galaxy A34 wires the volume keys the other way round:
++ *
++ *   volume up    the SoC keypad controller, KP_MEM1 bit 1 (clear while down)
++ *   volume down  MT6359P TOPSTATUS bit 3 (HOMEKEY_DEB, clear while down)
++ *   power        MT6359P TOPSTATUS bit 1 (PWRKEY_DEB, clear while down)
++ *
++ * and only the 20 ms poll is used (no legacy keypad interrupt: the A34's
++ * keypad interrupt is edge-triggered and the poll alone is enough).
+  *
+  * TOPSTATUS is the PMIC's debounced key level.  It is independent of the PSC
+  * interrupt enable (0x910), so this driver never writes the PMIC; the boot
+@@ -62,6 +67,7 @@ void ruby_keys_init(void);
+ #define RK_MT6359_TOPSTATUS  0x002au
+ #define RK_TOP_PWRKEY_DEB    (1u << 1)
+ #define RK_TOP_HOMEKEY_DEB   (1u << 3)
++#define RK_A34_KPD_VOLUP     (1u << 1)
+ 
+ #define RK_POLL_MS       20
+ #define RK_POWER         0
+@@ -205,7 +211,7 @@ rk_kpd_isr(void *target, void *refCon, void *nub, int source)
+ 	wakeup(&rk_sleep_chan);
+ }
+ 
+-static void
++static void __attribute__((unused))   /* A34: not called, poll only */
+ rk_kpd_irq_init(void)
+ {
+ 	uint64_t smc = 0, mpidr, route;
+@@ -291,10 +297,10 @@ rk_thread(void *arg, wait_result_t result)
+ 		if (rk_kpd)
+ 			mem1 = ruby_rd16(rk_kpd, RK_KPD_MEM1);
+ 		now[0] = pmic_ok ? !(top & RK_TOP_PWRKEY_DEB) : rk_keys[0].down;
+-		now[1] = pmic_ok ? !(top & RK_TOP_HOMEKEY_DEB) : rk_keys[1].down;
+-		now[2] = rk_kpd &&
++		now[1] = rk_kpd &&
+ 		    !__atomic_load_n(&rk_kpd_native, __ATOMIC_ACQUIRE) ?
+-		    !(mem1 & 1u) : rk_keys[2].down;
++		    !(mem1 & RK_A34_KPD_VOLUP) : rk_keys[1].down;
++		now[2] = pmic_ok ? !(top & RK_TOP_HOMEKEY_DEB) : rk_keys[2].down;
+ 		if (pmic_ok) {
+ 			rk_errors = 0;
+ 		} else if ((rk_errors++ % 250u) == 0) {
+@@ -309,7 +315,7 @@ rk_thread(void *arg, wait_result_t result)
+ 		if (!__atomic_load_n(&rk_kpd_native, __ATOMIC_ACQUIRE) &&
+ 		    rk_kpd_irq_ready &&
+ 		    __atomic_load_n(&rk_kpd_irq_masked, __ATOMIC_ACQUIRE) &&
+-		    !now[2]) {
++		    !now[1]) {
+ 			__atomic_store_n(&rk_kpd_irq_masked, 0,
+ 			    __ATOMIC_RELEASE);
+ 			rk_kpd_irq_unmask();
+@@ -346,9 +352,7 @@ ruby_keys_init(void)
+ 	printf("RUBY KEYS: start kpd=%d pwrap=%d top-ok=%d top=%04x mem1=%04x\n",
+ 	    rk_kpd != 0, rk_pwrap != 0, pmic_ok, top,
+ 	    rk_kpd ? ruby_rd16(rk_kpd, RK_KPD_MEM1) : 0xffffu);
+-	if (!__atomic_load_n(&rk_kpd_native, __ATOMIC_ACQUIRE)) {
+-		rk_kpd_irq_init();
+-	}
++	/* A34: poll only, see the top of the file. */
+ 	if (kernel_thread_start(rk_thread, NULL, &thread) == KERN_SUCCESS)
+ 		thread_deallocate(thread);
+ 	else
