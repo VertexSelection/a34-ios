@@ -1,0 +1,1138 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index b0e480e..da19ba3 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -77,6 +77,34 @@
+  * (osfmk/arm/pmap/pmap.c). Boot-arg a34maliwc=2: 0916's physically
+  * contiguous pages behind a device pager (A34MaliWCMemory); a34maliwc=0:
+  * all cacheable, as in 0915.
++ *
++ * A34 (0919): two more requests that are not Linux's, for a client that
++ * does not want to wait in SUBMIT for its job (boot-arg a34maliasync=0: no
++ * such thing, 0x7a answers kIOReturnUnsupported):
++ *
++ *   0x7a SET_MODE { uint32_t async, pad; }: 1: this client's SUBMITs are
++ *        queued from now on; 0: synchronous again, once its queue is empty.
++ *        A client that never asks is synchronous, as before.
++ *   0x7b WAIT_SEQ { uint64_t seq, timeout_ns; uint32_t status, pad; }: until
++ *        every queued job of this client up to number seq is done (0, or
++ *        more than the last: every one queued so far), for at most
++ *        timeout_ns (0: only asked; ~0: no limit): kIOReturnTimeout if they
++ *        are not, kIOReturnAborted if the thread is interrupted (ask again).
++ *        status back: 1 if one of them failed, told once for each failure
++ *        (a later wait says 0 again unless a later job failed).
++ *   GET_PARAM 0x1000: 1 if SET_MODE can queue (0 with a34maliasync=0).
++ *
++ * A queued SUBMIT returns at once with the job's number (the client's own
++ * count, from 1) in in_syncs; an error then means it was not queued. The
++ * jobs of every such client run one at a time in the order they were
++ * queued, in a kernel thread, each exactly as a synchronous SUBMIT runs
++ * its job; a failed one is recovered from as before and the ones behind it
++ * still run. WAIT_BO waits for the queued jobs that name the buffer in
++ * bo_handles (timeout_ns <= 0: kIOReturnBusy while there is one);
++ * GEM_CLOSE waits for them too before the buffer goes, a client that goes
++ * has its queued jobs dropped and its running one waited for; and a
++ * surface's CPU side (IOSurfaceLock, the panel's copy) waits for the jobs
++ * that name the surface. See "queued jobs" below.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -139,6 +167,8 @@ enum {
+ 	kA34PanfrostJmCtxDestroy = 0x4b,
+ 	kA34PanfrostSyncBO      = 0x4c,
+ 	kA34PanfrostQueryBOInfo = 0x4d,
++	kA34MaliSetMode         = 0x7a,         /* A34 (0919): ours, queued or synchronous SUBMIT for this client */
++	kA34MaliWaitSeq         = 0x7b,         /* A34 (0919): ours, wait for this client's queued jobs */
+ 	kA34RedwoodSurface      = 0x7e,         /* A34 (0914): ios-topaz's, an IOSurface's memory as a buffer */
+ };
+ 
+@@ -153,6 +183,7 @@ enum {
+ #define PANFROST_JM_CTX_PRIORITY_HIGH 2u
+ #define PANFROST_MADV_DONTNEED  1u              /* (PANFROST_MADV_WILLNEED 0) */
+ #define DRM_PANFROST_BO_IS_IMPORTED 1u
++#define A34_PARAM_ASYNC         0x1000u         /* A34 (0919): GET_PARAM, ours: 1: SET_MODE can queue this client's jobs */
+ #define A34_REDWOOD_DESCRIBE    0xffffffffu     /* 0x7e's handle in: only describe the surface */
+ 
+ struct a34_drm_version {                /* the start of drm.h's struct drm_version */
+@@ -232,6 +263,21 @@ struct a34_redwood_surface {
+ };
+ static_assert(sizeof(struct a34_redwood_surface) == 40, "ios-topaz's struct redwood_surface is 40 bytes");
+ 
++/* A34 (0919): requests 0x7a and 0x7b (see "queued jobs" below) */
++struct a34_set_mode {
++	uint32_t async;                 /* 1: SUBMIT queues the job and returns; 0: SUBMIT runs it (once the queue is empty). Back: as it is now */
++	uint32_t pad;
++};
++static_assert(sizeof(struct a34_set_mode) == 8, "SET_MODE is 8 bytes");
++
++struct a34_wait_seq {
++	uint64_t seq;                   /* this client's jobs up to this number (0, or past the last: all queued so far) */
++	uint64_t timeout_ns;            /* from now; 0: only ask; ~0: no limit */
++	uint32_t status;                /* back: 0 all done, 1 one of them failed (each failure told once) */
++	uint32_t pad;
++};
++static_assert(sizeof(struct a34_wait_seq) == 24, "WAIT_SEQ is 24 bytes");
++
+ union a34_request {
+ 	struct a34_drm_version version;
+ 	struct a34_gem_close close;
+@@ -247,6 +293,8 @@ union a34_request {
+ 	struct a34_sync_bo sync;
+ 	struct a34_query_bo_info info;
+ 	struct a34_redwood_surface surface;
++	struct a34_set_mode mode;
++	struct a34_wait_seq waitseq;
+ 	uint8_t raw[64];                /* the largest: struct drm_version */
+ };
+ 
+@@ -259,12 +307,15 @@ struct a34_bo {
+ 	uint64_t vasize;                /* GPU addresses it holds (a heap: all it asked for) */
+ 	uint64_t backed;                /* bytes of memory, mapped from va on */
+ 	uint32_t flags;                 /* the PANFROST_BO_* it was made with */
+-	uint32_t state;                 /* A34 (0915): A34_BO_* */
++	uint32_t state;                 /* A34 (0915): A34_BO_*; with gA34MaliLock */
++	/* A34 (0919): these two with gA34MaliQLock when the client queues its jobs */
++	uint32_t madv;                  /* MADVISE: PANFROST_MADV_DONTNEED: in Mesa's cache */
++	uint32_t pad;
++	uint64_t busySeq;               /* place in the order of jobs of the last queued job that names it */
+ };
+ 
+ /* A34 (0915): struct a34_bo state */
+ #define A34_BO_MAPPED           1u      /* the program has had it mapped: the CPU may write and read it */
+-#define A34_BO_DONTNEED         2u      /* MADVISE DONTNEED: in Mesa's cache, no job uses it */
+ #define A34_BO_LISTED           4u      /* named by the SUBMIT being run */
+ #define A34_BO_WC               8u      /* A34 (0918): no cacheable mapping of its pages exists for a program: no upkeep */
+ 
+@@ -294,6 +345,10 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_LOGGED_SURFACES     16u             /* A34 (0914): surfaces taken / refused, logged per client */
+ #define A34_LOGGED_WC_FALLBACKS 8u              /* A34 (0916): cacheable for want of contiguous memory, logged per client */
+ #define A34_WC_MAX              (64ull << 20)   /* A34 (0916): bigger buffers are not tried contiguous (a34maliwc=2) */
++#define A34_QUEUE_MAX           1024u           /* A34 (0919): a client's unfinished queued jobs; SUBMIT waits beyond */
++#define A34_CLOSE_WAIT_NS       (5ull * NSEC_PER_SEC)   /* ... GEM_CLOSE waits so long for jobs that name the buffer */
++#define A34_WAIT_BO_NS          (10ull * NSEC_PER_SEC)  /* ... WAIT_BO with a timeout waits so long at most */
++#define A34_FOREVER             (~0ull)
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+@@ -308,6 +363,189 @@ static uint32_t gA34MaliSurfaces = 1;           /* A34 (0914): boot-arg a34malis
+  */
+ static uint32_t gA34MaliWC = 1;
+ 
++/*
++ * A34 (0919): queued jobs.
++ *
++ * A client that asks for it (SET_MODE 0x7a, async = 1; boot-arg
++ * a34maliasync=0 refuses) has its SUBMITs queued: SUBMIT checks the
++ * request, copies bo_handles in, queues the job and returns at once, the
++ * job's number (the client's own count from 1) in in_syncs. One kernel
++ * thread (worker()) takes the jobs of every such client in the order they
++ * were queued and runs each as a synchronous SUBMIT runs: gA34MaliLock held
++ * for the cache upkeep before, a34_mali_submit() (start, wait, recover) and
++ * the upkeep and accounts after. That call waits as it always did: polled
++ * every 10 us for the first half millisecond of a job, then asleep 200 us
++ * at a time; between jobs the lock is free, and with no job queued the
++ * thread sleeps. (Not the GPU's JOB interrupt, INTID 487. It could be
++ * taken: RubyGICInterruptController registers a level SPI for a service
++ * that carries IOInterruptControllers/IOInterruptSpecifiers, as SweetKPD
++ * does. But it is a level interrupt that the handler has to quiet at the
++ * GPU, JOB_INT_MASK is 0 and every reset and recovery would have to keep
++ * it, the GIC's line 487 has never been programmed here, and a mistake in
++ * any of that is an interrupt storm, a phone that hangs. Polling adds at
++ * most 10 us to a job and is what the phone has run so far.)
++ *
++ * Other clients' SUBMITs stay synchronous and take the lock as before;
++ * every job of one client is either queued or not (SET_MODE back to 0
++ * waits for its queue), so the order within a client holds.
++ *
++ * Two locks. gA34MaliLock: the GPU, its address space and the handle
++ * tables, held for the whole of a job. gA34MaliQLock: the queue, each
++ * client's job numbers, and of each buffer the last queued job that names
++ * it (busySeq) and its MADVISE state; never held across a job, taken after
++ * gA34MaliLock where both are, and nobody sleeps on the queue with
++ * gA34MaliLock held (the worker needs it to get anywhere). A queuing
++ * client's SUBMIT, WAIT_BO, MADVISE and WAIT_SEQ take only gA34MaliQLock:
++ * they do not wait for the job that is running.
++ *
++ * Every queued job has a place in one order of all of them (gseq). "Done up
++ * to": one less than the place of the job running or first in the queue,
++ * or the last place given out when there is none. A buffer or surface is
++ * busy while the queue is not done up to its busySeq: GEM_CLOSE and client
++ * close wait for that before the pages leave the GPU's tables (a closing
++ * client's queued jobs are dropped, the running one waited for), WAIT_BO
++ * answers by it, and so does the CPU's side of a surface
++ * (a34_mali_surface_idle(): IOSurfaceLock and AppleCLCD's copy wait for the
++ * jobs that name the surface).
++ */
++class RedwoodMaliUserClient;
++
++struct a34_qjob {
++	struct a34_qjob *next;
++	RedwoodMaliUserClient *client;  /* held until the job is done or dropped */
++	uint32_t *handles;              /* SUBMIT's bo_handles, copied in (NULL: all) */
++	uint32_t nhandles;
++	uint32_t depth;                 /* jobs ahead of it when it was queued */
++	bool all;                       /* the list could not be read: every buffer counts as named */
++	bool failed;
++	uint64_t seq;                   /* the client's number for it (WAIT_SEQ) */
++	uint64_t gseq;                  /* its place in the order of every client's queued jobs */
++	uint64_t queued;                /* mach time it was queued */
++	struct a34_mali_job job;
++};
++
++static IOLock *gA34MaliQLock;
++static struct a34_qjob *gA34MaliQHead, *gA34MaliQTail, *gA34MaliQRunning;
++static uint64_t gA34MaliQSeq;                   /* the last place given out */
++static uint32_t gA34MaliQDepth;                 /* jobs queued and not yet running */
++static uint32_t gA34MaliAsync = 1;              /* boot-arg a34maliasync=0: SET_MODE is refused, every SUBMIT synchronous */
++static volatile SInt32 gA34MaliWaiters;         /* threads waiting for gA34MaliLock, the worker not counted */
++static int gA34MaliQWork, gA34MaliQDone;        /* what the worker, and who waits for jobs, sleep on */
++static void a34_mali_worker(void *arg, wait_result_t result) __attribute__((noreturn));  /* (RedwoodMaliUserClient::worker()) */
++
++/*
++ * gA34MaliLock for everything but the worker's next job. The lock is not
++ * fair: the worker, back for its next job a microsecond after it let go,
++ * would take it again before a thread it has just woken has run. So such
++ * threads are counted, and the worker lets them go first (worker()).
++ */
++static void
++a34_gpu_lock(void)
++{
++	OSIncrementAtomic(&gA34MaliWaiters);
++	IOLockLock(gA34MaliLock);
++	OSDecrementAtomic(&gA34MaliWaiters);
++}
++
++/* The queue's lock, where gA34MaliLock is held too (a34maliasync=0: there is none, and nothing is queued). */
++static void
++a34_q_lock(void)
++{
++	if (gA34MaliQLock != NULL) {
++		IOLockLock(gA34MaliQLock);
++	}
++}
++
++static void
++a34_q_unlock(void)
++{
++	if (gA34MaliQLock != NULL) {
++		IOLockUnlock(gA34MaliQLock);
++	}
++}
++
++/* With the queue lock held: every queued job up to this place in the order is done (or was dropped). */
++static uint64_t
++a34_q_done(void)
++{
++	if (gA34MaliQRunning != NULL) {
++		return gA34MaliQRunning->gseq - 1;
++	}
++	if (gA34MaliQHead != NULL) {
++		return gA34MaliQHead->gseq - 1;
++	}
++	return gA34MaliQSeq;
++}
++
++/*
++ * With the queue lock held (let go of while asleep): until the queue is done
++ * up to `gseq`, for at most `ns` (0: only look; A34_FOREVER: no limit).
++ * THREAD_AWAKENED: it is; THREAD_TIMED_OUT; THREAD_INTERRUPTED (only with
++ * THREAD_ABORTSAFE: the thread is to go).
++ */
++static int
++a34_q_wait(uint64_t gseq, uint64_t ns, UInt32 interruptible)
++{
++	uint64_t deadline = 0;
++	int res;
++
++	if (ns != 0 && ns != A34_FOREVER) {
++		nanoseconds_to_absolutetime(ns, &deadline);
++		deadline += mach_absolute_time();
++	}
++	while (a34_q_done() < gseq) {
++		if (ns == 0) {
++			return THREAD_TIMED_OUT;
++		}
++		if (ns == A34_FOREVER) {
++			res = IOLockSleep(gA34MaliQLock, &gA34MaliQDone, interruptible);
++		} else {
++			res = IOLockSleepDeadline(gA34MaliQLock, &gA34MaliQDone, deadline, interruptible);
++		}
++		if (res != THREAD_AWAKENED) {
++			return a34_q_done() >= gseq ? THREAD_AWAKENED : (res == THREAD_TIMED_OUT ? THREAD_TIMED_OUT : THREAD_INTERRUPTED);
++		}
++	}
++	return THREAD_AWAKENED;
++}
++
++static void
++a34_qjob_free(struct a34_qjob *j)
++{
++	if (j->handles != NULL) {
++		IOFreeData(j->handles, j->nhandles * sizeof(uint32_t));
++	}
++	IODelete(j, struct a34_qjob, 1);
++}
++
++/*
++ * SweetSurface.h: before the CPU reads or writes a surface the GPU uses
++ * (IOSurfaceLock, AppleCLCD's copy to the panel): wait, at most `ms`, for
++ * the queued jobs that name it, or the CPU sees a picture half drawn.
++ * False: they were not done in that time (said in the log a few times).
++ */
++bool
++a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
++{
++	static uint32_t said;
++	uint64_t busy = surface->gpuBusySeq;
++	bool idle = true;
++
++	if (gA34MaliQLock == NULL || busy == 0) {
++		return true;
++	}
++	IOLockLock(gA34MaliQLock);
++	if (a34_q_done() < busy) {
++		idle = a34_q_wait(busy, (uint64_t)ms * NSEC_PER_MSEC, THREAD_UNINT) == THREAD_AWAKENED;
++	}
++	IOLockUnlock(gA34MaliQLock);
++	if (!idle && said < 8) {
++		said++;
++		IOLog("A34 MALI UC: surface %u: the jobs that name it were not done in %u ms; the CPU goes on\n", surface->id, ms);
++	}
++	return idle;
++}
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ class RedwoodMali : public IOService
+@@ -353,6 +591,24 @@ RedwoodMaliStart(void)
+ 	}
+ 	(void)PE_parse_boot_argn("a34malisurf", &gA34MaliSurfaces, sizeof(gA34MaliSurfaces));
+ 	(void)PE_parse_boot_argn("a34maliwc", &gA34MaliWC, sizeof(gA34MaliWC));
++	(void)PE_parse_boot_argn("a34maliasync", &gA34MaliAsync, sizeof(gA34MaliAsync));
++	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
++		/* A34 (0919): the queue and the thread that runs it */
++		IOLock *qlock = IOLockAlloc();
++		thread_t thread;
++
++		if (qlock == NULL) {
++			gA34MaliAsync = 0;
++		} else {
++			gA34MaliQLock = qlock;
++			if (kernel_thread_start(&a34_mali_worker, NULL, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++			} else {
++				gA34MaliAsync = 0;      /* (the lock stays: nothing is ever queued) */
++				IOLog("A34 MALI UC: no thread for queued jobs: every SUBMIT stays synchronous\n");
++			}
++		}
++	}
+ 	gpu = OSTypeAlloc(RedwoodMali);
+ 	if (gA34MaliLock == NULL || platform == NULL || gpu == NULL || !gpu->init()) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -376,6 +632,8 @@ RedwoodMaliStart(void)
+ 	    (unsigned long long)(gA34MaliWiredMax >> 20), gA34MaliSurfaces ? "shared" : "not shared (a34malisurf=0)",
+ 	    gA34MaliWC == 0 ? "cacheable (a34maliwc=0)" : gA34MaliWC == 2 ? "write-combined, contiguous (a34maliwc=2)" :
+ 	    "write-combined");
++	IOLog("A34 MALI UC: queued jobs (SET_MODE 0x7a, WAIT_SEQ 0x7b) %s\n", gA34MaliAsync ? "on request" :
++	    "refused (a34maliasync=0 or no thread)");
+ 	return true;
+ }
+ 
+@@ -478,7 +736,16 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	/* A34 (0915): cache upkeep per job, for the log: this window's jobs, mach time upkeep took (all, most), job ns, bytes */
+ 	uint32_t fWinJobs;
+ 	uint64_t fWinUpkeep, fWinUpkeepMax, fWinJobNs, fWinBytes, fWinStarted;
++	/* A34 (0919): of the window's jobs, the queued ones: how many, jobs ahead of them, mach time from SUBMIT to done */
++	uint32_t fWinQJobs, fWinQDepthMax;
++	uint64_t fWinQDepth, fWinQWait, fWinQWaitMax;
+ 	bool fOpen, fClosed;
++	/* A34 (0919), with gA34MaliQLock: */
++	bool fAsync, fClosing;                  /* SUBMIT queues; the client is going, nothing more is queued */
++	uint32_t fModeSaid;
++	uint64_t fLastSeq, fDoneSeq;            /* its jobs queued, and done, by its own numbers */
++	uint64_t fFailFirst, fFailLast;         /* failed jobs WAIT_SEQ has not told of: the first, the last */
++	uint64_t fBusyAllSeq;                   /* place in the order of its last job that named every buffer */
+ 	char fName[32];
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+@@ -487,6 +754,13 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	bool markListed(user_addr_t list, uint32_t count);
+ 	uint64_t upkeep(bool before, bool all);
+ 	void upkeepLog(uint32_t n, uint32_t requirements, uint64_t before, uint64_t after, uint64_t ticks, uint64_t jobNs);
++	IOReturn runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q);
++	void runQueued(struct a34_qjob *j);
++	IOReturn queueSubmit(struct a34_submit *req);
++	IOReturn setMode(struct a34_set_mode *req);
++	IOReturn waitSeq(struct a34_wait_seq *req);
++	IOReturn requestQueued(uint32_t selector, union a34_request *r);
++	void dropQueued(void);
+ 	void releaseAll(void);
+ 	void describeFault(uint64_t va);
+ 	IOReturn createBo(struct a34_create_bo *req);
+@@ -500,6 +774,7 @@ public:
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	static void worker(void *arg, wait_result_t result) __attribute__((noreturn));  /* A34 (0919): the thread that runs queued jobs */
+ };
+ 
+ OSDefineMetaClassAndStructors(RedwoodMaliUserClient, IOUserClient);
+@@ -520,7 +795,7 @@ RedwoodMaliUserClient::start(IOService *provider)
+ 		return false;
+ 	}
+ 	proc_selfname(fName, sizeof(fName));
+-	IOLockLock(gA34MaliLock);
++	a34_gpu_lock();
+ 	fOpen = true;
+ 	clients = ++gA34MaliClients;
+ 	IOLockUnlock(gA34MaliLock);
+@@ -595,7 +870,7 @@ RedwoodMaliUserClient::upkeep(bool before, bool all)
+ 
+ 	for (uint32_t i = 0; i < A34_BOS; i++) {
+ 		struct a34_bo *b = &fBos[i];
+-		bool listed = all || (b->state & A34_BO_LISTED) != 0;
++		bool named = (b->state & A34_BO_LISTED) != 0, listed = all || named;
+ 		uintptr_t va;
+ 
+ 		if (!before) {
+@@ -603,8 +878,13 @@ RedwoodMaliUserClient::upkeep(bool before, bool all)
+ 		}
+ 		if (b->mem != NULL) {
+ 			/* (0916: a write-combined one needs nothing: the CPU's caches never hold anything of it) */
++			/*
++			 * (0919: of a client that queues, one in Mesa's cache that the
++			 * job names is not skipped: it was put there after SUBMIT,
++			 * which is before the job ran)
++			 */
+ 			if ((b->state & A34_BO_WC) != 0 || (b->flags & PANFROST_BO_HEAP) != 0 || (b->state & A34_BO_MAPPED) == 0 ||
+-			    (b->state & A34_BO_DONTNEED) != 0 || (!before && !listed)) {
++			    (b->madv == PANFROST_MADV_DONTNEED && !(fAsync && (named || all))) || (!before && !listed)) {
+ 				continue;
+ 			}
+ 			va = (uintptr_t)b->mem->getBytesNoCopy();
+@@ -673,8 +953,464 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 		    (unsigned long long)(fWinJobNs / 1000 / fWinJobs), (long long)sweet_surface_sync_stats[0],
+ 		    (long long)sweet_surface_sync_stats[1], (long long)(sweet_surface_sync_stats[2] >> 20),
+ 		    (unsigned long long)(surf / NSEC_PER_MSEC));
++		if (fWinQJobs != 0) {
++			uint64_t qwait, qmost;
++
++			absolutetime_to_nanoseconds(fWinQWait, &qwait);
++			absolutetime_to_nanoseconds(fWinQWaitMax, &qmost);
++			IOLog("A34 MALI UC: %s: %u of them queued: %llu jobs ahead of each on average (most %u), done %llu us after "
++			    "their SUBMIT on average (most %llu us)\n", fName, fWinQJobs, (unsigned long long)(fWinQDepth / fWinQJobs),
++			    fWinQDepthMax, (unsigned long long)(qwait / 1000 / fWinQJobs), (unsigned long long)(qmost / 1000));
++		}
+ 		fWinJobs = 0;
+ 		fWinUpkeep = fWinUpkeepMax = fWinJobNs = fWinBytes = 0;
++		fWinQJobs = fWinQDepthMax = 0;
++		fWinQDepth = fWinQWait = fWinQWaitMax = 0;
++	}
++}
++
++/*
++ * With the lock held: one job chain run to its end, with the cache upkeep
++ * before and after it, the accounts and what the log gets; what SUBMIT
++ * answers. The buffers it names are marked (markListed(), runQueued()) or
++ * `all`; t0: the mach time the marking began. A34 (0919): the same for a
++ * synchronous SUBMIT (q NULL, in the caller's thread) and a queued job (in
++ * the worker's).
++ */
++IOReturn
++RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q)
++{
++	uint64_t ticks, cleaned, flushed;
++	uint32_t n = ++fSubmits;
++	IOReturn ret = kIOReturnSuccess;
++	bool done;
++
++	/* A34 (0915): only what the CPU and this job can both touch (upkeep()) */
++	cleaned = upkeep(true, all);            /* the program's writes to memory for the GPU */
++	ticks = mach_absolute_time() - t0;
++	done = a34_mali_submit(job);
++	t0 = mach_absolute_time();
++	flushed = upkeep(false, all);           /* and no stale lines over what the GPU wrote */
++	ticks += mach_absolute_time() - t0;
++	if (q != NULL) {
++		uint64_t waited = mach_absolute_time() - q->queued;
++
++		fWinQJobs++;
++		fWinQDepth += q->depth;
++		if (q->depth > fWinQDepthMax) {
++			fWinQDepthMax = q->depth;
++		}
++		fWinQWait += waited;
++		if (waited > fWinQWaitMax) {
++			fWinQWaitMax = waited;
++		}
++	}
++	upkeepLog(n, job->requirements, cleaned, flushed, ticks, job->ns);
++	if (!done) {
++		fFailed++;
++		IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s) failed after %llu us: JOB_INT 0x%08x JS_STATUS 0x%08x MMU_INT 0x%08x\n",
++		    fName, n, (unsigned long long)job->jc, (job->requirements & PANFROST_JD_REQ_FS) ? "fragment" : "vertex/tiler/compute",
++		    (unsigned long long)(job->ns / 1000), job->job_raw, job->js_status, job->mmu_raw);
++		if (job->mmu_raw != 0) {
++			describeFault(job->fault_va);
++		}
++		ret = a34_mali_ready() ? kIOReturnIOError : kIOReturnNotReady;
++	}
++	return ret;
++}
++
++/* A34 (0919). The worker's: a queued job run as a SUBMIT is. Takes the lock itself. */
++void
++RedwoodMaliUserClient::runQueued(struct a34_qjob *j)
++{
++	IOLockLock(gA34MaliLock);       /* (not a34_gpu_lock(): the worker is who those go before) */
++	if (fBos != NULL && fOpen && !fClosed) {
++		uint64_t t0 = mach_absolute_time();
++
++		for (uint32_t i = 0; !j->all && i < j->nhandles; i++) {
++			struct a34_bo *b = lookup(j->handles[i]);
++
++			if (b != NULL) {
++				b->state |= A34_BO_LISTED;
++			}
++		}
++		j->failed = runChain(&j->job, j->all, t0, j) != kIOReturnSuccess;
++	} else {
++		j->failed = true;
++	}
++	IOLockUnlock(gA34MaliLock);
++}
++
++/*
++ * A34 (0919): the thread that runs the queued jobs of every client, one at a
++ * time in the order they were queued, asleep while there is none.
++ */
++void
++RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
++{
++	for (;;) {
++		struct a34_qjob *j;
++		RedwoodMaliUserClient *c;
++
++		IOLockLock(gA34MaliQLock);
++		while (gA34MaliQHead == NULL) {
++			(void)IOLockSleep(gA34MaliQLock, &gA34MaliQWork, THREAD_UNINT);
++		}
++		j = gA34MaliQHead;
++		gA34MaliQHead = j->next;
++		if (gA34MaliQHead == NULL) {
++			gA34MaliQTail = NULL;
++		}
++		j->next = NULL;
++		gA34MaliQDepth--;
++		gA34MaliQRunning = j;
++		IOLockUnlock(gA34MaliQLock);
++		/* whoever waits for the GPU's lock to make, map or close a buffer goes first (a34_gpu_lock()): 1 ms at most */
++		for (uint32_t waits = 0; gA34MaliWaiters > 0 && waits < 100; waits++) {
++			IODelay(10);
++		}
++		c = j->client;
++		c->runQueued(j);
++		IOLockLock(gA34MaliQLock);
++		c->fDoneSeq = j->seq;
++		if (j->failed) {
++			if (c->fFailFirst == 0) {
++				c->fFailFirst = j->seq;
++			}
++			c->fFailLast = j->seq;
++		}
++		gA34MaliQRunning = NULL;
++		IOLockWakeup(gA34MaliQLock, &gA34MaliQDone, false);
++		IOLockUnlock(gA34MaliQLock);
++		a34_qjob_free(j);
++		c->release();
++	}
++}
++
++static void
++a34_mali_worker(void *arg, wait_result_t result)
++{
++	RedwoodMaliUserClient::worker(arg, result);
++}
++
++/*
++ * A34 (0919): SUBMIT of a client that queues. The request is checked and
++ * bo_handles copied in here, in the caller's thread; the job runs later, in
++ * the worker's. Back at once, the job's number in in_syncs. Takes only the
++ * queue's lock.
++ */
++IOReturn
++RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
++{
++	struct a34_qjob *j;
++	uint32_t n = req->bo_handle_count;
++	uint64_t seq = 0;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (req->jc == 0 || (req->requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	j = IONewZero(struct a34_qjob, 1);
++	if (j == NULL) {
++		return kIOReturnNoMemory;
++	}
++	j->all = true;
++	if (req->bo_handles != 0 && n != 0 && n <= A34_SUBMIT_BOS_MAX) {
++		j->handles = (uint32_t *)IOMallocData(n * sizeof(uint32_t));
++		if (j->handles != NULL) {
++			j->nhandles = n;
++			if (copyin(req->bo_handles, j->handles, n * sizeof(uint32_t)) == 0) {
++				j->all = false;
++			}
++		}
++	}
++	j->client = this;
++	j->job.jc = req->jc;
++	j->job.requirements = req->requirements;
++	retain();                       /* the job's hold on the client, until it is done or dropped */
++
++	IOLockLock(gA34MaliQLock);
++	while (fOpen && !fClosed && !fClosing && fAsync && fLastSeq - fDoneSeq >= A34_QUEUE_MAX) {
++		/* the program is far ahead of the GPU: it waits here */
++		if (IOLockSleep(gA34MaliQLock, &gA34MaliQDone, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
++			ret = kIOReturnAborted;
++			break;
++		}
++	}
++	if (ret == kIOReturnSuccess && (fBos == NULL || !fOpen || fClosed || fClosing)) {
++		ret = kIOReturnNotOpen;
++	} else if (ret == kIOReturnSuccess && !fAsync) {
++		ret = kIOReturnNotPermitted;    /* (SET_MODE 0 from another thread meanwhile) */
++	}
++	if (ret == kIOReturnSuccess) {
++		seq = j->seq = ++fLastSeq;
++		j->gseq = ++gA34MaliQSeq;
++		j->queued = mach_absolute_time();
++		j->depth = gA34MaliQDepth + (gA34MaliQRunning != NULL ? 1 : 0);
++		/* what it names is busy until it is done: GEM_CLOSE, WAIT_BO, IOSurfaceLock and the panel's copy wait for that */
++		if (j->all) {
++			fBusyAllSeq = j->gseq;
++			for (uint32_t i = 0; i < A34_BOS; i++) {
++				if (fBos[i].surface != NULL) {
++					fBos[i].surface->gpuBusySeq = j->gseq;
++				}
++			}
++		} else {
++			for (uint32_t i = 0; i < j->nhandles; i++) {
++				uint32_t h = j->handles[i];
++
++				if (h != 0 && h <= A34_BOS && a34_bo_used(&fBos[h - 1])) {
++					struct a34_bo *b = &fBos[h - 1];
++
++					b->busySeq = j->gseq;
++					if (b->surface != NULL) {
++						b->surface->gpuBusySeq = j->gseq;
++					}
++				}
++			}
++		}
++		if (gA34MaliQTail != NULL) {
++			gA34MaliQTail->next = j;
++		} else {
++			gA34MaliQHead = j;
++		}
++		gA34MaliQTail = j;
++		gA34MaliQDepth++;
++		IOLockWakeup(gA34MaliQLock, &gA34MaliQWork, true);
++	}
++	IOLockUnlock(gA34MaliQLock);
++	if (ret != kIOReturnSuccess) {
++		a34_qjob_free(j);
++		release();
++		return ret;
++	}
++	req->in_syncs = seq;            /* (j is the worker's now, and may be gone) */
++	return kIOReturnSuccess;
++}
++
++/* A34 (0919): request 0x7a. */
++IOReturn
++RedwoodMaliUserClient::setMode(struct a34_set_mode *req)
++{
++	IOReturn ret = kIOReturnSuccess;
++	bool say = false;
++
++	if (gA34MaliAsync == 0 || gA34MaliQLock == NULL) {
++		return kIOReturnUnsupported;
++	}
++	if (req->async > 1 || req->pad != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gA34MaliQLock);
++	if (fBos == NULL || !fOpen || fClosed || fClosing) {
++		ret = kIOReturnNotOpen;
++	} else if (req->async != 0) {
++		say = !fAsync;
++		fAsync = true;
++	} else {
++		/* back to synchronous: once its queue is empty, so that its jobs stay in their order */
++		while (fDoneSeq < fLastSeq && !fClosing) {
++			if (IOLockSleep(gA34MaliQLock, &gA34MaliQDone, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
++				ret = kIOReturnAborted;
++				break;
++			}
++		}
++		if (ret == kIOReturnSuccess) {
++			say = fAsync;
++			fAsync = false;
++		}
++	}
++	req->async = fAsync ? 1 : 0;
++	IOLockUnlock(gA34MaliQLock);
++	if (say && fModeSaid < 4) {
++		fModeSaid++;
++		IOLog("A34 MALI UC: %s: SUBMIT is %s from now on\n", fName, req->async ? "queued (jobs run by the kernel's thread)" :
++		    "synchronous again");
++	}
++	return ret;
++}
++
++/* A34 (0919): request 0x7b. */
++IOReturn
++RedwoodMaliUserClient::waitSeq(struct a34_wait_seq *req)
++{
++	uint64_t target, deadline = 0;
++	IOReturn ret = kIOReturnSuccess;
++	int res;
++
++	if (gA34MaliQLock == NULL) {
++		return kIOReturnUnsupported;
++	}
++	if (req->timeout_ns != 0 && req->timeout_ns != A34_FOREVER) {
++		/* (more than a day is a day: no overflow of the mach time) */
++		nanoseconds_to_absolutetime(req->timeout_ns < 86400ull * NSEC_PER_SEC ? req->timeout_ns : 86400ull * NSEC_PER_SEC,
++		    &deadline);
++		deadline += mach_absolute_time();
++	}
++	IOLockLock(gA34MaliQLock);
++	target = (req->seq == 0 || req->seq > fLastSeq) ? fLastSeq : req->seq;
++	while (fDoneSeq < target) {
++		if (req->timeout_ns == 0) {
++			ret = kIOReturnTimeout;
++			break;
++		}
++		if (req->timeout_ns == A34_FOREVER) {
++			res = IOLockSleep(gA34MaliQLock, &gA34MaliQDone, THREAD_ABORTSAFE);
++		} else {
++			res = IOLockSleepDeadline(gA34MaliQLock, &gA34MaliQDone, deadline, THREAD_ABORTSAFE);
++		}
++		if (res != THREAD_AWAKENED && fDoneSeq < target) {
++			ret = res == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
++			break;
++		}
++	}
++	req->status = 0;
++	if (ret == kIOReturnSuccess && fFailFirst != 0 && fFailFirst <= target) {
++		/* told once: the failures up to here; one after it is for a later wait */
++		req->status = 1;
++		if (fFailLast <= target) {
++			fFailFirst = fFailLast = 0;
++		} else {
++			fFailFirst = fFailLast;
++		}
++	}
++	IOLockUnlock(gA34MaliQLock);
++	return ret;
++}
++
++/*
++ * A34 (0919): the requests about one buffer that a client that queues makes
++ * all the time (Mesa: WAIT_BO, MADVISE and SET_LABEL_BO for every buffer
++ * that goes into or comes out of its cache; MMAP_BO, GET_BO_OFFSET and
++ * QUERY_BO_INFO for every new one), with only the queue's lock: behind
++ * gA34MaliLock each would wait for the job that is running. They read and
++ * write numbers of the handle and nothing it points to; a handle cannot go
++ * while the queue's lock is held (closeBo()).
++ *
++ * WAIT_BO: until the queued jobs that name the buffer are done (not every
++ * job of the client: Mesa asks it of the oldest buffer in its cache before
++ * it uses it again). timeout_ns <= 0: only asked, kIOReturnBusy if not;
++ * else waited for, A34_WAIT_BO_NS at most.
++ */
++IOReturn
++RedwoodMaliUserClient::requestQueued(uint32_t selector, union a34_request *r)
++{
++	struct a34_bo *b;
++	IOReturn ret = kIOReturnSuccess;
++	uint32_t handle;
++	uint64_t busy;
++	int res;
++
++	switch (selector) {
++	case kA34PanfrostWaitBO:
++		handle = r->wait.handle;
++		break;
++	case kA34PanfrostMadvise:
++		handle = r->madvise.handle;
++		break;
++	case kA34PanfrostSetLabelBO:
++		handle = r->label.handle;
++		break;
++	case kA34PanfrostMmapBO:
++		handle = r->mmapbo.handle;
++		break;
++	case kA34PanfrostGetBOOffset:
++		handle = r->offset.handle;
++		break;
++	case kA34PanfrostQueryBOInfo:
++		handle = r->info.handle;
++		break;
++	default:
++		return kIOReturnUnsupported;
++	}
++	IOLockLock(gA34MaliQLock);
++	if (fBos == NULL || !fOpen || fClosed || fClosing) {
++		ret = kIOReturnNotOpen;
++	} else if (handle == 0 || handle > A34_BOS || !a34_bo_used(&fBos[handle - 1])) {
++		ret = kIOReturnNotFound;
++	} else {
++		b = &fBos[handle - 1];
++		switch (selector) {
++		case kA34PanfrostWaitBO:
++			busy = b->busySeq > fBusyAllSeq ? b->busySeq : fBusyAllSeq;
++			if (a34_q_done() < busy) {
++				/* (b is not looked at after this: the lock is let go of in there) */
++				res = a34_q_wait(busy, r->wait.timeout_ns <= 0 ? 0 : A34_WAIT_BO_NS, THREAD_ABORTSAFE);
++				if (res != THREAD_AWAKENED) {
++					ret = r->wait.timeout_ns <= 0 ? kIOReturnBusy : res == THREAD_TIMED_OUT ? kIOReturnTimeout :
++					    kIOReturnAborted;
++				}
++			}
++			break;
++		case kA34PanfrostMadvise:       /* nothing is ever purged: kept for the cache upkeep (upkeep()) */
++			if (r->madvise.madv > PANFROST_MADV_DONTNEED) {
++				ret = kIOReturnBadArgument;
++			} else {
++				b->madv = r->madvise.madv;
++				r->madvise.retained = 1;
++			}
++			break;
++		case kA34PanfrostMmapBO:
++			if (r->mmapbo.flags != 0 || (b->flags & PANFROST_BO_HEAP) != 0) {
++				ret = kIOReturnBadArgument;
++			} else {
++				r->mmapbo.offset = (uint64_t)handle << 12;
++			}
++			break;
++		case kA34PanfrostGetBOOffset:
++			r->offset.offset = b->va;
++			break;
++		case kA34PanfrostQueryBOInfo:
++			r->info.extra_flags = b->surface != NULL ? DRM_PANFROST_BO_IS_IMPORTED : 0;
++			r->info.create_flags = b->flags;
++			r->info.pad = 0;
++			break;
++		default:                        /* SET_LABEL_BO: labels are not kept */
++			break;
++		}
++	}
++	IOLockUnlock(gA34MaliQLock);
++	return ret;
++}
++
++/*
++ * A34 (0919): the client is going. Nothing more of it is queued, what is
++ * queued and not running is dropped, and its job that is running is waited
++ * for: after this no job of it uses the GPU or its buffers.
++ */
++void
++RedwoodMaliUserClient::dropQueued(void)
++{
++	struct a34_qjob *dropped = NULL, **link, *j;
++
++	if (gA34MaliQLock == NULL) {
++		return;
++	}
++	IOLockLock(gA34MaliQLock);
++	fClosing = true;
++	gA34MaliQTail = NULL;
++	for (link = &gA34MaliQHead; (j = *link) != NULL;) {
++		if (j->client == this) {
++			*link = j->next;
++			j->next = dropped;
++			dropped = j;
++			gA34MaliQDepth--;
++		} else {
++			gA34MaliQTail = j;
++			link = &j->next;
++		}
++	}
++	while (gA34MaliQRunning != NULL && gA34MaliQRunning->client == this) {
++		(void)IOLockSleep(gA34MaliQLock, &gA34MaliQDone, THREAD_UNINT);
++	}
++	fDoneSeq = fLastSeq;
++	fAsync = false;
++	IOLockWakeup(gA34MaliQLock, &gA34MaliQDone, false);     /* (the order is done further now, and its waiters are) */
++	IOLockUnlock(gA34MaliQLock);
++	while ((j = dropped) != NULL) {
++		dropped = j->next;
++		a34_qjob_free(j);
++		release();                      /* (the caller holds the client) */
+ 	}
+ }
+ 
+@@ -690,7 +1426,8 @@ RedwoodMaliUserClient::lookup(uint32_t handle)
+ /*
+  * With the lock held: a buffer out of the GPU's tables and the client's
+  * accounts. No job can be using it: every job ran to its end before its
+- * SUBMIT returned. A34 (0918): what it holds is let go of afterwards,
++ * SUBMIT returned (0919: or closeBo() and dropQueued() have waited for the
++ * queued ones that name it). A34 (0918): what it holds is let go of afterwards,
+  * without the lock (a34_bo_dispose()): freeing pages and giving them their
+  * cache attributes back takes time no other program's job should wait for.
+  */
+@@ -734,12 +1471,40 @@ RedwoodMaliUserClient::closeBo(uint32_t handle)
+ 	struct a34_bo gone, *b;
+ 
+ 	bzero(&gone, sizeof(gone));
+-	IOLockLock(gA34MaliLock);
++	if (gA34MaliQLock != NULL && fBos != NULL && handle != 0 && handle <= A34_BOS) {
++		/*
++		 * A34 (0919): the queued jobs that name it first (Mesa lets go of a
++		 * buffer once the job is submitted, which is before it has run).
++		 * If they are not done in A34_CLOSE_WAIT_NS it goes all the same:
++		 * it leaves the GPU's tables between two jobs and before its pages
++		 * are freed, so a job that still names it faults and fails; it
++		 * does not reach freed memory.
++		 */
++		uint64_t busy;
++		bool late = false;
++
++		IOLockLock(gA34MaliQLock);
++		busy = fBos[handle - 1].busySeq;
++		if (fBusyAllSeq > busy) {
++			busy = fBusyAllSeq;
++		}
++		if (a34_q_done() < busy) {
++			late = a34_q_wait(busy, A34_CLOSE_WAIT_NS, THREAD_UNINT) != THREAD_AWAKENED;
++		}
++		IOLockUnlock(gA34MaliQLock);
++		if (late) {
++			IOLog("A34 MALI UC: %s: buffer %u is closed with queued jobs that name it not done\n", fName, handle);
++		}
++	}
++	a34_gpu_lock();
+ 	b = (fBos != NULL && fOpen) ? lookup(handle) : NULL;
+ 	if (b != NULL) {
+ 		detachBo(b);
++		/* (0919: the handle goes with the queue's lock held: SUBMIT reads a surface's handle with only that) */
++		a34_q_lock();
+ 		gone = *b;
+ 		bzero(b, sizeof(*b));
++		a34_q_unlock();
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
+ 	if (!a34_bo_used(&gone)) {
+@@ -755,7 +1520,8 @@ RedwoodMaliUserClient::releaseAll(void)
+ 	uint32_t freed = 0, clients = 0;
+ 	bool was = false;
+ 
+-	IOLockLock(gA34MaliLock);
++	dropQueued();                   /* A34 (0919): no job of this client is queued or running after this */
++	a34_gpu_lock();
+ 	if (fOpen && !fClosed) {
+ 		was = true;
+ 		for (uint32_t i = 0; i < A34_BOS; i++) {
+@@ -887,7 +1653,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	 */
+ 	a34_mali_cpu_flush((uintptr_t)mem->getBytesNoCopy(), backed);
+ 
+-	IOLockLock(gA34MaliLock);
++	a34_gpu_lock();
+ 	if (fBos == NULL || !fOpen || fClosed) {
+ 		ret = kIOReturnNotOpen;
+ 		goto out;
+@@ -1032,7 +1798,7 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 		return kIOReturnSuccess;
+ 	}
+ 
+-	IOLockLock(gA34MaliLock);
++	a34_gpu_lock();
+ 	if (fBos == NULL || !fOpen || fClosed) {
+ 		ret = kIOReturnNotOpen;
+ 		goto out;
+@@ -1096,7 +1862,9 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 		}
+ 		off += len;
+ 	}
++	a34_q_lock();                   /* (0919: as in closeBo()) */
+ 	b->surface = s;                 /* the reference sweet_surface_copy() gave, and gpuShared, until a34_bo_dispose() */
++	a34_q_unlock();
+ 	s = NULL;
+ 	b->kva = kva;
+ 	b->va = va;
+@@ -1129,7 +1897,7 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 	struct a34_bo *b;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+-	IOLockLock(gA34MaliLock);
++	a34_gpu_lock();
+ 	b = lookup(type);
+ 	if (b != NULL && (b->surface != NULL || (b->flags & PANFROST_BO_HEAP) == 0)) {
+ 		if ((b->state & (A34_BO_MAPPED | A34_BO_WC)) == 0) {
+@@ -1185,7 +1953,9 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		r->version.patchlevel = 0;
+ 		break;
+ 	case kA34PanfrostGetParam:
+-		if (r->param.pad != 0 || !a34_mali_param(r->param.param, &r->param.value)) {
++		if (r->param.pad == 0 && r->param.param == A34_PARAM_ASYNC) {
++			r->param.value = gA34MaliAsync != 0 ? 1 : 0;    /* A34 (0919): SET_MODE can queue jobs */
++		} else if (r->param.pad != 0 || !a34_mali_param(r->param.param, &r->param.value)) {
+ 			ret = kIOReturnBadArgument;
+ 		}
+ 		break;
+@@ -1220,11 +1990,7 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+ 			/* A34 (0915): DONTNEED: in Mesa's cache, no job uses it, no cache upkeep for it until WILLNEED */
+-			if (r->madvise.madv == PANFROST_MADV_DONTNEED) {
+-				b->state |= A34_BO_DONTNEED;
+-			} else {
+-				b->state &= ~A34_BO_DONTNEED;
+-			}
++			b->madv = r->madvise.madv;
+ 			r->madvise.retained = 1;
+ 		}
+ 		break;
+@@ -1257,8 +2023,7 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		break;
+ 	case kA34PanfrostSubmit: {
+ 		struct a34_mali_job job;
+-		uint64_t t0, ticks, cleaned, flushed;
+-		uint32_t n;
++		uint64_t t0;
+ 		bool listed;
+ 
+ 		if (r->submit.jc == 0 || (r->submit.requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
+@@ -1268,27 +2033,9 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		bzero(&job, sizeof(job));
+ 		job.jc = r->submit.jc;
+ 		job.requirements = r->submit.requirements;
+-		n = ++fSubmits;
+-		/* A34 (0915): only what the CPU and this job can both touch (upkeep()) */
+ 		t0 = mach_absolute_time();
+ 		listed = markListed(r->submit.bo_handles, r->submit.bo_handle_count);
+-		cleaned = upkeep(true, !listed);        /* the program's writes to memory for the GPU */
+-		ticks = mach_absolute_time() - t0;
+-		bool done = a34_mali_submit(&job);
+-		t0 = mach_absolute_time();
+-		flushed = upkeep(false, !listed);       /* and no stale lines over what the GPU wrote */
+-		ticks += mach_absolute_time() - t0;
+-		upkeepLog(n, job.requirements, cleaned, flushed, ticks, job.ns);
+-		if (!done) {
+-			fFailed++;
+-			IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s) failed after %llu us: JOB_INT 0x%08x JS_STATUS 0x%08x MMU_INT 0x%08x\n",
+-			    fName, n, (unsigned long long)job.jc, (job.requirements & PANFROST_JD_REQ_FS) ? "fragment" : "vertex/tiler/compute",
+-			    (unsigned long long)(job.ns / 1000), job.job_raw, job.js_status, job.mmu_raw);
+-			if (job.mmu_raw != 0) {
+-				describeFault(job.fault_va);
+-			}
+-			ret = a34_mali_ready() ? kIOReturnIOError : kIOReturnNotReady;
+-		}
++		ret = runChain(&job, !listed, t0, NULL);        /* (0919: what SUBMIT did here, shared with queued jobs) */
+ 		break;
+ 	}
+ 	case kA34PanfrostPerfcntEnable:
+@@ -1322,6 +2069,21 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			if (ret != kIOReturnSuccess && ret != kIOReturnUnsupported && fErrors++ < A34_LOGGED_ERRORS) {
+ 				IOLog("A34 MALI UC: %s: request 0x%02x for surface %u -> 0x%x\n", fName, selector, r.surface.surface, ret);
+ 			}
++		} else if (selector == kA34MaliSetMode || selector == kA34MaliWaitSeq || (fAsync &&
++		    (selector == kA34PanfrostSubmit || selector == kA34PanfrostWaitBO || selector == kA34PanfrostMadvise ||
++		    selector == kA34PanfrostSetLabelBO || selector == kA34PanfrostMmapBO || selector == kA34PanfrostGetBOOffset ||
++		    selector == kA34PanfrostQueryBOInfo))) {
++			/*
++			 * A34 (0919): queued jobs. None of these takes the GPU's lock:
++			 * they do not wait for the job that is running.
++			 */
++			ret = selector == kA34MaliSetMode ? setMode(&r.mode) :
++			    selector == kA34MaliWaitSeq ? waitSeq(&r.waitseq) :
++			    selector == kA34PanfrostSubmit ? queueSubmit(&r.submit) : requestQueued(selector, &r);
++			if (ret != kIOReturnSuccess && ret != kIOReturnTimeout && ret != kIOReturnBusy && ret != kIOReturnAborted &&
++			    fErrors++ < A34_LOGGED_ERRORS) {
++				IOLog("A34 MALI UC: %s: request 0x%02x (%u bytes) -> 0x%x\n", fName, selector, insize, ret);
++			}
+ 		} else if (selector == kA34PanfrostCreateBO || selector == kA34DrmGemClose) {
+ 			/* A34 (0918): memory is got before and let go of after the lock is held */
+ 			ret = selector == kA34PanfrostCreateBO ? createBo(&r.create) : closeBo(r.close.handle);
+@@ -1335,7 +2097,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 					return kIOReturnBusy;
+ 				}
+ 			} else {
+-				IOLockLock(gA34MaliLock);
++				a34_gpu_lock();
+ 			}
+ 			ret = request(selector, &r);
+ 			if (ret != kIOReturnSuccess && fErrors++ < A34_LOGGED_ERRORS) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d68829c..32e06d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -598,6 +598,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 			 * kernel's dcache routines are real dc civac loops.)
+ 			 */
+ 			if (s->gpuShared > 0) {
++				/*
++				 * A34 (0919): queued jobs that name it first (half a
++				 * second at most: this is the vsync work loop), or a
++				 * frame that the program did not wait for is shown
++				 * half drawn.
++				 */
++				(void)a34_mali_surface_idle(s, 500);
+ 				/* from the first row copied to the last pixel copied: inside the memory (`last` above) */
+ 				a34_mali_cpu_flush(src + s->offset + (uint64_t)sy * s->bytesPerRow,
+ 				    (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2fa5c19..574a086 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -333,10 +333,15 @@ sweet_surface_sync_count(unsigned which, uint64_t bytes, uint64_t began)
+ void
+ sweet_surface_cpu_begin(SweetSurface *s)
+ {
+-	SInt32 writes = s->gpuWrites;   /* (counted after a job ended: a later one makes this differ again) */
++	SInt32 writes;
+ 	uintptr_t va;
+ 	uint64_t size, began;
+ 
++	if (s->gpuShared > 0) {
++		/* A34 (0919): jobs that name it may still be queued: the picture is whole when they are done */
++		(void)a34_mali_surface_idle(s, 2000);
++	}
++	writes = s->gpuWrites;          /* (counted after a job ended: a later one makes this differ again) */
+ 	if (writes == s->cpuSeen || !sweet_surface_gpu_range(s, &va, &size)) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index d1ecb72..6760054 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -55,8 +55,10 @@ public:
+ 	 */
+ 	SInt32                    gpuWrites;
+ 	SInt32                    cpuSeen;
++	/* A34 (0919): place in the order of queued GPU jobs of the last one that names the surface (A34Mali.cpp) */
++	uint64_t                  gpuBusySeq;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -91,5 +93,12 @@ void sweet_surface_cpu_end(SweetSurface *surface);
+ void sweet_surface_cpu_whole(SweetSurface *surface);
+ extern SInt64 sweet_surface_sync_stats[4];
+ 
++/*
++ * A34 (0919), in A34Mali.cpp: wait, at most ms, for the queued GPU jobs
++ * that name the surface: before the CPU reads or writes it (IOSurfaceLock,
++ * AppleCLCD's copy to the panel). False: they were not done in time.
++ */
++bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
