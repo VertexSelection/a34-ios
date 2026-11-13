@@ -1,0 +1,158 @@
+--- a/include/EGL/eglmesaext.h
++++ b/include/EGL/eglmesaext.h
+@@ -49,6 +49,16 @@
+ #define EGL_DRM_BUFFER_FORMAT_RGB565_MESA       0x3292
+ #endif /* EGL_MESA_drm_image_formats */
+ 
++#ifndef EGL_A34_image_iosurface
++#define EGL_A34_image_iosurface 1
++/* a34-ios (Darwin, panfrost through redwood-drm): an EGLImage of an IOSurface's memory,
++ *   eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_IOSURFACE_A34,
++ *                     (EGLClientBuffer)(uintptr_t)IOSurfaceGetID(surface), NULL)
++ * made as an EGL_LINUX_DMA_BUF_EXT image whose "fd" is the surface ID; the kernel describes
++ * the surface and hands its memory over as a GEM handle (RedwoodMali selector 0x7e). */
++#define EGL_IOSURFACE_A34                       0x3A34
++#endif /* EGL_A34_image_iosurface */
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -41,6 +41,12 @@
+ #ifdef HAVE_LIBDRM
+ #include <xf86drm.h>
+ #include "drm-uapi/drm_fourcc.h"
++#ifdef __APPLE__
++#include <redwood_drm.h> /* libdrm's Darwin stand-in (a34-ios userland/mesa/redwood-drm) */
++#ifndef EGL_IOSURFACE_A34
++#define EGL_IOSURFACE_A34 0x3A34 /* EGL/eglmesaext.h */
++#endif
++#endif
+ #endif
+ #include <GL/gl.h>
+ #include "mesa_interface.h"
+@@ -2629,6 +2635,82 @@
+ 
+ #endif
+ 
++#if defined(HAVE_LIBDRM) && defined(__APPLE__)
++/*
++ * EGL_IOSURFACE_A34 (a34-ios): the buffer is an IOSurface ID. The kernel describes the
++ * surface (redwood_drm_surface(): RedwoodMali selector 0x7e, asked only to describe), and
++ * the image is then made as a dma-buf image whose one plane's "fd" is the surface ID: the
++ * driver imports it with drmPrimeFDToHandle(), which redwood-drm turns into the same
++ * request asked for a GEM handle of the surface's memory. One plane of the formats below,
++ * linear, at the offset and row pitch the kernel gives; anything else is EGL_BAD_MATCH.
++ */
++static uint32_t
++dri2_iosurface_fourcc(uint32_t pixel_format)
++{
++   switch (pixel_format) {
++   case 0x42475241: return DRM_FORMAT_ARGB8888;       /* 'BGRA': B, G, R, A bytes */
++   case 0x52474241: return DRM_FORMAT_ABGR8888;       /* 'RGBA': R, G, B, A bytes */
++   case 0x6c313072: return DRM_FORMAT_ARGB2101010;    /* 'l10r': A2 R10 G10 B10, little-endian */
++   case 0x52476841: return DRM_FORMAT_ABGR16161616F;  /* 'RGhA': R, G, B, A half floats */
++   case 0x4c303038: return DRM_FORMAT_R8;             /* 'L008': one 8-bit channel */
++   case 0x4c303136: return DRM_FORMAT_R16;            /* 'L016': one 16-bit channel */
++   default: return 0;
++   }
++}
++
++static _EGLImage *
++dri2_create_image_iosurface(_EGLDisplay *disp, _EGLContext *ctx,
++                            EGLClientBuffer buffer, const EGLint *attr_list)
++{
++   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
++   uintptr_t id = (uintptr_t)buffer;
++   struct redwood_drm_surface surface = { .surface = (uint32_t)id };
++   uint32_t fourcc;
++
++   if (ctx != NULL) {
++      _eglError(EGL_BAD_PARAMETER, "EGL_IOSURFACE_A34: a context");
++      return NULL;
++   }
++   if (attr_list != NULL && attr_list[0] != EGL_NONE) {
++      _eglError(EGL_BAD_PARAMETER, "EGL_IOSURFACE_A34: attributes");
++      return NULL;
++   }
++   if (id == 0 || id > INT32_MAX) {
++      _eglError(EGL_BAD_PARAMETER, "EGL_IOSURFACE_A34: no IOSurface ID");
++      return NULL;
++   }
++   if (redwood_drm_surface(dri2_dpy->fd_render_gpu, &surface) != 0) {
++      _eglLog(_EGL_DEBUG, "IOSurface %u: the kernel does not describe it (errno %d)",
++              (unsigned)id, errno);
++      _eglError(EGL_BAD_PARAMETER, "EGL_IOSURFACE_A34: not an IOSurface the GPU can use");
++      return NULL;
++   }
++   fourcc = dri2_iosurface_fourcc(surface.pixel_format);
++   _eglLog(_EGL_DEBUG, "IOSurface %u: %ux%u pixel format %#x, %u planes, "
++           "%u bytes a row from %u, buffer %llu bytes", (unsigned)id, surface.width,
++           surface.height, surface.pixel_format, surface.planes, surface.row_bytes,
++           surface.offset, (unsigned long long)surface.size);
++   if (fourcc == 0 || surface.planes != 0 || surface.width == 0 || surface.height == 0 ||
++       surface.width > INT32_MAX || surface.height > INT32_MAX ||
++       surface.row_bytes == 0 || surface.row_bytes > INT32_MAX || surface.offset > INT32_MAX ||
++       (uint64_t)surface.offset + (uint64_t)surface.row_bytes * surface.height > surface.size) {
++      _eglError(EGL_BAD_MATCH, "EGL_IOSURFACE_A34: a surface of a kind not imported");
++      return NULL;
++   }
++
++   const EGLint attribs[] = {
++      EGL_WIDTH, (EGLint)surface.width,
++      EGL_HEIGHT, (EGLint)surface.height,
++      EGL_LINUX_DRM_FOURCC_EXT, (EGLint)fourcc,
++      EGL_DMA_BUF_PLANE0_FD_EXT, (EGLint)id,
++      EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)surface.offset,
++      EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)surface.row_bytes,
++      EGL_NONE,
++   };
++   return dri2_create_image_dma_buf(disp, NULL, NULL, attribs);
++}
++#endif
++
+ _EGLImage *
+ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
+                       EGLClientBuffer buffer, const EGLint *attr_list)
+@@ -2649,6 +2731,10 @@
+ #ifdef HAVE_LIBDRM
+    case EGL_LINUX_DMA_BUF_EXT:
+       return dri2_create_image_dma_buf(disp, ctx, buffer, attr_list);
++#ifdef __APPLE__
++   case EGL_IOSURFACE_A34:
++      return dri2_create_image_iosurface(disp, ctx, buffer, attr_list);
++#endif
+ #endif
+ #ifdef HAVE_BIND_WL_DISPLAY
+    case EGL_WAYLAND_BUFFER_WL:
+--- a/src/gallium/auxiliary/util/u_screen.c
++++ b/src/gallium/auxiliary/util/u_screen.c
+@@ -175,7 +175,8 @@
+ 
+    caps->throttle = true;
+ 
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM || DETECT_OS_APPLE)
++   /* (Darwin: libdrm is a34-ios's redwood-drm, which imports IOSurfaces as dma-bufs) */
+    if (pscreen->get_screen_fd) {
+       uint64_t cap;
+       int fd = pscreen->get_screen_fd(pscreen);
+--- a/src/panfrost/lib/kmod/panfrost_kmod.c
++++ b/src/panfrost/lib/kmod/panfrost_kmod.c
+@@ -499,7 +499,15 @@
+ 
+         p_atomic_inc(&bo->refcnt);
+     } else {
++#ifdef __APPLE__
++        /* On Darwin the "dma-buf" is an IOSurface ID (redwood-drm's drmPrimeFDToHandle made
++         * the GEM handle of its memory, selector 0x7e): no file to lseek(), the kernel says
++         * how big the buffer is. */
++        struct redwood_drm_surface surface = { .surface = (uint32_t)fd };
++        size_t size = redwood_drm_surface(dev->fd, &surface) ? 0 : (size_t)surface.size;
++#else
+         size_t size = lseek(fd, 0, SEEK_END);
++#endif
+         if (size == 0 || size == (size_t)-1) {
+             mesa_loge("invalid dmabuf size");
+             goto err_close_handle;

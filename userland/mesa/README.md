@@ -11,6 +11,7 @@ client speaks Linux's panfrost DRM uAPI. Built by `.github/workflows/mesa-ios.ym
 | `build.sh` | the whole build: host tools, libdrm stand-in, Mesa, `mali-tri`, packaging |
 | `patches/0001-meson-darwin-drm.patch` | Darwin + panfrost builds as a DRM system (drm DRI platform, EGL, libdrm via pkg-config) |
 | `patches/0002-panfrost-darwin-bo-map.patch` | BO mmap/munmap through the user client; no `sched_setscheduler` on Darwin |
+| `patches/0003-darwin-iosurface-egl-image.patch` | IOSurfaces as EGLImages: target `EGL_IOSURFACE_A34` (buffer = IOSurface ID), imported as a dma-buf whose "fd" is the ID; `DRM_CAP_PRIME` asked on Darwin; the BO size of an import from selector `0x7e` (see `../a34gl/README.md`) |
 | `redwood-drm/` | `libdrm.2.dylib`: the libdrm functions Mesa calls, carried to `RedwoodMali` |
 | `mali-tri/mali-tri.c` | test: 256x256 pbuffer, clear, one triangle, `glReadPixels`, check |
 
@@ -29,13 +30,18 @@ picks the driver from `drmGetVersion`, `panfrost_drm_screen_create` on the descr
 Reviving OSMesa would have meant carrying the whole removed frontend as a patch against
 Mesa's moving internal APIs.
 
-Output (all `@rpath/...`, with an `@loader_path` rpath, ad-hoc signed):
+Output, for `/a34` on the phone (`INSTALL_DIR`): every library is named `/a34/<file>` and names
+the others so, nothing has an `LC_RPATH` -- iOS's dyld refuses `@rpath`, `@loader_path` and
+`@executable_path` for our binaries ("security policy does not allow @ path expansion") -- and
+everything is ad-hoc signed after the last change to a load command (a signature broken
+afterwards made launchd panic: "unexpected exec of non-platform binary"):
 
 - `libEGL.1.dylib`, `libGLESv2.2.dylib`: the API libraries a program links;
 - `libgallium-26.3.0.dylib`: Mesa itself (GL state tracker, DRI frontend, panfrost);
-- `libdrm.2.dylib`: the stand-in below;
-- `mali-tri`: the test (rpath `@executable_path`; put the dylibs next to it);
-- `include/`: EGL, GLES2, GLES3, KHR headers; `BUILD_INFO.txt`.
+- `libdrm.2.dylib`: the stand-in below (linked as `/a34/libdrm.2.dylib` from the start);
+- `mali-tri`: the test, linked against those (it runs from anywhere once they are in `/a34`);
+- `include/`: EGL (with `eglmesaext.h`: `EGL_IOSURFACE_A34`), GLES2, GLES3, KHR headers and
+  `redwood_drm.h`; `BUILD_INFO.txt`.
 
 ## The libdrm stand-in (`redwood-drm/`)
 
@@ -54,12 +60,14 @@ headers (`iokit_check.c`) and compiles that branch for iOS as well.
 | `DRM_IOCTL_PANFROST_SUBMIT` | as above, with `in_syncs`/`in_sync_count`/`out_sync` cleared; `out_sync` is signalled when the call returns |
 | `drmCloseBufferHandle`, `DRM_IOCTL_GEM_CLOSE` | selector `0x09` |
 | `drmGetVersion`, `DRM_IOCTL_VERSION` | answered here: `panfrost` 1.1 (`REDWOOD_DRM_MINOR` overrides the minor) |
-| `drmGetCap` | answered here: `SYNCOBJ` 1, `SYNCOBJ_TIMELINE` 0, `PRIME` 0, `TIMESTAMP_MONOTONIC` 1 |
+| `drmGetCap` | answered here: `SYNCOBJ` 1, `SYNCOBJ_TIMELINE` 0, `PRIME` `IMPORT` (IOSurfaces only), `TIMESTAMP_MONOTONIC` 1 |
 | `drmGetDevices2`, `drmGetDevice2`, ... | one platform-bus device, render node `/dev/null` (no service: no device) |
 | `drmOpen*`, the EGL loader's `open()` | `/dev/null`: any descriptor in the process means the one GPU |
 | `drmSyncobj*` | user space only: create/destroy/reset/signal/wait (`WAIT_FOR_SUBMIT` blocks until a SUBMIT signals), sync files are signalled pipes |
 | BO mmap / munmap (patched in Mesa) | `redwood_drm_mmap` = `IOConnectMapMemory64(type = GEM handle, kIOMapAnywhere)`, `redwood_drm_munmap` = `IOConnectUnmapMemory64` |
-| `drmPrime*` | `EOPNOTSUPP` (no dma-buf sharing) |
+| `drmPrimeFDToHandle(fd, IOSurfaceID)` | selector `0x7e` (ios-topaz's IOSurface request, 40 bytes, `handle` = 0): the GEM handle of the surface's memory |
+| `redwood_drm_surface()` (not libdrm's) | selector `0x7e` with `handle` = `0xffffffff`: only describe the surface (buffer size, pixel offset, row bytes, width and height, format, planes) |
+| `drmPrimeHandleToFD` | `EOPNOTSUPP` (no export) |
 
 Environment: `REDWOOD_DRM_DEBUG=1` logs every request; `REDWOOD_DRM_SERVICE`,
 `REDWOOD_DRM_NODE`, `REDWOOD_DRM_MINOR`.
@@ -75,7 +83,8 @@ Selectors and structure sizes (Mesa 26.3's `panfrost_drm.h`, all little-endian, 
 | `0x41` | `PANFROST_WAIT_BO` `{u32 handle, pad; s64 timeout_ns}` | 16 | yes (answer at once: jobs are synchronous) |
 | `0x42` | `PANFROST_CREATE_BO` `{u32 size, flags, handle, pad; u64 offset}` | 24 | yes; flags `NOEXEC` 1, `HEAP` 2 (the tiler heap, one 128 MiB BO per screen: grow on fault, or back it all); `offset` = GPU VA, which Mesa expects in [0x2000000, 4 GiB) as on Linux |
 | `0x44` | `PANFROST_GET_PARAM` `{u32 param, pad; u64 value}` | 16 | yes, params below |
-| `0x45` | `PANFROST_GET_BO_OFFSET` `{u32 handle, pad; u64 offset}` | 16 | only for imported BOs (not today) |
+| `0x45` | `PANFROST_GET_BO_OFFSET` `{u32 handle, pad; u64 offset}` | 16 | only for imported BOs (IOSurfaces, `0x7e`) |
+| `0x7e` | IOSurface -> GEM handle, or describe (ios-topaz's layout) | 40 | `EGL_IOSURFACE_A34` images: `../a34gl/README.md` |
 | `0x48` | `PANFROST_MADVISE` `{u32 handle, madv, retained}` | 12 | yes (BO cache: `DONTNEED` 1 when cached, `WILLNEED` 0 on reuse); `retained = 0` makes Mesa free the BO instead |
 | `0x43` | `PANFROST_MMAP_BO` | 16 | **not used**: mapping is `IOConnectMapMemory64(type = handle)` |
 | `0x49`-`0x4d` | `SET_LABEL_BO`, `JM_CTX_*`, `SYNC_BO`, `QUERY_BO_INFO` | | only at versions 1.4 / 1.5 / 1.6 |
@@ -92,8 +101,8 @@ memory is mapped write-combined (no `WB_MMAP` before 1.6). IOReturn codes become
 
 ## Running
 
-Copy the `mesa-ios` artifact's files into one directory on the phone and run `./mali-tri`
-(or `./mali-tri out.ppm`). It prints `GL_RENDERER` (expected: `Mali-G68 (Panfrost)`),
+Copy the `mesa-ios` artifact's files into `/a34` on the phone and run `/a34/mali-tri`
+(or `/a34/mali-tri out.ppm`). It prints `GL_RENDERER` (expected: `Mali-G68 (Panfrost)`),
 `GL_VERSION`, a few pixels and `PASS`/`FAIL`; exit status 0 = right pixels, 1 = wrong
 pixels, 2 = EGL/GL setup failed. `EGL_LOG_LEVEL=debug`, `PAN_MESA_DEBUG=sync,trace` and
 `REDWOOD_DRM_DEBUG=1` help. The binaries are ad-hoc signed only; add entitlements (ldid)
