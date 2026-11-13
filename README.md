@@ -16,7 +16,9 @@ usable as a daily system, and installing it erases the phone.
 | Buttons | volume up/down, power (patch 0902) |
 | CPU | all 8 cores (6× Cortex-A55 at ~1.8 GHz, 2× Cortex-A78), one scheduler cluster |
 | Storage | iOS root (HFS+) at the start of `userdata` |
-| Not yet | GPU, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
+| GPU | Mali-G68 MC4 brought up from the kernel (0908, `a34mali=1`): shader power domains, reset, cores, and test jobs through its own MMU; not used for drawing yet (Mesa Panfrost port in progress) |
+| Boot time | empty `IOAcceleratorES` (0907, from ios-topaz) saves ~45 s; first frames ~65 s after XNU starts |
+| Not yet | GPU rendering, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
 The base firmware is One UI 7 (A346EXXSADYG1). Do not go to One UI 8 or
 later: it removes bootloader unlocking. Never write the `efs`, `sec_efs`,
@@ -77,6 +79,8 @@ No Apple firmware, Samsung firmware or device dumps are kept in this repository.
 - Samsung's A34 kernel sources (via
   [Fede2782/android_kernel_samsung_a34x](https://github.com/Fede2782/android_kernel_samsung_a34x)):
   I2C, clock, PMIC and touch register facts.
+- [oosexgang/hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) (HackiOS, APSL 2.0 / MIT):
+  the Mali bring-up in 0908 is ported from its `redwood_mali.c`.
 - [UniXNU](https://github.com/UniXNU/UniXNU): reference for loaders and device trees.
 - [TWRP](https://twrp.me) for a34x, [Magisk](https://github.com/topjohnwu/Magisk),
   [Heimdall](https://git.sr.ht/~grimler/Heimdall), [samloader-rs](https://github.com/topjohnwu/samloader-rs).
