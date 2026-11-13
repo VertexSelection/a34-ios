@@ -1,0 +1,341 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index e3c2c9d..766d8bd 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -51,11 +51,25 @@
+  * OPP (the same in all three from 670 MHz up; the variant is chosen by an
+  * efuse not read here); no voltage ever exceeds the table's.
+  *
+- * CPUs: not raised. Their Vproc rails sit on MT6315 PMICs behind SPMI,
+- * which the preloader-started MCUPM firmware drives ("cpuhvfs": Android's
+- * kernel only fills tables in its CSRAM and asks it by IPI); writing ARMPLL
+- * and the dividers directly would mean an SPMI driver of our own and racing
+- * that firmware. a34cpufreq=N only says so.
++ * CPUs: never their PLLs or Vproc directly. Their Vproc rails sit on MT6315
++ * PMICs behind SPMI, which the preloader-started MCUPM firmware drives;
++ * Android's kernel (drivers/misc/mediatek/cpufreq_v2, "hybrid" DVFS) only
++ * shares a CSRAM with it (dvfsp, 0x0011bc00): it writes the OPP tables
++ * there, starts the firmware's DVFS by IPI over the MCUPM mailbox
++ * (IPI_DVFS_INIT_PTBL, IPI_DVFS_INIT), and then asks for an OPP per cluster
++ * by writing its index into the CSRAM (cpuhvfs_set_dvfs(): OFFS_WFI_S).
++ * A34 (0923): the report reads that CSRAM (read only): the guards, each
++ * cluster's table checked against Android's FY table (CPU_LEVEL_0, the
++ * preloader's segment code 3), the OPP the firmware says each cluster is
++ * at, the requests and limits, the newest log entry. Boot-arg
++ * a34cpuopp=<L MHz>[,<LL MHz>[,<CCI MHz>]] asks the firmware the way
++ * Android does, for the table's OPP at or below that, only if the CSRAM
++ * holds the guards and Android's table and its idea of the current OPP
++ * matches the cluster's PLL; then the PLL is watched for 200 ms, and if the
++ * firmware did not act the request is taken back. No IPI is sent (its
++ * DVFS is started by IPI in Android; if it was not, nothing happens).
++ * The CCI follows the clusters (the firmware's CCI map), as in Android.
++ * Nothing throttles here for heat.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -286,32 +300,262 @@ ck_cpu_divide(uint32_t khz, uint32_t sel)
+ 	return khz;
+ }
+ 
++/* The clusters, in the CSRAM's order (mt_cpu_dvfs_id: LL, L, CCI). */
++#define CK_CLUSTERS             3
++
++static const struct {
++	const char *name;
++	uint32_t con0, div;
++} ck_cluster[CK_CLUSTERS] = {
++	{ "LL (cpu0-5, Cortex-A55)", ARMPLL_LL_CON0, CKDIV1_LL },
++	{ "L (cpu6-7, Cortex-A78)", ARMPLL_BL_CON0, CKDIV1_L },
++	{ "CCI", CCIPLL_CON0, CKDIV1_CCI },
++};
++
++/* A cluster's clock from its PLL and divider (get_cur_phy_freq()), kHz; 0: not from its PLL or 26 MHz. */
++static uint32_t
++ck_cpu_khz(unsigned i, uint32_t *con0, uint32_t *con1, uint32_t *div)
++{
++	uint32_t mux, sel, posdiv, vco;
++
++	*con0 = ruby_rd32(ck_apmixed, ck_cluster[i].con0);
++	*con1 = ruby_rd32(ck_apmixed, ck_cluster[i].con0 + 4u);
++	*div = ruby_rd32(ck_mcucfg, ck_cluster[i].div);
++	mux = (*div >> 9) & 3u;
++	sel = (*div >> 17) & 0x1fu;
++	posdiv = (*con1 >> CON1_POSDIV_SHIFT) & 7u;
++	vco = (uint32_t)((((uint64_t)(*con1 & 0x3fffffu) * 26u) >> 14) * 1000u);   /* kHz, as _cpu_freq_calc() */
++	return mux == 1 ? ck_cpu_divide(vco >> (posdiv > 4 ? 4 : posdiv), sel) : (mux == 0 ? 26000 : 0);
++}
++
+ static void
+ ck_cpu_report(void)
+ {
+-	static const struct {
+-		const char *name;
+-		uint32_t con0, div;
+-	} c[3] = {
+-		{ "LL (cpu0-5, Cortex-A55)", ARMPLL_LL_CON0, CKDIV1_LL },
+-		{ "L (cpu6-7, Cortex-A78)", ARMPLL_BL_CON0, CKDIV1_L },
+-		{ "CCI", CCIPLL_CON0, CKDIV1_CCI },
+-	};
+ 	static const char *const src[4] = { "26 MHz", "its ARMPLL", "MAINPLL", "UNIVPLL" };
+ 
+-	for (unsigned i = 0; i < 3; i++) {
+-		uint32_t con0 = ruby_rd32(ck_apmixed, c[i].con0), con1 = ruby_rd32(ck_apmixed, c[i].con0 + 4u);
+-		uint32_t div = ruby_rd32(ck_mcucfg, c[i].div), mux = (div >> 9) & 3u, sel = (div >> 17) & 0x1fu;
++	for (unsigned i = 0; i < CK_CLUSTERS; i++) {
++		uint32_t con0, con1, div, khz = ck_cpu_khz(i, &con0, &con1, &div);
+ 		uint32_t posdiv = (con1 >> CON1_POSDIV_SHIFT) & 7u;
+-		uint32_t vco = (uint32_t)((((uint64_t)(con1 & 0x3fffffu) * 26u) >> 14) * 1000u);    /* kHz, as _cpu_freq_calc() */
+-		uint32_t pll = vco >> (posdiv > 4 ? 4 : posdiv);
+-		uint32_t khz = mux == 1 ? ck_cpu_divide(pll, sel) : (mux == 0 ? 26000 : 0);
++		uint32_t vco = (uint32_t)((((uint64_t)(con1 & 0x3fffffu) * 26u) >> 14) * 1000u);
++		uint32_t mux = (div >> 9) & 3u;
+ 
+ 		printf("A34 CLOCKS: CPU %s: PLL CON0 0x%08x CON1 0x%08x (%s, VCO %u MHz / %u = %u MHz), "
+-		    "divider 0x%08x (from %s, divider %u): %u MHz%s\n", c[i].name, con0, con1, (con0 & 1u) ? "on" : "OFF",
+-		    vco / 1000, 1u << (posdiv > 4 ? 4 : posdiv), pll / 1000, div, src[mux], sel, khz / 1000,
+-		    mux >= 2 ? " (rate of that PLL not read)" : "");
++		    "divider 0x%08x (from %s, divider %u): %u MHz%s\n", ck_cluster[i].name, con0, con1, (con0 & 1u) ? "on" : "OFF",
++		    vco / 1000, 1u << (posdiv > 4 ? 4 : posdiv), (vco >> (posdiv > 4 ? 4 : posdiv)) / 1000, div, src[mux],
++		    (div >> 17) & 0x1fu, khz / 1000, mux >= 2 ? " (rate of that PLL not read)" : "");
++	}
++}
++
++/* ---- the CPUs: MCUPM's DVFS, through its CSRAM ---- */
++
++#define CK_CSRAM_PA             0x0011bc00u     /* dvfsp (mt6877.dts), CSRAM_BASE */
++#define CK_CSRAM_SIZE           0x1400u
++#define CS_GUARD0               0x55aa55aau     /* REPO_GUARD0/1, words 0-3 */
++#define CS_GUARD1               0xaa55aa55u
++#define CS_TBL                  0x0010u         /* OFFS_TBL_S: the PVT tables (cpuhvfs_pvt_tbl_create()) */
++#define CS_SCHED_DIS            0x02bcu         /* OFFS_SCHED_DIS */
++#define CS_PPM_LIMIT            0x0320u         /* per cluster: [31:16] fastest OPP allowed, [15:0] slowest */
++#define CS_CUR_VPROC            0x032cu         /* per buck: VPROC2, VPROC1, VSRAM2, VSRAM1 */
++#define CS_CUR_FREQ             0x0354u         /* per cluster: the OPP it is at */
++#define CS_WFI                  0x037cu         /* per cluster: the OPP asked for (cpuhvfs_set_dvfs()) */
++#define CS_SCHED                0x03a4u         /* per cluster: schedule-assist request */
++#define CS_LOG                  0x03d0u         /* OFFS_LOG_S: 150 entries of 5 words, timestamp low and high first */
++#define CS_LOG_N                150u
++#define CS_CLUSTER_ONOFF        0x1224u         /* per cluster */
++#define CS_CLUSTER_ON           0x43434f4eu     /* CPUDVFS_CLUSTER_ON */
++#define CK_OPPS                 16u             /* NR_FREQ */
++#define CK_ASK_POLLS            100u            /* 2 ms each */
++
++static vm_offset_t ck_csram;
++
++/*
++ * plat_k6877's FY_6833Tbl (CPU_LEVEL_0, chosen for segment code 3): per
++ * cluster MHz, the Vproc in 6.25 mV steps (the firmware may hold less:
++ * Android's EEM lowers them), post divider; the clock divider is 1.
++ */
++static const uint16_t ck_cpu_mhz[CK_CLUSTERS][CK_OPPS] = {
++	{ 2000, 1903, 1800, 1703, 1600, 1503, 1407, 1310, 1260, 1150, 1053, 980, 900, 740, 650, 500 },
++	{ 2600, 2400, 2275, 2150, 2000, 1900, 1800, 1660, 1540, 1430, 1300, 1140, 1040, 910, 740, 650 },
++	{ 1700, 1621, 1542, 1440, 1350, 1271, 1120, 1041, 962, 900, 840, 740, 661, 600, 560, 520 },
++};
++static const uint8_t ck_cpu_step[CK_CLUSTERS][CK_OPPS] = {
++	{ 160, 155, 148, 143, 136, 133, 130, 127, 125, 121, 118, 116, 113, 108, 104, 104 },
++	{ 168, 160, 152, 144, 142, 140, 139, 136, 133, 129, 125, 120, 117, 113, 107, 104 },
++	{ 160, 155, 150, 143, 136, 133, 128, 125, 122, 119, 117, 113, 110, 108, 106, 104 },
++};
++static const uint8_t ck_cpu_posdiv[CK_CLUSTERS][CK_OPPS] = {
++	{ 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4 },
++	{ 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 4 },
++	{ 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4, 4, 4 },
++};
++static const uint32_t ck_pvt_word[CK_CLUSTERS] = { 0, 36, 72 };    /* each cluster's table, in words from CS_TBL */
++
++static uint32_t
++ck_cs(uint32_t off)
++{
++	return ruby_rd32(ck_csram, off);
++}
++
++static bool
++ck_cs_guarded(void)
++{
++	return ck_cs(0) == CS_GUARD0 && ck_cs(4) == CS_GUARD1 && ck_cs(8) == CS_GUARD0 && ck_cs(12) == CS_GUARD1;
++}
++
++/*
++ * 0: cluster c's table in the CSRAM is Android's FY table (MHz and dividers
++ * the same, each Vproc at or under the table's, not under 0.5 V, the end
++ * marker after it); else the first entry that is not, from 1 (17: the
++ * marker).
++ */
++static uint32_t
++ck_pvt_check(unsigned c)
++{
++	for (uint32_t i = 0; i < CK_OPPS; i++) {
++		uint32_t w = ck_cs(CS_TBL + 4u * (ck_pvt_word[c] + i)), d = ck_cs(CS_TBL + 4u * (ck_pvt_word[c] + CK_OPPS + i));
++		uint32_t step = (w >> 16) & 0xfffu;
++
++		if ((w & 0xffffu) != ck_cpu_mhz[c][i] || step > ck_cpu_step[c][i] || step < 80u ||
++		    (d & 0xffu) != ck_cpu_posdiv[c][i] || ((d >> 16) & 0xfffu) != 1u) {
++			return i + 1u;
++		}
++	}
++	return ck_cs(CS_TBL + 4u * (ck_pvt_word[c] + 2u * CK_OPPS)) == 0xffffffffu ? 0 : CK_OPPS + 1u;
++}
++
++static void
++ck_csram_report(void)
++{
++	uint64_t newest = 0;
++
++	for (uint32_t n = 0; n < CS_LOG_N; n++) {
++		uint64_t ts = ((uint64_t)ck_cs(CS_LOG + 20u * n + 4u) << 32) | ck_cs(CS_LOG + 20u * n);
++
++		if (ts > newest) {
++			newest = ts;
++		}
++	}
++	printf("A34 CLOCKS: CPU DVFS CSRAM (MCUPM's, 0x%x): guards %08x %08x %08x %08x (%s), schedule-assist off %u, "
++	    "Vproc2/Vproc1/Vsram2/Vsram1 %u %u %u %u, newest log entry at %llu (now %llu)\n", CK_CSRAM_PA, ck_cs(0), ck_cs(4),
++	    ck_cs(8), ck_cs(12), ck_cs_guarded() ? "as Android leaves them" : "NOT Android's", ck_cs(CS_SCHED_DIS),
++	    ck_cs(CS_CUR_VPROC), ck_cs(CS_CUR_VPROC + 4u), ck_cs(CS_CUR_VPROC + 8u), ck_cs(CS_CUR_VPROC + 12u),
++	    (unsigned long long)newest, (unsigned long long)mach_absolute_time());
++	for (unsigned c = 0; c < CK_CLUSTERS; c++) {
++		uint32_t con0, con1, div, khz = ck_cpu_khz(c, &con0, &con1, &div), bad = ck_pvt_check(c);
++		uint32_t cur = ck_cs(CS_CUR_FREQ + 4u * c), w0 = ck_cs(CS_TBL + 4u * ck_pvt_word[c]);
++		uint32_t w15 = ck_cs(CS_TBL + 4u * (ck_pvt_word[c] + CK_OPPS - 1u));
++
++		printf("A34 CLOCKS: CPU %s in the CSRAM: table %s %u (OPP 0 %u MHz step %u .. OPP 15 %u MHz step %u), "
++		    "at OPP %u (%u MHz by the table, %u MHz by the PLL), asked OPP %u, schedule-assist 0x%x, limits 0x%08x, "
++		    "state 0x%08x\n", ck_cluster[c].name, bad == 0 ? "is Android's FY table" : "differs from Android's at entry",
++		    bad, w0 & 0xffffu, (w0 >> 16) & 0xfffu, w15 & 0xffffu, (w15 >> 16) & 0xfffu, cur,
++		    cur < CK_OPPS ? ck_cpu_mhz[c][cur] : 0u, khz / 1000, ck_cs(CS_WFI + 4u * c), ck_cs(CS_SCHED + 4u * c),
++		    ck_cs(CS_PPM_LIMIT + 4u * c), ck_cs(CS_CLUSTER_ONOFF + 4u * c));
++	}
++}
++
++/*
++ * a34cpuopp: cluster c (0 LL, 1 L) asked for the table's OPP at or below
++ * mhz, as cpuhvfs_set_dvfs() asks (its index in the cluster's OFFS_WFI_S
++ * word; the cluster marked on, as cpuhvfs_set_cluster_on_off() does when
++ * its processors are up), only if the CSRAM looks as Android leaves it and
++ * agrees with the PLL. The firmware does the voltages and the PLL; then
++ * the PLL is watched. Not done in 200 ms: the words put back.
++ */
++static void
++ck_cpu_ask(unsigned c, uint32_t mhz)
++{
++	uint32_t opp, cur, lim, old_wfi, old_state, con0, con1, div, khz, want, bad;
++	const char *name = ck_cluster[c].name;
++
++	for (opp = 0; opp < CK_OPPS && ck_cpu_mhz[c][opp] > mhz; opp++) {
++	}
++	if (opp == CK_OPPS) {
++		printf("A34 CLOCKS: CPU %s: %u MHz is under the table's lowest OPP: not asked\n", name, mhz);
++		return;
++	}
++	want = ck_cpu_mhz[c][opp] * 1000u;
++	if (!ck_cs_guarded()) {
++		printf("A34 CLOCKS: CPU %s: the CSRAM has not the guards Android's kernel writes: the firmware's DVFS "
++		    "was not set up; not asked\n", name);
++		return;
++	}
++	bad = ck_pvt_check(c);
++	if (bad != 0) {
++		printf("A34 CLOCKS: CPU %s: the CSRAM's table differs from Android's at entry %u: not asked\n", name, bad);
++		return;
++	}
++	cur = ck_cs(CS_CUR_FREQ + 4u * c);
++	lim = ck_cs(CS_PPM_LIMIT + 4u * c);
++	khz = ck_cpu_khz(c, &con0, &con1, &div);
++	if (cur >= CK_OPPS || khz < ck_cpu_mhz[c][cur] * 980u || khz > ck_cpu_mhz[c][cur] * 1020u) {
++		printf("A34 CLOCKS: CPU %s: the CSRAM says OPP %u, the PLL says %u kHz: the firmware does not keep this "
++		    "cluster; not asked\n", name, cur, khz);
++		return;
++	}
++	if (opp < (lim >> 16) || opp > (lim & 0xffffu)) {
++		printf("A34 CLOCKS: CPU %s: the CSRAM's limits 0x%08x do not allow OPP %u: not asked\n", name, lim, opp);
++		return;
+ 	}
++	if (opp == cur) {
++		printf("A34 CLOCKS: CPU %s is at OPP %u (%u MHz) already\n", name, opp, want / 1000);
++		return;
++	}
++	old_wfi = ck_cs(CS_WFI + 4u * c);
++	old_state = ck_cs(CS_CLUSTER_ONOFF + 4u * c);
++	printf("A34 CLOCKS: CPU %s: asking the firmware for OPP %u (%u MHz) instead of OPP %u (%u kHz)\n", name, opp,
++	    want / 1000, cur, khz);
++	if (old_state != CS_CLUSTER_ON) {
++		ruby_wr32(ck_csram, CS_CLUSTER_ONOFF + 4u * c, CS_CLUSTER_ON);
++	}
++	ruby_wr32(ck_csram, CS_WFI + 4u * c, opp);
++	for (uint32_t i = 0; i < CK_ASK_POLLS; i++) {
++		delay(2000);
++		khz = ck_cpu_khz(c, &con0, &con1, &div);
++		if (khz >= want - want / 100u && khz <= want + want / 100u) {
++			printf("A34 CLOCKS: CPU %s now at %u kHz after %u ms (PLL CON1 0x%08x, divider 0x%08x; the CSRAM says "
++			    "OPP %u, Vproc words %u %u)\n", name, khz, 2u * (i + 1u), con1, div, ck_cs(CS_CUR_FREQ + 4u * c),
++			    ck_cs(CS_CUR_VPROC), ck_cs(CS_CUR_VPROC + 4u));
++			return;
++		}
++	}
++	ruby_wr32(ck_csram, CS_WFI + 4u * c, old_wfi);
++	if (old_state != CS_CLUSTER_ON) {
++		ruby_wr32(ck_csram, CS_CLUSTER_ONOFF + 4u * c, old_state);
++	}
++	printf("A34 CLOCKS: CPU %s: the firmware did not act in %u ms (PLL CON1 0x%08x, %u kHz; the CSRAM says OPP %u): "
++	    "its DVFS is not running (Android starts it by IPI); the request taken back\n", name, 2u * CK_ASK_POLLS, con1,
++	    khz, ck_cs(CS_CUR_FREQ + 4u * c));
++}
++
++/* a34cpuopp=<L MHz>[,<LL MHz>[,<CCI MHz>]] */
++static void
++ck_cpu_requests(void)
++{
++	char arg[48];
++	uint32_t mhz[3] = { 0, 0, 0 }, n = 0;
++
++	if (!PE_parse_boot_arg_str("a34cpuopp", arg, (int)sizeof(arg))) {
++		return;
++	}
++	for (uint32_t i = 0; i < sizeof(arg) && arg[i] != '\0' && n < 3; i++) {
++		if (arg[i] == ',') {
++			n++;
++		} else if (arg[i] >= '0' && arg[i] <= '9' && mhz[n] < 100000u) {
++			mhz[n] = mhz[n] * 10u + (uint32_t)(arg[i] - '0');
++		}
++	}
++	if (mhz[0] != 0) {
++		ck_cpu_ask(1, mhz[0]);
++	}
++	if (mhz[1] != 0) {
++		ck_cpu_ask(0, mhz[1]);
++	}
++	if (mhz[2] != 0) {
++		printf("A34 CLOCKS: CPU CCI: not asked: the firmware sets it from the clusters' OPPs (its CCI map), "
++		    "as in Android\n");
++	}
++	ck_cpu_report();
+ }
+ 
+ static uint32_t
+@@ -368,7 +612,8 @@ a34_clocks_init(void)
+ 	ck_pwrap = ml_io_map(CK_PWRAP_PA, CK_PAGE);
+ 	ck_mcucfg = ml_io_map(CK_MCUCFG_PA, CK_PAGE);
+ 	ck_gpupll = ml_io_map(CK_GPUPLL_PA, CK_PAGE);
+-	if (!ck_top || !ck_spm || !ck_apmixed || !ck_pwrap || !ck_mcucfg || !ck_gpupll) {
++	ck_csram = ml_io_map(CK_CSRAM_PA, CK_CSRAM_SIZE);
++	if (!ck_top || !ck_spm || !ck_apmixed || !ck_pwrap || !ck_mcucfg || !ck_gpupll || !ck_csram) {
+ 		ck_pwrap = 0;           /* (a34_clocks_gpu_wanted(): no) */
+ 		printf("A34 CLOCKS: MMIO mapping failed\n");
+ 		return;
+@@ -383,11 +628,12 @@ a34_clocks_init(void)
+ 		ck_rail_say(i, "");
+ 	}
+ 	printf("A34 CLOCKS: the CPU clusters' Vproc (MT6315 bucks on SPMI) are not read\n");
++	ck_csram_report();
+ 	if (PE_parse_boot_argn("a34cpufreq", &cpu, (int)sizeof(cpu)) && cpu != 0) {
+-		printf("A34 CLOCKS: a34cpufreq=%u: the CPU clocks stay as they are: their Vproc rails are MT6315 bucks on SPMI, "
+-		    "driven by the MCUPM firmware the preloader starts (Android asks it through its CSRAM and IPIs); "
+-		    "there is no direct path to raise them safely\n", cpu);
++		printf("A34 CLOCKS: a34cpufreq=%u does nothing: a34cpuopp=<L MHz>,<LL MHz> asks MCUPM's firmware, "
++		    "never the PLLs or Vproc directly\n", cpu);
+ 	}
++	ck_cpu_requests();
+ 	if (ck_gpu_want_mhz != 0) {
+ 		printf("A34 CLOCKS: a34gpumhz=%u: the GPU's clock is raised before programs get the GPU (a34_mali.c)\n",
+ 		    ck_gpu_want_mhz);

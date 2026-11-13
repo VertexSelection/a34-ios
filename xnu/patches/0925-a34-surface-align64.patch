@@ -1,0 +1,228 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index da19ba3..183d007 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -732,6 +732,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fBoCount, fBoMade, fSubmits, fFailed, fErrors;
+ 	uint64_t fWired;                        /* bytes of this client's buffers */
+ 	uint32_t fSurfaceBos, fSurfacesTaken, fSurfacesRefused; /* A34 (0914): surfaces among the buffers; taken, refused */
++	uint32_t fRefusedWhy;                   /* A34 (0925): the reasons 0x7e has logged (a bit each) */
+ 	uint32_t fWcMade, fWcFallbacks;         /* A34 (0916): buffers made write-combined; that had to be cacheable */
+ 	/* A34 (0915): cache upkeep per job, for the log: this window's jobs, mach time upkeep took (all, most), job ns, bytes */
+ 	uint32_t fWinJobs;
+@@ -1541,8 +1542,8 @@ RedwoodMaliUserClient::releaseAll(void)
+ 			}
+ 		}
+ 		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made, %u write-combined, %u cacheable for want of "
+-		    "memory, %u surfaces taken), %u job chains, %u failed, %u errors; %u clients left\n", fName, freed,
+-		    fBoMade, fWcMade, fWcFallbacks, fSurfacesTaken, fSubmits, fFailed, fErrors, clients);
++		    "memory, %u surfaces taken, %u refused), %u job chains, %u failed, %u errors; %u clients left\n", fName, freed,
++		    fBoMade, fWcMade, fWcFallbacks, fSurfacesTaken, fSurfacesRefused, fSubmits, fFailed, fErrors, clients);
+ 	}
+ }
+ 
+@@ -1740,10 +1741,23 @@ out:
+ IOReturn
+ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ {
++	/* A34 (0925): each reason logged once per client, with the first surface it refused */
++	static const char *const reasons[] = {
++		"boot-arg a34malisurf=0",
++		"no memory of its own (the panel's)",
++		"a program's memory not from a page start, or read-only",
++		"not 4 bytes a pixel in 1x1 elements",
++		"more than one plane",
++		"rows not a multiple of 64 bytes (Mesa's linear stride on Valhall; a34surfrowfix)",
++		"pixels not starting at a multiple of 64 bytes",
++		"no width or height",
++		"pixels past its memory, or too big",
++		"not mapped into the kernel",
++	};
+ 	SweetSurface *s = sweet_surface_copy(req->surface);
+ 	IOMemoryDescriptor *md;
+ 	struct a34_bo *b = NULL;
+-	const char *why = NULL;
++	int why = -1;
+ 	uint64_t size = 0, need, va, off;
+ 	uintptr_t kva = 0;
+ 	uint32_t handle = 0;
+@@ -1755,15 +1769,22 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	}
+ 	md = s->memory;
+ 	if (gA34MaliSurfaces == 0) {
+-		why = "boot-arg a34malisurf=0";
++		why = 0;
+ 	} else if (md == NULL || (OSDynamicCast(IOBufferMemoryDescriptor, md) == NULL && !s->wrapped)) {
+-		why = "no memory of its own (the panel's)";
++		why = 1;
+ 	} else if (s->wrapped && (s->wrapDelta != 0 || (md->getDirection() & kIODirectionIn) == 0)) {
+-		why = "a program's memory not from a page start, or read-only";
+-	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount > 1 ||
+-	    (s->bytesPerRow & 63) != 0 || s->width == 0 || s->height == 0) {
++		why = 2;
++	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++		why = 3;
++	} else if (s->planeCount > 1) {
++		why = 4;
++	} else if ((s->bytesPerRow & 63) != 0) {
+ 		/* ios-topaz 0938/0940: the GPU stopped after sharing text masks with 640- and 480-byte rows */
+-		why = "not 32-bit pixels in one plane with 64-byte aligned rows";
++		why = 5;
++	} else if ((s->offset & 63) != 0 || (s->planeCount == 1 && (s->planes[0].offset & 63) != 0)) {
++		why = 6;
++	} else if (s->width == 0 || s->height == 0) {
++		why = 7;
+ 	} else {
+ 		size = md->getLength() & ~0xfffull;
+ 		need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height;
+@@ -1771,16 +1792,19 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 			need = (uint64_t)s->planes[0].offset + s->planes[0].size;
+ 		}
+ 		if (size == 0 || need > size || size > A34_BO_MAX) {
+-			why = "pixels past its memory, or too big";
++			why = 8;
+ 		} else if ((kva = s->kernelAddress()) == 0) {
+-			why = "not mapped into the kernel";
++			why = 9;
+ 		}
+ 	}
+-	if (why != NULL) {
+-		if (fSurfacesRefused++ < A34_LOGGED_SURFACES) {
+-			IOLog("A34 MALI UC: %s: surface %u (%ux%u fmt 0x%x bpe %u bpr %u planes %u, %u bytes) not shared: %s\n", fName,
+-			    req->surface, s->width, s->height, s->pixelFormat, s->bytesPerElement, s->bytesPerRow, s->planeCount,
+-			    s->allocSize, why);
++	if (why >= 0) {
++		fSurfacesRefused++;
++		if ((fRefusedWhy & (1u << why)) == 0) {
++			fRefusedWhy |= 1u << why;
++			IOLog("A34 MALI UC: %s: surface %u (%ux%u fmt 0x%x bpe %u bpr %u offset %u planes %u, %u bytes) not shared: %s "
++			    "(this reason is said once; %u refused so far)\n", fName, req->surface, s->width, s->height,
++			    s->pixelFormat, s->bytesPerElement, s->bytesPerRow, s->offset, s->planeCount, s->allocSize, reasons[why],
++			    fSurfacesRefused);
+ 		}
+ 		s->release();
+ 		return kIOReturnUnsupported;    /* (the library then copies the surface instead) */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 574a086..ea0d0fa 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -52,6 +52,7 @@
+ #include <libkern/c++/OSString.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -102,6 +103,20 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++/*
++ * A34 (0925): the row and offset alignment: rows the kernel lays out itself
++ * (no IOSurfaceBytesPerRow given) and what IOSurface.framework learns at
++ * connect (sel 13, its _ioSurfaceLimits: IOSurfaceGetPropertyAlignment()
++ * and IOSurfaceAlignProperty() of IOSurfaceBytesPerRow/PlaneBytesPerRow
++ * use +4, of IOSurfaceOffset/PlaneOffset/PlaneBase +0). 64, what Mesa wants
++ * of a linear RGBA picture on Valhall; boot-arg a34surfalign=N (a power of
++ * two, 16..4096). a34surfrowfix=1: an IOSurfaceBytesPerRow the creator gave
++ * that is not a multiple of it, for a 32-bit single-plane surface in the
++ * kernel's memory, is rounded up (the creator learns the real one from the
++ * lock result, as IOSurfaceGetBytesPerRow does); default 0: kept as given.
++ */
++static uint32_t      sweet_surface_row_align = SWEET_SURFACE_ROW_ALIGN;
++static uint32_t      sweet_surface_row_fix;
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -430,7 +445,7 @@ static uint32_t
+ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ {
+ 	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
+-	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++	return (uint32_t)((row + sweet_surface_row_align - 1) & ~(uint64_t)(sweet_surface_row_align - 1));
+ }
+ 
+ /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -456,6 +471,16 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (props->getObject("IOSurfaceBytesPerRow") != NULL) {
++		/* A34 (0925): given; rounded up only with a34surfrowfix=1, and only for the kernel's own memory */
++		s->askedBytesPerRow = s->bytesPerRow;
++		if (sweet_surface_row_fix != 0 && (s->bytesPerRow & (sweet_surface_row_align - 1)) != 0 &&
++		    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
++		    props->getObject("IOSurfacePlaneInfo") == NULL && props->getObject("IOSurfaceAddress") == NULL &&
++		    (uint64_t)s->bytesPerRow + sweet_surface_row_align <= UINT32_MAX) {
++			s->bytesPerRow = (s->bytesPerRow + sweet_surface_row_align - 1) & ~(sweet_surface_row_align - 1);
++		}
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+@@ -554,9 +579,18 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	/* A34 (0925): see sweet_surface_row_align */
++	uint32_t align = 0;
++	if (PE_parse_boot_argn("a34surfalign", &align, sizeof(align)) && align >= 16 && align <= 4096 &&
++	    (align & (align - 1)) == 0) {
++		sweet_surface_row_align = align;
++	}
++	(void)PE_parse_boot_argn("a34surfrowfix", &sweet_surface_row_fix, sizeof(sweet_surface_row_fix));
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+-	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
++	IOLog("SWEET SURF: IOCoreSurfaceRoot registered: rows and offsets aligned to %u bytes (a34surfalign), "
++	    "rows the creator gives %s (a34surfrowfix)\n", sweet_surface_row_align,
++	    sweet_surface_row_fix ? "rounded up to that for 32-bit single-plane surfaces" : "kept");
+ 	return true;
+ }
+ 
+@@ -908,9 +942,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u (%s %u) planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->askedBytesPerRow != 0 ? "asked" : "default, align", s->askedBytesPerRow != 0 ?
++		    s->askedBytesPerRow : sweet_surface_row_align, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+@@ -1244,8 +1279,8 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+ 		uint8_t limits[0x18] = { 0 };
+-		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+-		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
++		put32(limits, 0x0, sweet_surface_row_align - 1);       /* A34 (0925): a34surfalign */
++		put32(limits, 0x4, sweet_surface_row_align - 1);
+ 		limits[0x16] = 1;
+ 		sweet_surf_log_once("sel", selector);
+ 		return sweet_struct_out(args, limits, sizeof(limits));
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 6760054..827e82a 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -36,6 +36,7 @@ public:
+ 	uint8_t  elementWidth, elementHeight;
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
++	uint32_t askedBytesPerRow;      /* A34 (0925): IOSurfaceBytesPerRow as the creator gave it, 0: not given */
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer, physical, or a task's prepared range) */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+@@ -58,7 +59,7 @@ public:
+ 	/* A34 (0919): place in the order of queued GPU jobs of the last one that names the surface (A34Mali.cpp) */
+ 	uint64_t                  gpuBusySeq;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

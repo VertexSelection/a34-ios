@@ -1,0 +1,351 @@
+diff --git a/bsd/dev/a34_diag.c b/bsd/dev/a34_diag.c
+index 10ff70a..51e3e8f 100644
+--- a/bsd/dev/a34_diag.c
++++ b/bsd/dev/a34_diag.c
+@@ -24,6 +24,8 @@ extern unsigned int a34_cpu_diag(uint64_t *out, unsigned int max_cpus);
+ extern uint64_t sweet_fb_swap_count;
+ extern uint64_t a34_fb_stats[6];
+ extern uint64_t a34_kick_stats[6];
++extern void a34_big_init(void);         /* A34 (0922): osfmk/kern/sched_prim.c */
++extern void a34_big_report(void);
+ void a34_diag_init(void);
+ 
+ #define A34_HB_CPUS 8
+@@ -64,6 +66,7 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 		printf("A34 HB %llus on c%u swaps %llu |%s\n", now_ns / NSEC_PER_SEC, cpu,
+ 		    sweet_fb_swap_count, line);
++		a34_big_report();       /* A34 (0922): where the UI threads ran */
+ 
+ 		/* present() cost since the last line, in microseconds per present */
+ 		uint64_t s[6], dp;
+@@ -106,6 +109,7 @@ a34_diag_init(void)
+ {
+ 	thread_t thread;
+ 
++	a34_big_init();         /* A34 (0922): a34big, before any program runs */
+ 	if (!PE_parse_boot_argn("a34hb", &a34_hb_secs, sizeof(a34_hb_secs)) || a34_hb_secs == 0)
+ 		return;
+ 	if (kernel_thread_start(a34_hb_thread, NULL, &thread) == KERN_SUCCESS)
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..c293e9b 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -350,6 +350,13 @@ uint64_t    perfcontrol_failsafe_starvation_threshold;
+ extern char *proc_name_address(struct proc *p);
+ #endif /* __arm64__ */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* A34 (0922): the big cores for the UI (end of this file) */
++void a34_big_init(void);
++void a34_big_report(void);
++static processor_t a34_big_choose(thread_t thread, processor_t processor);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ uint64_t        sched_one_second_interval;
+ boolean_t       allow_direct_handoff = TRUE;
+ 
+@@ -5681,6 +5688,10 @@ thread_setrun(
+ 			pset_lock(pset);
+ 			assert((pset_available_cpu_count(pset) > 0) || (processor->state != PROCESSOR_OFF_LINE && processor->is_recommended));
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* A34 (0922): a UI thread of a chosen program to a Cortex-A78 if one is free for it (a34big=1) */
++		processor = a34_big_choose(thread, processor);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 		task_t task = get_threadtask(thread);
+ 		if (!(task->t_flags & TF_USE_PSET_HINT_CLUSTER_TYPE)) {
+ 			task->pset_hint = pset; /* NRG this is done without holding the task lock */
+@@ -8936,3 +8947,292 @@ sysctl_get_quantum_us(void)
+ }
+ 
+ #endif /* DEVELOPMENT || DEBUG */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * A34 (0922): the big cores for the UI.
++ *
++ * The MT6877 has six Cortex-A55s (cpu0-5) and two Cortex-A78s (cpu6-7,
++ * MPIDR 0x600/0x700), about twice as fast a clock. This kernel runs all
++ * eight as one cluster of equal processors (ruby/sweet: no AMP, one
++ * processor set, the clutch scheduler), and choose_processor() takes the
++ * lowest-numbered idle processor: an A55 whenever one is idle. So
++ * backboardd's drawing thread mostly runs on an A55.
++ *
++ * With boot-arg a34big=1, thread_setrun() asks a34_big_choose() after
++ * choose_processor(): a thread of priority a34bigpri (default 47, the UI's;
++ * the render server runs higher) up to, not including, realtime, of a
++ * program named in a34bignames (default backboardd,SpringBoard; "*": any
++ * program, not the kernel), goes to an idle A78, or else to an A78 running
++ * something of lower priority (which is then preempted and finds an idle
++ * A55 the usual way); if both A78s run something at least as important, it
++ * stays where choose_processor() put it. Nothing is bound: the thread still
++ * sits on the one run queue every processor takes from, so this is a
++ * preference at each wakeup, never a wait for a big core. a34bigmask
++ * (default 0xc0) names the big processors; processors not running
++ * (cpus=6) are never chosen. a34big=0 (default): nothing changes but a
++ * load of a34_big_on in thread_setrun().
++ *
++ * a34_big_report(), from bsd/dev/a34_diag.c's heartbeat (a34hb): where the
++ * eligible threads were sent since the last report, and backboardd's
++ * threads' CPU time over that time by the processor each last ran on, with
++ * its busiest thread.
++ */
++#define A34_BIG_NAMES           8
++#define A34_BIG_NAME_LEN        17      /* struct proc's p_comm: MAXCOMLEN + 1 */
++#define A34_BIG_CPUS            8
++#define A34_BIG_TRACKED         128     /* backboardd threads whose CPU time is followed */
++
++static uint32_t a34_big_on;             /* a34big */
++static uint32_t a34_big_pri = 47;       /* a34bigpri */
++static uint64_t a34_big_cpus = 0xc0;    /* a34bigmask */
++static bool a34_big_all;                /* a34bignames=* */
++static uint32_t a34_big_nnames;
++static char a34_big_names[A34_BIG_NAMES][A34_BIG_NAME_LEN];
++/* Statistics, under the (one) pset lock: eligible threads sent to each processor, and how. */
++static uint64_t a34_big_sent[A34_BIG_CPUS];
++static uint64_t a34_big_kept, a34_big_to_idle, a34_big_preempted, a34_big_little;
++
++static bool
++a34_big_name_is(const char *name, const char *want)
++{
++	for (uint32_t i = 0; i < A34_BIG_NAME_LEN; i++) {
++		if (name[i] != want[i]) {
++			return false;
++		}
++		if (name[i] == '\0') {
++			return true;
++		}
++	}
++	return true;
++}
++
++/* Thread locked, splsched: the thread's program is a chosen one (its proc and task are one allocation, held by the thread). */
++static bool
++a34_big_program(thread_t thread)
++{
++	void *p;
++	const char *name;
++
++	if (get_threadtask(thread) == kernel_task) {
++		return false;
++	}
++	if (a34_big_all) {
++		return true;
++	}
++	p = get_bsdthreadtask_info(thread);
++	if (p == NULL) {
++		return false;
++	}
++	name = proc_name_address(p);
++	for (uint32_t i = 0; i < a34_big_nnames; i++) {
++		if (a34_big_name_is(name, a34_big_names[i])) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * thread_setrun(), unbound thread: thread locked, splsched, the pset of
++ * `processor` (choose_processor()'s choice) locked. Returns `processor` or
++ * a big processor of the same pset.
++ */
++static processor_t
++a34_big_choose(thread_t thread, processor_t processor)
++{
++	processor_set_t pset = processor->processor_set;
++	cpumap_t big, idle, busy;
++	int cpuid, best = -1, lowest;
++
++	if (os_atomic_load(&a34_big_on, relaxed) == 0 || thread->sched_pri < (int)a34_big_pri ||
++	    thread->sched_pri >= BASEPRI_RTQUEUES || !a34_big_program(thread)) {
++		return processor;
++	}
++	big = a34_big_cpus & pset->cpu_bitmask & pset_available_cpumap(pset);
++	if (big == 0 || bit_test(big, processor->cpu_id)) {
++		if (big != 0) {
++			a34_big_kept++;
++		} else {
++			a34_big_little++;
++		}
++	} else {
++		idle = big & pset->cpu_state_map[PROCESSOR_IDLE];
++		cpuid = lsb_first(idle);
++		if (cpuid >= 0) {
++			a34_big_to_idle++;
++			processor = processor_array[cpuid];
++		} else {
++			busy = big & (pset->cpu_state_map[PROCESSOR_RUNNING] | pset->cpu_state_map[PROCESSOR_DISPATCHING]) &
++			    ~(pset->pending_AST_URGENT_cpu_mask | pset->pending_AST_PREEMPT_cpu_mask);
++			lowest = thread->sched_pri;
++			for (cpuid = lsb_first(busy); cpuid >= 0; cpuid = lsb_next(busy, cpuid)) {
++				if (processor_array[cpuid]->current_pri < lowest) {
++					lowest = processor_array[cpuid]->current_pri;
++					best = cpuid;
++				}
++			}
++			if (best >= 0) {
++				a34_big_preempted++;
++				processor = processor_array[best];
++			} else {
++				a34_big_little++;
++			}
++		}
++	}
++	if (processor->cpu_id >= 0 && processor->cpu_id < A34_BIG_CPUS) {
++		a34_big_sent[processor->cpu_id]++;
++	}
++	return processor;
++}
++
++/* bsd/dev/a34_diag.c, at boot before any program: the boot-args. */
++void
++a34_big_init(void)
++{
++	char names[A34_BIG_NAMES * A34_BIG_NAME_LEN];
++	uint32_t on = 0, pri = 0, n = 0, len = 0;
++	uint64_t mask = 0;
++
++	if (PE_parse_boot_argn("a34bigpri", &pri, (int)sizeof(pri)) && pri >= 1 && pri < BASEPRI_RTQUEUES) {
++		a34_big_pri = pri;
++	}
++	if (PE_parse_boot_argn("a34bigmask", &mask, (int)sizeof(mask)) && (mask & 0xffull) != 0) {
++		a34_big_cpus = mask & 0xffull;
++	}
++	strlcpy(names, "backboardd,SpringBoard", sizeof(names));
++	(void)PE_parse_boot_arg_str("a34bignames", names, (int)sizeof(names));
++	for (uint32_t i = 0;; i++) {
++		char c = names[i];
++
++		if (c == ',' || c == '\0') {
++			if (len != 0 && n < A34_BIG_NAMES) {
++				a34_big_names[n][len] = '\0';
++				if (len == 1 && a34_big_names[n][0] == '*') {
++					a34_big_all = true;
++				} else {
++					n++;
++				}
++			}
++			len = 0;
++			if (c == '\0' || i + 1 >= sizeof(names)) {
++				break;
++			}
++		} else if (n < A34_BIG_NAMES && len + 1 < A34_BIG_NAME_LEN) {
++			a34_big_names[n][len++] = c;
++		}
++	}
++	a34_big_nnames = n;
++	if (PE_parse_boot_argn("a34big", &on, (int)sizeof(on)) && on != 0) {
++		os_atomic_store(&a34_big_on, 1u, release);
++	}
++	printf("A34 BIG: %s: threads of priority %u..%d of \"%s\" (%u names%s) prefer the processors of mask 0x%llx\n",
++	    on != 0 ? "on (a34big=1)" : "off (a34big=0)", a34_big_pri, BASEPRI_RTQUEUES - 1, names, n,
++	    a34_big_all ? ", every program" : "", (unsigned long long)a34_big_cpus);
++}
++
++/* bsd/dev/a34_diag.c's heartbeat thread, every a34hb seconds; only that thread calls it. */
++void
++a34_big_report(void)
++{
++	static struct {
++		uint64_t tid, time;
++	} prev[A34_BIG_TRACKED], cur[A34_BIG_TRACKED];
++	static uint32_t nprev;
++	static uint64_t last[A34_BIG_CPUS + 4];
++	uint64_t now[A34_BIG_CPUS + 4], cpu_ns[A34_BIG_CPUS], per_cpu[A34_BIG_CPUS], ns, all_ns;
++	uint64_t total = 0, busiest = 0, busiest_tid = 0;
++	uint32_t ncur = 0, nthreads = 0;
++	int busiest_cpu = -1, busiest_pri = 0;
++	bool found = false;
++	task_t task;
++
++	for (uint32_t i = 0; i < A34_BIG_CPUS; i++) {
++		now[i] = a34_big_sent[i];
++	}
++	now[A34_BIG_CPUS] = a34_big_kept;
++	now[A34_BIG_CPUS + 1] = a34_big_to_idle;
++	now[A34_BIG_CPUS + 2] = a34_big_preempted;
++	now[A34_BIG_CPUS + 3] = a34_big_little;
++	if (os_atomic_load(&a34_big_on, relaxed) != 0) {
++		printf("A34 BIG: eligible wakeups to cpu0-7: %llu %llu %llu %llu %llu %llu | %llu %llu; on a big one already %llu, "
++		    "to an idle big one %llu, preempting one %llu, left on a little one %llu\n",
++		    (unsigned long long)(now[0] - last[0]), (unsigned long long)(now[1] - last[1]),
++		    (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
++		    (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]),
++		    (unsigned long long)(now[6] - last[6]), (unsigned long long)(now[7] - last[7]),
++		    (unsigned long long)(now[8] - last[8]), (unsigned long long)(now[9] - last[9]),
++		    (unsigned long long)(now[10] - last[10]), (unsigned long long)(now[11] - last[11]));
++	}
++	for (uint32_t i = 0; i < A34_BIG_CPUS + 4; i++) {
++		last[i] = now[i];
++	}
++
++	/* backboardd's threads: CPU time since the last report, put on the processor each last ran on */
++	for (uint32_t i = 0; i < A34_BIG_CPUS; i++) {
++		per_cpu[i] = 0;
++	}
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *p = get_bsdtask_info(task);
++		thread_t thread;
++
++		if (task == kernel_task || p == NULL || !a34_big_name_is(proc_name_address(p), "backboardd")) {
++			continue;
++		}
++		found = true;
++		task_lock(task);
++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
++			uint64_t t = recount_thread_time_mach(thread), d = t, tid = thread_tid(thread);
++			processor_t lp = thread->last_processor;
++			int cpu = lp != PROCESSOR_NULL ? lp->cpu_id : -1;
++
++			for (uint32_t i = 0; i < nprev; i++) {
++				if (prev[i].tid == tid) {
++					d = t >= prev[i].time ? t - prev[i].time : 0;
++					break;
++				}
++			}
++			if (ncur < A34_BIG_TRACKED) {
++				cur[ncur].tid = tid;
++				cur[ncur].time = t;
++				ncur++;
++			}
++			nthreads++;
++			total += d;
++			if (cpu >= 0 && cpu < A34_BIG_CPUS) {
++				per_cpu[cpu] += d;
++			}
++			if (d > busiest) {
++				busiest = d;
++				busiest_tid = tid;
++				busiest_cpu = cpu;
++				busiest_pri = thread->sched_pri;
++			}
++		}
++		task_unlock(task);
++		break;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	for (uint32_t i = 0; i < ncur; i++) {
++		prev[i] = cur[i];
++	}
++	nprev = ncur;
++	if (!found) {
++		return;
++	}
++	for (uint32_t i = 0; i < A34_BIG_CPUS; i++) {
++		absolutetime_to_nanoseconds(per_cpu[i], &cpu_ns[i]);
++	}
++	absolutetime_to_nanoseconds(busiest, &ns);
++	absolutetime_to_nanoseconds(total, &all_ns);
++	printf("A34 BIG: backboardd %u threads, %llu CPU ms since the last line, by the processor each last ran on, cpu0-7: "
++	    "%llu %llu %llu %llu %llu %llu | %llu %llu; busiest thread 0x%llx (priority %d) %llu ms, last on cpu%d\n", nthreads,
++	    (unsigned long long)(all_ns / NSEC_PER_MSEC),
++	    (unsigned long long)(cpu_ns[0] / NSEC_PER_MSEC), (unsigned long long)(cpu_ns[1] / NSEC_PER_MSEC),
++	    (unsigned long long)(cpu_ns[2] / NSEC_PER_MSEC), (unsigned long long)(cpu_ns[3] / NSEC_PER_MSEC),
++	    (unsigned long long)(cpu_ns[4] / NSEC_PER_MSEC), (unsigned long long)(cpu_ns[5] / NSEC_PER_MSEC),
++	    (unsigned long long)(cpu_ns[6] / NSEC_PER_MSEC), (unsigned long long)(cpu_ns[7] / NSEC_PER_MSEC),
++	    (unsigned long long)busiest_tid, busiest_pri, (unsigned long long)(ns / NSEC_PER_MSEC), busiest_cpu);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
