@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/a34_diag.c b/bsd/dev/a34_diag.c
+index ee7d11c..d84e2a9 100644
+--- a/bsd/dev/a34_diag.c
++++ b/bsd/dev/a34_diag.c
+@@ -22,6 +22,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern unsigned int a34_cpu_diag(uint64_t *out, unsigned int max_cpus);
+ extern uint64_t sweet_fb_swap_count;
++extern uint64_t a34_fb_stats[6];
+ void a34_diag_init(void);
+ 
+ #define A34_HB_CPUS 8
+@@ -37,6 +38,8 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 
++	uint64_t prev[6] = { 0 };
++
+ 	absolutetime_to_nanoseconds(1000, &tick_ns);    /* ns per 1000 ticks */
+ 	for (;;) {
+ 		clock_interval_to_deadline(a34_hb_secs, NSEC_PER_SEC, &deadline);
+@@ -60,6 +63,24 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 		printf("A34 HB %llus on c%u swaps %llu |%s\n", now_ns / NSEC_PER_SEC, cpu,
+ 		    sweet_fb_swap_count, line);
++
++		/* present() cost since the last line, in microseconds per present */
++		uint64_t s[6], dp;
++		for (int k = 0; k < 6; k++) {
++			s[k] = a34_fb_stats[k];
++		}
++		dp = s[0] - prev[0];
++		if (dp != 0) {
++			printf("A34 FB %llu presents %llu vsyncs: copy %lluus flush %lluus kick %lluus (max %lluus)\n",
++			    dp, s[5] - prev[5],
++			    (s[1] - prev[1]) / dp * tick_ns / 1000000,
++			    (s[2] - prev[2]) / dp * tick_ns / 1000000,
++			    (s[3] - prev[3]) / dp * tick_ns / 1000000,
++			    s[4] * tick_ns / 1000000);
++		}
++		for (int k = 0; k < 6; k++) {
++			prev[k] = s[k];
++		}
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cb886b9..7ba3987 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,11 +253,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
++	/* A34 (0905): re-arm first; the present below must not stretch the
++	 * vsync period that backboardd paces its frames by. */
++	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	a34_fb_stats[5]++;
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -292,6 +295,12 @@ static uint32_t sweet_fb_dbg_logged;
+ /* A34 (0904): read by the heartbeat in bsd/dev/a34_diag.c. */
+ extern "C" uint64_t sweet_fb_swap_count;
+ uint64_t sweet_fb_swap_count;
++/*
++ * A34 (0905): where present() spends its time, in mach ticks, for the
++ * heartbeat: presents, copy, cache flush, panel kick, slowest kick, vsyncs.
++ */
++extern "C" uint64_t a34_fb_stats[6];
++uint64_t a34_fb_stats[6];
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -403,15 +412,20 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
+ 			const uint32_t *srccp = (const uint32_t *)(src + s->offset +
+ 			    (uint64_t)(s->height / 2) * s->bytesPerRow + (uint64_t)(s->width / 2) * 4);
++			uint64_t t_copy = mach_absolute_time();
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			uint64_t t_flush = mach_absolute_time();
+ 			/* ruby: the DSI scanout reads DRAM; flush the CPU copy to it. */
+ 			flush_dcache64((addr64_t)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
+ 			    (uint32_t)((uint64_t)h * fRowBytes), FALSE);
+ 			__asm__ __volatile__("dsb sy" ::: "memory");
++			uint64_t t_done = mach_absolute_time();
++			a34_fb_stats[1] += t_flush - t_copy;
++			a34_fb_stats[2] += t_done - t_flush;
+ 			if (sweet_fb_dbg_logged < 8) {
+ 				sweet_fb_dbg_logged++;
+ 				IOLog("SWEET FB DBG: layer %u id %u src_va=%p dst_va=%p dst_pa=0x%llx w=%d h=%d src0=%08x srcc=%08x dst0=%08x dstc=%08x\n",
+@@ -425,7 +439,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		s->release();
+ 	}
+ 	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
++	uint64_t t_kick = mach_absolute_time();
+ 	a34_display_kick();
++	t_kick = mach_absolute_time() - t_kick;
++	a34_fb_stats[0]++;
++	a34_fb_stats[3] += t_kick;
++	if (t_kick > a34_fb_stats[4]) {
++		a34_fb_stats[4] = t_kick;
++	}
+ }
+ 
+ bool
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 8a13548..f3e9702 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -735,7 +735,9 @@ fbcon_kick(void)
+ 		return;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	for (unsigned int i = 0; i < 2000000 && (fbcon_dsi[0x0c / 4] & (1u << 31)); i++) {
++	/* A34 (0905): was 2,000,000 reads (~200 ms when the busy bit stays up,
++	 * which stalled every GUI frame); a frame transfer takes < 20 ms. */
++	for (unsigned int i = 0; i < 100000 && (fbcon_dsi[0x0c / 4] & (1u << 31)); i++) {
+ 	}
+ 	for (unsigned int n = 0; n < 16; n++) {
+ 		if (fbcon_mutex[(0x30 + 0x20 * n) / 4]) {

@@ -218,7 +218,38 @@ u64 shim_main(u64 dtb, u64 load)
     paint();
     int have_out = find_placeholder(dtb);
 
-#ifdef TOUCH_PROBE
+#ifdef CPU_PROBE
+    // v7c: CPU clock of the boot core as LK leaves it, measured with a chain
+    // of dependent adds (1 cycle each on Cortex-A55) against the 13 MHz
+    // counter, and the first words of the CPU DVFS shared SRAM ("dvfsp",
+    // 0x0011bc00) that MediaTek's cpufreq driver talks to the MCUPM through.
+    if (have_out) {
+        u64 best = 0;
+        for (int run = 0; run < 3; run++) {
+            u64 iters = 1000000, t0, t1;
+            __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
+            __asm__ volatile(
+                "mov x9, %0\n"
+                "1:\n"
+                ".rept 32\n add x10, x10, #1\n .endr\n"
+                "subs x9, x9, #1\n"
+                "b.ne 1b\n"
+                :: "r"(iters) : "x9", "x10", "cc");
+            __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t1));
+            u64 f = SYSREG(cntfrq_el0);
+            u64 mhz = (32 * iters) * (f ? f : 13000000) / ((t1 - t0) ? (t1 - t0) : 1) / 1000000;
+            if (mhz > best)
+                best = mhz;
+        }
+        put_str("v7c-MHz"); put_hex(best, 4);
+        put_str("-R");
+        for (int i = 0; i < 40; i++) {
+            put_hex(rd32(0x0011bc00UL + 4 * i), 8);
+            put(i % 8 == 7 ? '/' : '.');
+        }
+    }
+    if (0) {
+#elif defined(TOUCH_PROBE)
     // v6t: touch bring-up facts instead of the display dump (see a34touch.c).
     if (have_out) {
         static struct a34touch t;
@@ -270,7 +301,7 @@ u64 shim_main(u64 dtb, u64 load)
     if (have_out) {
         put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
         put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
-#ifndef TOUCH_PROBE
+#if !defined(TOUCH_PROBE) && !defined(CPU_PROBE)
         // OVL1_2L last: mutex 0 bit 16 may be it; if reading it hangs, the
         // results above are lost but the recovery note is already cleared.
         dump_ovl('Q', OVL1_2L, 2);
