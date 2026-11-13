@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 79b8caf..99a0ab0 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -1486,13 +1486,20 @@ am_uc_start(void)
+ 		printf("A34 MALI UC: no memory for the GPU's tables, user client not started\n");
+ 		return;
+ 	}
+-	if (!am_gpu_reinit(true)) {
+-		printf("A34 MALI UC: the GPU did not come back from its reset, user client not started\n");
+-		return;
+-	}
+-	if (!am_run_job(7, AM_GPU_VA, 0xc0ffee07u)) {
+-		printf("A34 MALI UC: the job after the reset failed, user client not started\n");
+-		return;
++	/* A34 (0910): a34malistep7=0 skips the reset/setup and its job (display hunt). */
++	uint32_t step7 = 1;
++	(void)PE_parse_boot_argn("a34malistep7", &step7, (int)sizeof(step7));
++	if (step7 == 0) {
++		printf("A34 MALI UC: step 7 skipped (a34malistep7=0)\n");
++	} else {
++		if (!am_gpu_reinit(true)) {
++			printf("A34 MALI UC: the GPU did not come back from its reset, user client not started\n");
++			return;
++		}
++		if (!am_run_job(7, AM_GPU_VA, 0xc0ffee07u)) {
++			printf("A34 MALI UC: the job after the reset failed, user client not started\n");
++			return;
++		}
+ 	}
+ 	l3[(AM_GPU_VA >> 12) & 511] = 0;
+ 	am_flush((vm_offset_t)&l3[(AM_GPU_VA >> 12) & 511], sizeof(uint64_t));
+@@ -1517,7 +1524,14 @@ am_thread(void *arg, wait_result_t result)
+ 	printf("A34 MALI: bring-up start (a34mali=%u, pause %u s, park %u)\n", am_mode, am_pause_s, am_park);
+ 	reached = am_bringup();
+ 	if (reached == 6) {
+-		am_uc_start();          /* the RedwoodMali service, for programs */
++		/* A34 (0910): a34malisvc=0 stops after step 6, as 0908 did. */
++		uint32_t svc = 1;
++		(void)PE_parse_boot_argn("a34malisvc", &svc, (int)sizeof(svc));
++		if (svc != 0) {
++			am_uc_start();          /* the RedwoodMali service, for programs */
++		} else {
++			printf("A34 MALI UC: not started (a34malisvc=0)\n");
++		}
+ 	}
+ 	printf("A34 MALI: done step %u/6\n", reached);
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2302386..b7faff9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -198,6 +198,57 @@ a34_dsi_wait_idle(uint64_t *ticks)
+ 	return true;
+ }
+ 
++extern "C" uint32_t a34_dsi_rd(uint32_t off);
++extern "C" uint32_t a34_mutex_rd(uint32_t off);
++
++/*
++ * A34 (0910): the first time a frame transfer does not finish, log the DSI,
++ * the display mutex, RDMA0 and both OVLs once, to see what the pipe waits on.
++ */
++static void
++a34_disp_dump(const char *why)
++{
++	static bool done;
++	static const uint16_t dsi[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c,
++		                        0x104, 0x160, 0x164, 0x168, 0x16c, 0x170, 0x174, 0x178, 0x17c };
++	char line[400];
++	size_t n;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	n = 0;
++	for (unsigned i = 0; i < sizeof(dsi) / sizeof(dsi[0]) && n < sizeof(line); i++) {
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", dsi[i], a34_dsi_rd(dsi[i]));
++	}
++	IOLog("A34 DISP %s: DSI%s\n", why, line);
++	n = 0;
++	for (uint32_t off = 0; off <= 0x3c && n < sizeof(line); off += 4) {
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", off, a34_mutex_rd(off));
++	}
++	IOLog("A34 DISP %s: MUTEX%s\n", why, line);
++	static const struct { const char *name; uint32_t pa; } blk[] = {
++		{ "RDMA0", 0x14007000u }, { "OVL0", 0x14005000u }, { "OVL0_2L", 0x14006000u },
++	};
++	for (unsigned b = 0; b < sizeof(blk) / sizeof(blk[0]); b++) {
++		volatile uint32_t *r = (volatile uint32_t *)ml_io_map(blk[b].pa, 0x1000);
++		if (r == NULL) {
++			continue;
++		}
++		n = 0;
++		for (uint32_t off = 0; off <= 0x4c && n < sizeof(line); off += 4) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", off, r[off / 4]);
++		}
++		IOLog("A34 DISP %s: %s%s\n", why, blk[b].name, line);
++		n = 0;
++		for (uint32_t off = 0x200; off <= 0x24c && n < sizeof(line); off += 4) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", off, r[off / 4]);
++		}
++		IOLog("A34 DISP %s: %s+%s\n", why, blk[b].name, line);
++	}
++}
++
+ static void
+ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -212,6 +263,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 	IODelay(50);
+ 	if (!a34_dsi_wait_idle(&xfer)) {
+ 		a34_kick_stats[5]++;
++		a34_disp_dump("transfer did not finish in 1 s");
+ 	}
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 65a1bdc..bd729ab 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -766,6 +766,21 @@ a34_dsi_busy(void)
+ 	return (fbcon_dsi[0x0c / 4] & (1u << 31)) != 0;
+ }
+ 
++/* A34 (0910): raw register reads for SweetFramebuffer's hang report. */
++uint32_t a34_dsi_rd(uint32_t off);
++uint32_t
++a34_dsi_rd(uint32_t off)
++{
++	return fbcon_dsi != NULL ? fbcon_dsi[off / 4] : 0xdeadbeef;
++}
++
++uint32_t a34_mutex_rd(uint32_t off);
++uint32_t
++a34_mutex_rd(uint32_t off)
++{
++	return fbcon_mutex != NULL ? fbcon_mutex[off / 4] : 0xdeadbeef;
++}
++
+ void a34_dsi_trigger(void);
+ void
+ a34_dsi_trigger(void)
