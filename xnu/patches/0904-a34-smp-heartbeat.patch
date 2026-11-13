@@ -1,0 +1,186 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 91809be..03f3372 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/ruby_keys.c			standard
+ bsd/dev/a34_touch.c			standard
++bsd/dev/a34_diag.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_diag.c b/bsd/dev/a34_diag.c
+new file mode 100644
+index 0000000..ee7d11c
+--- /dev/null
++++ b/bsd/dev/a34_diag.c
+@@ -0,0 +1,76 @@
++/*
++ * A34 (0904): heartbeat for the 6-core stall hunt.
++ *
++ * Every a34hb seconds (boot arg, default 0 = off) one line in the kernel log:
++ *
++ *   A34 HB <uptime s> on c<cpu> swaps <n> | c<i> t<timer irqs> i<IPIs>
++ *       o<other irqs> p<ms to the CPU's next timer deadline> ...
++ *
++ * A CPU whose timer count stops while the others go on, or whose next
++ * deadline drifts into the past, is the one that stalls.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern unsigned int a34_cpu_diag(uint64_t *out, unsigned int max_cpus);
++extern uint64_t sweet_fb_swap_count;
++void a34_diag_init(void);
++
++#define A34_HB_CPUS 8
++
++static uint32_t a34_hb_secs;
++static int a34_hb_chan;
++
++static void
++a34_hb_thread(void *arg, wait_result_t result)
++{
++	uint64_t d[4 * A34_HB_CPUS], deadline, now_ns, tick_ns;
++	char line[A34_HB_CPUS * 56];
++	(void)arg;
++	(void)result;
++
++	absolutetime_to_nanoseconds(1000, &tick_ns);    /* ns per 1000 ticks */
++	for (;;) {
++		clock_interval_to_deadline(a34_hb_secs, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&a34_hb_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		unsigned int cpu = a34_cpu_diag(d, A34_HB_CPUS);
++		size_t n = 0;
++		line[0] = 0;
++		for (unsigned int i = 0; i < A34_HB_CPUS; i++) {
++			if (d[4 * i] == 0 && d[4 * i + 1] == 0 && d[4 * i + 2] == 0)
++				continue;
++			int64_t ahead_ms = (int64_t)d[4 * i + 3] / 1000 * (int64_t)tick_ns / 1000000;
++			if (ahead_ms > 99999 || ahead_ms < -99999)
++				ahead_ms = 99999;
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " c%u t%llu i%llu o%llu p%lld",
++			    i, d[4 * i], d[4 * i + 1], d[4 * i + 2], ahead_ms);
++			if (n >= sizeof(line))
++				break;
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++		printf("A34 HB %llus on c%u swaps %llu |%s\n", now_ns / NSEC_PER_SEC, cpu,
++		    sweet_fb_swap_count, line);
++	}
++}
++
++void
++a34_diag_init(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a34hb", &a34_hb_secs, sizeof(a34_hb_secs)) || a34_hb_secs == 0)
++		return;
++	if (kernel_thread_start(a34_hb_thread, NULL, &thread) == KERN_SUCCESS)
++		thread_deallocate(thread);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 88e58f4..29dce2b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void ruby_keys_init(void);
+ extern void a34_touch_init(void);
++extern void a34_diag_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -706,6 +707,7 @@ sweet_ufs_init(void)
+ 	/* A34 (0903): touch first, it powers the chip through the PMIC wrapper
+ 	 * before the key poll thread starts using it. */
+ 	a34_touch_init();
++	a34_diag_init();
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3cf3caa..cb886b9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -289,7 +289,9 @@ get32(const uint8_t *p, uint32_t off)
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint32_t sweet_fb_dbg_logged;
+-static uint64_t sweet_fb_swap_count;
++/* A34 (0904): read by the heartbeat in bsd/dev/a34_diag.c. */
++extern "C" uint64_t sweet_fb_swap_count;
++uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 893659e..1c2da30 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1848,6 +1848,29 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++/*
++ * A34 (0904): per-CPU interrupt counts and the next timer deadline, for the
++ * heartbeat in bsd/dev/a34_diag.c (6-core stall hunt).
++ */
++static uint64_t a34_irq_count[3][8];            /* timer, IPI, other */
++unsigned int a34_cpu_diag(uint64_t *out, unsigned int max_cpus);
++unsigned int
++a34_cpu_diag(uint64_t *out, unsigned int max_cpus)
++{
++	uint64_t now = mach_absolute_time();
++
++	for (unsigned int i = 0; i < max_cpus && i < 8; i++) {
++		cpu_data_t *cdp = cpu_datap((int)i);
++		out[4 * i + 0] = os_atomic_load(&a34_irq_count[0][i], relaxed);
++		out[4 * i + 1] = os_atomic_load(&a34_irq_count[1][i], relaxed);
++		out[4 * i + 2] = os_atomic_load(&a34_irq_count[2][i], relaxed);
++		out[4 * i + 3] = cdp ? cdp->rtcPop - now : 0;   /* signed: ticks ahead */
++	}
++	return getCpuDatap()->cpu_number;
++}
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1869,6 +1892,7 @@ sleh_irq(arm_saved_state_t *state)
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
++		os_atomic_inc(&a34_irq_count[0][cdp->cpu_number & 7], relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+@@ -1876,12 +1900,14 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
++		os_atomic_inc(&a34_irq_count[1][cdp->cpu_number & 7], relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
++		os_atomic_inc(&a34_irq_count[2][cdp->cpu_number & 7], relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (!sweet_irq_dispatch(intid)) {
+ 			if (cdp->interrupt_handler) {
