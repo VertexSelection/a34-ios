@@ -218,7 +218,73 @@ u64 shim_main(u64 dtb, u64 load)
     paint();
     int have_out = find_placeholder(dtb);
 
-#ifdef CPU_PROBE
+#ifdef DSI_PROBE
+    // v8d: the panel link as LK leaves it. DSI0 registers, then 200 ms of
+    // sampling DSI_INTSTA bit 31 ("busy"): busy fraction, number of busy->idle
+    // edges, longest/shortest idle run and longest busy run (13 MHz ticks);
+    // then one frame trigger: ticks waited for idle before it, and ticks until
+    // the link is idle again after it.
+    if (have_out) {
+        static const uint16_t regs[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c,
+                                    0x104, 0x108, 0x110, 0x114, 0x118, 0x11c,
+                                    0x160, 0x164, 0x168, 0x16c, 0x170, 0x174 };
+        put_str("v8d-R");
+        for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+            put_hex(rd32(DSI0 + regs[i]), 8);
+            put(i % 7 == 6 ? '/' : '.');
+        }
+        u64 f = SYSREG(cntfrq_el0), t, end, run0;
+        u64 samples = 0, busy = 0, edges = 0, idle_max = 0, idle_min = ~0ull, busy_max = 0;
+        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+        end = t + f / 5;
+        run0 = t;
+        u32 prev = rd32(DSI0 + 0x0c) >> 31;
+        for (;;) {
+            u32 b = rd32(DSI0 + 0x0c) >> 31;
+            __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+            samples++;
+            busy += b;
+            if (b != prev) {
+                u64 run = t - run0;
+                if (prev) {
+                    edges++;
+                    if (run > busy_max) busy_max = run;
+                } else {
+                    if (run > idle_max) idle_max = run;
+                    if (run < idle_min) idle_min = run;
+                }
+                prev = b;
+                run0 = t;
+            }
+            if (t >= end)
+                break;
+        }
+        put_str("-S"); put_hex(samples, 7); put('_'); put_hex(busy, 7); put('_');
+        put_hex(edges, 5); put('_'); put_hex(idle_max, 6); put('_');
+        put_hex(idle_min == ~0ull ? 0 : idle_min, 6); put('_'); put_hex(busy_max, 7);
+        put('_'); put_hex(prev, 1);
+        // one trigger
+        u64 t0, t1, t2, start_wait;
+        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
+        start_wait = t0;
+        end = t0 + f / 2;
+        while ((rd32(DSI0 + 0x0c) >> 31) && t0 < end)
+            __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
+        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t1));
+        display_trigger();
+        u32 after = rd32(DSI0 + 0x0c);
+        end = t1 + f;
+        do {
+            __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t2));
+        } while ((rd32(DSI0 + 0x0c) >> 31) && t2 < end);
+        // -T <ticks waited for idle before the trigger> _ <INTSTA right after
+        //    the trigger> _ <ticks until idle again> _ <INTSTA at the end>
+        put_str("-T"); put_hex(t1 - start_wait, 7); put('_');
+        put_hex(after, 8); put('_'); put_hex(t2 - t1, 7);
+        put('_'); put_hex(rd32(DSI0 + 0x0c), 8);
+    }
+    if (0) {
+#elif defined(CPU_PROBE)
     // v7c: CPU clock of the boot core as LK leaves it, measured with a chain
     // of dependent adds (1 cycle each on Cortex-A55) against the 13 MHz
     // counter, and the first words of the CPU DVFS shared SRAM ("dvfsp",
@@ -301,7 +367,7 @@ u64 shim_main(u64 dtb, u64 load)
     if (have_out) {
         put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
         put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
-#if !defined(TOUCH_PROBE) && !defined(CPU_PROBE)
+#if !defined(TOUCH_PROBE) && !defined(CPU_PROBE) && !defined(DSI_PROBE)
         // OVL1_2L last: mutex 0 bit 16 may be it; if reading it hangs, the
         // results above are lost but the recovery note is already cleared.
         dump_ovl('Q', OVL1_2L, 2);
