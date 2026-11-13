@@ -47,13 +47,14 @@ index 79b8caf..99a0ab0 100644
  	printf("A34 MALI: done step %u/6\n", reached);
  }
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 2302386..b7faff9 100644
+index 2302386..7b5f391 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -198,6 +198,57 @@ a34_dsi_wait_idle(uint64_t *ticks)
+@@ -198,6 +198,58 @@ a34_dsi_wait_idle(uint64_t *ticks)
  	return true;
  }
  
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" uint32_t a34_dsi_rd(uint32_t off);
 +extern "C" uint32_t a34_mutex_rd(uint32_t off);
 +
@@ -108,7 +109,7 @@ index 2302386..b7faff9 100644
  static void
  a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -212,6 +263,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+@@ -212,6 +264,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
  	IODelay(50);
  	if (!a34_dsi_wait_idle(&xfer)) {
  		a34_kick_stats[5]++;
