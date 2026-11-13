@@ -119,6 +119,7 @@ host_tools() {
 	libdrm_standin "$HOST_DRM" "$HOST_DRM/lib/libdrm.2.dylib" "$CLANG" -isysroot "$MAC_SDK"
 	(
 		export PATH="$LLVM_PREFIX/bin:$BISON_PREFIX/bin:$PATH"
+		export SDKROOT="$MAC_SDK"       # the toolchain's clang, called directly, knows no SDK
 		export PKG_CONFIG_PATH="$HOST_DRM/lib/pkgconfig:$BREW/lib/pkgconfig"
 		export CC="${CCACHE:+$CCACHE }$CLANG" CXX="${CCACHE:+$CCACHE }$CLANGXX" OBJC="${CCACHE:+$CCACHE }$CLANG"
 		meson_setup "$WORK/build-host" "$SRC" --buildtype=release -Db_ndebug=true \

@@ -71,7 +71,7 @@ Selectors and structure sizes (Mesa 26.3's `panfrost_drm.h`, all little-endian, 
 | `0x09` | `GEM_CLOSE` `{u32 handle, pad}` | 8 | yes |
 | `0x40` | `PANFROST_SUBMIT` | **48** (`jm_ctx_handle`, `pad` after `requirements`) | yes; `jc` = first job, `bo_handles` = user pointer to `bo_handle_count` u32s, `requirements` bit 0 `FS`; syncobj fields always 0 |
 | `0x41` | `PANFROST_WAIT_BO` `{u32 handle, pad; s64 timeout_ns}` | 16 | yes (answer at once: jobs are synchronous) |
-| `0x42` | `PANFROST_CREATE_BO` `{u32 size, flags, handle, pad; u64 offset}` | 24 | yes; flags `NOEXEC` 1, `HEAP` 2 (tiler heap: grow on fault, or back it all) |
+| `0x42` | `PANFROST_CREATE_BO` `{u32 size, flags, handle, pad; u64 offset}` | 24 | yes; flags `NOEXEC` 1, `HEAP` 2 (the tiler heap, one 128 MiB BO per screen: grow on fault, or back it all); `offset` = GPU VA |
 | `0x44` | `PANFROST_GET_PARAM` `{u32 param, pad; u64 value}` | 16 | yes, params below |
 | `0x45` | `PANFROST_GET_BO_OFFSET` `{u32 handle, pad; u64 offset}` | 16 | only for imported BOs (not today) |
 | `0x48` | `PANFROST_MADVISE` `{u32 handle, madv, retained}` | 12 | yes (BO cache); answer `retained = 1` |
