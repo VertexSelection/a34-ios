@@ -123,7 +123,7 @@ jobs:
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
           ccache -s
-          if grep -E "Skipping patch .*a34" ../build.log; then
+          if grep -E "Skipping patch .*/patches/[0-9]+[a-z]?-a34-" ../build.log; then
             echo "an A34 patch did not apply"; exit 1
           fi
 
