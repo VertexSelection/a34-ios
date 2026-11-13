@@ -16,9 +16,9 @@ usable as a daily system, and installing it erases the phone.
 | Buttons | volume up/down, power (patch 0902) |
 | CPU | all 8 cores (6× Cortex-A55 at ~1.8 GHz, 2× Cortex-A78), one scheduler cluster |
 | Storage | iOS root (HFS+) at the start of `userdata` |
-| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up (0908) and a panfrost-style IOKit service (0909–0912, `a34mali=1`); **Mesa 26.3 Panfrost (OpenGL ES 3.1) renders on it** (`userland/mesa`, test `mali-tri` passes); CoreAnimation does not use it yet |
+| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up and a panfrost-style IOKit service (0908–0916, `a34mali=1`), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected into backboardd with `a34inject=/a34/liba34gl-inject.dylib,backboardd`): **the UI is GPU-rendered, ~20 fps**; some visual glitches |
 | Boot time | empty `IOAcceleratorES` (0907, from ios-topaz) saves ~45 s; first frames ~65 s after XNU starts |
-| Not yet | GPU-accelerated UI (CoreAnimation), Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
+| Not yet | Metal, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
 The base firmware is One UI 7 (A346EXXSADYG1). Do not go to One UI 8 or
 later: it removes bootloader unlocking. Never write the `efs`, `sec_efs`,
@@ -50,7 +50,8 @@ The kernel keeps a persistent log at the end of `userdata`;
 Boot args in use: `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
 ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1 sweethw=0 sweetgt=0
 launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt=-1
-wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_hz=30 rubkeys=1 a34touch=1`
+wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_hz=30 rubkeys=1 a34touch=1 a34mali=1
+a34inject=/a34/liba34gl-inject.dylib,backboardd`
 (`cpus=8`; `a34hb=10` adds a 10-second heartbeat with per-CPU interrupt counts and
 display timings to the kernel log)
 
