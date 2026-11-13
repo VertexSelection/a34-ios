@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 99a0ab0..d3fbe54 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -175,6 +175,11 @@ bool RedwoodMaliStart(void);            /* iokit/Kernel/arm/A34Mali.cpp */
+ #define GPU_COHERENCY_ENABLE    0x304u
+ #define GPU_STACK_PRESENT_LO    0xe00u
+ #define GPU_STACK_READY_LO      0xe10u
++#define GPU_JM_CONFIG           0xf00u
++#define GPU_SHADER_CONFIG       0xf04u
++#define SC_VAR_ALGORITHM        (1u << 29)
++#define JM_IDVS_GROUP_SIZE_MASK (0x3fu << 16)
++#define JM_IDVS_GROUP_SIZE_DEF  (0xfu << 16)
+ #define GPU_CMD_SOFT_RESET      1u
+ #define GPU_IRQ_RESET_COMPLETED (1u << 8)
+ 
+@@ -534,6 +539,17 @@ am_step4(void)
+ 		return false;
+ 	}
+ 	printf("A34 MALI: step 4: soft reset done\n");
++	/*
++	 * A34 (0912): the G68 settings Linux/kbase write after a reset, before
++	 * any core has power. 0909 wrote them in a second bring-up ("step 7")
++	 * that first powered the shader cores off again; with that step the
++	 * first GUI frame never left the display pipe (DSI busy forever), with
++	 * it skipped the display works. So: here, once, and no power-off.
++	 */
++	am_wr(am_gpu, GPU_SHADER_CONFIG, am_rd(am_gpu, GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
++	am_wr(am_gpu, GPU_JM_CONFIG, (am_rd(am_gpu, GPU_JM_CONFIG) & ~JM_IDVS_GROUP_SIZE_MASK) | JM_IDVS_GROUP_SIZE_DEF);
++	printf("A34 MALI: step 4: SHADER_CONFIG 0x%08x JM_CONFIG 0x%08x\n", am_rd(am_gpu, GPU_SHADER_CONFIG),
++	    am_rd(am_gpu, GPU_JM_CONFIG));
+ 
+ 	am_wr(am_gpu, GPU_L2_PWRON_LO, am_l2);
+ 	if (!am_wait(am_gpu, GPU_L2_READY_LO, am_l2, am_l2, 50000)) {
+@@ -831,11 +847,6 @@ am_bringup(void)
+ #define GPU_SHADER_PWROFF_LO    0x1c0u
+ #define GPU_SHADER_PWRTRANS_LO  0x200u
+ #define GPU_THREAD_TLS_ALLOC    0x310u
+-#define GPU_JM_CONFIG           0xf00u
+-#define GPU_SHADER_CONFIG       0xf04u
+-#define SC_VAR_ALGORITHM        (1u << 29)
+-#define JM_IDVS_GROUP_SIZE_MASK (0x3fu << 16)
+-#define JM_IDVS_GROUP_SIZE_DEF  (0xfu << 16)
+ #define GPU_CMD_HARD_RESET      2u
+ #define GPU_CMD_CYCLE_COUNT_START 5u
+ #define GPU_CMD_CYCLE_COUNT_STOP 6u
+@@ -983,10 +994,8 @@ am_gpu_reinit(bool idle)
+ {
+ 	uint32_t sc, jm;
+ 
+-	if (idle && (am_rd(am_gpu, GPU_SHADER_READY_LO) & am_shaders) != 0 && !am_shaders_switch(false)) {
+-		printf("A34 MALI UC: shader cores not off in 100 ms (SHADER_READY 0x%08x PWRTRANS 0x%08x), reset anyway\n",
+-		    am_rd(am_gpu, GPU_SHADER_READY_LO), am_rd(am_gpu, GPU_SHADER_PWRTRANS_LO));
+-	}
++	/* A34 (0912): never power the shader cores off first: that broke the display (see step 4). */
++	(void)idle;
+ 	if (!am_soft_reset()) {
+ 		printf("A34 MALI UC: no RESET_COMPLETED in 100 ms after a soft reset, hard reset\n");
+ 		am_wr(am_gpu, GPU_INT_CLEAR, 0xffffffffu);
+@@ -1486,8 +1495,8 @@ am_uc_start(void)
+ 		printf("A34 MALI UC: no memory for the GPU's tables, user client not started\n");
+ 		return;
+ 	}
+-	/* A34 (0910): a34malistep7=0 skips the reset/setup and its job (display hunt). */
+-	uint32_t step7 = 1;
++	/* A34 (0910/0912): a34malistep7=1 runs the reset/setup and its job again (it breaks the display). */
++	uint32_t step7 = 0;
+ 	(void)PE_parse_boot_argn("a34malistep7", &step7, (int)sizeof(step7));
+ 	if (step7 == 0) {
+ 		printf("A34 MALI UC: step 7 skipped (a34malistep7=0)\n");

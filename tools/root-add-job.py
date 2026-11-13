@@ -49,6 +49,9 @@ def main():
         'StandardOutPath': '/dev/console',
         'StandardErrorPath': '/dev/console',
         'EnvironmentVariables': {'EGL_LOG_LEVEL': 'debug', 'MESA_DEBUG': '1'},
+        # Unknown daemons get a small jetsam limit; Mesa plus GPU buffers is
+        # far above it (mali-tri was killed: reason namespace 1, code 7).
+        'JetsamProperties': {'JetsamMemoryLimit': 2048},
     }
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
