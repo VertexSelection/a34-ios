@@ -37,6 +37,7 @@ typedef uint8_t u8;
 #define GREY    0xff606060u
 
 extern u8 _start[];
+extern const u64 shim_payload_size, shim_payload2_size;
 
 static inline u32 rd32(u64 a) { return *(volatile u32 *)a; }
 
@@ -332,6 +333,52 @@ static void zero64(u64 dst, u64 n)
 
 typedef void (*xnu_entry_t)(u64 boot_args_pa);
 
+// ---------------------------------------------------------- TWRP escape --
+//
+// Holding Volume Up while the loader starts boots the TWRP kernel carried in
+// the same image instead of XNU (root shell over adb, for logs and new test
+// images once Android no longer boots). Volume Up is the only key on the
+// MediaTek keypad (kp@10010000, hw-init-map index 1 = KEY_VOLUMEUP); KP_MEM1
+// bit 1 reads 0 while it is pressed.
+
+#define KPD_MEM1    0x10010004UL
+#define TWO_MB      0x200000UL
+#define RAM_LIMIT   0x46c00000UL        // secdbg-kernel-log starts here
+
+static u64 now(void)
+{
+    u64 t;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+    return t;
+}
+
+static int volume_up_held(u64 ms)
+{
+    u64 end = now() + 13000ull * ms;
+    while (now() < end)
+        if (!(rd32(KPD_MEM1) & 2))
+            return 1;
+    return 0;
+}
+
+// Copy the second payload (an arm64 Image) to the next 2 MiB boundary after
+// the blob; returns its entry point or 0.
+static u64 place_image(u64 src, u64 len)
+{
+    if (!len || *(volatile u32 *)(src + 56) != 0x644d5241)
+        return 0;
+    u64 text_offset = *(volatile u64 *)(src + 8);
+    u64 kimage_size = *(volatile u64 *)(src + 16);
+    if (kimage_size < len)
+        kimage_size = len;
+    u64 dest = (src + len + TWO_MB - 1) & ~(TWO_MB - 1);
+    if (dest + text_offset + kimage_size > RAM_LIMIT)
+        return 0;
+    copy64(dest + text_offset, src, len);
+    __asm__ volatile("dsb sy" ::: "memory");
+    return dest + text_offset;
+}
+
 u64 shim_main(u64 dtb, u64 load)
 {
     (void)dtb;
@@ -351,6 +398,22 @@ u64 shim_main(u64 dtb, u64 load)
     stage(0, (uo == 0 && (bcb == UFS_BCB_CLEARED || bcb == UFS_BCB_EMPTY)) ? GREEN : YELLOW);
     stage(6, GREEN);
     stage(7, gic_prepare() ? GREEN : YELLOW);
+
+    // TWRP escape: a white bar for two seconds; Volume Up held -> TWRP.
+    rect(40, 300, FB_W - 80, 40, 0xffffffffu);
+    kick();
+    if (volume_up_held(2000)) {
+        rect(40, 300, FB_W - 80, 40, 0xff0060ffu);
+        kick();
+        u64 twrp_src = load + PAYLOAD_OFF + ((shim_payload_size + 15) & ~15ull);
+        u64 entry = place_image(twrp_src, shim_payload2_size);
+        if (entry)
+            return entry;               // shim-start.S enters it with x0 = DTB
+        rect(40, 300, FB_W - 80, 40, RED);
+        kick();
+    }
+    rect(40, 300, FB_W - 80, 40, 0xff000000u);
+    kick();
 
     // 2. Payload present?
     const struct payload *p = (const struct payload *)(load + PAYLOAD_OFF);

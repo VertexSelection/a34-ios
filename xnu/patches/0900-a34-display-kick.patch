@@ -1,3 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3c67ce9..5e1759b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -310,6 +310,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/* A34: command-mode DSI panel, see pexpert/arm/pe_serial.c fbcon_kick(). */
++extern "C" void a34_display_kick(void);
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -449,6 +452,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		IOLog("SWEET FB DBG: marker va=%p pa=0x%llx fPhys=0x%llx fPixels=0x%llx rows=64\n",
+ 		    (void *)fPixels, fPhys, fPhys, (uint64_t)fPixels);
+ 	}
++	a34_display_kick();
+ }
+ 
+ bool
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 5787304..1921273 100644
 --- a/osfmk/arm64/start.s
@@ -79,10 +101,10 @@ index 5a05b91..a32c537 100644
  	__asm__ volatile("dsb sy" ::: "memory");
  	sweet_early_mark(9, "kernel framebuffer VA live");
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 19f27cd..5a5d1fa 100644
+index 19f27cd..8a13548 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -721,6 +721,34 @@ static volatile uint32_t *fbcon_base;
+@@ -721,6 +721,42 @@ static volatile uint32_t *fbcon_base;
  static uint32_t fbcon_width, fbcon_height, fbcon_stride;
  static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
  
@@ -114,10 +136,18 @@ index 19f27cd..5a5d1fa 100644
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
++/* For the GUI framebuffer (SweetFramebuffer.cpp): show a presented frame. */
++void a34_display_kick(void);
++void
++a34_display_kick(void)
++{
++	fbcon_kick();
++}
++
  static void
  fbcon_clear_row(uint32_t row)
  {
-@@ -739,6 +767,7 @@ fbcon_newline(void)
+@@ -739,6 +775,7 @@ fbcon_newline(void)
  	fbcon_row = (fbcon_row + 1) % fbcon_rows;
  	fbcon_clear_row(fbcon_row);
  	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
@@ -125,7 +155,7 @@ index 19f27cd..5a5d1fa 100644
  }
  
  static void
-@@ -750,6 +779,7 @@ fbcon_init(void)
+@@ -750,6 +787,7 @@ fbcon_init(void)
  	for (uint32_t r = 0; r < fbcon_rows; r++) {
  		fbcon_clear_row(r);
  	}
@@ -133,7 +163,7 @@ index 19f27cd..5a5d1fa 100644
  }
  
  static unsigned int
-@@ -836,6 +866,14 @@ fbcon_probe(void)
+@@ -836,6 +874,14 @@ fbcon_probe(void)
  	}
  	sweet_early_mark(17, "fbcon config read; mapping");
  	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);

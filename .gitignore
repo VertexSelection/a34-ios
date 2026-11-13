@@ -19,3 +19,7 @@
 *.img
 *.pyc
 __pycache__/
+
+# Apple firmware and anything extracted from it
+/research/
+/ipsw/

@@ -20,7 +20,10 @@ _start:
     .ascii  "ARM\x64"           // magic
     .long   0                   // reserved
 shim_payload_size:
-    .quad   0                   // offset 64: patched by the builder
+    .quad   0                   // offset 64: first payload size, patched by the builder
+    .global shim_payload2_size
+shim_payload2_size:
+    .quad   0                   // offset 72: second payload size (a34boot: TWRP Image)
 
 entry:
     mov     x19, x0             // DTB from LK

@@ -30,20 +30,31 @@ aarch64-linux-gnu-objcopy -O binary "$P/a34boot.elf" "$P/a34boot.bin"
 python3 -I "$ROOT/tools/mkadt_a34.py" "$OUT/a34.adt"
 python3 -I "$SWEET/mkpayload.py" "$KERNEL" "$OUT/a34.adt" "$OUT/xnu-payload.bin" --cmdline "$CMDLINE"
 
-python3 -I - "$P/a34boot.bin" "$OUT/xnu-payload.bin" "$OUT/xnu-blob.bin" <<'EOF'
-import struct, sys
-shim, payload = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
-assert len(shim) <= 0xC000, len(shim)
-assert payload[:8] == b"SWEETXNU"
-blob = bytearray(shim + b"\0" * (0x10000 - len(shim)) + payload)
-struct.pack_into("<Q", blob, 16, len(blob))     # image_size
-struct.pack_into("<Q", blob, 64, len(payload))  # shim_payload_size (informational here)
-open(sys.argv[3], "wb").write(blob)
-print("loader %d bytes, payload %d bytes, blob %d bytes" % (len(shim), len(payload), len(blob)))
-EOF
+# TWRP rides along as the Volume Up escape: its raw kernel goes behind the
+# XNU payload, and the recovery image takes TWRP's ramdisk, DTB and DTBO.
+TWRP="$ROOT/tools/twrp/twrp-3.7.1_12-2-a34x.img"
+python3 -I - "$TWRP" "$OUT/twrp-Image" <<'PYEOF'
+import gzip, struct, sys
+d = open(sys.argv[1], "rb").read()
+ksz, page = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<I", d, 36)[0]
+open(sys.argv[2], "wb").write(gzip.decompress(d[page:page + ksz]))
+PYEOF
 
-python3 -I "$ROOT/tools/mkrecovery.py" "$ROOT/firmware/A346EXXSADYG1_TUR/images/recovery.img" \
-    "$OUT/xnu-blob.bin" "$OUT/xnu-recovery.img"
+python3 -I - "$P/a34boot.bin" "$OUT/xnu-payload.bin" "$OUT/twrp-Image" "$OUT/xnu-blob.bin" <<'PYEOF'
+import struct, sys
+shim, payload, twrp = (open(f, "rb").read() for f in sys.argv[1:4])
+assert len(shim) <= 0xC000, len(shim)
+assert payload[:8] == b"SWEETXNU" and twrp[56:60] == b"ARM\x64"
+payload += b"\0" * (-len(payload) & 15)
+blob = bytearray(shim + b"\0" * (0x10000 - len(shim)) + payload + twrp)
+struct.pack_into("<Q", blob, 16, len(blob))     # image_size
+struct.pack_into("<Q", blob, 64, len(payload))  # shim_payload_size: XNU payload
+struct.pack_into("<Q", blob, 72, len(twrp))     # shim_payload2_size: TWRP Image
+open(sys.argv[4], "wb").write(blob)
+print("loader %d, xnu payload %d, twrp %d, blob %d bytes" % (len(shim), len(payload), len(twrp), len(blob)))
+PYEOF
+
+python3 -I "$ROOT/tools/mkrecovery.py" "$TWRP" "$OUT/xnu-blob.bin" "$OUT/xnu-recovery.img"
 python3 -I "$ROOT/ref/avb/avbtool.py" add_hash_footer \
     --image "$OUT/xnu-recovery.img" --partition_name recovery --partition_size 67108864 \
     --key "$ROOT/ref/avb/testkey_rsa4096.pem" --algorithm SHA256_RSA4096
