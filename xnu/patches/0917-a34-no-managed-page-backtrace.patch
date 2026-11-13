@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/IOMemoryDescriptor.cpp b/iokit/Kernel/IOMemoryDescriptor.cpp
+index 4d96763..1e8233a 100644
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -5194,8 +5194,20 @@ IOMemoryDescriptor::populateDevicePager(
+ #if DEBUG || DEVELOPMENT
+ 		if ((kIOMemoryTypeUPL != type)
+ 		    && pmap_has_managed_page((ppnum_t) atop_64(physAddr), (ppnum_t) atop_64(physAddr + segLen - 1))) {
+-			OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx",
+-			    physAddr, (uint64_t)segLen);
++			/*
++			 * A34 (0917): the Mali's write-combined buffers are managed
++			 * pages mapped this way on purpose (A34Mali.cpp), thousands
++			 * of times a minute; the backtrace report for each one
++			 * flooded the log and backboardd's drawing thread stopped
++			 * for good inside OSReportWithBacktrace. Say it a few
++			 * times, without the backtrace.
++			 */
++			static uint32_t a34ManagedPageReports;
++			if (a34ManagedPageReports < 4) {
++				a34ManagedPageReports++;
++				IOLog("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx\n",
++				    physAddr, (uint64_t)segLen);
++			}
+ 		}
+ #endif /* DEBUG || DEVELOPMENT */
+ 
