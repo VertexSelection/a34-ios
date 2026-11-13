@@ -1,30 +1,67 @@
 # a34-ios
 
-Bring-up of Apple's XNU and iOS userland on the Samsung Galaxy A34 5G
-(SM-A346E, MediaTek MT6877 / Dimensity 1080), booted from the stock Samsung
-bootloader. Research project; nothing here is usable as a daily system.
+Apple's XNU kernel and the unmodified iOS 16.7.16 userland (iPhone X build)
+on the Samsung Galaxy A34 5G (SM-A346E, MediaTek MT6877 / Dimensity 1080),
+booted from the stock Samsung bootloader. Research project; nothing here is
+usable as a daily system, and installing it erases the phone.
 
 ## Status
 
-| Step | State |
+| Area | State |
 | --- | --- |
-| Bootloader unlock, One UI 7 (A346EXXSADYG1) base, root | done |
-| Own code started by Samsung LK from the `recovery` partition | done |
-| LK framebuffer and display-engine state at handoff | mapped |
-| Loop-free test harness (shim runs, then boots TWRP) | done |
-| XNU build pipeline (GitHub Actions, macOS runner) | in progress |
-| XNU loader, device tree, root filesystem | not started |
+| Boot | Samsung LK → our loader in `recovery` → XNU 8796 (ruby-ios-bringup patch set + `xnu/patches/09xx`) |
+| Userland | launchd → backboardd → SpringBoard → **lock screen** |
+| Display | LK's framebuffer, command-mode DSI panel kicked after every frame; CPU rendering (no GPU) |
+| Touch | Goodix GT9895 on I2C0, polled (patch 0903) |
+| Buttons | volume up/down, power (patch 0902) |
+| CPU | 1 core; 6 cores start but the system stalls after ~5 minutes (open) |
+| Storage | iOS root (HFS+) at the start of `userdata` |
+| Not yet | GPU, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
+
+The base firmware is One UI 7 (A346EXXSADYG1). Do not go to One UI 8 or
+later: it removes bootloader unlocking. Never write the `efs`, `sec_efs`,
+`nvram`, `nvdata`, `nvcfg`, `protect1/2` or `proinfo` partitions (IMEI).
+
+## How it boots
+
+1. `recovery` holds a boot image whose "kernel" is our loader
+   (`tools/payload/a34boot.c`) followed by the XNU payload and TWRP's kernel.
+2. The loader wakes the UFS, clears the bootloader's recovery note, turns off
+   LK's watchdog, prepares the GIC and the display, and shows grey squares.
+3. Holding **Volume Up** on the white bar starts TWRP instead (rescue path).
+4. Otherwise it copies XNU, an Apple device tree built for the A34
+   (`tools/mkadt_a34.py`) and boot args into place and jumps to XNU.
+5. XNU mounts the iOS root from `userdata` and runs launchd.
+
+The kernel keeps a persistent log at the end of `userdata`;
+`tools/pull-log.sh` reads it from TWRP.
+
+## Build and install (outline)
+
+- Kernel: `.github/workflows/xnu-a34.yml` on GitHub's macOS runners.
+- iOS root: `tools/build-iosroot.sh iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`
+  (you supply the IPSW; it applies the first-boot fix in `tools/icl-nop.py`).
+- Write the root from TWRP: `tools/write-root.sh build/ios16-root.img`.
+- Boot image: `tools/build-xnu.sh KERNEL "BOOT-ARGS"`, then
+  `tools/run-test.sh build/xnu-recovery.img`.
+
+Boot args in use: `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0
+ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1 sweethw=0 sweetgt=0
+launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt=-1
+wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_hz=30 rubkeys=1 a34touch=1`
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `tools/payload/` | bare-metal test payloads (`hello.S`, `shim-start.S`, `shim.c`) |
-| `tools/mkrecovery.py` | packs a payload into a recovery image the bootloader accepts |
-| `tools/build-hello.sh`, `tools/build-shim.sh` | build and sign test images |
-| `tools/expdb-grep.py` | reads the bootloader's own log from an `expdb` dump |
-| `tools/fw-*.py`, `tools/fw-fetch.sh`, `tools/tarmd5.py` | firmware download, repair and flash planning |
-| `.github/workflows/` | kernel builds on GitHub's macOS runners |
+| `tools/payload/` | loader (`a34boot.c`), UFS access, test shim and touch probe |
+| `tools/mkadt_a34.py` | Apple device tree for the A34 |
+| `tools/build-xnu.sh`, `tools/mkrecovery.py` | boot image packing and signing |
+| `tools/build-iosroot.sh`, `tools/write-root.sh`, `tools/icl-nop*.{py,sh}` | iOS root image |
+| `tools/run-test.sh`, `tools/pull-log.sh` | flash-and-boot, kernel log |
+| `xnu/` | A34 kernel patches on top of ruby-ios-bringup |
+| `third_party/ios-sweet/` | loader pieces and tools from ios-sweet (MIT) |
+| `.github/workflows/` | kernel builds |
 
 No Apple firmware, Samsung firmware or device dumps are kept in this repository.
 
@@ -32,7 +69,12 @@ No Apple firmware, Samsung firmware or device dumps are kept in this repository.
 
 - [lky005/ruby-ios-bringup](https://github.com/lky005/ruby-ios-bringup): XNU on
   the same SoC (Redmi Note 12 Pro 5G). Its patches are fetched at build time,
-  not copied here.
+  not copied here. The first-boot InstalledContentLibrary fix is theirs.
+- [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (MIT) and
+  [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz): the XNU-on-Android-phone work this all builds on.
+- Samsung's A34 kernel sources (via
+  [Fede2782/android_kernel_samsung_a34x](https://github.com/Fede2782/android_kernel_samsung_a34x)):
+  I2C, clock, PMIC and touch register facts.
 - [UniXNU](https://github.com/UniXNU/UniXNU): reference for loaders and device trees.
 - [TWRP](https://twrp.me) for a34x, [Magisk](https://github.com/topjohnwu/Magisk),
   [Heimdall](https://git.sr.ht/~grimler/Heimdall), [samloader-rs](https://github.com/topjohnwu/samloader-rs).
