@@ -1,0 +1,857 @@
+# Mali-G68 bring-up and WRITE_VALUE self-test. Ported from HackiOS hakios-mt6768
+# (github.com/oosexgang/hakios-mt6768 @ad65e1f, kernel/bsd/dev/redwood_mali.c, APSL 2.0).
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 03f3372..f5065b8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/ruby_keys.c			standard
+ bsd/dev/a34_touch.c			standard
+ bsd/dev/a34_diag.c			standard
++bsd/dev/a34_mali.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+new file mode 100644
+index 0000000..2453861
+--- /dev/null
++++ b/bsd/dev/a34_mali.c
+@@ -0,0 +1,817 @@
++/*
++ * A34 (0907): the GPU, a Mali-G68 MC4 (Valhall v9, job manager) in the
++ * MT6877, powered from the kernel and given one job to prove it works.
++ * Only with boot-arg a34mali=1 (default off).
++ *
++ * Ported from HackiOS's Mali-G52 bring-up, bsd/dev/redwood_mali.c of
++ * hakios-mt6768 (github.com/oosexgang/hakios-mt6768 @ad65e1f), Apple Public
++ * Source License 2.0: its steps 4-6, with the power part redone for the
++ * MT6877. Addresses and sequences come from the phone itself (bare-metal
++ * probe, live device tree) and from Samsung's A34 kernel 6.6
++ * (drivers/clk/mediatek/clk-mt6877-pg.c, clk-mt6877.c, clk-mt6877-mfgcfg.c,
++ * drivers/gpu/mediatek/gpufreq/v2_legacy/gpufreq_mt6877.c, the r49p1 kbase),
++ * Linux panfrost and Mesa's genxml v9.xml -- read, not copied.
++ *
++ *   1  base power and clock, checked: MFG0 and MFG1 on in the SPM (the boot
++ *      loader leaves them on, MFG1's bus protection released, the GPU on
++ *      MFGPLL1 at 385 MHz), the BG3D clock gate open
++ *   2  the GPU: GPU_ID 0x9204xxxx (arch 9.2 product 4, Mali-G68) and what
++ *      it has; the shader cores must be the four known ones
++ *   3  the shader-core stacks' power domains MFG2..MFG5, each with its SRAM,
++ *      in gpufreq_mt6877.c's order (they have no bus protection)
++ *   4  soft reset; L2, tiler and shader cores powered. While the shader
++ *      cores switch on, the GPU clock is parked on 26 MHz, as MediaTek's
++ *      kbase does on this SoC around every shader power transition
++ *      (CONFIG_MALI_MTK_SHADER_PWR_CTL_WA); a34malipark=0 skips that
++ *   5  a WRITE_VALUE job on job slot 1 through address space 0 in identity
++ *      mode (a GPU address is the physical one); the CPU reads the value
++ *   6  the same job through the GPU's own AArch64 4 KB-granule page tables,
++ *      at a GPU address above the 40-bit physical range, so that a job that
++ *      somehow ran untranslated faults instead of touching memory
++ *
++ * Every wait is bounded; a failure is logged and ends the bring-up (a job
++ * that did not finish is hard-stopped and the GPU soft-reset first). The
++ * last line is "A34 MALI: done step N/6". The GPU memory is never freed:
++ * the GPU may still hold its addresses. On success the GPU stays powered,
++ * address space 0 on the page tables.
++ *
++ * Boot-args: a34mali=1 all steps; a34mali=2 skips step 5 (for a GPU that
++ * refuses identity mode); a34malipause=S sleeps S seconds (at most 60)
++ * between steps, so that the persistent log (written every 10 s) shows how
++ * far it got if a step hangs the phone; a34malipark=0 (see step 4).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* The headers sweet_ufs.c is built with: it makes the same VM calls. */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++void a34_mali_init(void);
++
++/* ---- where things are ---- */
++
++#define AM_TOP_PA               0x10000000u     /* topckgen; infracfg_ao at +0x1000 */
++#define AM_TOP_SIZE             0x4000u
++#define AM_SPM_PA               0x10006000u
++#define AM_SPM_SIZE             0x1000u
++#define AM_GPU_PA               0x13000000u
++#define AM_GPU_SIZE             0x4000u
++#define AM_MFGCFG_PA            0x13fbf000u
++#define AM_MFGCFG_SIZE          0x1000u
++
++/* SPM (clk-mt6877-pg.c) */
++#define SPM_POWERON_CONFIG_EN   0x000u
++#define SPM_PROJECT_CODE        0xb16u
++#define SPM_MFG_PWR_CON(n)      (0xe80u + 4u * (n))
++#define SPM_XPU_PWR_STATUS      0xef8u          /* MFGn: bit n */
++#define SPM_XPU_PWR_STATUS_2ND  0xefcu
++#define PWR_RST_B               (1u << 0)
++#define PWR_ISO                 (1u << 1)
++#define PWR_ON                  (1u << 2)
++#define PWR_ON_2ND              (1u << 3)
++#define PWR_CLK_DIS             (1u << 4)
++#define PWR_SRAM_PDN            (1u << 8)
++#define PWR_SRAM_PDN_ACK        (1u << 12)
++
++/* topckgen CLK_CFG_20 (clk-mt6877.c): the GPU clock is mfg_internal2_sel */
++#define TOP_CLK_CFG_20          0x120u
++#define TOP_CLK_CFG_20_SET      0x124u
++#define TOP_CLK_CFG_20_CLR      0x128u
++#define TOP_MFG_PLL1            (1u << 18)      /* mfg_internal2_sel: 1 mfgpll1, 0 mfg_internal1 */
++#define TOP_MFG_INT1_PLL4       (1u << 19)      /* mfg_internal1_sel: 1 mfgpll4, 0 26 MHz */
++
++/* infracfg_ao bus protection status, as offsets from AM_TOP_PA */
++#define IFR_PROT_STA1           0x1228u         /* INFRA_TOPAXI_PROTECTEN_STA1 */
++#define IFR_PROT_STA1_2         0x1724u         /* INFRA_TOPAXI_PROTECTEN_STA1_2 */
++#define MFG1_PROT_STEP2         ((1u << 21) | (1u << 22))       /* in STA1 */
++#define MFG1_PROT_STEP1         ((1u << 5) | (1u << 6))         /* in STA1_2 */
++
++/* mfgcfg (clk-mt6877-mfgcfg.c) */
++#define MFG_CG_CON              0x000u
++#define MFG_CG_CLR              0x008u
++#define MFG_CG_BG3D             (1u << 0)
++
++/* ---- the GPU's registers (panfrost_regs.h; the same on Valhall JM) ---- */
++
++#define GPU_ID                  0x000u
++#define GPU_L2_FEATURES         0x004u
++#define GPU_TILER_FEATURES      0x00cu
++#define GPU_MMU_FEATURES        0x014u
++#define GPU_AS_PRESENT          0x018u
++#define GPU_JS_PRESENT          0x01cu
++#define GPU_INT_RAWSTAT         0x020u
++#define GPU_INT_CLEAR           0x024u
++#define GPU_INT_MASK            0x028u
++#define GPU_CMD                 0x030u
++#define GPU_STATUS              0x034u
++#define GPU_FAULT_STATUS        0x03cu
++#define GPU_FAULT_ADDRESS_LO    0x040u
++#define GPU_SHADER_PRESENT_LO   0x100u
++#define GPU_SHADER_PRESENT_HI   0x104u
++#define GPU_TILER_PRESENT_LO    0x110u
++#define GPU_L2_PRESENT_LO       0x120u
++#define GPU_SHADER_READY_LO     0x140u
++#define GPU_TILER_READY_LO      0x150u
++#define GPU_L2_READY_LO         0x160u
++#define GPU_SHADER_PWRON_LO     0x180u
++#define GPU_TILER_PWRON_LO      0x190u
++#define GPU_L2_PWRON_LO         0x1a0u
++#define GPU_COHERENCY_FEATURES  0x300u
++#define GPU_COHERENCY_ENABLE    0x304u
++#define GPU_STACK_PRESENT_LO    0xe00u
++#define GPU_STACK_READY_LO      0xe10u
++#define GPU_CMD_SOFT_RESET      1u
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
++
++#define JOB_INT_RAWSTAT         0x1000u
++#define JOB_INT_CLEAR           0x1004u
++#define JOB_INT_MASK            0x1008u
++#define JOB_DONE_JS1            (1u << 1)
++#define JOB_FAIL_JS1            (1u << 17)
++#define JS1                     0x1880u         /* job slot 1: compute-like jobs */
++#define JS_HEAD_LO              0x00u
++#define JS_HEAD_HI              0x04u
++#define JS_COMMAND              0x20u
++#define JS_STATUS               0x24u
++#define JS_HEAD_NEXT_LO         0x40u
++#define JS_HEAD_NEXT_HI         0x44u
++#define JS_AFFINITY_NEXT_LO     0x50u
++#define JS_AFFINITY_NEXT_HI     0x54u
++#define JS_CONFIG_NEXT          0x58u
++#define JS_COMMAND_NEXT         0x60u
++#define JS_COMMAND_NOP          0u
++#define JS_COMMAND_START        1u
++#define JS_COMMAND_HARD_STOP    3u
++/* address space 0, caches cleaned and invalidated at both ends, priority 8 */
++#define JS_CONFIG_AS0           ((3u << 8) | (3u << 12) | (8u << 16))
++
++#define MMU_INT_RAWSTAT         0x2000u
++#define MMU_INT_CLEAR           0x2004u
++#define MMU_INT_MASK            0x2008u
++#define AS0                     0x2400u
++#define AS_TRANSTAB_LO          0x00u
++#define AS_TRANSTAB_HI          0x04u
++#define AS_MEMATTR_LO           0x08u
++#define AS_MEMATTR_HI           0x0cu
++#define AS_COMMAND              0x18u
++#define AS_FAULTSTATUS          0x1cu
++#define AS_FAULTADDRESS_LO      0x20u
++#define AS_FAULTADDRESS_HI      0x24u
++#define AS_STATUS               0x28u
++#define AS_TRANSCFG_LO          0x30u
++#define AS_TRANSCFG_HI          0x34u
++#define AS_COMMAND_UPDATE       1u
++#define AS_STATUS_ACTIVE        1u
++#define AS_TRANSCFG_IDENTITY    2u
++#define AS_TRANSCFG_AARCH64_4K  6u
++#define AS_TRANSCFG_INA_BITS(x) ((x) << 6)
++#define AS_TRANSCFG_PTW_WB      (2u << 24)
++#define AS_TRANSCFG_PTW_RA      (1u << 30)
++/*
++ * Every attribute index: inner and outer write-back, Mali-internal
++ * shareability (the GPU is not coherent: the live device tree's mali node
++ * has no dma-coherent), allocation as the GPU likes -- kbase's index-0
++ * value, and what redwood_mali.c used.
++ */
++#define AS_MEMATTR_ALL_WB       0x88888888u
++
++/* ---- the GPU memory: two 16 KB kernel pages, physically contiguous ---- */
++
++#define AM_MEM_SIZE             0x8000u
++#define AM_JOB_OFF              0x0000u         /* the job descriptor (Valhall: 128-byte aligned) */
++#define AM_TARGET_OFF           0x0800u         /* the word the job writes, same 4 KB GPU page */
++#define AM_PT_OFF               0x4000u         /* four 4 KB GPU tables: levels 0, 1, 2, 3 */
++#define AM_GPU_VA               0x0000010000100000ull   /* 1 TB + 1 MB: above any physical address */
++
++/* AArch64 stage-1 descriptors, 4 KB granule, as Mali reads them */
++#define PTE_TABLE               3ull
++#define PTE_PAGE                3ull
++#define PTE_AP_RW               (1ull << 6)
++#define PTE_SH_INNER            (3ull << 8)
++#define PTE_AF                  (1ull << 10)
++#define PTE_ADDR                0x0000fffffffff000ull
++
++/* Job descriptor (genxml v9.xml "Job Header" and "Write Value Job Payload") */
++#define JOB_TYPE_WRITE_VALUE    2u
++#define WRITE_VALUE_IMM32       6u
++
++/* Shader cores (SHADER_PRESENT bits) and the SPM domain of their stack */
++static const struct {
++	uint32_t core;
++	uint32_t domain;
++} am_stacks[4] = {
++	{ 1u << 0, 2 },         /* MFG2_SHADER_STACK0 = T0C0 */
++	{ 1u << 2, 3 },         /* MFG3_SHADER_STACK2 = T2C0 */
++	{ 1u << 16, 4 },        /* MFG4_SHADER_STACK4 = T4C0 */
++	{ 1u << 18, 5 },        /* MFG5_SHADER_STACK6 = T6C0 */
++};
++#define AM_KNOWN_CORES          0x00050005u
++
++static vm_offset_t am_top, am_spm, am_gpu, am_mfgcfg;
++static vm_offset_t am_mem;              /* kernel address of the GPU memory */
++static uint64_t am_mem_pa;              /* its physical address */
++static uint32_t am_gpu_id, am_shaders, am_tiler, am_l2, am_va_bits, am_pa_bits;
++static uint32_t am_mode, am_pause_s, am_park = 1;
++static bool am_started;
++static int am_sleep_chan;
++
++/* ---- helpers ---- */
++
++static inline uint32_t
++am_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++am_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Until (register & mask) == want, for at most `us` microseconds. */
++static bool
++am_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while ((am_rd(base, off) & mask) != want) {
++		if (mach_absolute_time() > deadline) {
++			return (am_rd(base, off) & mask) == want;
++		}
++		delay(10);
++	}
++	return true;
++}
++
++/* Until any bit of mask is set, for at most `us`: the bits seen (0: none). */
++static uint32_t
++am_wait_any(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t us)
++{
++	uint64_t deadline;
++	uint32_t seen;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while ((seen = am_rd(base, off) & mask) == 0) {
++		if (mach_absolute_time() > deadline) {
++			return am_rd(base, off) & mask;
++		}
++		delay(10);
++	}
++	return seen;
++}
++
++/*
++ * Clean and invalidate the CPU's data cache to the point of coherency over
++ * [va, va + len): the GPU reads and writes memory behind the CPU's caches.
++ */
++static void
++am_flush(vm_offset_t va, vm_size_t len)
++{
++	uint64_t ctr;
++	vm_offset_t line, p, end = va + len;
++
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	line = (vm_offset_t)4 << ((ctr >> 16) & 0xf);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (p = va & ~(line - 1); p < end; p += line) {
++		__asm__ volatile ("dc civac, %0" : : "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++am_pause(void)
++{
++	uint64_t deadline;
++
++	if (am_pause_s == 0) {
++		return;
++	}
++	clock_interval_to_deadline(am_pause_s, (uint32_t)NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&am_sleep_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- 1: base power and clock ---- */
++
++static bool
++am_step1(void)
++{
++	uint32_t cfg, sta, sta2, prot1, prot2, cfg20, cg;
++
++	am_top = ml_io_map(AM_TOP_PA, AM_TOP_SIZE);
++	am_spm = ml_io_map(AM_SPM_PA, AM_SPM_SIZE);
++	am_gpu = ml_io_map(AM_GPU_PA, AM_GPU_SIZE);
++	am_mfgcfg = ml_io_map(AM_MFGCFG_PA, AM_MFGCFG_SIZE);
++	if (!am_top || !am_spm || !am_gpu || !am_mfgcfg) {
++		printf("A34 MALI: step 1: MMIO mapping failed\n");
++		return false;
++	}
++
++	/* SPM register writes need its enable bit; it reads 1 at hand-off. */
++	cfg = am_rd(am_spm, SPM_POWERON_CONFIG_EN);
++	if (!(cfg & 1u)) {
++		am_wr(am_spm, SPM_POWERON_CONFIG_EN, (SPM_PROJECT_CODE << 16) | 1u);
++		printf("A34 MALI: step 1: POWERON_CONFIG_EN was 0x%08x, now 0x%08x\n", cfg,
++		    am_rd(am_spm, SPM_POWERON_CONFIG_EN));
++	}
++	sta = am_rd(am_spm, SPM_XPU_PWR_STATUS);
++	sta2 = am_rd(am_spm, SPM_XPU_PWR_STATUS_2ND);
++	printf("A34 MALI: step 1: POWERON_CONFIG_EN 0x%08x XPU_PWR_STATUS 0x%08x/0x%08x "
++	    "MFG0..5_PWR_CON 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n", cfg, sta, sta2,
++	    am_rd(am_spm, SPM_MFG_PWR_CON(0u)), am_rd(am_spm, SPM_MFG_PWR_CON(1u)),
++	    am_rd(am_spm, SPM_MFG_PWR_CON(2u)), am_rd(am_spm, SPM_MFG_PWR_CON(3u)),
++	    am_rd(am_spm, SPM_MFG_PWR_CON(4u)), am_rd(am_spm, SPM_MFG_PWR_CON(5u)));
++	if ((sta & 3u) != 3u || (sta2 & 3u) != 3u) {
++		/* Powering MFG0/1 needs MFG1's bus protection handled: not done here. */
++		printf("A34 MALI: step 1: MFG0/MFG1 are not on, stop\n");
++		return false;
++	}
++
++	/* Any of these wrong and a GPU register access would hang the bus. */
++	prot1 = am_rd(am_top, IFR_PROT_STA1);
++	prot2 = am_rd(am_top, IFR_PROT_STA1_2);
++	cfg20 = am_rd(am_top, TOP_CLK_CFG_20);
++	cg = am_rd(am_mfgcfg, MFG_CG_CON);
++	printf("A34 MALI: step 1: bus protect STA1 0x%08x STA1_2 0x%08x, CLK_CFG_20 0x%08x (GPU clock %s), "
++	    "MFG_CG_CON 0x%08x\n", prot1, prot2, cfg20,
++	    (cfg20 & TOP_MFG_PLL1) ? "mfgpll1" : ((cfg20 & TOP_MFG_INT1_PLL4) ? "mfgpll4" : "26 MHz"), cg);
++	if ((prot1 & MFG1_PROT_STEP2) || (prot2 & MFG1_PROT_STEP1)) {
++		printf("A34 MALI: step 1: MFG1 bus protection is on, stop\n");
++		return false;
++	}
++	if (cg & MFG_CG_BG3D) {
++		am_wr(am_mfgcfg, MFG_CG_CLR, MFG_CG_BG3D);
++		cg = am_rd(am_mfgcfg, MFG_CG_CON);
++		printf("A34 MALI: step 1: BG3D was gated, MFG_CG_CON now 0x%08x\n", cg);
++		if (cg & MFG_CG_BG3D) {
++			printf("A34 MALI: step 1: BG3D stays gated, stop\n");
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- 2: which GPU ---- */
++
++static bool
++am_step2(void)
++{
++	uint32_t shaders_hi, mmu, as, js;
++
++	am_gpu_id = am_rd(am_gpu, GPU_ID);
++	am_shaders = am_rd(am_gpu, GPU_SHADER_PRESENT_LO);
++	shaders_hi = am_rd(am_gpu, GPU_SHADER_PRESENT_HI);
++	am_tiler = am_rd(am_gpu, GPU_TILER_PRESENT_LO);
++	am_l2 = am_rd(am_gpu, GPU_L2_PRESENT_LO);
++	mmu = am_rd(am_gpu, GPU_MMU_FEATURES);
++	as = am_rd(am_gpu, GPU_AS_PRESENT);
++	js = am_rd(am_gpu, GPU_JS_PRESENT);
++	am_va_bits = mmu & 0xffu;
++	am_pa_bits = (mmu >> 8) & 0xffu;
++	printf("A34 MALI: step 2: GPU_ID 0x%08x (arch %u.%u product %u, r%up%u) L2_FEATURES 0x%08x "
++	    "TILER_FEATURES 0x%x MMU_FEATURES 0x%x (VA %u, PA %u) AS_PRESENT 0x%x JS_PRESENT 0x%x GPU_STATUS 0x%x\n",
++	    am_gpu_id, am_gpu_id >> 28, (am_gpu_id >> 24) & 0xfu, (am_gpu_id >> 16) & 0xfu,
++	    (am_gpu_id >> 12) & 0xfu, (am_gpu_id >> 4) & 0xffu, am_rd(am_gpu, GPU_L2_FEATURES),
++	    am_rd(am_gpu, GPU_TILER_FEATURES), mmu, am_va_bits, am_pa_bits, as, js, am_rd(am_gpu, GPU_STATUS));
++	printf("A34 MALI: step 2: SHADER_PRESENT 0x%08x_%08x TILER_PRESENT 0x%x L2_PRESENT 0x%x STACK_PRESENT 0x%x "
++	    "COHERENCY_FEATURES 0x%x COHERENCY_ENABLE 0x%x\n", shaders_hi, am_shaders, am_tiler, am_l2,
++	    am_rd(am_gpu, GPU_STACK_PRESENT_LO), am_rd(am_gpu, GPU_COHERENCY_FEATURES),
++	    am_rd(am_gpu, GPU_COHERENCY_ENABLE));
++	if ((am_gpu_id >> 16) != 0x9204u) {
++		printf("A34 MALI: step 2: not the Mali-G68 this was written for, stop\n");
++		return false;
++	}
++	if (am_shaders == 0 || shaders_hi != 0 || (am_shaders & ~AM_KNOWN_CORES) != 0 ||
++	    am_tiler == 0 || am_l2 == 0) {
++		printf("A34 MALI: step 2: unexpected cores (known: shader 0x%08x), stop\n", AM_KNOWN_CORES);
++		return false;
++	}
++	if (!(as & 1u) || !(js & 2u) || am_va_bits < 41 || am_va_bits > 48 || am_pa_bits < 32 || am_pa_bits > 48) {
++		printf("A34 MALI: step 2: no AS0/JS1 or unexpected MMU address sizes, stop\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---- 3: the shader-core stacks' power domains ---- */
++
++/* clk-mt6877-pg.c: spm_mtcmos_ctrl_mfgN_pwr(ON), then _bus_prot(release) = SRAM. */
++static bool
++am_domain_on(uint32_t n)
++{
++	uint32_t con = SPM_MFG_PWR_CON(n), bit = 1u << n, v;
++
++	v = am_rd(am_spm, con);
++	if ((am_rd(am_spm, SPM_XPU_PWR_STATUS) & bit) && (am_rd(am_spm, SPM_XPU_PWR_STATUS_2ND) & bit) &&
++	    (v & (PWR_RST_B | PWR_ISO | PWR_CLK_DIS | PWR_SRAM_PDN | PWR_SRAM_PDN_ACK)) == PWR_RST_B) {
++		printf("A34 MALI: step 3: MFG%u already on (PWR_CON 0x%x)\n", n, v);
++		return true;
++	}
++	am_wr(am_spm, con, am_rd(am_spm, con) | PWR_ON);
++	am_wr(am_spm, con, am_rd(am_spm, con) | PWR_ON_2ND);
++	if (!am_wait(am_spm, SPM_XPU_PWR_STATUS, bit, bit, 20000) ||
++	    !am_wait(am_spm, SPM_XPU_PWR_STATUS_2ND, bit, bit, 20000)) {
++		printf("A34 MALI: step 3: MFG%u did not power up in 20 ms: PWR_CON 0x%x XPU_PWR_STATUS 0x%x/0x%x, stop\n",
++		    n, am_rd(am_spm, con), am_rd(am_spm, SPM_XPU_PWR_STATUS), am_rd(am_spm, SPM_XPU_PWR_STATUS_2ND));
++		return false;
++	}
++	am_wr(am_spm, con, am_rd(am_spm, con) & ~PWR_CLK_DIS);
++	am_wr(am_spm, con, am_rd(am_spm, con) & ~PWR_ISO);
++	am_wr(am_spm, con, am_rd(am_spm, con) | PWR_RST_B);
++	am_wr(am_spm, con, am_rd(am_spm, con) & ~PWR_SRAM_PDN);
++	if (!am_wait(am_spm, con, PWR_SRAM_PDN_ACK, 0, 20000)) {
++		printf("A34 MALI: step 3: MFG%u SRAM did not wake in 20 ms: PWR_CON 0x%x, stop\n", n, am_rd(am_spm, con));
++		return false;
++	}
++	printf("A34 MALI: step 3: MFG%u on, PWR_CON 0x%x\n", n, am_rd(am_spm, con));
++	return true;
++}
++
++static bool
++am_step3(void)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		if ((am_shaders & am_stacks[i].core) && !am_domain_on(am_stacks[i].domain)) {
++			return false;
++		}
++	}
++	printf("A34 MALI: step 3: XPU_PWR_STATUS 0x%08x/0x%08x\n", am_rd(am_spm, SPM_XPU_PWR_STATUS),
++	    am_rd(am_spm, SPM_XPU_PWR_STATUS_2ND));
++	return true;
++}
++
++/* ---- 4: reset, and the cores ---- */
++
++static bool
++am_soft_reset(void)
++{
++	bool ok;
++
++	am_wr(am_gpu, GPU_INT_MASK, 0);
++	am_wr(am_gpu, GPU_INT_CLEAR, 0xffffffffu);
++	am_wr(am_gpu, GPU_CMD, GPU_CMD_SOFT_RESET);
++	ok = am_wait(am_gpu, GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100000);
++	/* Interrupts stay masked: everything here polls. */
++	am_wr(am_gpu, GPU_INT_CLEAR, 0xffffffffu);
++	am_wr(am_gpu, GPU_INT_MASK, 0);
++	am_wr(am_gpu, JOB_INT_MASK, 0);
++	am_wr(am_gpu, JOB_INT_CLEAR, 0xffffffffu);
++	am_wr(am_gpu, MMU_INT_MASK, 0);
++	am_wr(am_gpu, MMU_INT_CLEAR, 0xffffffffu);
++	return ok;
++}
++
++static bool
++am_step4(void)
++{
++	uint32_t cfg20, parked_cfg20 = 0;
++	bool park, ok;
++
++	if (!am_soft_reset()) {
++		printf("A34 MALI: step 4: no RESET_COMPLETED in 100 ms (GPU_INT_RAWSTAT 0x%08x), stop\n",
++		    am_rd(am_gpu, GPU_INT_RAWSTAT));
++		return false;
++	}
++	printf("A34 MALI: step 4: soft reset done\n");
++
++	am_wr(am_gpu, GPU_L2_PWRON_LO, am_l2);
++	if (!am_wait(am_gpu, GPU_L2_READY_LO, am_l2, am_l2, 50000)) {
++		printf("A34 MALI: step 4: L2 not ready in 50 ms (L2_READY 0x%x), stop\n", am_rd(am_gpu, GPU_L2_READY_LO));
++		return false;
++	}
++	am_wr(am_gpu, GPU_TILER_PWRON_LO, am_tiler);
++	if (!am_wait(am_gpu, GPU_TILER_READY_LO, am_tiler, am_tiler, 50000)) {
++		printf("A34 MALI: step 4: tiler not ready in 50 ms (TILER_READY 0x%x), stop\n",
++		    am_rd(am_gpu, GPU_TILER_READY_LO));
++		return false;
++	}
++
++	/*
++	 * MediaTek's kbase on the MT6877 parks the GPU clock on 26 MHz while
++	 * shader cores switch (mfg_internal1_sel to 26 MHz, then
++	 * mfg_internal2_sel to mfg_internal1) and goes back to MFGPLL1 after.
++	 * Only from the state it is known to work from: on MFGPLL1, with
++	 * mfg_internal1 already on 26 MHz (so no mux ever leaves a clock that
++	 * might be off).
++	 */
++	cfg20 = am_rd(am_top, TOP_CLK_CFG_20);
++	park = am_park != 0 && (cfg20 & TOP_MFG_PLL1) && !(cfg20 & TOP_MFG_INT1_PLL4);
++	if (park) {
++		am_wr(am_top, TOP_CLK_CFG_20_CLR, TOP_MFG_INT1_PLL4);
++		am_wr(am_top, TOP_CLK_CFG_20_CLR, TOP_MFG_PLL1);
++		delay(2);
++		parked_cfg20 = am_rd(am_top, TOP_CLK_CFG_20);
++	}
++	am_wr(am_gpu, GPU_SHADER_PWRON_LO, am_shaders);
++	ok = am_wait(am_gpu, GPU_SHADER_READY_LO, am_shaders, am_shaders, 100000);
++	if (park) {
++		am_wr(am_top, TOP_CLK_CFG_20_SET, TOP_MFG_PLL1);
++		am_wr(am_top, TOP_CLK_CFG_20_CLR, TOP_MFG_INT1_PLL4);
++	}
++	printf("A34 MALI: step 4: CLK_CFG_20 0x%08x, %s 0x%08x, after 0x%08x\n", cfg20,
++	    park ? "parked on 26 MHz" : "not parked", parked_cfg20, am_rd(am_top, TOP_CLK_CFG_20));
++	if (!ok) {
++		printf("A34 MALI: step 4: shader cores not ready in 100 ms (SHADER_READY 0x%08x), stop\n",
++		    am_rd(am_gpu, GPU_SHADER_READY_LO));
++		return false;
++	}
++	printf("A34 MALI: step 4: GPU_ID 0x%08x, L2_READY 0x%x TILER_READY 0x%x SHADER_READY 0x%08x "
++	    "STACK_READY 0x%x: all powered\n", am_gpu_id, am_rd(am_gpu, GPU_L2_READY_LO),
++	    am_rd(am_gpu, GPU_TILER_READY_LO), am_rd(am_gpu, GPU_SHADER_READY_LO),
++	    am_rd(am_gpu, GPU_STACK_READY_LO));
++	return true;
++}
++
++/* ---- 5 and 6: one job ---- */
++
++/* Address space 0 to the given tables and mode; an UPDATE makes the MMU take them. */
++static bool
++am_as0_set(uint64_t transtab, uint32_t transcfg)
++{
++	if (!am_wait(am_gpu, AS0 + AS_STATUS, AS_STATUS_ACTIVE, 0, 50000)) {
++		printf("A34 MALI: AS0 busy for 50 ms (AS_STATUS 0x%x)\n", am_rd(am_gpu, AS0 + AS_STATUS));
++		return false;
++	}
++	am_wr(am_gpu, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	am_wr(am_gpu, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	am_wr(am_gpu, AS0 + AS_MEMATTR_LO, AS_MEMATTR_ALL_WB);
++	am_wr(am_gpu, AS0 + AS_MEMATTR_HI, AS_MEMATTR_ALL_WB);
++	am_wr(am_gpu, AS0 + AS_TRANSCFG_LO, transcfg);
++	am_wr(am_gpu, AS0 + AS_TRANSCFG_HI, 0);
++	am_wr(am_gpu, AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
++	if (!am_wait(am_gpu, AS0 + AS_STATUS, AS_STATUS_ACTIVE, 0, 50000)) {
++		printf("A34 MALI: AS0 UPDATE not done in 50 ms (AS_STATUS 0x%x)\n", am_rd(am_gpu, AS0 + AS_STATUS));
++		return false;
++	}
++	printf("A34 MALI: AS0 TRANSTAB 0x%08x%08x TRANSCFG 0x%08x (wrote 0x%08x) MEMATTR 0x%08x\n",
++	    am_rd(am_gpu, AS0 + AS_TRANSTAB_HI), am_rd(am_gpu, AS0 + AS_TRANSTAB_LO),
++	    am_rd(am_gpu, AS0 + AS_TRANSCFG_LO), transcfg, am_rd(am_gpu, AS0 + AS_MEMATTR_LO));
++	return true;
++}
++
++/* A job that did not finish, or failed: stop the slot, reset the GPU. */
++static void
++am_recover(void)
++{
++	uint32_t raw;
++	bool reset;
++
++	am_wr(am_gpu, JS1 + JS_COMMAND_NEXT, JS_COMMAND_NOP);
++	am_wr(am_gpu, JS1 + JS_COMMAND, JS_COMMAND_HARD_STOP);
++	raw = am_wait_any(am_gpu, JOB_INT_RAWSTAT, JOB_DONE_JS1 | JOB_FAIL_JS1, 20000);
++	reset = am_soft_reset();
++	printf("A34 MALI: recovery: after hard stop JOB_INT_RAWSTAT bits 0x%08x; soft reset %s\n", raw,
++	    reset ? "done" : "NOT done in 100 ms");
++}
++
++/*
++ * The smallest job there is, in the first 4 KB of the GPU memory: a job
++ * header saying "write value", and its payload (where, a 32-bit immediate,
++ * the value). `job_gpu` is the GPU address of the descriptor; the word it
++ * writes is AM_TARGET_OFF further on.
++ *
++ * Valhall v9 (genxml v9.xml) keeps Bifrost v7's layout -- header words 0-7,
++ * payload at byte 32 -- but drops header bit 0 ("is 64-bit": all jobs are)
++ * and wants the descriptor 128-byte aligned (v7: 64); redwood_mali.c set
++ * that bit for the G52, here it stays 0.
++ */
++static bool
++am_run_job(unsigned step, uint64_t job_gpu, uint32_t value)
++{
++	volatile uint32_t *job = (volatile uint32_t *)(am_mem + AM_JOB_OFF);
++	volatile uint32_t *target = (volatile uint32_t *)(am_mem + AM_TARGET_OFF);
++	uint64_t where = job_gpu + AM_TARGET_OFF, start, ns;
++	uint32_t raw, got, status;
++	bool ok;
++
++	bzero((void *)(am_mem + AM_JOB_OFF), 0x1000);
++	job[4] = (JOB_TYPE_WRITE_VALUE << 1) | (1u << 16);     /* type; job index 1; no dependencies */
++	job[8] = (uint32_t)where;                               /* payload: the address */
++	job[9] = (uint32_t)(where >> 32);
++	job[10] = WRITE_VALUE_IMM32;
++	job[12] = value;                                        /* the immediate (low word) */
++	am_flush(am_mem, AM_MEM_SIZE);                          /* descriptor, word and tables to memory */
++
++	if (am_rd(am_gpu, JS1 + JS_COMMAND_NEXT) != 0) {
++		printf("A34 MALI: step %u: job slot 1 busy (JS_COMMAND_NEXT 0x%x), stop\n", step,
++		    am_rd(am_gpu, JS1 + JS_COMMAND_NEXT));
++		return false;
++	}
++	am_wr(am_gpu, JOB_INT_MASK, 0);
++	am_wr(am_gpu, JOB_INT_CLEAR, 0xffffffffu);
++	am_wr(am_gpu, MMU_INT_CLEAR, 0xffffffffu);
++	am_wr(am_gpu, JS1 + JS_HEAD_NEXT_LO, (uint32_t)job_gpu);
++	am_wr(am_gpu, JS1 + JS_HEAD_NEXT_HI, (uint32_t)(job_gpu >> 32));
++	am_wr(am_gpu, JS1 + JS_AFFINITY_NEXT_LO, am_shaders);
++	am_wr(am_gpu, JS1 + JS_AFFINITY_NEXT_HI, 0);
++	am_wr(am_gpu, JS1 + JS_CONFIG_NEXT, JS_CONFIG_AS0);
++	start = mach_absolute_time();
++	am_wr(am_gpu, JS1 + JS_COMMAND_NEXT, JS_COMMAND_START);
++	raw = am_wait_any(am_gpu, JOB_INT_RAWSTAT, JOB_DONE_JS1 | JOB_FAIL_JS1, 200000);
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++
++	am_flush(am_mem, 0x1000);               /* drop stale lines: the GPU wrote behind the cache */
++	got = *target;
++	status = job[0];
++	ok = (raw & JOB_DONE_JS1) && !(raw & JOB_FAIL_JS1) && got == value;
++	printf("A34 MALI: step %u: JOB_INT_RAWSTAT 0x%08x JS1_STATUS 0x%08x JS1_HEAD 0x%08x%08x MMU_INT_RAWSTAT 0x%08x "
++	    "AS0_FAULTSTATUS 0x%08x at 0x%08x%08x GPU_FAULT_STATUS 0x%08x at 0x%08x\n", step,
++	    am_rd(am_gpu, JOB_INT_RAWSTAT), am_rd(am_gpu, JS1 + JS_STATUS), am_rd(am_gpu, JS1 + JS_HEAD_HI),
++	    am_rd(am_gpu, JS1 + JS_HEAD_LO), am_rd(am_gpu, MMU_INT_RAWSTAT), am_rd(am_gpu, AS0 + AS_FAULTSTATUS),
++	    am_rd(am_gpu, AS0 + AS_FAULTADDRESS_HI), am_rd(am_gpu, AS0 + AS_FAULTADDRESS_LO),
++	    am_rd(am_gpu, GPU_FAULT_STATUS), am_rd(am_gpu, GPU_FAULT_ADDRESS_LO));
++	printf("A34 MALI: step %u: job at GPU 0x%llx, descriptor status 0x%08x, word 0x%08x (want 0x%08x) after %llu us: %s\n",
++	    step, (unsigned long long)job_gpu, status, got, value, (unsigned long long)(ns / 1000),
++	    ok ? "the GPU ran it" : (raw == 0 ? "NO ANSWER in 200 ms" : "FAILED"));
++	if (!ok) {
++		am_recover();
++	}
++	am_wr(am_gpu, JOB_INT_CLEAR, 0xffffffffu);
++	return ok;
++}
++
++/* GPU memory for the jobs and the tables: contiguous, as sweet_ufs.c gets its DMA memory. */
++static bool
++am_alloc(void)
++{
++	ppnum_t pn, pn_pt;
++
++	if (kmem_alloc_contig(kernel_map, &am_mem, AM_MEM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("A34 MALI: no contiguous memory for the jobs, stop\n");
++		return false;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)am_mem);
++	pn_pt = pmap_find_phys(kernel_pmap, (addr64_t)(am_mem + AM_PT_OFF));
++	am_mem_pa = ptoa_64(pn) + (am_mem & PAGE_MASK);
++	if (pn == 0 || pn_pt == 0 || ptoa_64(pn_pt) + ((am_mem + AM_PT_OFF) & PAGE_MASK) != am_mem_pa + AM_PT_OFF ||
++	    am_mem_pa + AM_MEM_SIZE > (1ull << am_pa_bits)) {
++		printf("A34 MALI: GPU memory at 0x%llx not usable (pages 0x%x 0x%x), stop\n",
++		    (unsigned long long)am_mem_pa, pn, pn_pt);
++		return false;
++	}
++	printf("A34 MALI: GPU memory 0x%x bytes at physical 0x%llx\n", AM_MEM_SIZE, (unsigned long long)am_mem_pa);
++	return true;
++}
++
++static bool
++am_step5(void)
++{
++	if (!am_as0_set(0, AS_TRANSCFG_IDENTITY)) {
++		return false;
++	}
++	return am_run_job(5, am_mem_pa + AM_JOB_OFF, 0xc0ffee05u);
++}
++
++/*
++ * The GPU's own tables, the AArch64 stage-1 format Linux panfrost uses on
++ * Valhall: 4 KB granule, VA bits from MMU_FEATURES (48 here: four levels,
++ * INA_BITS 55 - 48 = 7; the G52's 35 bits needed three). The kernel's pages
++ * are 16 KB, the GPU's 4 KB: the four tables are the four 4 KB quarters of
++ * one 16 KB page, and one 4 KB GPU page maps the first quarter of the job
++ * page. Walks write-back with read-allocate, as panfrost and kbase do; the
++ * tables reach memory through am_flush, and the GPU's L2 holds nothing of
++ * them (reset, and every job starts with an L2 clean+invalidate).
++ */
++static bool
++am_step6(void)
++{
++	uint64_t *l0 = (uint64_t *)(am_mem + AM_PT_OFF);
++	uint64_t *l1 = (uint64_t *)(am_mem + AM_PT_OFF + 0x1000);
++	uint64_t *l2 = (uint64_t *)(am_mem + AM_PT_OFF + 0x2000);
++	uint64_t *l3 = (uint64_t *)(am_mem + AM_PT_OFF + 0x3000);
++	uint64_t pt = am_mem_pa + AM_PT_OFF;
++	uint32_t transcfg = AS_TRANSCFG_AARCH64_4K | AS_TRANSCFG_INA_BITS(55u - am_va_bits) |
++	    AS_TRANSCFG_PTW_WB | AS_TRANSCFG_PTW_RA;
++
++	bzero((void *)(am_mem + AM_PT_OFF), 0x4000);
++	l0[(AM_GPU_VA >> 39) & 511] = ((pt + 0x1000) & PTE_ADDR) | PTE_TABLE;
++	l1[(AM_GPU_VA >> 30) & 511] = ((pt + 0x2000) & PTE_ADDR) | PTE_TABLE;
++	l2[(AM_GPU_VA >> 21) & 511] = ((pt + 0x3000) & PTE_ADDR) | PTE_TABLE;
++	l3[(AM_GPU_VA >> 12) & 511] = ((am_mem_pa + AM_JOB_OFF) & PTE_ADDR) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
++	am_flush(am_mem + AM_PT_OFF, 0x4000);
++	printf("A34 MALI: step 6: tables at 0x%llx: L0[%llu] 0x%llx L1[%llu] 0x%llx L2[%llu] 0x%llx L3[%llu] 0x%llx\n",
++	    (unsigned long long)pt,
++	    (unsigned long long)((AM_GPU_VA >> 39) & 511), (unsigned long long)l0[(AM_GPU_VA >> 39) & 511],
++	    (unsigned long long)((AM_GPU_VA >> 30) & 511), (unsigned long long)l1[(AM_GPU_VA >> 30) & 511],
++	    (unsigned long long)((AM_GPU_VA >> 21) & 511), (unsigned long long)l2[(AM_GPU_VA >> 21) & 511],
++	    (unsigned long long)((AM_GPU_VA >> 12) & 511), (unsigned long long)l3[(AM_GPU_VA >> 12) & 511]);
++	if (!am_as0_set(pt, transcfg)) {
++		return false;
++	}
++	return am_run_job(6, AM_GPU_VA, 0xc0ffee06u);
++}
++
++/* ---- all of it ---- */
++
++static unsigned
++am_bringup(void)
++{
++	if (!am_step1()) {
++		return 0;
++	}
++	am_pause();
++	if (!am_step2()) {
++		return 1;
++	}
++	am_pause();
++	if (!am_step3()) {
++		return 2;
++	}
++	am_pause();
++	if (!am_step4()) {
++		return 3;
++	}
++	am_pause();
++	if (!am_alloc()) {
++		return 4;
++	}
++	if (am_mode == 2) {
++		printf("A34 MALI: step 5 skipped (a34mali=2)\n");
++	} else {
++		if (!am_step5()) {
++			return 4;
++		}
++		am_pause();
++	}
++	if (!am_step6()) {
++		return am_mode == 2 ? 4 : 5;
++	}
++	return 6;
++}
++
++static void
++am_thread(void *arg, wait_result_t result)
++{
++	unsigned reached;
++
++	(void)arg;
++	(void)result;
++	printf("A34 MALI: bring-up start (a34mali=%u, pause %u s, park %u)\n", am_mode, am_pause_s, am_park);
++	reached = am_bringup();
++	if (reached == 6) {
++		/*
++		 * TODO: start the user client here -- HackiOS's RedwoodMaliStart()
++		 * (iokit/Kernel/RedwoodMali.cpp, the panfrost-style IOKit service)
++		 * once it is ported. What a shader job needs and this WRITE_VALUE
++		 * does not comes with it: SHADER_CONFIG SC_VAR_ALGORITHM (G68
++		 * TTRX_2968/3162), JM_CONFIG IDVS group size, the 26 MHz parking
++		 * around every shader power transition, MMU fault handling.
++		 */
++		printf("A34 MALI: user client not started (RedwoodMali.cpp is not ported yet)\n");
++	}
++	printf("A34 MALI: done step %u/6\n", reached);
++}
++
++void
++a34_mali_init(void)
++{
++	thread_t thread;
++
++	if (am_started) {
++		return;
++	}
++	am_started = true;
++	if (!PE_parse_boot_argn("a34mali", &am_mode, (int)sizeof(am_mode)) || (am_mode != 1 && am_mode != 2)) {
++		printf("A34 MALI: disabled (boot-arg a34mali=1 runs the GPU bring-up)\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("a34malipause", &am_pause_s, (int)sizeof(am_pause_s));
++	(void)PE_parse_boot_argn("a34malipark", &am_park, (int)sizeof(am_park));
++	if (am_pause_s > 60) {
++		am_pause_s = 60;
++	}
++	if (kernel_thread_start(am_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A34 MALI: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 29dce2b..40b7308 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void ruby_keys_init(void);
+ extern void a34_touch_init(void);
+ extern void a34_diag_init(void);
++extern void a34_mali_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -708,6 +709,7 @@ sweet_ufs_init(void)
+ 	 * before the key poll thread starts using it. */
+ 	a34_touch_init();
+ 	a34_diag_init();
++	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
