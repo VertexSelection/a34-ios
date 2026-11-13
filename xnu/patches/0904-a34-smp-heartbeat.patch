@@ -128,10 +128,10 @@ index 3cf3caa..cb886b9 100644
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 893659e..1c2da30 100644
+index 893659e..438adad 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1848,6 +1848,29 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+@@ -1848,6 +1848,31 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
  	__builtin_unreachable();
  }
  
@@ -146,9 +146,11 @@ index 893659e..1c2da30 100644
 +a34_cpu_diag(uint64_t *out, unsigned int max_cpus)
 +{
 +	uint64_t now = mach_absolute_time();
++	unsigned int last = (unsigned int)ml_get_max_cpu_number();
 +
 +	for (unsigned int i = 0; i < max_cpus && i < 8; i++) {
-+		cpu_data_t *cdp = cpu_datap((int)i);
++		/* cpu_datap() asserts on CPUs past the configured count (cpus=N). */
++		cpu_data_t *cdp = i <= last ? cpu_datap((int)i) : NULL;
 +		out[4 * i + 0] = os_atomic_load(&a34_irq_count[0][i], relaxed);
 +		out[4 * i + 1] = os_atomic_load(&a34_irq_count[1][i], relaxed);
 +		out[4 * i + 2] = os_atomic_load(&a34_irq_count[2][i], relaxed);
@@ -161,7 +163,7 @@ index 893659e..1c2da30 100644
  void
  sleh_irq(arm_saved_state_t *state)
  {
-@@ -1869,6 +1892,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1869,6 +1894,7 @@ sleh_irq(arm_saved_state_t *state)
  		return; /* spurious */
  	}
  	if (intid == sweet_vtimer_intid) {
@@ -169,7 +171,7 @@ index 893659e..1c2da30 100644
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
  		cdp->cpu_decrementer = -1; /* Large */
  		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
-@@ -1876,12 +1900,14 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1876,12 +1902,14 @@ sleh_irq(arm_saved_state_t *state)
  		INTERRUPT_MASKED_DEBUG_END();
  		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
  	} else if (intid < 16) {
