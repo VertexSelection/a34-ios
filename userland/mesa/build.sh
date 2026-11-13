@@ -66,7 +66,9 @@ fetch() {
 	file=$DL/$(basename "$url")
 	mkdir -p "$DL"
 	if [ ! -f "$file" ]; then
-		curl -fsSL --retry 3 -o "$file.part" "$url"
+		# (a download that fails in $(...) would not stop the script by itself)
+		curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$file.part" "$url" ||
+			{ echo "error: cannot fetch $url" >&2; return 1; }
 		mv "$file.part" "$file"
 	fi
 	echo "$sum  $file" | shasum -a 256 -c --quiet >&2
