@@ -1716,8 +1716,11 @@ my_glClear(void *context, GLbitfield mask)
 			g->state = GROUP_FRESH;         /* (a group about to be drawn: see group_draw_begin()) */
 		}
 	}
-	if (e->colour != 0) {
-		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
+	if (e->colour != 0 && render_server) {
+		/*
+		 * what is about to be cleared may be what the next draw reads: see reads_what_it_writes()
+		 * (CoreAnimation's ways; another program's clear is made at once: it may read the pixels next)
+		 */
 		e->unclear = mask;
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
 		glGetIntegerv(GL_SCISSOR_BOX, e->unclear_box);
