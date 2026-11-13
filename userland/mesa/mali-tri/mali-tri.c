@@ -149,7 +149,7 @@ main(int argc, char **argv)
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
-	EGLDisplay dpy = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+	EGLDisplay dpy = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
 	EGLint major = 0, minor = 0;
 
 	if (dpy == EGL_NO_DISPLAY) {

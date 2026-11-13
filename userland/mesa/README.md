@@ -42,9 +42,11 @@ Output (all `@rpath/...`, with an `@loader_path` rpath, ad-hoc signed):
 Built against libdrm's own `xf86drm.h` (fetched from the libdrm 2.4.134 release) and Mesa's
 `include/drm-uapi`, so every structure is the Linux one. One `io_connect_t` per process,
 opened on first need with `IOServiceGetMatchingService(IOServiceMatching("RedwoodMali"))` and
-`IOServiceOpen(type 0)`. The iPhoneOS SDK has `IOKit.tbd` but no IOKit headers;
-`redwood_iokit.h` declares the eight calls used (the native build stage checks those
-declarations and values against the macOS SDK's real headers, `iokit_check.c`).
+`IOServiceOpen(type 0)`. Older iPhoneOS SDKs ship `IOKit.tbd` without IOKit headers (the
+18.5 SDK of Xcode 16.4 has `IOKitLib.h`): `redwood_iokit.h` uses the SDK's header when there
+is one and otherwise declares the eight calls used, as ios-topaz relied on linking IOKit
+directly. The build checks those declarations and values against the macOS SDK's real
+headers (`iokit_check.c`) and compiles that branch for iOS as well.
 
 | libdrm call | here |
 | --- | --- |

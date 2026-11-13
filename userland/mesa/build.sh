@@ -148,6 +148,9 @@ ios_libdrm() {
 	else
 		echo "iPhoneOS SDK has no IOKit headers: redwood_iokit.h declares the calls"
 	fi
+	# the branch for SDKs without IOKit headers must build too
+	"$CLANG" "${IOS_TARGET[@]}" -fsyntax-only -Wall -Wextra -DREDWOOD_OWN_IOKIT -I"$WORK/libdrm-$LIBDRM_VERSION" \
+		-I"$SRC/include" -I"$SRC/include/drm-uapi" -I"$HERE/redwood-drm" "$HERE/redwood-drm/redwood_drm.c"
 	libdrm_standin "$IOS_DRM" "@rpath/libdrm.2.dylib" "$CLANG" "${IOS_TARGET[@]}"
 }
 
@@ -195,6 +198,12 @@ ios_mesa() {
 			return 1
 		fi
 		tail -n 3 "$WORK/build-ios.log"
+		echo "compiler warnings: $(grep -c 'warning:' "$WORK/build-ios.log" || true)"
+		# an API newer than iOS $IOS_MIN, called unguarded, would keep the libraries from loading there
+		if grep -E 'warning: .*(only available on iOS|is unavailable|-Wunguarded-availability)' "$WORK/build-ios.log" | sort -u | grep .; then
+			echo "error: APIs newer than iOS $IOS_MIN are used (above)"
+			return 1
+		fi
 		rm -rf "$STAGE"
 		meson install -C "$WORK/build-ios" --no-rebuild --destdir "$STAGE" >"$WORK/install-ios.log"
 	)
@@ -210,7 +219,7 @@ mali_tri() {
 
 package() {
 	log "package"
-	local lib=$STAGE$PREFIX/lib f
+	local lib=$STAGE$PREFIX/lib f dep
 	rm -rf "$OUT"
 	mkdir -p "$OUT/include"
 	cp "$IOS_DRM/lib/libdrm.2.dylib" "$OUT/"
@@ -222,17 +231,54 @@ package() {
 		"$STAGE$PREFIX/include/KHR" "$OUT/include/" 2>/dev/null || true
 	(
 		cd "$OUT"
-		for f in *.dylib; do
-			install_name_tool -id "@rpath/$f" "$f"
-			# their dependencies on each other are @rpath/...: look next to the library itself
-			install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
-		done
 		for f in *.dylib mali-tri; do
+			[ "$f" = mali-tri ] || install_name_tool -id "@rpath/$f" "$f"
+			# meson install wrote $PREFIX/lib/... into the libraries that use another: @rpath/...
+			for dep in $(otool -L "$f" | awk -v p="$PREFIX/lib/" 'NR > 1 && index($1, p) == 1 { print $1 }'); do
+				install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$f"
+			done
+			# and @rpath is first of all the library's own directory
+			if [ "$f" != mali-tri ] && ! otool -l "$f" | grep 'path @loader_path ' >/dev/null; then
+				install_name_tool -add_rpath @loader_path "$f"
+			fi
 			codesign -f -s - "$f"
 		done
 	)
+	check
 	build_info >"$OUT/BUILD_INFO.txt"
 	cat "$OUT/BUILD_INFO.txt"
+}
+
+# What a loader on the phone would trip over, found here instead.
+check() {
+	local f sym bad=0
+	log "check"
+	for f in "$OUT"/*.dylib "$OUT/mali-tri"; do
+		if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E '^(@rpath/|/usr/lib/|/System/Library/)'; then
+			echo "error: $(basename "$f") refers to a library outside @rpath and the system"
+			bad=1
+		fi
+		if [ "$(lipo -archs "$f")" != arm64 ]; then
+			echo "error: $(basename "$f") is $(lipo -archs "$f"), not arm64"
+			bad=1
+		fi
+		codesign -v "$f" || bad=1
+	done
+	for sym in eglGetPlatformDisplay eglInitialize eglCreatePbufferSurface eglGetProcAddress; do
+		nm -gU "$OUT/libEGL.1.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libEGL lacks $sym"; bad=1; }
+	done
+	for sym in glClear glDrawArrays glReadPixels glCreateShader glGetString; do
+		nm -gU "$OUT/libGLESv2.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libGLESv2 lacks $sym"; bad=1; }
+	done
+	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait redwood_drm_mmap redwood_drm_munmap; do
+		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
+	done
+	# panfrost maps BOs through the user client (patch 0002)
+	for sym in redwood_drm_mmap redwood_drm_munmap; do
+		nm -u "$OUT/libgallium-$MESA_VERSION.dylib" | grep "^_$sym\$" >/dev/null || { echo "error: libgallium does not call $sym"; bad=1; }
+	done
+	[ "$bad" = 0 ] && echo "ok"
+	return "$bad"
 }
 
 build_info() {
@@ -263,6 +309,10 @@ build_info() {
 	(cd "$OUT" && for f in *.dylib mali-tri; do
 		printf '  %-26s %9s  %s\n' "$f" "$(stat -f %z "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)"
 	done)
+	echo
+	echo "libdrm functions Mesa imports (all from libdrm.2.dylib, redwood-drm):"
+	nm -u "$OUT"/libgallium-*.dylib "$OUT"/libEGL.1.dylib | grep -E '^_(drm|redwood_drm)' | sort -u | sed 's/^_//' |
+		paste -sd ' ' - | fold -s -w 92 | sed 's/^/  /' || true
 	echo
 	for f in "$OUT"/*.dylib "$OUT/mali-tri"; do
 		echo "$(basename "$f"):"

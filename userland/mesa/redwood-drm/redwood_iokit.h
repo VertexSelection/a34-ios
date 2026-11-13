@@ -1,6 +1,6 @@
 /*
- * The few IOKit calls redwood_drm.c makes. The iPhoneOS SDK ships IOKit.framework's
- * library (IOKit.tbd) but not its headers, so where <IOKit/IOKitLib.h> is missing the
+ * The few IOKit calls redwood_drm.c makes. iPhoneOS SDKs ship IOKit.framework's library
+ * (IOKit.tbd) but not always its headers, so where <IOKit/IOKitLib.h> is missing the
  * declarations below take its place. They are the public IOKitLib API, unchanged since
  * macOS 10.5 / iOS 2. build.sh compiles iokit_check.c against the macOS SDK's real
  * header, which checks every value in REDWOOD_IOKIT_VALUES against it.
