@@ -51,7 +51,7 @@ done < "$T/runs"
 echo "[$(date +%H:%M:%S)] written $(wc -l < "$T/runs") runs; verifying"
 bad=0
 while read -r start len; do
-    "$A" shell "/tmp/chunksum $DEV $CH $len $start" | tr -d '\r' > "$T/check"
+    "$A" shell "/tmp/chunksum $DEV $CH $len $start" < /dev/null | tr -d '\r' > "$T/check"
     awk -v s="$start" -v l="$len" '$1 >= s && $1 < s + l' "$T/host" | diff -q - "$T/check" >/dev/null || bad=$((bad + 1))
 done < "$T/runs"
 [ $bad -eq 0 ] && echo "[$(date +%H:%M:%S)] root image verified ($c chunks rewritten)" || { echo "MISMATCH in $bad runs" >&2; exit 1; }
