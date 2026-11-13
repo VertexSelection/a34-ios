@@ -24,3 +24,5 @@ __pycache__/
 /research/
 /ipsw/
 /tools/bin/
+/tools/chunksum/chunksum-arm64
+/tools/chunksum/chunksum-host
