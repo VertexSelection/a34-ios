@@ -68,7 +68,7 @@
  * "where a frame's time goes"), glsum=0 (copied IOSurfaces refilled by their seed only, see
  * surface_changed(); glsum=2: as often as before), glerrors=0|1 (glGetError after every call never |
  * always; default: the first 120 frames), glasync=0 (GPU jobs synchronous: REDWOOD_DRM_ASYNC=0),
- * glseedwait=1 (see seed_bump()).
+ * glseedwait=1 (see seed_bump()), gltarget=0 (see target_of()), glblack=0 (see picture_note()).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -246,6 +246,10 @@ struct image {
 	unsigned quiet;                 /* ... how many sums in a row came out the same */
 	bool summed, empty, said_empty; /* ... a sum has been made; that memory was all zero; which was written down */
 	unsigned copies, told, silent;  /* copies made; of them, after its seed moved; after a sum alone said it changed */
+	unsigned draws;                 /* (drawn into) draws made into it so far */
+	unsigned made;                  /* when it was made (image_new()): the later the newer */
+	GLuint source;                  /* (shown) the texture of ours drawn into for the same surface, filled from by the GPU */
+	unsigned source_draws;          /* ... the draws into that when this was last filled from it */
 	bool sub_ok;                    /* ... refilled with glTexSubImage2D (until that fails) */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
@@ -955,6 +959,8 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+static unsigned images_made;
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
@@ -974,6 +980,7 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	}
 	memset(image, 0, sizeof(*image));
 	image->texture = texture;
+	image->made = ++images_made;
 	image->sub_ok = true;
 	image->surface = (IOSurfaceRef)CFRetain(surface);
 	return image;
@@ -1105,6 +1112,101 @@ mirror_to_texture(struct eagl *e, struct image *image)
 	done = done && glGetError() == 0;
 	prof_end(PW_COPY_IN, began, done ? (uint64_t)image->width * (uint64_t)image->height * 4 : 0);
 	return done;
+}
+
+/*
+ * A surface shown (-texImageIOSurface:) that is also drawn into here (-attachImage:) into a
+ * texture of ours that is not its memory (rows the kernel or Mesa do not take: 'BGRA' 1125 x
+ * 2436 at 4512 bytes a row): its memory has what was drawn only once the frame's end has read
+ * it back (target_to_surface()). The texture shown is filled by the GPU from the texture drawn
+ * into instead, when it is made and whenever that has been drawn into since: never older than
+ * what was drawn, and no 11 MB through the CPU. Boot-arg gltarget=0: from the memory, as before.
+ */
+static int from_targets = 1;
+
+static struct image *
+target_of(struct eagl *e, struct image *image)
+{
+	uint32_t id = IOSurfaceGetID(image->surface);
+	struct image *found = NULL;
+
+	if (!from_targets || image->target || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
+	    image->alpha_first || image->to != GL_TEXTURE_2D) {
+		return NULL;
+	}
+	for (unsigned i = 0; i < e->image_count; i++) {
+		struct image *from = &e->images[i];
+
+		/* (the newest, if the surface has been attached to more than one texture) */
+		if (from != image && from->target && !from->shared && from->mirror == 0 && !from->alpha_first &&
+		    IOSurfaceGetID(from->surface) == id && from->width == image->width && from->height == image->height &&
+		    (found == NULL || from->made > found->made)) {
+			found = from;
+		}
+	}
+	return found;
+}
+
+/* Fill the texture of `image`, which is bound, from the texture drawn into, `from`, by the GPU. false: not done. */
+static bool
+image_from_target(struct eagl *e, struct image *image, struct image *from)
+{
+	static unsigned told;
+	GLint read = 0, draw = 0, width = 0, height = 0, format = 0, box[4];
+	GLenum internal = internal_format(image->internal, image->format);
+	bool flip = image->invert != from->invert, done, boxed;
+	uint64_t began = prof_begin();
+
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+	if (width != image->width || height != image->height || format != (GLint)internal) {
+		glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal, image->width, image->height, 0, image->format, image->type, NULL);
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	boxed = glIsEnabled(GL_SCISSOR_TEST);
+	glGetIntegerv(GL_SCISSOR_BOX, box);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	done = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+	    glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	if (done) {
+		glDisable(GL_SCISSOR_TEST);
+		/* (memory row r is drawn row r, or height-1-r if drawn inverted; shown the same way: one flip if they differ) */
+		glBlitFramebuffer(0, 0, image->width, image->height, 0, flip ? image->height : 0, image->width, flip ? 0 : image->height,
+		    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		if (boxed) {
+			glEnable(GL_SCISSOR_TEST);
+		}
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	prof_end(PW_COPY_IN, began, done ? (uint64_t)image->width * (uint64_t)image->height * 4 : 0);
+	if (!done) {
+		say("a34gl: IOSurface %u: texture %u could not be filled from texture %u (drawn into) by the GPU; from its memory\n",
+		    IOSurfaceGetID(image->surface), image->texture, from->texture);
+		image->source = 0;
+		return false;
+	}
+	if (image->source != from->texture && told++ < 16) {
+		say("a34gl: IOSurface %u ('BGRA' %d x %d) shown as texture %u is filled by the GPU from texture %u, drawn into here "
+		    "(%u draws so far), not from its memory\n", IOSurfaceGetID(image->surface), image->width, image->height, image->texture,
+		    from->texture, from->draws);
+	}
+	image->source = from->texture;
+	image->source_draws = from->draws;
+	image->seed = IOSurfaceGetSeed(image->surface);
+	image->copies++;
+	return true;
 }
 
 /*
@@ -1400,9 +1502,67 @@ surface_to_texture(struct eagl *e, struct image *image)
 static int seed_wait;                   /* boot-arg glseedwait=1 */
 static dispatch_queue_t seed_queue;
 static pthread_once_t seed_once = PTHREAD_ONCE_INIT;
-static IOSurfaceRef seed_pending[16];
+static struct seed_bump {
+	IOSurfaceRef surface;
+	unsigned frame;
+} seed_pending[16];
 static unsigned seed_pending_count;
 static pthread_mutex_t seed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * A picture drawn here into a surface of the screen's size that comes out (nearly) all black:
+ * written down when it becomes so and when it is not any more, with the frame and the surface.
+ * Sixty-four pixels of a grid, read from the surface's memory under the lock that moves its seed
+ * (after the frame's jobs, with queued jobs; synchronous: the frame before). Black flashes on the
+ * screen that are never written down here are made after a34gl (the display's copy).
+ * Boot-arg glblack=0: not looked at.
+ */
+static int black_check = 1;
+static struct {
+	uint32_t id;
+	bool black;
+} black_seen[16];
+static pthread_mutex_t black_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+picture_note(IOSurfaceRef surface, unsigned frame)
+{
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	uint32_t id = IOSurfaceGetID(surface);
+	unsigned black = 0, slot = id % 16;
+	bool now;
+
+	if (!black_check || base == NULL || width < 1000 || height < 2000 || IOSurfaceGetBytesPerElement(surface) != 4 ||
+	    IOSurfaceGetPlaneCount(surface) > 0) {
+		return;
+	}
+	for (size_t y = 0; y < 8; y++) {
+		for (size_t x = 0; x < 8; x++) {
+			const uint8_t *p = base + row * ((2 * y + 1) * height / 16) + 4 * ((2 * x + 1) * width / 16);
+
+			black += p[0] <= 4 && p[1] <= 4 && p[2] <= 4;
+		}
+	}
+	now = black >= 60;
+	pthread_mutex_lock(&black_lock);
+	for (unsigned i = 0; i < 16; i++) {
+		if (black_seen[i].id == id) {
+			slot = i;
+			break;
+		}
+	}
+	if (black_seen[slot].id != id) {
+		black_seen[slot].id = id;
+		black_seen[slot].black = false;
+	}
+	if (now != black_seen[slot].black) {
+		black_seen[slot].black = now;
+		say("a34gl: frame %u: IOSurface %u (%zu x %zu, %zu bytes a row), drawn here, is %s (%u of 64 samples black)\n", frame, id,
+		    width, height, row, now ? "BLACK" : "not black any more", black);
+	}
+	pthread_mutex_unlock(&black_lock);
+}
 
 static void
 seed_queue_make(void)
@@ -1413,27 +1573,31 @@ seed_queue_make(void)
 static void
 seed_bump_work(void *context)
 {
-	IOSurfaceRef surface = context;
+	struct seed_bump *bump = context;
 
-	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		IOSurfaceUnlock(surface, 0, NULL);
+	if (IOSurfaceLock(bump->surface, 0, NULL) == 0) {
+		picture_note(bump->surface, bump->frame);
+		IOSurfaceUnlock(bump->surface, 0, NULL);
 	}
-	CFRelease(surface);
+	CFRelease(bump->surface);
+	free(bump);
 }
 
 static void
-seed_bump(IOSurfaceRef surface)
+seed_bump(IOSurfaceRef surface, unsigned frame)
 {
 	if (!seed_wait && redwood_drm_queued()) {
 		pthread_mutex_lock(&seed_lock);
 		if (seed_pending_count < sizeof(seed_pending) / sizeof(seed_pending[0])) {
-			seed_pending[seed_pending_count++] = (IOSurfaceRef)CFRetain(surface);
+			seed_pending[seed_pending_count].surface = (IOSurfaceRef)CFRetain(surface);
+			seed_pending[seed_pending_count++].frame = frame;
 			pthread_mutex_unlock(&seed_lock);
 			return;
 		}
 		pthread_mutex_unlock(&seed_lock);
 	}
 	if (surface_lock(surface, 0) == 0) {
+		picture_note(surface, frame);
 		surface_unlock(surface, 0);
 	}
 }
@@ -1445,10 +1609,17 @@ seed_bumps_send(void)
 	if (seed_pending_count != 0) {
 		pthread_once(&seed_once, seed_queue_make);
 		for (unsigned i = 0; i < seed_pending_count; i++) {
+			struct seed_bump *bump = malloc(sizeof(*bump));
+
+			if (bump == NULL) {
+				CFRelease(seed_pending[i].surface);
+				continue;
+			}
+			*bump = seed_pending[i];
 			if (seed_queue != NULL) {
-				dispatch_async_f(seed_queue, (void *)seed_pending[i], seed_bump_work);
+				dispatch_async_f(seed_queue, bump, seed_bump_work);
 			} else {
-				seed_bump_work((void *)seed_pending[i]);
+				seed_bump_work(bump);
 			}
 		}
 		seed_pending_count = 0;
@@ -1485,12 +1656,12 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		seed_bump(surface);
+		seed_bump(surface, e->frames + 1);
 		return;
 	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
-		seed_bump(surface);
+		seed_bump(surface, e->frames + 1);
 		return;
 	}
 	if (e->reader == 0) {
@@ -1516,7 +1687,14 @@ target_to_surface_work(struct eagl *e, struct image *image)
 		/* (as they were: CoreAnimation has them so, another program has its own) */
 		glPixelStorei(GL_PACK_ROW_LENGTH, render_server ? 0 : row_length);
 		glPixelStorei(GL_PACK_ALIGNMENT, render_server ? 4 : alignment);
+		picture_note(surface, e->frames + 1);
 		surface_unlock(surface, 0);
+		/* the textures shown that are filled from this one by the GPU have what the memory now has: the seed is theirs */
+		for (unsigned i = 0; i < e->image_count; i++) {
+			if (e->images[i].source == image->texture && e->images[i].source_draws == image->draws) {
+				e->images[i].seed = IOSurfaceGetSeed(surface);
+			}
+		}
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 }
@@ -1830,6 +2008,7 @@ drawing(struct eagl *e)
 	 */
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && (image->target || !render_server)) {
 		image->drawn = image->painted = true;
+		image->draws++;
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
 			e->line.into_display++;
@@ -1849,7 +2028,7 @@ static void
 my_glBindTexture(void *context, GLenum target, GLuint texture)
 {
 	struct eagl *e = context;
-	struct image *image;
+	struct image *image = NULL;
 
 	EAGL_ENTER(e, 0x30);
 	if (eagl_tracing) {
@@ -1859,7 +2038,22 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
 	}
-	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
+	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && image->source != 0) {
+		/* (shown, and drawn into here: see target_of()) */
+		struct image *from = image_of(e, image->source);
+
+		if (from != NULL && from->target && target_of(e, image) == from) {
+			if (from->draws != image->source_draws) {
+				image_from_target(e, image, from);
+			} else if (IOSurfaceGetSeed(image->surface) != image->seed) {
+				surface_to_texture(e, image);   /* (somebody else's change) */
+			}
+			image = NULL;
+		} else {
+			image->source = 0;
+		}
+	}
+	if (texture != 0 && e->image_count != 0 && image != NULL && !image->shared &&
 	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
 	    image->wrapped && !image->painted && surface_changed(e, image))) {
 		surface_to_texture(e, image);
@@ -3468,10 +3662,12 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 #define GL_PIXEL_PACK_BUFFER_BINDING    0x88ed
 
 static unsigned vbafter_frames, vbafter_skip;   /* glvbafter=N,K: frames still to be followed; vrb frames still to be let by */
+static unsigned vbafter_min_height = 100;       /* glvbafter=N,K,H: the least height of a vrb's rectangle that starts a frame followed */
 static struct {
 	struct eagl *e;                 /* the context followed (NULL: none, this frame) */
 	unsigned frame;                 /* ... its frame */
-	unsigned marks, draw, listed, unlisted, seen_frame;
+	unsigned marks, draw, listed, unlisted, seen_frame, brightened;
+	uint8_t before[16][4];          /* the draw at hand: the row before it */
 	bool seen_skip;                 /* (the frame seen_frame is one of those let by) */
 	struct vbafter_mark {
 		GLuint framebuffer, texture;    /* (by the texture where there is one: framebuffers' names are new every frame) */
@@ -3523,7 +3719,7 @@ vbafter_keep_program(struct eagl *e, GLuint program)
 
 /* Sixteen pixels across a row of the framebuffer bound for drawing (or of `framebuffer`, if not 0), in hex. */
 static void
-vbafter_row(char *text, size_t size, const GLint row[3], GLuint framebuffer, GLuint texture)
+vbafter_row(char *text, size_t size, const GLint row[3], GLuint framebuffer, GLuint texture, uint8_t (*out)[4])
 {
 	GLint read = 0, draw = 0, pack = 0, alignment = 4;
 	size_t used = 0;
@@ -3549,6 +3745,9 @@ vbafter_row(char *text, size_t size, const GLint row[3], GLuint framebuffer, GLu
 
 		glReadPixels(row[1] + (GLint)((long)i * (width > 1 ? width - 1 : 0) / 15), row[0], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
 		used += (size_t)snprintf(text + used, size - used, " %02x%02x%02x%02x", p[0], p[1], p[2], p[3]);
+		if (out != NULL) {
+			memcpy(out[i], p, 4);
+		}
 	}
 	if (glGetError() != 0) {
 		snprintf(text, size, " (not readable)");       /* (and the error is not left for CoreAnimation's next call) */
@@ -3725,7 +3924,7 @@ vbafter_end(struct eagl *e)
 			if (e->reader == 0) {
 				glGenFramebuffers(1, &e->reader);
 			}
-			vbafter_row(text, sizeof(text), row, e->reader, mark->texture);
+			vbafter_row(text, sizeof(text), row, e->reader, mark->texture, NULL);
 		}
 		say_always("a34gl-vb: %u end: rect %u (tex %u, %d,%d-%d,%d, draw %u) y=%d:%s\n", vbafter.frame + 1, i,
 		    mark->texture, mark->box[0], mark->box[1], mark->box[2], mark->box[3], mark->draw, row[0], text);
@@ -3755,7 +3954,7 @@ vbafter_clear(struct eagl *e, GLbitfield what, bool boxed, const GLint scissor[4
 		if (vbafter_same(e, &vbafter.mark[i]) && vbafter_meet(box, vbafter.mark[i].box, both)) {
 			GLint row[3] = { (both[1] + both[3]) / 2, both[0], both[2] };
 
-			vbafter_row(text, sizeof(text), row, 0, 0);
+			vbafter_row(text, sizeof(text), row, 0, 0, NULL);
 			say_always("a34gl-vb: %u.%u a clear to %.3g %.3g %.3g %.3g over rectangle %u (framebuffer %u, %d,%d-%d,%d)\n",
 			    vbafter.frame + 1, vbafter.draw, (double)colour[0], (double)colour[1], (double)colour[2], (double)colour[3], i,
 			    e->framebuffer, both[0], both[1], both[2], both[3]);
@@ -3924,7 +4123,8 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 	}
 	snprintf(vbafter.line[1], sizeof(vbafter.line[1]), "a34gl-vb:   reads%s; blending %s; colour %s%s\n", used ? reads : " nothing",
 	    text, colour, e->unclear != 0 ? "; a clear pending (not in before)" : "");
-	vbafter_row(text, sizeof(text), vbafter.row, 0, 0);
+	memset(vbafter.before, 0xff, sizeof(vbafter.before));
+	vbafter_row(text, sizeof(text), vbafter.row, 0, 0, vbafter.before);
 	say_always("%s", vbafter.line[0]);
 	say_always("%s", vbafter.line[1]);
 	say_always("a34gl-vb:   before, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
@@ -3957,15 +4157,23 @@ vbafter_drawn_with(struct eagl *e, bool ours)
 static void
 vbafter_after(struct eagl *e, GLenum type, const void *indices, GLint first, GLsizei count)
 {
+	uint8_t after[16][4];
+	unsigned brightened = 0;
 	char text[200];
 	int marked;
 
 	if (vbafter.vrb) {
 		GLint box[4];
-		int marked;
 
 		vbafter.vrb = false;
+		if (vbafter_box(e, type, indices, first, count, box) == 0) {
+			return;
+		}
 		if (vbafter.e == NULL) {
+			/* (only a vrb this tall starts a frame followed: the status bar's is 80 pixels, the App Library's 238) */
+			if (box[3] - box[1] < (GLint)vbafter_min_height) {
+				return;
+			}
 			if (e->frames != vbafter.seen_frame) {
 				vbafter.seen_frame = e->frames;
 				vbafter.seen_skip = vbafter_skip > 0;
@@ -3977,21 +4185,16 @@ vbafter_after(struct eagl *e, GLenum type, const void *indices, GLint first, GLs
 			vbafter_frames--;
 			vbafter.e = e;
 			vbafter.frame = e->frames;
-			vbafter.marks = vbafter.draw = vbafter.listed = vbafter.unlisted = 0;
+			vbafter.marks = vbafter.draw = vbafter.listed = vbafter.unlisted = vbafter.brightened = 0;
 			say_always("a34gl-vb: %u: a frame with a draw of \"vrb\": the draws after it that reach what it drew, or where that "
 			    "went (%u frames more after this)\n", e->frames + 1, vbafter_frames);
 		}
 		vbafter.draw++;
-		if (vbafter_box(e, type, indices, first, count, box) == 0) {
-			say_always("a34gl-vb: %u.%u the vrb, into framebuffer %u (texture %u): nowhere in the viewport\n", vbafter.frame + 1,
-			    vbafter.draw, e->framebuffer, e->colour);
-			return;
-		}
 		marked = vbafter_mark(e, box, 0);
 		vbafter.row[0] = (box[1] + box[3]) / 2;
 		vbafter.row[1] = box[0];
 		vbafter.row[2] = box[2];
-		vbafter_row(text, sizeof(text), vbafter.row, 0, 0);
+		vbafter_row(text, sizeof(text), vbafter.row, 0, 0, NULL);
 		say_always("a34gl-vb: %u.%u the vrb, into framebuffer %u (texture %u) %d,%d-%d,%d, reading texture %u: rectangle %d\n",
 		    vbafter.frame + 1, vbafter.draw, e->framebuffer, e->colour, box[0], box[1], box[2], box[3], e->bound[0], marked);
 		say_always("a34gl-vb:   after, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
@@ -4001,8 +4204,18 @@ vbafter_after(struct eagl *e, GLenum type, const void *indices, GLint first, GLs
 		return;
 	}
 	vbafter.listed_now = false;
-	vbafter_row(text, sizeof(text), vbafter.row, 0, 0);
+	vbafter_row(text, sizeof(text), vbafter.row, 0, 0, after);
 	say_always("a34gl-vb:   after, y=%d x=%d-%d:%s\n", vbafter.row[0], vbafter.row[1], vbafter.row[2], text);
+	/* a sample dark before (no colour above 0x40) and bright after (none below 0xc0) */
+	for (unsigned i = 0; i < 16; i++) {
+		uint8_t *b = vbafter.before[i], *a = after[i];
+
+		brightened += b[0] < 0x40 && b[1] < 0x40 && b[2] < 0x40 && a[0] > 0xc0 && a[1] > 0xc0 && a[2] > 0xc0;
+	}
+	if (brightened != 0) {
+		say_always("a34gl-vb:   ^ %s draw that made dark samples bright here: %u of 16\n", vbafter.brightened++ == 0 ?
+		    "THE FIRST" : "another", brightened);
+	}
 	if (vbafter.reads && (marked = vbafter_mark(e, vbafter.box, vbafter.draw)) >= 0) {
 		say_always("a34gl-vb:   what it drew: rectangle %d\n", marked);
 	}
@@ -5218,8 +5431,12 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
 	if (!surface_shared(e, image)) {
-		surface_changed(e, image);              /* (what it adds up to now) */
-		surface_to_texture(e, image);
+		struct image *from = target_of(e, image);
+
+		if (from == NULL || !image_from_target(e, image, from)) {
+			surface_changed(e, image);      /* (what it adds up to now) */
+			surface_to_texture(e, image);
+		}
 	}
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
@@ -5478,11 +5695,14 @@ install(void)
 			char *end = (char *)argument + 10;
 
 			vbafter_frames = (unsigned)strtoul(end, &end, 10);
-			vbafter_skip = *end == ',' ? (unsigned)strtoul(end + 1, NULL, 10) : 1;
+			vbafter_skip = *end == ',' ? (unsigned)strtoul(end + 1, &end, 10) : 1;
 			vbafter_skip -= vbafter_skip > 0;
+			if (*end == ',') {
+				vbafter_min_height = (unsigned)strtoul(end + 1, NULL, 10);
+			}
 			if (vbafter_frames != 0) {
-				say("a34gl: glvbafter: %u frames with a draw of \"vrb\" followed, from the %uth on (lines \"a34gl-vb:\")\n",
-				    vbafter_frames, vbafter_skip + 1);
+				say("a34gl: glvbafter: %u frames with a draw of \"vrb\" %u pixels tall or more followed, from the %uth on (lines "
+				    "\"a34gl-vb:\")\n", vbafter_frames, vbafter_min_height, vbafter_skip + 1);
 			}
 		}
 		if ((argument = strstr(arguments, "gltable=")) != NULL) {
@@ -5507,6 +5727,8 @@ install(void)
 		}
 		sum_surfaces = strstr(arguments, "glsum=0") != NULL ? 0 : strstr(arguments, "glsum=2") != NULL ? 2 : 1;
 		seed_wait = strstr(arguments, "glseedwait=1") != NULL;
+		black_check = strstr(arguments, "glblack=0") == NULL;
+		from_targets = strstr(arguments, "gltarget=0") == NULL;
 		if (strstr(arguments, "glerrors=0") != NULL) {
 			check_errors = 0;
 		} else if (strstr(arguments, "glerrors=1") != NULL) {

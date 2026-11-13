@@ -305,6 +305,19 @@ next copy that is not. Sums: every look until 30 alike, then every 2nd frame, af
 4th; a surface whose owner has told every change by its seed (twice or more), every 8th.
 `glsum=2`: as before, `glsum=0`: none.
 
+A surface that is drawn into here (-attachImage:) into a texture that is not its memory (rows
+the kernel or Mesa do not take, e.g. 'BGRA' 1125 x 2436 at 4512 bytes a row: Mesa wants 64-byte
+rows for linear RGBA on Valhall, `pan_linear_or_tiled_row_align_req()`) has what was drawn only
+after the frame's end reads it back. Shown here as well (-texImageIOSurface:), it is now filled
+by the GPU from the texture drawn into: when it is made, and whenever that has been drawn into
+since. Its memory is used only for others' changes. `gltarget=0`: from the memory, as before.
+
+Black pictures: at the lock that moves the seed of a full-screen surface drawn here (frame end;
+with queued jobs on the seed queue, after the jobs), 64 pixels of a grid are read from its
+memory. A picture that becomes (nearly) all black is logged ("is BLACK", with frame and surface),
+and so is the next one that is not. A black flash on the screen that never shows up here is
+made after a34gl, in the display's copy. `glblack=0`: not looked at.
+
 ## The log
 
 Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
@@ -341,7 +354,9 @@ a34gl's own: `glprof=N` (below),
 `glsum=0` (an IOSurface that is copied into a texture is refilled when its seed moves, never
 because its memory adds up differently -- that check reads the whole surface; `glsum=2`: as often
 as before, see "Copied surfaces"), `glasync=0` (GPU jobs synchronous), `glseedwait=1` (a drawn
-surface's seed moved on the drawing thread), `glvbafter=N[,K]` (the draws after the variable blur),
+surface's seed moved on the drawing thread), `glvbafter=N[,K[,H]]` (the draws after the variable blur; H:
+the least height of the vrb's rectangle that starts a frame, default 100, which leaves out the status
+bar's), `gltarget=0`, `glblack=0` (see "Copied surfaces"),
 `glerrors=0|1` (`glGetError` after every call never | always; default the first 120 frames).
 The log: see "The log".
 
@@ -376,7 +391,11 @@ of ours drew it, the framebuffer and the box in pixels, the textures read (`*`: 
 blending, the first corner's colour, and sixteen pixels across the middle row of the box, before and
 after the draw (hex RGBA as the framebuffer holds them). Clears over a followed rectangle are listed
 too, and at the frame's end every followed rectangle is read once more. At most 64 draws a frame are
-written down, and the pixel reads wait for the GPU, so those frames are slow.
+written down, and the pixel reads wait for the GPU, so those frames are slow. A draw that makes
+dark samples (no colour above 0x40) bright (none below 0xc0) gets `^ THE FIRST draw that made
+dark samples bright here` (then `another`). `glvbafter=N,K,H`: only a vrb whose rectangle is at
+least H pixels tall starts a frame followed (default 100: the status bar's is 80, the App
+Library's 238).
 
 ### Profiling: `glprof=N`
 
