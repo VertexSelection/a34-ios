@@ -43,10 +43,10 @@ index d84e2a9..10ff70a 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 02db05c..22ff58a 100644
+index 02db05c..f1fa26a 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -150,6 +150,65 @@ public:
+@@ -150,6 +150,66 @@ public:
  
  OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
  
@@ -72,12 +72,13 @@ index 02db05c..22ff58a 100644
 +	uint64_t t0 = mach_absolute_time(), limit;
 +
 +	nanoseconds_to_absolutetime(NSEC_PER_SEC, &limit);
++	/* Poll without sleeping: 0905 saw the busy bit set at every kick even
++	 * 10 s after the previous one, so the idle windows may be short. */
 +	while (a34_dsi_busy()) {
 +		if (mach_absolute_time() - t0 > limit) {
 +			*ticks = mach_absolute_time() - t0;
 +			return false;
 +		}
-+		IODelay(200);
 +	}
 +	*ticks = mach_absolute_time() - t0;
 +	return true;
@@ -112,7 +113,7 @@ index 02db05c..22ff58a 100644
  bool
  AppleCLCD::start(IOService *provider)
  {
-@@ -197,6 +256,13 @@ AppleCLCD::start(IOService *provider)
+@@ -197,6 +257,13 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
@@ -126,7 +127,7 @@ index 02db05c..22ff58a 100644
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -209,6 +275,7 @@ AppleCLCD::start(IOService *provider)
+@@ -209,6 +276,7 @@ AppleCLCD::start(IOService *provider)
  
  extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
  
@@ -134,7 +135,7 @@ index 02db05c..22ff58a 100644
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -442,7 +509,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -442,7 +510,11 @@ AppleCLCD::present(const uint8_t *rec)
  	}
  	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
  	uint64_t t_kick = mach_absolute_time();
