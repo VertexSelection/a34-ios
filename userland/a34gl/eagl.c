@@ -311,6 +311,7 @@ struct eagl {
 		unsigned used;          /* the frame it was last used in */
 	} chains[VBLUR_CHAINS];
 	bool vblur_bound;               /* a draw of ours has textures of its own on units 2 to 5 */
+	bool vblur_dump;                /* (glvbdump=1) what that draw left is to be written down after it */
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -2399,6 +2400,28 @@ vblur_forget(struct eagl *e, GLuint picture)
  * texture of ours. Every bit of state touched is put back as CoreAnimation had it.
  */
 static int vblur_cover_forced = -1;     /* (vblur_draw_begin() making a chain again the other way) */
+/*
+ * boot-arg glvbdump=N: for the first N draws of "vrb" (default 0), sixteen pixels across the middle row
+ * of the picture it reads (the first level) and of what it leaves where it draws, red green blue
+ * opacity: whether something white is in the picture already or made by the reading.
+ */
+static unsigned vblur_dumps;
+
+/* Sixteen pixels across row `y` of the framebuffer bound for reading, `width` wide, into `text`. */
+static void
+dump_row(char *text, size_t size, GLint x0, GLint y, GLint width)
+{
+	size_t used = 0;
+
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	for (int i = 0; i < 16 && used < size - 24; i++) {
+		uint8_t p[4] = { 0, 0, 0, 0 };
+
+		glReadPixels(x0 + (GLint)((long)i * (width - 1) / 15), y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		used += (size_t)snprintf(text + used, size - used, " %u,%u,%u,%u", p[0], p[1], p[2], p[3]);
+	}
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+}
 
 /* Are the levels to hold how much of the picture they cover (cover_fragment) rather than its opacity? */
 static bool
@@ -2839,6 +2862,21 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 	}
 	glActiveTexture(GL_TEXTURE0 + e->unit);
 	e->vblur_bound = true;
+	if (vblur_dumps != 0) {
+		char text[400];
+
+		vblur_dumps--;
+		if (e->reader == 0) {
+			glGenFramebuffers(1, &e->reader);
+		}
+		glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, chain->picture, 0);
+		dump_row(text, sizeof(text), 0, chain->height / 2, chain->width);
+		glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+		say_always("a34gl: vrb reads texture %u (%d x %d), its middle row:%s\n", chain->picture, chain->width, chain->height,
+		    text);
+		e->vblur_dump = true;
+	}
 	for (GLuint i = 0; i < 4; i++) {
 		glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
 		if (!enabled[i]) {
@@ -3410,6 +3448,16 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 		if (!enabled[i]) {
 			glDisableVertexAttribArray(i);
 		}
+	}
+	if (e->vblur_dump) {
+		GLint view[4] = { 0, 0, 0, 0 };
+		char text[400];
+
+		e->vblur_dump = false;
+		glGetIntegerv(GL_VIEWPORT, view);
+		dump_row(text, sizeof(text), view[0], view[1] + view[3] / 2, view[2]);
+		say_always("a34gl: vrb left in framebuffer %u (texture %u, viewport %d,%d %dx%d), its middle row:%s\n", e->framebuffer,
+		    e->colour, view[0], view[1], view[2], view[3], text);
 	}
 	if (e->vblur_bound) {
 		/* the textures of units 2 to 5 back as CoreAnimation had them */
@@ -4669,6 +4717,9 @@ install(void)
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		release_frames = strstr(arguments, "glrelease=1") != NULL;
+		if ((argument = strstr(arguments, "glvbdump=")) != NULL) {
+			vblur_dumps = (unsigned)strtoul(argument + 9, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "gltable=")) != NULL) {
 			table_draws = (int)strtoul(argument + 8, NULL, 10);
 		}

@@ -327,7 +327,11 @@ search field the pods came out white (icons and gaps, opaque, were right). Now t
 of the blur counts which of its sixteen pixels are picture at all (opacity not 0, inside the
 texture), the further levels carry that, and the reading divides by it: edges still do not
 darken, and the picture's colours are taken as they are. `vblur=3` is topaz's division,
-`vblur=0` no variable blur, `vblur=2` the mask painted.
+`vblur=0` no variable blur, `vblur=2` the mask painted, `glvbdump=N` writes down for the first N
+"vrb" draws sixteen pixels across the middle row of the picture read and of what was left.
+HackiOS's variable blur (hakios-mtk `eagl.c`: `vblur_level()`, `vblur_draw_begin()`, the four
+shaders, 8 levels, 6 chains) is byte for byte topaz's: `vblur=3`. The App Library's white pods
+stayed with the coverage division (boot 32), so the white is not made by the division alone.
 
 ### Profiling: `glprof=N`
 
