@@ -12,7 +12,7 @@
 #                 liba34gl.dylib, liba34gl-inject.dylib, a34gl-bbd, a34gl-surftest,
 #                 backboardd.env.example
 #   INSTALL.md    how to put it there and into backboardd
-#   BUILD_INFO.txt
+#   BUILD_INFO.txt, dSYM/ (debug symbols, not for the phone)
 # Install names are absolute ($INSTALL_DIR/<file>), nothing has an LC_RPATH, and everything
 # is ad-hoc signed last.
 set -euo pipefail
@@ -49,7 +49,8 @@ log "eagl_gen.h: the function table of iOS's OpenGLES (eagl_slots.txt), against 
 nm -gU "$MESA_OUT/libGLESv2.2.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' | sort -u >"$BUILD/exported-gl.txt"
 echo "libGLESv2 exports $(wc -l <"$BUILD/exported-gl.txt") gl* functions"
 python3 -I "$HERE/mkeagl.py" "$HERE/eagl_slots.txt" "$GL_XML" "$BUILD/exported-gl.txt" "$HERE/eagl.c" \
-	>"$BUILD/eagl_gen.h"
+	>"$BUILD/eagl_gen.h" 2>"$BUILD/mkeagl.log"
+cat "$BUILD/mkeagl.log"
 
 log "liba34gl.dylib (EAGLContext on Mesa: eagl.c, gl_egl.c)"
 "${CC[@]}" "${INCLUDES[@]}" -Wno-unused-parameter -dynamiclib -install_name "$INSTALL_DIR/liba34gl.dylib" \
@@ -73,6 +74,8 @@ log "a34gl-surftest (the IOSurface path, on its own: surftest.c)"
 	-framework CoreFoundation -framework IOSurface
 
 log "package"
+mkdir -p "$A34GL_OUT/dSYM"          # (clang -g leaves them next to what it links: not for the phone)
+mv "$A"/*.dSYM "$A34GL_OUT/dSYM/"
 cp "$MESA_OUT"/*.dylib "$MESA_OUT/mali-tri" "$A/"
 cp "$HERE/backboardd.env.example" "$A/"
 cp "$HERE/INSTALL.md" "$A34GL_OUT/"
@@ -120,7 +123,8 @@ done
 	echo "built:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	echo "install dir:   $INSTALL_DIR (absolute install names, no LC_RPATH, ad-hoc signed)"
 	echo "iPhoneOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version); target arm64-apple-ios$IOS_MIN"
-	echo "eagl table:    $(grep -c '^0x' "$HERE/eagl_slots.txt") named slots (eagl_slots.txt), $(wc -l <"$BUILD/exported-gl.txt") gl* exported by libGLESv2"
+	echo "eagl table:    $(grep -c '^0x' "$HERE/eagl_slots.txt") named slots (eagl_slots.txt), $(wc -l <"$BUILD/exported-gl.txt" | tr -d ' ') gl* exported by libGLESv2"
+	echo "               $(grep '^mkeagl.py' "$BUILD/mkeagl.log" || true)"
 	echo
 	echo "files (into $INSTALL_DIR):"
 	(cd "$A" && for f in *; do

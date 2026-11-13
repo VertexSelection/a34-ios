@@ -251,8 +251,9 @@ mali_tri() {
 	log "mali-tri"
 	mkdir -p "$WORK/mali-tri"
 	"$CLANG" "${IOS_TARGET[@]}" -std=gnu11 -O2 -g -Wall -Wextra \
-		-I"$OUT/include" -o "$OUT/mali-tri" "$HERE/mali-tri/mali-tri.c" \
+		-I"$OUT/include" -o "$WORK/mali-tri/mali-tri" "$HERE/mali-tri/mali-tri.c" \
 		"$OUT/libEGL.1.dylib" "$OUT/libGLESv2.2.dylib"
+	cp "$WORK/mali-tri/mali-tri" "$OUT/"     # (its .dSYM stays behind)
 }
 
 # Ad-hoc signatures, after the last change to any load command.
