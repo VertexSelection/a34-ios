@@ -218,7 +218,47 @@ u64 shim_main(u64 dtb, u64 load)
     paint();
     int have_out = find_placeholder(dtb);
 
-#ifdef DSI_PROBE
+#ifdef GPU_PROBE
+    // v9g: Mali-G68 power state as the boot chain leaves it, read-only.
+    // Registers from Samsung's A34 6.6 kernel (clk-mt6877-pg.c, clkchk,
+    // clk-mt6877-mfgcfg.c) and the live device tree. The MFG PLL and config
+    // blocks need MFG0 powered and the GPU itself MFG1 + bus protection off +
+    // the BG3D clock, so each step is only taken when the previous one says
+    // it is safe.
+    if (have_out) {
+        const u64 spm = 0x10006000UL, infra = 0x10001000UL;
+        u32 xpu = rd32(spm + 0xef8), xpu2 = rd32(spm + 0xefc);
+        put_str("v9g-P"); put_hex(rd32(spm + 0x000), 8);
+        for (int n = 0; n < 6; n++) {
+            put(n ? '.' : '_'); put_hex(rd32(spm + 0xe80 + 4 * n), 8);
+        }
+        put_str("-X"); put_hex(xpu, 8); put('_'); put_hex(xpu2, 8);
+        u32 prot1 = rd32(infra + 0x228), prot2 = rd32(infra + 0x724);
+        put_str("-B"); put_hex(prot1, 8); put('_'); put_hex(prot2, 8);
+        put_str("-C"); put_hex(rd32(0x10000120UL), 8);              // CLK_CFG_20 (mfg mux)
+        int mfg0 = (xpu & 1) && (xpu2 & 1);
+        int mfg1 = (xpu & 2) && (xpu2 & 2);
+        int bus = !(prot1 & ((1u << 21) | (1u << 22))) && !(prot2 & ((1u << 5) | (1u << 6)));
+        u32 cg = 0xffffffff;
+        if (mfg0) {
+            put_str("-L"); put_hex(rd32(0x13fa0008UL), 8); put('_');
+            put_hex(rd32(0x13fa000cUL), 8); put('_'); put_hex(rd32(0x13fa0014UL), 8);
+            cg = rd32(0x13fbf000UL);
+            put_str("-G"); put_hex(cg, 8);
+        }
+        put_str("-s"); put_hex(mfg0, 1); put_hex(mfg1, 1); put_hex(bus, 1);
+        if (mfg0 && mfg1 && bus && !(cg & 1)) {
+            static const uint16_t gregs[] = { 0x000, 0x004, 0x008, 0x00c, 0x014, 0x018,
+                                              0x01c, 0x034, 0x100, 0x110, 0x120 };
+            put_str("-M");
+            for (unsigned i = 0; i < sizeof(gregs) / sizeof(gregs[0]); i++) {
+                put_hex(rd32(0x13000000UL + gregs[i]), 8);
+                put(i == 5 ? '/' : '.');
+            }
+        }
+    }
+    if (0) {
+#elif defined(DSI_PROBE)
     // v8d: the panel link as LK leaves it. DSI0 registers, then 200 ms of
     // sampling DSI_INTSTA bit 31 ("busy"): busy fraction, number of busy->idle
     // edges, longest/shortest idle run and longest busy run (13 MHz ticks);
@@ -367,7 +407,7 @@ u64 shim_main(u64 dtb, u64 load)
     if (have_out) {
         put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
         put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
-#if !defined(TOUCH_PROBE) && !defined(CPU_PROBE) && !defined(DSI_PROBE)
+#if !defined(TOUCH_PROBE) && !defined(CPU_PROBE) && !defined(DSI_PROBE) && !defined(GPU_PROBE)
         // OVL1_2L last: mutex 0 bit 16 may be it; if reading it hangs, the
         // results above are lost but the recovery note is already cleared.
         dump_ovl('Q', OVL1_2L, 2);
