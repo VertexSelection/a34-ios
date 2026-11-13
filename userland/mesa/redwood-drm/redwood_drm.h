@@ -111,9 +111,39 @@ struct redwood_drm_stats {
 	uint64_t maps, map_ticks;
 	uint64_t unmaps, unmap_ticks;
 	uint64_t local_waits, local_madvises;   /* WAIT_BO and MADVISE answered here, without the kernel */
+	uint64_t queued_jobs, failed_jobs;      /* SUBMITs queued (kernel 0919); jobs WAIT_SEQ said failed */
 };
 
 void redwood_drm_stats(struct redwood_drm_stats *stats);
+
+/*
+ * Queued GPU jobs (kernel 0919, A34Mali.cpp "queued jobs"). GET_PARAM REDWOOD_DRM_PARAM_ASYNC
+ * answers 1 when the kernel can queue. SET_MODE (0x7a) { async = 1 }: from then on this client's
+ * SUBMITs return at once, the job's number (this client's own count, from 1) in the SUBMIT's
+ * in_syncs; the jobs of every client run one at a time in the order they were queued. WAIT_SEQ
+ * (0x7b): until every job of this client up to `seq` is done (0: all so far), at most
+ * timeout_ns (0: only asked; ~0: no limit): kIOReturnTimeout if not, kIOReturnAborted if the
+ * thread was interrupted (ask again); status 1 if one of them failed (said once a failure).
+ * WAIT_BO waits for the queued jobs that name the buffer, GEM_CLOSE for them before the buffer
+ * goes, and a surface's CPU side (IOSurfaceLock, the panel's copy) for the jobs naming it.
+ *
+ * redwood-drm asks for it when it opens the connection unless REDWOOD_DRM_ASYNC=0, and says on
+ * stderr which it got. redwood_drm_queued(): 1 if this process's jobs are queued.
+ */
+#define REDWOOD_DRM_PARAM_ASYNC         0x1000
+#define REDWOOD_DRM_SET_MODE            0x7a
+#define REDWOOD_DRM_WAIT_SEQ            0x7b
+
+struct redwood_drm_set_mode {
+	uint32_t async, pad;
+};
+
+struct redwood_drm_wait_seq {
+	uint64_t seq, timeout_ns;
+	uint32_t status, pad;
+};
+
+int redwood_drm_queued(void);
 
 #ifdef __cplusplus
 }

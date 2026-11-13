@@ -602,7 +602,7 @@ prof_report(unsigned frame)
 		const char *name;
 	} requests[] = {
 		{ 0x40, "submit" }, { 0x41, "wait_bo" }, { 0x42, "create_bo" }, { 0x44, "get_param" }, { 0x45, "bo_offset" },
-		{ 0x48, "madvise" }, { 0x09, "gem_close" }, { 0x7e, "iosurface" },
+		{ 0x48, "madvise" }, { 0x09, "gem_close" }, { 0x7e, "iosurface" }, { 0x7b, "wait_seq" },
 	};
 
 	if (prof.frames == 0) {
@@ -645,10 +645,13 @@ prof_report(unsigned frame)
 		}
 	}
 	used += (size_t)snprintf(text + used, sizeof(text) - used, " map %.1f (%.0f us) unmap %.1f (%.0f us); answered "
-	    "without the kernel: wait_bo %.1f madvise %.1f",
+	    "without the kernel: wait_bo %.1f madvise %.1f; jobs %s %.1f, failed %llu",
 	    (double)(drm.maps - prof.drm.maps) / n, ticks_us(drm.map_ticks - prof.drm.map_ticks) / n,
 	    (double)(drm.unmaps - prof.drm.unmaps) / n, ticks_us(drm.unmap_ticks - prof.drm.unmap_ticks) / n,
-	    (double)(drm.local_waits - prof.drm.local_waits) / n, (double)(drm.local_madvises - prof.drm.local_madvises) / n);
+	    (double)(drm.local_waits - prof.drm.local_waits) / n, (double)(drm.local_madvises - prof.drm.local_madvises) / n,
+	    redwood_drm_queued() ? "queued" : "synchronous", redwood_drm_queued() ?
+	    (double)(drm.queued_jobs - prof.drm.queued_jobs) / n : (double)(drm.calls[0x40] - prof.drm.calls[0x40]) / n,
+	    (unsigned long long)(drm.failed_jobs - prof.drm.failed_jobs));
 	say_always("a34gl-prof:   kernel requests a frame (redwood-drm):%s\n", text);
 	used = 0;
 	for (unsigned i = 0; i < 8 && prof.threads[i].tid != 0; i++) {
@@ -4711,11 +4714,19 @@ install(void)
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
-		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
+		/*
+		 * With queued GPU jobs (kernel 0919, redwood_drm_queued()) the window server hands a frame
+		 * on as soon as its jobs are queued: the panel's copy of a surface waits for the jobs that
+		 * name it (at most 500 ms), IOSurfaceLock too. Not waiting here lets the next frame be
+		 * prepared while the GPU draws this one. glwait=1: waited for here all the same.
+		 */
+		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL &&
+		    (display_waits() || (render_server && redwood_drm_queued())))) {
 			wait_for_frames = 0;
 		}
-		say("a34gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
-		    "by the display's driver, not here");
+		say("a34gl: GPU jobs %s; a frame is waited for %s\n", redwood_drm_queued() ? "queued" : "synchronous",
+		    wait_for_frames ? "here, before it is handed to the display" :
+		    "by the display's driver (the panel's copy waits for the jobs that name the surface), not here");
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");

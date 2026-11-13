@@ -298,7 +298,7 @@ check() {
 		nm -gU "$OUT/libGLESv2.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libGLESv2 lacks $sym"; bad=1; }
 	done
 	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait drmPrimeFDToHandle redwood_drm_mmap redwood_drm_munmap \
-		redwood_drm_surface; do
+		redwood_drm_surface redwood_drm_stats redwood_drm_queued; do
 		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
 	done
 	# panfrost maps BOs through the user client (patch 0002) and sizes IOSurface imports by it (0003)

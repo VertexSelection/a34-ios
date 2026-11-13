@@ -67,6 +67,7 @@ headers (`iokit_check.c`) and compiles that branch for iOS as well.
 | `drmOpen*`, the EGL loader's `open()` | `/dev/null`: any descriptor in the process means the one GPU |
 | `PANFROST_WAIT_BO` | answered here ("ready") when none of the process's threads is inside a SUBMIT and the BO is not an IOSurface's: the kernel runs a job to its end inside SUBMIT, so the process's own BOs are idle then. Otherwise the kernel is asked |
 | `PANFROST_MADVISE` | answered here (`retained` 1) for BOs the kernel has declared write-combined (`REDWOOD_DRM_CREATE_BO_WC`, bit 0 of the `pad` that comes back from `CREATE_BO`): it does no CPU cache upkeep for them, so `DONTNEED` tells it nothing. For all others the kernel is asked: `DONTNEED` is what keeps a cacheable BO out of its per-job upkeep while Mesa has no use for it |
+| queued jobs (kernel 0919) | asked for at open (GET_PARAM `0x1000` = 1, then SET_MODE `0x7a` `{async = 1}`; `REDWOOD_DRM_ASYNC=0` stays synchronous; one stderr line says which). A queued SUBMIT returns at once with the job's number in `in_syncs`: `out_sync` gets that number as its fence, and every BO in `bo_handles` notes it. A fence is signalled once WAIT_SEQ (`0x7b`) has said every job up to its number is done (`drmSyncobjWait`: for all, the last; for any, the first -- a client's jobs end in the order queued). `in_syncs` need no wait (same order). WAIT_BO: answered here when the last job naming the BO is known done, else WAIT_SEQ for it, and the kernel's WAIT_BO for IOSurface BOs (other programs' jobs). Sync files carry the fence (pipe inode -> number); a failed job is said once on stderr. Host-tested against a fake kernel: out-of-order ends, a failed job, blocking waits, WAIT_FOR_SUBMIT, sync files |
 | `drmSyncobj*` | user space only: create/destroy/reset/signal/wait (`WAIT_FOR_SUBMIT` blocks until a SUBMIT signals), sync files are signalled pipes |
 | BO mmap / munmap (patched in Mesa) | `redwood_drm_mmap` = `IOConnectMapMemory64(type = GEM handle, kIOMapAnywhere)`, `redwood_drm_munmap` = `IOConnectUnmapMemory64` |
 | `drmPrimeFDToHandle(fd, IOSurfaceID)` | selector `0x7e` (ios-topaz's IOSurface request, 40 bytes, `handle` = 0): the GEM handle of the surface's memory |
@@ -74,7 +75,8 @@ headers (`iokit_check.c`) and compiles that branch for iOS as well.
 | `drmPrimeHandleToFD` | `EOPNOTSUPP` (no export) |
 
 Environment: `REDWOOD_DRM_DEBUG=1` logs every request; `REDWOOD_DRM_SERVICE`,
-`REDWOOD_DRM_NODE`, `REDWOOD_DRM_MINOR`. `REDWOOD_DRM_LOCAL` (default 1): 0 sends
+`REDWOOD_DRM_NODE`, `REDWOOD_DRM_MINOR`. `REDWOOD_DRM_ASYNC=0`: synchronous SUBMITs even
+where the kernel queues. `REDWOOD_DRM_LOCAL` (default 1): 0 sends
 every `WAIT_BO` and `MADVISE` to the kernel; 2 takes every BO made here to be write-combined
 (all `MADVISE` answered here -- to measure, with a kernel that does not say: a BO the kernel
 made cacheable then stays in its per-job cache upkeep while cached, slower but never wrong).

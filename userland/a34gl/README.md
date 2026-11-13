@@ -257,6 +257,21 @@ unless they use `sampler2DRect`; no `glGetError` after every call; what is drawn
 cost per program is above); keep launchd out, and `A34GL_MODE=off` in `/a34/NAME.env` excepts
 one. Each program that really draws is one more client of the GPU with Mesa's own buffers.
 
+## Queued GPU jobs (kernel 0919)
+
+With a kernel that queues (redwood-drm asks at open; `REDWOOD_DRM_ASYNC=0` declines), Mesa's
+SUBMIT returns at once and the job runs in the kernel's worker; redwood-drm turns the job
+numbers into Mesa's syncobjs, fences and WAIT_BO (see `../mesa/README.md`). Where the CPU reads
+what the GPU wrote, it waits for the right job: `glFinish` and `glClientWaitSync` through the
+fence (WAIT_SEQ); `glReadPixels` (and so eagl.c's copies out, `glshow`, `gltrace`), texture and
+buffer maps through Mesa's WAIT_BO before it maps a busy BO; IOSurfaceLock in the kernel, for
+the jobs that name the surface (eagl.c's CPU uploads lock the surface). The frame: backboardd
+no longer waits for it (`glFinish` at the frame's end) but hands it on once its jobs are queued
+(`glFlush`): the **panel's copy of the surface waits in the kernel** for the jobs that name it,
+at most 500 ms -- that is what is relied on. `glwait=1` waits here as before. Other programs
+still wait at the end of a frame drawn into a surface. glprof's kernel line gives the jobs
+queued a frame, the time in `wait_seq` and `wait_bo`, and failed jobs.
+
 ## The log
 
 Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
