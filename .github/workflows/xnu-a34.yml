@@ -1,0 +1,154 @@
+name: xnu-a34
+
+# The ruby (MT6877) XNU kernel from lky005/ruby-ios-bringup at a pinned commit,
+# retargeted to the Galaxy A34: xnu/a34-baseline.py rewrites the early
+# console's framebuffer constants, then xnu/patches/*.patch are added after
+# ruby's series. A skipped A34 patch fails the build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+
+concurrency:
+  group: xnu-a34-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUBY_REPO: lky005/ruby-ios-bringup
+  RUBY_SHA: 1aaa883755e546726b2f3a49a3ad099d77de4e62
+  # ruby's own pins for that commit (see their .github/workflows/xnu.yml)
+  PATCHSET_SHA256: a9cc0050432d4259f38c2e5431e0ac05eecf95c3a78324ad94f11283d8031983
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "13.5"
+  XCODE_VERSION: "16.0"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: SWEET
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 3G
+  CCACHE_WRAP: ${{ github.workspace }}/ccache-bin
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fetch ruby-ios-bringup
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.RUBY_REPO }}
+          ref: ${{ env.RUBY_SHA }}
+          path: ruby
+          persist-credentials: false
+
+      - name: Prepare pinned baseline (public upstream path)
+        working-directory: ruby
+        env:
+          ALLOW_PUBLIC_UPSTREAM: "1"
+        run: sh ci/prepare-baseline.sh ../base
+
+      - name: A34 changes
+        run: |
+          python3 xnu/a34-baseline.py base/xnu/patches
+          cp xnu/patches/*.patch base/xnu/patches/
+          ls base/xnu/patches | tail -3
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp base/xnu/patches/*.patch base/xnu/patches/*.sh dxb/patches/
+          # Plain arm64 kernel tuned for Cortex-A55 (ARMv8.2: no LSE-only or LDAPR
+          # surprises from clang's apple-m1 default), as ruby does.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a55"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a55"' dxb/build.sh
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+          grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja ccache
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=""
+          for cand in "/Applications/Xcode_${XCODE_VERSION}.app" "/Applications/Xcode_${XCODE_VERSION%%.*}.app"; do
+            if [ -d "$cand" ]; then XC="$cand"; break; fi
+          done
+          if [ -z "$XC" ]; then
+            echo "Xcode ${XCODE_VERSION} not found; refusing to drift"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          mkdir -p "$CCACHE_WRAP"
+          for t in clang clang++; do
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$CCACHE_WRAP/$t"
+            chmod +x "$CCACHE_WRAP/$t"
+          done
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ env.XCODE_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ env.RUBY_SHA }}-${{ hashFiles('xnu/**') }}
+          restore-keys: |
+            ccache-${{ env.XCODE_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: url.https://github.com/status-im/BearSSL.insteadOf
+          GIT_CONFIG_VALUE_0: https://www.bearssl.org/git/BearSSL
+        run: |
+          ccache -z
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+          ccache -s
+          if grep -E "Skipping patch .*a34" ../build.log; then
+            echo "an A34 patch did not apply"; exit 1
+          fi
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          {
+            echo "ruby=$RUBY_REPO@$RUBY_SHA"
+            echo "a34_patches=$(cd xnu && sha256sum a34-baseline.py patches/*.patch | sha256sum | cut -c1-16)"
+            echo "patchset_sha256=$(python3 ruby/ci/patchset_hash.py base/xnu/patches 2>/dev/null || echo missing)"
+            echo "dxb=$DXB_REPO@$DXB_SHA"
+            echo "macos_version=$MACOS_VERSION"
+            echo "xcode=$(xcodebuild -version | tr '\n' ' ')"
+            echo "kernel_config=$KERNEL_CONFIG machine_config=$MACHINE_CONFIG"
+            echo "run_id=$GITHUB_RUN_ID commit=$GITHUB_SHA"
+          } > out/PROVENANCE.txt
+          ls -la out
+          cat out/PROVENANCE.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: xnu-a34-kernel
+          path: out/
+          if-no-files-found: warn

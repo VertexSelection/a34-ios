@@ -1,0 +1,150 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5787304..1921273 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -693,6 +693,17 @@ Lkernelcache_base_found:
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/*
++	 * A34: the display engine's registers (mutex 0x14001000, DSI0
++	 * 0x14013000) as one Device block, so the early console can ask the
++	 * command-mode panel for a frame (sweet_early_kick).
++	 */
++	MOV64	x10, 0x14000000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 5a05b91..a32c537 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -28,6 +28,36 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/*
++ * A34: the panel is a DSI command-mode panel; memory writes only appear when
++ * the display engine sends a frame. Re-enable every display mutex that has
++ * modules attached and start DSI0, after waiting for a frame in flight.
++ * Uses start.s's VA=PA Device map of 0x14000000, so only before relocation.
++ */
++#define EARLY_DSI0      ((volatile uint32_t *)(uintptr_t)0x14013000)
++#define EARLY_MUTEX     ((volatile uint32_t *)(uintptr_t)0x14001000)
++static unsigned int early_kick_off;
++
++static void
++sweet_early_kick(void)
++{
++	if (early_kick_off || (EARLY_DSI0[0x14 / 4] & 3)) {
++		return;
++	}
++	for (unsigned int i = 0; i < 2000000 && (EARLY_DSI0[0x0c / 4] & (1u << 31)); i++) {
++	}
++	for (unsigned int n = 0; n < 16; n++) {
++		if (EARLY_MUTEX[(0x30 + 0x20 * n) / 4]) {
++			EARLY_MUTEX[(0x20 + 0x20 * n) / 4] = 0;
++			EARLY_MUTEX[(0x20 + 0x20 * n) / 4] = 1;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	EARLY_DSI0[0] = 0;
++	EARLY_DSI0[0] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -58,6 +88,8 @@ sweet_early_putc(char c)
+ 		early_row = (early_row + 1) % EARLY_ROWS;
+ 		sweet_early_clear_row();
+ 		if (c == '\n') {
++			__asm__ volatile("dsb sy" ::: "memory");
++			sweet_early_kick();
+ 			return;
+ 		}
+ 	}
+@@ -129,6 +161,7 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
++	early_kick_off = 1;	/* the VA=PA register map goes away with TTBR0 */
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..5a5d1fa 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -721,6 +721,34 @@ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++/*
++ * A34: command-mode DSI panel. The optional ADT node "a34-disp" gives
++ * reg = <DSI0 phys, size, display mutex phys, size>; with it, each finished
++ * line asks the display engine for a frame (see sweet_early_kick).
++ */
++static volatile uint32_t *fbcon_dsi, *fbcon_mutex;
++
++static void
++fbcon_kick(void)
++{
++	if (fbcon_dsi == NULL || (fbcon_dsi[0x14 / 4] & 3)) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned int i = 0; i < 2000000 && (fbcon_dsi[0x0c / 4] & (1u << 31)); i++) {
++	}
++	for (unsigned int n = 0; n < 16; n++) {
++		if (fbcon_mutex[(0x30 + 0x20 * n) / 4]) {
++			fbcon_mutex[(0x20 + 0x20 * n) / 4] = 0;
++			fbcon_mutex[(0x20 + 0x20 * n) / 4] = 1;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	fbcon_dsi[0] = 0;
++	fbcon_dsi[0] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+@@ -739,6 +767,7 @@ fbcon_newline(void)
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	fbcon_kick();
+ }
+ 
+ static void
+@@ -750,6 +779,7 @@ fbcon_init(void)
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
++	fbcon_kick();
+ }
+ 
+ static unsigned int
+@@ -836,6 +866,14 @@ fbcon_probe(void)
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	if (SecureDTFindEntry("name", "a34-disp", &entry) == kSuccess &&
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) == kSuccess && size >= 32) {
++		fbcon_dsi = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++		fbcon_mutex = (volatile uint32_t *)ml_io_map(reg[2], reg[3]);
++		if (fbcon_mutex == NULL) {
++			fbcon_dsi = NULL;
++		}
++	}
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
