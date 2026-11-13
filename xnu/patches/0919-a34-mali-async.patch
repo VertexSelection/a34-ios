@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
-index b0e480e..cb2996b 100644
+index b0e480e..da19ba3 100644
 --- a/iokit/Kernel/arm/A34Mali.cpp
 +++ b/iokit/Kernel/arm/A34Mali.cpp
 @@ -77,6 +77,34 @@
@@ -361,7 +361,7 @@ index b0e480e..cb2996b 100644
  	void upkeepLog(uint32_t n, uint32_t requirements, uint64_t before, uint64_t after, uint64_t ticks, uint64_t jobNs);
 +	IOReturn runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q);
 +	void runQueued(struct a34_qjob *j);
-+	IOReturn enqueue(struct a34_submit *req);
++	IOReturn queueSubmit(struct a34_submit *req);
 +	IOReturn setMode(struct a34_set_mode *req);
 +	IOReturn waitSeq(struct a34_wait_seq *req);
 +	IOReturn requestQueued(uint32_t selector, union a34_request *r);
@@ -561,7 +561,7 @@ index b0e480e..cb2996b 100644
 + * queue's lock.
 + */
 +IOReturn
-+RedwoodMaliUserClient::enqueue(struct a34_submit *req)
++RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
 +{
 +	struct a34_qjob *j;
 +	uint32_t n = req->bo_handle_count;
@@ -1051,7 +1051,7 @@ index b0e480e..cb2996b 100644
 +			 */
 +			ret = selector == kA34MaliSetMode ? setMode(&r.mode) :
 +			    selector == kA34MaliWaitSeq ? waitSeq(&r.waitseq) :
-+			    selector == kA34PanfrostSubmit ? enqueue(&r.submit) : requestQueued(selector, &r);
++			    selector == kA34PanfrostSubmit ? queueSubmit(&r.submit) : requestQueued(selector, &r);
 +			if (ret != kIOReturnSuccess && ret != kIOReturnTimeout && ret != kIOReturnBusy && ret != kIOReturnAborted &&
 +			    fErrors++ < A34_LOGGED_ERRORS) {
 +				IOLog("A34 MALI UC: %s: request 0x%02x (%u bytes) -> 0x%x\n", fName, selector, insize, ret);
