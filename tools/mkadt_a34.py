@@ -39,6 +39,8 @@ VTIMER_INTID = 27
 # LK framebuffer reservation (mblock-23-framebuffer) and buffer 0 of three
 FB, FB_SIZE = 0x74180000, 0x1d80000
 FB_W, FB_H, FB_STRIDE = 1080, 2340, 4352
+# dsi@14013000 and disp_mutex@14001000
+DSI0, DISP_MUTEX = 0x14013000, 0x14001000
 # ufshci@11270000 "mediatek,mt8183-ufshci", reg size 0x2300
 UFS, UFS_SIZE = 0x11270000, 0x2300
 
@@ -158,6 +160,13 @@ def build(d22ap=D22AP_ADT, seed=None):
         ('stride', u32(FB_STRIDE)),
     ])
 
+    # xnu/patches/0900-a34-display-kick.patch: DSI0 and the display mutex, so
+    # the framebuffer console can ask the command-mode panel for frames.
+    disp = node('a34-disp', [
+        ph(),
+        ('reg', u64(DSI0, 0x1000, DISP_MUTEX, 0x1000)),
+    ])
+
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('mediatek,mt8183-ufshci')),
@@ -187,7 +196,7 @@ def build(d22ap=D22AP_ADT, seed=None):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + [ufs])
+    ], [chosen, defaults, cpus, arm_io, fbcon, disp, buttons, pram] + product + [ufs])
 
 
 if __name__ == '__main__':

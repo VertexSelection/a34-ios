@@ -14,7 +14,7 @@ CFLAGS="-O2 -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-
         -fno-asynchronous-unwind-tables -Wall -Werror"
 BCB_WRITE=${BCB_WRITE:-0}
 $CC $CFLAGS -c -o "$P/shim-start.o" "$P/shim-start.S"
-$CC $CFLAGS -DBCB_WRITE=$BCB_WRITE -c -o "$P/shim.o" "$P/shim.c"
+$CC $CFLAGS -DBCB_WRITE=$BCB_WRITE ${SHIM_DEFS:-} -c -o "$P/shim.o" "$P/shim.c"
 $CC $CFLAGS -c -o "$P/a34ufs.o" "$P/a34ufs.c"
 aarch64-linux-gnu-ld -T "$P/shim.ld" -o "$P/shim.elf" "$P/shim-start.o" "$P/shim.o" "$P/a34ufs.o"
 echo "BCB_WRITE=$BCB_WRITE"

@@ -35,6 +35,7 @@ typedef uint8_t u8;
 #define MUTEX         0x14001000UL
 #define OVL0          0x14005000UL
 #define OVL0_2L       0x14006000UL
+#define OVL1_2L       0x1401f000UL
 #define RDMA0         0x14007000UL
 #define PAYLOAD_OFF   0x10000UL
 #define TWO_MB        0x200000UL
@@ -82,7 +83,11 @@ static void rect(u64 buf, u64 x, u64 y, u64 w, u64 h, u32 color)
 
 static void paint(void)
 {
+#ifdef TRIGGER_TEST
+    static const u32 colors[3] = { 0xff00ff00, 0xff00ff00, 0xff00ff00 };   // all green
+#else
     static const u32 colors[3] = { 0xff00ff00, 0xffff00ff, 0xffffffff };
+#endif
     for (u64 k = 0; k < 3; k++) {
         u64 buf = FB_BASE + k * FRAME;
         fill(buf, FRAME, colors[k]);
@@ -146,6 +151,26 @@ static int find_placeholder(u64 dtb)
     return 0;
 }
 
+// Command-mode panels only show memory changes when the engine sends a frame:
+// re-enable every display mutex that has modules attached, then start DSI0
+// (MTK LK's ddp_mutex_enable + DSI_Start).
+static void display_trigger(void)
+{
+    if (rd32(DSI0 + 0x14) & 3)          // video mode refreshes by itself
+        return;
+    for (u64 n = 0; n < 16; n++) {
+        u64 m = MUTEX + 0x20 * n;
+        if (!rd32(m + 0x30))
+            continue;
+        wr32(m + 0x20, 0);
+        wr32(m + 0x20, 1);
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    wr32(DSI0 + 0x00, 0);
+    wr32(DSI0 + 0x00, 1);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 // OVL register layout as in Linux's mtk_disp_ovl.c: SRC_CON 0x2c (layer enable
 // bits), per layer n: CON 0x30, SRC_SIZE 0x38, PITCH 0x44, ADDR 0xf40 (+0x20 n).
 static void dump_ovl(char tag, u64 base, int layers)
@@ -183,11 +208,17 @@ static void mark_scanned_buffer(void)
 
 u64 shim_main(u64 dtb, u64 load)
 {
+    // UFS first: clear the recovery note before anything that could hang, so a
+    // forced restart from here on boots Android.
+    u32 hcs = 0, err = 0;
+    u32 uo = ufs_open(&hcs);
+    u32 bcb = ufs_bcb_clear(BCB_WRITE, &err);
+
     paint();
     int have_out = find_placeholder(dtb);
 
     if (have_out) {
-        put_str("v4");
+        put_str("v5");
         put_str("-E"); put_hex(SYSREG(CurrentEL) >> 2, 1);
         put_str("-S"); put_hex(SYSREG(sctlr_el1), 8);
         put_str("-L"); put_hex(load, 8);
@@ -207,19 +238,12 @@ u64 shim_main(u64 dtb, u64 load)
     }
     mark_scanned_buffer();
 
-    // UFS: open the host LK left running, then look at (and maybe clear) the
-    // misc bootloader message.
-    u32 hcs = 0, err = 0;
-    u32 uo = ufs_open(&hcs);
-    u32 bcb = ufs_bcb_clear(BCB_WRITE, &err);
     if (have_out) {
         put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
         put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
-        put('_'); put_hex(ufs_diag.head, 8);
-        put_str("-V"); put_hex(ufs_diag.tur1, 3); put('_'); put_hex(ufs_diag.sense1, 6);
-        put('_'); put_hex(ufs_diag.ssu, 3); put('_'); put_hex(ufs_diag.tur2, 3);
-        put('_'); put_hex(ufs_diag.sense, 6);
-        put('_'); put_hex(ufs_diag.resp6, 8);
+        // OVL1_2L last: mutex 0 bit 16 may be it; if reading it hangs, the
+        // results above are lost but the recovery note is already cleared.
+        dump_ovl('Q', OVL1_2L, 2);
     }
 
     // Copy the payload Image to the next 2 MiB boundary after the blob.
@@ -251,6 +275,26 @@ u64 shim_main(u64 dtb, u64 load)
             put('.');
     }
 
+#ifdef TRIGGER_TEST
+    // Refresh test: the buffers were painted green at the start without any
+    // trigger. Wait, then ask the display engine for a frame and wait again.
+    u32 dsta0 = rd32(DSI0 + 0x04), cnt0 = rd32(DSI0 + 0x168);
+    delay_ms(15000);
+    u32 dsta1 = rd32(DSI0 + 0x04), cnt1 = rd32(DSI0 + 0x168);
+    display_trigger();
+    delay_ms(100);
+    u32 dsta2 = rd32(DSI0 + 0x04), cnt2 = rd32(DSI0 + 0x168);
+    delay_ms(15000);
+    if (have_out) {
+        // overwrite the trailing dots: DSI status and debug counter before/after
+        while (out[-1] == '.')
+            out--;
+        put_str("-G"); put_hex(dsta0, 8); put('_'); put_hex(cnt0, 8);
+        put('_'); put_hex(dsta1, 8); put('_'); put_hex(cnt1, 8);
+        put('_'); put_hex(dsta2, 8); put('_'); put_hex(cnt2, 8);
+    }
+#else
     delay_ms(5000);
+#endif
     return dest + text_offset;
 }

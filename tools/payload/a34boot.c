@@ -41,50 +41,199 @@ extern u8 _start[];
 static inline u32 rd32(u64 a) { return *(volatile u32 *)a; }
 
 // ---------------------------------------------------------------- display --
+//
+// At handoff LK scans two layers: OVL0_2L layer 0 (pitch 4352, the base) and,
+// on some boots, OVL0 layer 1 (pitch 4320) on top of it. Which one is visible
+// varies, so the loader draws its progress squares into every scanned buffer,
+// then points the OVL0 layers at the base buffer so XNU's console, drawn
+// there, is visible either way.
 
-static u64 fb_base = FB_BASE;
-static u32 fb_stride = 4352;
+static inline void wr32(u64 a, u32 v) { *(volatile u32 *)a = v; }
+
+#define MAX_FBS 6
+static u64 fbs[MAX_FBS];
+static u32 fb_pitches[MAX_FBS];
+static int nfbs;
+// What XNU gets. Fixed: the kernel's early console (xnu/a34-baseline.py) is
+// built for LK buffer 0 with 4352-byte rows.
+static const u64 fb_base = FB_BASE;
+static const u32 fb_stride = 4352;
 
 static int layer_ok(u64 addr, u32 pitch)
 {
-    return pitch >= FB_W * 4 && addr >= FB_BASE && addr + (u64)pitch * FB_H <= FB_BASE + FB_SIZE;
+    return pitch >= FB_W * 4 && pitch <= 8192 && addr >= FB_BASE &&
+           addr + (u64)pitch * FB_H <= FB_BASE + FB_SIZE;
 }
 
-// The topmost enabled overlay layer that scans an LK buffer: OVL0's layers sit
-// above OVL0_2L's output; within an OVL the higher layer index is on top.
-static void pick_fb(void)
+static void find_fbs(void)
 {
-    static const u64 ovls[2] = { OVL0, OVL0_2L };
-    static const int nlayers[2] = { 4, 2 };
+    static const u64 ovls[2] = { OVL0_2L, OVL0 };
+    static const int nlayers[2] = { 2, 4 };
+    int have_base = 0;
     for (int o = 0; o < 2; o++) {
         u32 en = rd32(ovls[o] + 0x2c);
-        for (int n = nlayers[o] - 1; n >= 0; n--) {
+        for (int n = 0; n < nlayers[o]; n++) {
             if (!(en & (1u << n)))
                 continue;
             u64 a = rd32(ovls[o] + 0xf40 + 0x20 * n);
             u32 p = rd32(ovls[o] + 0x20 * n + 0x44) & 0xffff;
-            if (layer_ok(a, p)) {
-                fb_base = a;
-                fb_stride = p;
-                return;
-            }
+            if (!layer_ok(a, p) || nfbs == MAX_FBS)
+                continue;
+            fbs[nfbs] = a;
+            fb_pitches[nfbs++] = p;
+            if (a == fb_base && p == fb_stride)
+                have_base = 1;
         }
     }
+    if (!have_base && nfbs < MAX_FBS) {
+        fbs[nfbs] = fb_base;
+        fb_pitches[nfbs++] = fb_stride;
+    }
+}
+
+// Make every enabled layer of OVL0_2L and OVL0 scan the base buffer with the
+// base pitch, so whichever layer is on top shows what XNU draws.
+static void unify_layers(void)
+{
+    static const u64 ovls[2] = { OVL0_2L, OVL0 };
+    static const int nlayers[2] = { 2, 4 };
+    for (int o = 0; o < 2; o++) {
+        u32 en = rd32(ovls[o] + 0x2c);
+        for (int n = 0; n < nlayers[o]; n++) {
+            if (!(en & (1u << n)))
+                continue;
+            u64 l = ovls[o] + 0x20 * n;
+            wr32(ovls[o] + 0xf40 + 0x20 * n, (u32)fb_base);
+            wr32(l + 0x44, (rd32(l + 0x44) & 0xffff0000u) | fb_stride);
+        }
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+#define DSI0    0x14013000UL
+#define MUTEX   0x14001000UL
+
+// Command-mode panel: ask the display engine for one frame (display mutexes
+// with modules attached re-enabled, then DSI0 started), after waiting for a
+// frame in flight. Same sequence as xnu/patches/0900-a34-display-kick.patch.
+static void kick(void)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (rd32(DSI0 + 0x14) & 3)
+        return;
+    for (int i = 0; i < 2000000 && (rd32(DSI0 + 0x0c) & (1u << 31)); i++)
+        ;
+    for (u64 n = 0; n < 16; n++) {
+        u64 m = MUTEX + 0x20 * n;
+        if (!rd32(m + 0x30))
+            continue;
+        wr32(m + 0x20, 0);
+        wr32(m + 0x20, 1);
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    wr32(DSI0 + 0x00, 0);
+    wr32(DSI0 + 0x00, 1);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void clear_base(void)
+{
+    volatile u64 *p = (volatile u64 *)fb_base;
+    for (u64 i = 0; i < (u64)fb_stride * FB_H / 8; i++)
+        p[i] = 0xff000000ff000000ull;
 }
 
 static void rect(u64 x, u64 y, u64 w, u64 h, u32 color)
 {
-    for (u64 r = 0; r < h; r++) {
-        volatile u32 *row = (volatile u32 *)(fb_base + (y + r) * fb_stride + x * 4);
-        for (u64 c = 0; c < w; c++)
-            row[c] = color;
-    }
+    for (int f = 0; f < nfbs; f++)
+        for (u64 r = 0; r < h; r++) {
+            volatile u32 *row = (volatile u32 *)(fbs[f] + (y + r) * fb_pitches[f] + x * 4);
+            for (u64 c = 0; c < w; c++)
+                row[c] = color;
+        }
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
 static void stage(int n, u32 color)
 {
     rect(40 + n * 120, 160, 100, 100, color);
+    kick();
+}
+
+// -------------------------------------------------------- watchdog, GIC --
+
+#define TOPRGU          0x10007000UL
+#define GICD            0x0c000000UL
+#define GICR            0x0c040000UL
+#define GICR_SIZE       0x200000UL
+#define GICR_PE_SIZE    0x20000UL
+#define VTIMER_INTID    27
+#define PTIMER_INTID    30
+#define SGI_INTID       1
+
+#define RSR(r) ({ u64 _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
+#define WSR(r, v) __asm__ volatile("msr " r ", %0" :: "r"((u64)(v)))
+
+// LK arms MediaTek's TOPRGU watchdog; XNU never feeds it, so it resets the
+// phone ~25 s in. Turn it off as the ruby loader does (key 0x22, enable clear).
+static void wdt_off(void)
+{
+    wr32(TOPRGU + 0x00, 0x22000000u);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static inline void wr8(u64 a, u8 v) { *(volatile u8 *)a = v; }
+static inline u64 rd64(u64 a) { return *(volatile u64 *)a; }
+
+// Boot CPU GIC setup before XNU, after ios-sweet/ios-topaz's test_gic() and
+// gold_gicr_prepare(): without it XNU hangs after initCPU (no timer/SGI).
+static int gic_prepare(void)
+{
+    u64 sre = RSR("S3_0_C12_C12_5");                 // ICC_SRE_EL1
+    if (!(sre & 1)) {
+        WSR("S3_0_C12_C12_5", sre | 1);
+        __asm__ volatile("isb");
+    }
+    if (!(RSR("S3_0_C12_C12_5") & 1))
+        return 0;
+
+    wr32(GICD, rd32(GICD) | 0x13);                   // EnableGrp1(NS), Grp1A, ARE_NS
+    for (int i = 0; i < 1000000 && (rd32(GICD) & (1u << 31)); i++)
+        ;
+
+    u64 mpidr = RSR("mpidr_el1");
+    u32 aff = (u32)((mpidr & 0xffffff) | ((mpidr >> 32) & 0xff) << 24);
+    u64 r = 0;
+    for (u64 off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+        u64 typer = rd64(GICR + off + 0x08);
+        if ((u32)(typer >> 32) == aff) {
+            r = GICR + off;
+            break;
+        }
+        if (typer & (1 << 4))                        // Last
+            break;
+    }
+    if (!r)
+        return 0;
+    u32 waker = rd32(r + 0x14);
+    if (waker & 2) {
+        wr32(r + 0x14, waker & ~2u);
+        for (int i = 0; i < 100000 && (rd32(r + 0x14) & 4); i++)
+            ;
+    }
+    u64 sgi = r + 0x10000;
+    wr32(sgi + 0x080, 0xffffffff);                   // IGROUPR0: all Group 1
+    for (int id = 0; id < 32; id++)
+        wr8(sgi + 0x400 + id, 0xa0);                 // IPRIORITYR
+    wr32(sgi + 0x100, (1u << VTIMER_INTID) | (1u << PTIMER_INTID) | (1u << SGI_INTID));
+
+    u64 ctlr = RSR("S3_0_C12_C12_4");                // ICC_CTLR_EL1
+    WSR("S3_0_C12_C12_4", ctlr & ~2ull);             // EOImode 0
+    WSR("S3_0_C4_C6_0", 0xf0);                       // ICC_PMR_EL1
+    WSR("S3_0_C12_C12_3", 0);                        // ICC_BPR1_EL1
+    WSR("S3_0_C12_C12_7", 1);                        // ICC_IGRPEN1_EL1
+    __asm__ volatile("isb");
+    return 1;
 }
 
 // ------------------------------------------------------------- ADT patch --
@@ -186,15 +335,22 @@ typedef void (*xnu_entry_t)(u64 boot_args_pa);
 u64 shim_main(u64 dtb, u64 load)
 {
     (void)dtb;
-    pick_fb();
-    for (int i = 0; i < 6; i++)
-        stage(i, GREY);
-
-    // 1. UFS awake, recovery note cleared.
+    // 1. UFS awake and recovery note cleared first, then the watchdog off:
+    //    from here on any hang or forced restart lands in Android.
     u32 hcs, err;
     u32 uo = ufs_open(&hcs);
     u32 bcb = ufs_bcb_clear(1, &err);
+    wdt_off();
+
+    // Display: every layer onto buffer 0, cleared to black, progress squares.
+    find_fbs();
+    unify_layers();
+    clear_base();
+    for (int i = 0; i < 8; i++)
+        stage(i, GREY);
     stage(0, (uo == 0 && (bcb == UFS_BCB_CLEARED || bcb == UFS_BCB_EMPTY)) ? GREEN : YELLOW);
+    stage(6, GREEN);
+    stage(7, gic_prepare() ? GREEN : YELLOW);
 
     // 2. Payload present?
     const struct payload *p = (const struct payload *)(load + PAYLOAD_OFF);
@@ -259,6 +415,7 @@ u64 shim_main(u64 dtb, u64 load)
 
     // 6. Jump. The square stays yellow if XNU never draws anything.
     stage(5, YELLOW);
+    kick();
     u64 entry_pa = p->entry_va + pa_of_va_base;
     __asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
     ((xnu_entry_t)entry_pa)(ba_pa);
