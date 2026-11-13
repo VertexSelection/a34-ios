@@ -362,6 +362,16 @@ The log: see "The log".
 
 ### Draws with no program, and the variable blur
 
+The App Library's pods (boot 44, the frame after a vrb, followed whole): their backgrounds are
+function 45, "vcm" (a colour matrix over what is behind), drawn with our program before the vrb.
+The matrix's fourth row makes opacity of luminance, and our program wrote it into the screen's
+picture: 0x35-0xd3 there, 0xff everywhere else. CoreAnimation reads that opacity. The fade
+under the search field adds a copy of the band with `ONE_MINUS_DST_ALPHA, ONE`, so a pod that is
+not opaque gets brighter. The finished picture also goes to the display with that opacity in it.
+The vcm program, and the group program that does the same, now keep the opacity that was there
+(the colour as before). `glvcmalpha=1`: the matrix's opacity, as before. `glskip=45` (the pods'
+backgrounds not drawn) shows whether the white is theirs.
+
 CoreAnimation's GL renderer draws the functions it has no shader for with no program at all;
 eagl.c draws them with programs of its own. The first draw of each function in each way now
 gets a line without `glcensus=1`: `a34gl: no program: function N ("xxx"), <how it is drawn>:

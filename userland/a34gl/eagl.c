@@ -291,7 +291,7 @@ struct eagl {
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
 	int blended;                    /* blending is off for such a draw, to be put back after it */
 	bool no_vibrant;                /* the first of the two could not be made */
-	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
+	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours, vibrant_keep, group_over_keep;
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
 	GLfloat unclear_colour[4];
@@ -2478,11 +2478,23 @@ static const char table_fragment[] =
 #define FUNCTION_VIBRANT_MATRIX         45
 #define FUNCTION_HOME_AFFORDANCE        53
 
+/*
+ * The matrix's fourth row makes opacity of luminance (0.213 0.715 0.072: Rec. 709), and drawn as
+ * it was, the screen's picture under the App Library's pods (boot 44, frame 204: "vcm" at
+ * 69,90-534,555) came out with opacity 0x35-0xd3 where everything else on the screen is 0xff.
+ * CoreAnimation reads the picture's opacity afterwards: the fade under the search field takes a
+ * copy of the band with ONE_MINUS_DST_ALPHA, ONE (a pixel that is not opaque gets that much of
+ * the copy added: brighter), and the screen's picture goes to the display with it. The colour is
+ * as before; the opacity is what was there. Boot-arg glvcmalpha=1: the matrix's, as before.
+ */
+static int vcm_keep_alpha = 1;
+
 static const char vibrant_fragment[] =
     "#version 300 es\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform mediump vec4 colours[5];\n"
+    "uniform mediump float keep_alpha;\n"
     "in lowp vec4 color;\n"
     "in highp vec2 texcoord;\n"
     "layout(location = 0) inout highp vec4 result;\n"
@@ -2494,6 +2506,7 @@ static const char vibrant_fragment[] =
     "  s.a = clamp(s.a, 0., 1.);\n"
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
     "  result = mix(behind, s, layer.a);\n"
+    "  result.a = mix(result.a, behind.a, keep_alpha);\n"
     "}\n";
 static const char masking_fragment[] =
     "#version 300 es\n"
@@ -3389,6 +3402,7 @@ static const char group_over_fragment[] =
     "uniform lowp sampler2D texture0;\n"
     "uniform highp vec4 texmat;\n"
     "uniform mediump vec4 colours[5];\n"
+    "uniform mediump float keep_alpha;\n"
     "in lowp vec4 color;\n"
     "in highp vec2 texcoord;\n"
     "layout(location = 0) inout highp vec4 result;\n"
@@ -3400,6 +3414,7 @@ static const char group_over_fragment[] =
     "  s.a = clamp(s.a, 0., 1.);\n"
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
     "  result = mix(behind, s, layer.a);\n"
+    "  result.a = mix(result.a, behind.a, keep_alpha);\n"
     "}\n";
 static const char group_flat_fragment[] =
     "#version 300 es\n"
@@ -3457,6 +3472,7 @@ group_programs(struct eagl *e)
 	e->group_over_matrix = glGetUniformLocation(e->group_over, "vertex_matrix");
 	e->group_over_texmat = glGetUniformLocation(e->group_over, "texmat");
 	e->group_over_colours = glGetUniformLocation(e->group_over, "colours");
+	e->group_over_keep = glGetUniformLocation(e->group_over, "keep_alpha");
 	e->group_flat_matrix = glGetUniformLocation(e->group_flat, "vertex_matrix");
 	e->group_flat_colour = glGetUniformLocation(e->group_flat, "flat_colour");
 	return !e->group_failed;
@@ -3659,6 +3675,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		glUniformMatrix4fv(e->group_over_matrix, 1, 0, matrix);
 		glUniform4fv(e->group_over_texmat, 1, texmat);
 		glUniform4fv(e->group_over_colours, 5, colours);
+		glUniform1f(e->group_over_keep, vcm_keep_alpha ? 1.f : 0.f);
 		e->group_blend = glIsEnabled(GL_BLEND);
 		glGetIntegerv(GL_BLEND_SRC_RGB, &e->group_blend_func[0]);
 		glGetIntegerv(GL_BLEND_DST_RGB, &e->group_blend_func[1]);
@@ -4569,6 +4586,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 			e->no_vibrant = !good;                  /* (a library without the extension: Mesa's software one) */
 			e->vibrant_matrix = glGetUniformLocation(e->vibrant, "vertex_matrix");
 			e->vibrant_colours = glGetUniformLocation(e->vibrant, "colours");
+			e->vibrant_keep = glGetUniformLocation(e->vibrant, "keep_alpha");
 		} else if (!vibrant && e->masking == 0) {
 			e->masking = plain_program(masking_fragment, "a colour matrix over premultiplied pixels");
 			e->masking_matrix = glGetUniformLocation(e->masking, "vertex_matrix");
@@ -4583,6 +4601,9 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		glUseProgram(program);
 		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 		glUniform4fv(vibrant ? e->vibrant_colours : e->masking_colours, 5, function_values[function]);
+		if (vibrant) {
+			glUniform1f(e->vibrant_keep, vcm_keep_alpha ? 1.f : 0.f);
+		}
 		if (vibrant && glIsEnabled(GL_BLEND)) {
 			e->blended = 1;                 /* the program has blended already */
 			glDisable(GL_BLEND);
@@ -6008,6 +6029,7 @@ install(void)
 		}
 		sum_surfaces = strstr(arguments, "glsum=0") != NULL ? 0 : strstr(arguments, "glsum=2") != NULL ? 2 : 1;
 		seed_wait = strstr(arguments, "glseedwait=1") != NULL;
+		vcm_keep_alpha = strstr(arguments, "glvcmalpha=1") == NULL;
 		black_check = strstr(arguments, "glblack=0") == NULL;
 		from_targets = strstr(arguments, "gltarget=0") == NULL;
 		if (strstr(arguments, "glerrors=0") != NULL) {

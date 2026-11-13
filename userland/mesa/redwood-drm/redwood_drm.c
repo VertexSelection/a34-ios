@@ -45,6 +45,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
@@ -117,6 +118,14 @@ static pthread_once_t connection_once = PTHREAD_ONCE_INIT;
 static io_connect_t connection;
 static kern_return_t connection_result = kIOReturnNotFound;
 static bool queued;                     /* this client's SUBMITs are queued (kernel 0919: redwood_drm.h) */
+/*
+ * The kernel makes a program's buffers write-combined (0918, boot-arg a34maliwc not 0; a kernel
+ * that queues has that) but does not say so in CREATE_BO's `pad`: every buffer that is neither a
+ * heap nor asked for with a cached mapping (PANFROST_BO_WB_MMAP) is taken to be such, and its
+ * MADVISE answered here. One the kernel could not make write-combined (it logs "no
+ * write-combined memory") then keeps its cache upkeep while in Mesa's cache: slower, not wrong.
+ */
+static bool kernel_wc;
 
 /*
  * The queued mode, asked for when the connection is made: when the kernel offers it (GET_PARAM
@@ -128,12 +137,19 @@ ask_queued(const char *service)
 	struct drm_panfrost_get_param param = { .param = REDWOOD_DRM_PARAM_ASYNC };
 	struct redwood_drm_set_mode mode = { .async = 1 };
 	size_t size = sizeof(param);
+	char arguments[1024] = "";
+	size_t length = sizeof(arguments) - 1;
+	bool can_queue;
 	const char *why;
 
+	can_queue = IOConnectCallStructMethod(connection, DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param), &param,
+	    &size) == kIOReturnSuccess && param.value == 1;
+	if (can_queue && sysctlbyname("kern.bootargs", arguments, &length, NULL, 0) == 0) {
+		kernel_wc = strstr(arguments, "a34maliwc=0") == NULL;
+	}
 	if (strcmp(setting("REDWOOD_DRM_ASYNC", "1"), "0") == 0) {
 		why = "REDWOOD_DRM_ASYNC=0";
-	} else if (IOConnectCallStructMethod(connection, DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param), &param,
-	    &size) != kIOReturnSuccess || param.value != 1) {
+	} else if (!can_queue) {
 		why = "the kernel does not queue";
 	} else if (size = sizeof(mode), IOConnectCallStructMethod(connection, REDWOOD_DRM_SET_MODE, &mode, sizeof(mode), &mode,
 	    &size) != kIOReturnSuccess) {
@@ -142,8 +158,9 @@ ask_queued(const char *service)
 		queued = true;
 		why = NULL;
 	}
-	fprintf(stderr, "redwood-drm: %s[%d]: %s: GPU jobs %s%s%s\n", getprogname(), (int)getpid(), service,
-	    queued ? "queued (SUBMIT returns at once)" : "synchronous", why ? " -- " : "", why ? why : "");
+	fprintf(stderr, "redwood-drm: %s[%d]: %s: GPU jobs %s%s%s; buffers %s\n", getprogname(), (int)getpid(), service,
+	    queued ? "queued (SUBMIT returns at once)" : "synchronous", why ? " -- " : "", why ? why : "",
+	    kernel_wc ? "write-combined by the kernel (MADVISE answered here)" : "as the kernel says at CREATE_BO");
 }
 
 static void
@@ -812,7 +829,8 @@ driver_request(unsigned nr, void *data, size_t size)
 		ret = call(nr, data, size);
 		if (ret == 0 && size >= sizeof(*create)) {
 			bool wc = (create->pad & REDWOOD_DRM_CREATE_BO_WC) != 0 ||
-			    (local_answers() >= 2 && !(create->flags & PANFROST_BO_HEAP));
+			    (local_answers() >= 2 && !(create->flags & PANFROST_BO_HEAP)) ||
+			    (kernel_wc && !(create->flags & (PANFROST_BO_HEAP | PANFROST_BO_WB_MMAP)));
 
 			set_handle_kind(create->handle, local_answers() >= 1 && wc ? HANDLE_WC : 0);
 			create->pad = 0;        /* (as Linux leaves it) */

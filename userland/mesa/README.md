@@ -80,6 +80,11 @@ where the kernel queues. `REDWOOD_DRM_LOCAL` (default 1): 0 sends
 every `WAIT_BO` and `MADVISE` to the kernel; 2 takes every BO made here to be write-combined
 (all `MADVISE` answered here -- to measure, with a kernel that does not say: a BO the kernel
 made cacheable then stays in its per-job cache upkeep while cached, slower but never wrong).
+The kernel makes a program's BOs write-combined (0918, `a34maliwc` not 0) but does not report it in
+CREATE_BO's `pad`, so every `MADVISE` went to the kernel: about 110 a frame in Control Center,
+1.7 ms of backboardd's drawing thread. With a kernel that queues and no `a34maliwc=0` in the
+boot-args, redwood-drm now takes every BO that is neither a heap nor `PANFROST_BO_WB_MMAP` to be
+write-combined. Its `MADVISE` is then answered here; the line at open says so.
 
 ### What the kernel user client must implement
 
