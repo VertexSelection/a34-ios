@@ -99,7 +99,11 @@ for f in "$OUT/A34Metal.bundle/A34Metal" "$A"/*; do
 		bad=1
 	fi
 	[ "$(lipo -archs "$f")" = arm64 ] || { echo "error: $name is $(lipo -archs "$f"), not arm64"; bad=1; }
-	codesign -v "$f" || { echo "error: $name: signature"; bad=1; }
+	# (the bundle's executable is checked as the file it was signed as: codesign -v on the copy
+	# inside the bundle wants the bundle's resources sealed, which an ad-hoc plug-in has not)
+	signed=$f
+	[ "$name" = A34Metal ] && signed=$BUILD/A34Metal && cmp -s "$f" "$signed"
+	codesign -v "$signed" || { echo "error: $name: signature"; bad=1; }
 done
 otool -hv "$OUT/A34Metal.bundle/A34Metal" | grep -w BUNDLE >/dev/null || { echo "error: A34Metal is not an MH_BUNDLE"; bad=1; }
 nm -u "$OUT/A34Metal.bundle/A34Metal" | grep -F '_OBJC_CLASS_$__MTLDevice' >/dev/null ||
