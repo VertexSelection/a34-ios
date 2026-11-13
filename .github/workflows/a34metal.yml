@@ -1,0 +1,56 @@
+name: a34metal
+
+# The Metal plug-in for the Galaxy A34's Mali-G68 under iOS 16.7.16 (docs/metal-plan.md,
+# userland/a34metal/README.md): A34Metal.bundle, which Metal.framework loads as its GPU driver,
+# and metal-probe, the test of that. Built by userland/a34metal/build.sh for arm64 iOS 16 and
+# ad-hoc signed; the plug-in's own logic is also run against the runner's Metal (macOS).
+# The artifact "a34metal" holds A34Metal.bundle/ (for /System/Library/Extensions on the phone),
+# a34/metal-probe (for /a34) and README.md.
+
+on:
+  push:
+    branches: [metal]
+  workflow_dispatch:
+
+concurrency:
+  group: a34metal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_MIN: "16.0"
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: a34metal (userland/a34metal/build.sh)
+        run: A34METAL_OUT="$WORK/a34metal-out" userland/a34metal/build.sh
+
+      - name: Logs
+        if: failure()
+        run: |
+          for f in "$WORK"/a34metal-build/*.log; do
+            [ -f "$f" ] && { echo "=== $f"; tail -n 200 "$f"; }
+          done
+          true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: a34metal
+          path: ${{ env.WORK }}/a34metal-out
+          if-no-files-found: error
