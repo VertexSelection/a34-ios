@@ -3408,7 +3408,7 @@ static int
 vbafter_box(struct eagl *e, GLenum type, const void *indices, GLint first, GLsizei count, GLint box[4])
 {
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
-	GLint view[4] = { 0, 0, 0, 0 }, scissor[4], buffer = 1, elements = 0, located = -1;
+	GLint view[4] = { 0, 0, 0, 0 }, scissor[4], buffer = 1, elements = 0, located = -1, enabled = 0;
 	GLfloat m[16], low[2] = { 1e9f, 1e9f }, high[2] = { -1e9f, -1e9f };
 	int known = 1;
 
@@ -3418,10 +3418,12 @@ vbafter_box(struct eagl *e, GLenum type, const void *indices, GLint first, GLsiz
 		glGetUniformfv(e->program, located, m);
 	}
 	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
 	if (indices != NULL) {
 		glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &elements);
 	}
-	if (buffer != 0 || elements != 0 || e->arrays[0].pointer == NULL || e->arrays[0].type != GL_FLOAT || e->arrays[0].size < 2) {
+	if (!enabled || buffer != 0 || elements != 0 || e->arrays[0].pointer == NULL || e->arrays[0].type != GL_FLOAT ||
+	    e->arrays[0].size < 2) {
 		known = 2;
 	}
 	for (GLsizei i = 0; known == 1 && i < count && i < 4096; i++) {
@@ -3714,17 +3716,20 @@ vbafter_before(struct eagl *e, GLenum type, const void *indices, GLint first, GL
 	    why < 100 ? "over rectangle" : "reads rectangle", why < 100 ? why : why - 100);
 	/* the colour of the first corner (CoreAnimation's colour array, or the colour for all) */
 	{
-		GLint on = 0;
+		GLint on = 0, buffer = 1, elements = 1;
 		GLfloat c[4] = { 0, 0, 0, 0 };
-		unsigned vertex = count <= 0 ? 0 : indices == NULL ? (unsigned)first : type == GL_UNSIGNED_SHORT ?
-		    ((const uint16_t *)indices)[0] : type == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[0] : ((const uint32_t *)indices)[0];
-		GLint buffer = 1;
+		unsigned vertex = 0;
 
 		glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
 		glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
+		glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &elements);
+		if (indices == NULL || elements == 0) {
+			vertex = count <= 0 ? 0 : indices == NULL ? (unsigned)first : type == GL_UNSIGNED_SHORT ? ((const uint16_t *)indices)[0] :
+			    type == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[0] : ((const uint32_t *)indices)[0];
+		}
 		if (!on) {
 			glGetVertexAttribfv(1, GL_CURRENT_VERTEX_ATTRIB, c);
-		} else if (buffer == 0 && e->arrays[1].pointer != NULL && e->arrays[1].size >= 4) {
+		} else if (buffer == 0 && (indices == NULL || elements == 0) && e->arrays[1].pointer != NULL && e->arrays[1].size >= 4) {
 			const uint8_t *at = (const uint8_t *)e->arrays[1].pointer + (size_t)vertex * (size_t)(e->arrays[1].stride ?
 			    e->arrays[1].stride : e->arrays[1].type == GL_FLOAT ? 16 : e->arrays[1].type == GL_HALF_FLOAT ? 8 : 4);
 
