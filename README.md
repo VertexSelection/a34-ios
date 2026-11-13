@@ -16,9 +16,9 @@ usable as a daily system, and installing it erases the phone.
 | Buttons | volume up/down, power (patch 0902) |
 | CPU | all 8 cores (6× Cortex-A55 at ~1.8 GHz, 2× Cortex-A78), one scheduler cluster |
 | Storage | iOS root (HFS+) at the start of `userdata` |
-| GPU | Mali-G68 MC4 brought up from the kernel (0908, `a34mali=1`): shader power domains, reset, cores, and test jobs through its own MMU; not used for drawing yet (Mesa Panfrost port in progress) |
+| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up (0908) and a panfrost-style IOKit service (0909–0912, `a34mali=1`); **Mesa 26.3 Panfrost (OpenGL ES 3.1) renders on it** (`userland/mesa`, test `mali-tri` passes); CoreAnimation does not use it yet |
 | Boot time | empty `IOAcceleratorES` (0907, from ios-topaz) saves ~45 s; first frames ~65 s after XNU starts |
-| Not yet | GPU rendering, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
+| Not yet | GPU-accelerated UI (CoreAnimation), Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
 The base firmware is One UI 7 (A346EXXSADYG1). Do not go to One UI 8 or
 later: it removes bootloader unlocking. Never write the `efs`, `sec_efs`,
