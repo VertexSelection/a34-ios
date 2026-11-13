@@ -1,0 +1,263 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index c208bb8..f8681db 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -390,6 +390,8 @@ ck_cpu_report(void)
+ #define CK_ASK_POLLS            100u            /* 2 ms each */
+ 
+ static vm_offset_t ck_csram;
++static uint32_t ck_notices;             /* A34 (0924): the firmware's notices taken off its CPU DVFS pin */
++static bool ck_dvfs_started;            /* A34 (0926): its DVFS started this boot (a34cpudvfs=1, both IPIs answered) */
+ 
+ /*
+  * plat_k6877's FY_6833Tbl (CPU_LEVEL_0, chosen for segment code 3): per
+@@ -446,6 +448,65 @@ ck_pvt_check(unsigned c)
+ 	return ck_cs(CS_TBL + 4u * (ck_pvt_word[c] + 2u * CK_OPPS)) == 0xffffffffu ? 0 : CK_OPPS + 1u;
+ }
+ 
++/*
++ * A34 (0926): the firmware's log (OFFS_LOG_S, 150 entries of struct
++ * cpu_dvfs_log): timestamp low and high, then a word per cluster: [3:2]
++ * on, [7:4] limit, [11:8] base, [15:12] the OPP it runs at
++ * (opp_idx_log: what Android's Ripi thread takes as the cluster's OPP),
++ * [24:21] the OPP asked for. Read only.
++ */
++#define LOG_ON(w)               (((w) >> 2) & 3u)
++#define LOG_LIMIT(w)            (((w) >> 4) & 0xfu)
++#define LOG_BASE(w)             (((w) >> 8) & 0xfu)
++#define LOG_OPP(w)              (((w) >> 12) & 0xfu)
++#define LOG_ASKED(w)            (((w) >> 21) & 0xfu)
++
++/* The newest entry (the largest timestamp) and how many entries have one; false: none. */
++static bool
++ck_log_newest(uint32_t w[5], uint32_t *count)
++{
++	uint64_t best = 0;
++	uint32_t best_off = 0, n, k;
++
++	*count = 0;
++	for (n = 0; n < CS_LOG_N; n++) {
++		uint32_t off = CS_LOG + 20u * n;
++		uint64_t ts = ((uint64_t)ck_cs(off + 4u) << 32) | ck_cs(off);
++
++		if (ts != 0) {
++			(*count)++;
++		}
++		if (ts > best) {
++			best = ts;
++			best_off = off;
++		}
++	}
++	if (best == 0) {
++		return false;
++	}
++	for (k = 0; k < 5; k++) {
++		w[k] = ck_cs(best_off + 4u * k);
++	}
++	return true;
++}
++
++static void
++ck_log_say(const char *when)
++{
++	uint32_t w[5], count;
++
++	if (!ck_log_newest(w, &count)) {
++		printf("A34 CLOCKS: CPU DVFS log%s: no entry; Vproc words %u %u %u %u, %u notices\n", when, ck_cs(CS_CUR_VPROC),
++		    ck_cs(CS_CUR_VPROC + 4u), ck_cs(CS_CUR_VPROC + 8u), ck_cs(CS_CUR_VPROC + 12u), ck_notices);
++		return;
++	}
++	printf("A34 CLOCKS: CPU DVFS log%s: %u entries, newest at %llu: LL OPP %u (asked %u, limits %u..%u, on %u), "
++	    "L OPP %u (asked %u, limits %u..%u, on %u), CCI OPP %u; Vproc words %u %u %u %u; %u notices\n", when, count,
++	    ((unsigned long long)w[1] << 32) | w[0], LOG_OPP(w[2]), LOG_ASKED(w[2]), LOG_LIMIT(w[2]), LOG_BASE(w[2]),
++	    LOG_ON(w[2]), LOG_OPP(w[3]), LOG_ASKED(w[3]), LOG_LIMIT(w[3]), LOG_BASE(w[3]), LOG_ON(w[3]), LOG_OPP(w[4]),
++	    ck_cs(CS_CUR_VPROC), ck_cs(CS_CUR_VPROC + 4u), ck_cs(CS_CUR_VPROC + 8u), ck_cs(CS_CUR_VPROC + 12u), ck_notices);
++}
++
+ static void
+ ck_csram_report(void)
+ {
+@@ -475,6 +536,7 @@ ck_csram_report(void)
+ 		    cur < CK_OPPS ? ck_cpu_mhz[c][cur] : 0u, khz / 1000, ck_cs(CS_WFI + 4u * c), ck_cs(CS_SCHED + 4u * c),
+ 		    ck_cs(CS_PPM_LIMIT + 4u * c), ck_cs(CS_CLUSTER_ONOFF + 4u * c));
+ 	}
++	ck_log_say(ck_dvfs_started ? "" : " (left from before this boot unless the firmware's DVFS runs)");
+ }
+ 
+ /*
+@@ -485,44 +547,53 @@ ck_csram_report(void)
+  * agrees with the PLL. The firmware does the voltages and the PLL; then
+  * the PLL is watched. Not done in 200 ms: the words put back.
+  */
+-static void
++static bool
+ ck_cpu_ask(unsigned c, uint32_t mhz)
+ {
+-	uint32_t opp, cur, lim, old_wfi, old_state, con0, con1, div, khz, want, bad;
++	uint32_t opp, cur, lim, old_wfi, old_state, con0, con1, div, khz, want, bad, w[5], count;
+ 	const char *name = ck_cluster[c].name;
+ 
+ 	for (opp = 0; opp < CK_OPPS && ck_cpu_mhz[c][opp] > mhz; opp++) {
+ 	}
+ 	if (opp == CK_OPPS) {
+ 		printf("A34 CLOCKS: CPU %s: %u MHz is under the table's lowest OPP: not asked\n", name, mhz);
+-		return;
++		return false;
+ 	}
+ 	want = ck_cpu_mhz[c][opp] * 1000u;
++	if (!ck_dvfs_started) {
++		/* A34 (0926): only a firmware whose DVFS this boot started (a34cpudvfs=1) is asked */
++		printf("A34 CLOCKS: CPU %s: not asked: the firmware's DVFS was not started this boot (a34cpudvfs=1)\n", name);
++		return false;
++	}
+ 	if (!ck_cs_guarded()) {
+ 		printf("A34 CLOCKS: CPU %s: the CSRAM has not the guards Android's kernel writes: the firmware's DVFS "
+ 		    "was not set up; not asked\n", name);
+-		return;
++		return false;
+ 	}
+ 	bad = ck_pvt_check(c);
+ 	if (bad != 0) {
+ 		printf("A34 CLOCKS: CPU %s: the CSRAM's table differs from Android's at entry %u: not asked\n", name, bad);
+-		return;
++		return false;
++	}
++	/* A34 (0926): where the firmware has the cluster, from its newest log entry, as Android reads it */
++	if (!ck_log_newest(w, &count)) {
++		printf("A34 CLOCKS: CPU %s: the firmware's log has no entry: not asked\n", name);
++		return false;
+ 	}
+-	cur = ck_cs(CS_CUR_FREQ + 4u * c);
++	cur = LOG_OPP(w[2u + c]);
+ 	lim = ck_cs(CS_PPM_LIMIT + 4u * c);
+ 	khz = ck_cpu_khz(c, &con0, &con1, &div);
+-	if (cur >= CK_OPPS || khz < ck_cpu_mhz[c][cur] * 980u || khz > ck_cpu_mhz[c][cur] * 1020u) {
+-		printf("A34 CLOCKS: CPU %s: the CSRAM says OPP %u, the PLL says %u kHz: the firmware does not keep this "
+-		    "cluster; not asked\n", name, cur, khz);
+-		return;
++	if (khz < ck_cpu_mhz[c][cur] * 980u || khz > ck_cpu_mhz[c][cur] * 1020u) {
++		printf("A34 CLOCKS: CPU %s: the firmware's log says OPP %u, the PLL says %u kHz: not asked\n", name, cur, khz);
++		return false;
+ 	}
+ 	if (opp < (lim >> 16) || opp > (lim & 0xffffu)) {
+ 		printf("A34 CLOCKS: CPU %s: the CSRAM's limits 0x%08x do not allow OPP %u: not asked\n", name, lim, opp);
+-		return;
++		return false;
+ 	}
+ 	if (opp == cur) {
+ 		printf("A34 CLOCKS: CPU %s is at OPP %u (%u MHz) already\n", name, opp, want / 1000);
+-		return;
++		return true;
+ 	}
+ 	old_wfi = ck_cs(CS_WFI + 4u * c);
+ 	old_state = ck_cs(CS_CLUSTER_ONOFF + 4u * c);
+@@ -536,19 +607,21 @@ ck_cpu_ask(unsigned c, uint32_t mhz)
+ 		delay(2000);
+ 		khz = ck_cpu_khz(c, &con0, &con1, &div);
+ 		if (khz >= want - want / 100u && khz <= want + want / 100u) {
+-			printf("A34 CLOCKS: CPU %s now at %u kHz after %u ms (PLL CON1 0x%08x, divider 0x%08x; the CSRAM says "
+-			    "OPP %u, Vproc words %u %u)\n", name, khz, 2u * (i + 1u), con1, div, ck_cs(CS_CUR_FREQ + 4u * c),
+-			    ck_cs(CS_CUR_VPROC), ck_cs(CS_CUR_VPROC + 4u));
+-			return;
++			printf("A34 CLOCKS: CPU %s now at %u kHz after %u ms (PLL CON1 0x%08x, divider 0x%08x)\n", name, khz,
++			    2u * (i + 1u), con1, div);
++			delay(20000);           /* (its notice and log entry for this) */
++			ck_log_say(" after the request");
++			return true;
+ 		}
+ 	}
+ 	ruby_wr32(ck_csram, CS_WFI + 4u * c, old_wfi);
+ 	if (old_state != CS_CLUSTER_ON) {
+ 		ruby_wr32(ck_csram, CS_CLUSTER_ONOFF + 4u * c, old_state);
+ 	}
+-	printf("A34 CLOCKS: CPU %s: the firmware did not act in %u ms (PLL CON1 0x%08x, %u kHz; the CSRAM says OPP %u): "
+-	    "its DVFS is not running (Android starts it by IPI); the request taken back\n", name, 2u * CK_ASK_POLLS, con1,
+-	    khz, ck_cs(CS_CUR_FREQ + 4u * c));
++	printf("A34 CLOCKS: CPU %s: the firmware did not act in %u ms (PLL CON1 0x%08x, %u kHz); the request taken back\n",
++	    name, 2u * CK_ASK_POLLS, con1, khz);
++	ck_log_say(" after the request");
++	return false;
+ }
+ 
+ /* ---- A34 (0924): the firmware's DVFS started as Android starts it ---- */
+@@ -574,7 +647,6 @@ ck_cpu_ask(unsigned c, uint32_t mhz)
+ #define GIC_MBOX_INTIDS         (0xffu << 24)   /* MCUPM mailboxes 0-7 to the processors: SPI 24-31, INTID 56-63 */
+ 
+ static vm_offset_t ck_mbox, ck_mbox_regs;
+-static uint32_t ck_notices;
+ static int ck_notice_chan;
+ 
+ /* plat_k6877 CCI_FYTbl: the CCI's OPP for each LL OPP (row) and L OPP (column); then its second mode */
+@@ -686,7 +758,7 @@ ck_notice_thread(__unused void *arg, __unused wait_result_t result)
+ 			uint32_t w0 = ruby_rd32(ck_mbox, 4u * MB_RECV_SLOT), w1 = ruby_rd32(ck_mbox, 4u * MB_RECV_SLOT + 4u);
+ 
+ 			ruby_wr32(ck_mbox_regs, MB_CLR, MB_PIN_CPU_DVFS);
+-			if (ck_notices++ < 4u) {
++			if (ck_notices++ < 16u) {
+ 				printf("A34 CLOCKS: CPU DVFS: notice %u from the firmware: %08x %08x\n", ck_notices, w0, w1);
+ 			}
+ 		}
+@@ -798,23 +870,30 @@ ck_dvfs_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ 
+-	/* the firmware takes over: it should say each cluster is where it is, and leave the PLLs */
++	ck_dvfs_started = true;
++
++	/*
++	 * the firmware takes over: its log (cleared above with the rest) should
++	 * say each cluster is where it is (A34 0926: not the current-OPP word,
++	 * which it does not keep), and the PLLs stay
++	 */
+ 	for (i = 0; i < 250u; i++) {
++		uint32_t w[5], count;
++
+ 		delay(2000);
+-		if (ck_cs(CS_CUR_FREQ) == opp[0] && ck_cs(CS_CUR_FREQ + 4u) == opp[1]) {
++		if (ck_log_newest(w, &count) && LOG_OPP(w[2]) == opp[0] && LOG_OPP(w[3]) == opp[1]) {
+ 			break;
+ 		}
+ 	}
+ 	for (c = 0; c < CK_CLUSTERS; c++) {
+ 		uint32_t now = ck_cpu_khz(c, &con0, &con1, &div);
+ 
+-		printf("A34 CLOCKS: CPU DVFS: %s: the firmware says OPP %u, the PLL %u kHz (CON1 0x%08x)%s\n",
+-		    ck_cluster[c].name, ck_cs(CS_CUR_FREQ + 4u * c), now, con1,
++		printf("A34 CLOCKS: CPU DVFS: %s: the PLL %u kHz (CON1 0x%08x)%s\n", ck_cluster[c].name, now, con1,
+ 		    (c < 2 && now < khz[c] - khz[c] / 100u) ? ": SLOWER than before" : "");
+ 	}
+-	printf("A34 CLOCKS: CPU DVFS: started%s; Vproc words %u %u %u %u\n",
+-	    i < 250u ? "" : " (the firmware did not confirm the OPPs in 500 ms)", ck_cs(CS_CUR_VPROC),
+-	    ck_cs(CS_CUR_VPROC + 4u), ck_cs(CS_CUR_VPROC + 8u), ck_cs(CS_CUR_VPROC + 12u));
++	printf("A34 CLOCKS: CPU DVFS: started%s\n", i < 250u ? "; its log has both clusters where they were" :
++	    " (its log did not show both clusters where they were in 500 ms)");
++	ck_log_say(" after the start");
+ 	return true;
+ }
+ 
+@@ -836,10 +915,23 @@ ck_cpu_requests(void)
+ 		}
+ 	}
+ 	if (mhz[0] != 0) {
+-		ck_cpu_ask(1, mhz[0]);
++		/*
++		 * A34 (0926): the A78s from 650 MHz in two steps: first 1300 MHz
++		 * (OPP 10: the same 2600 MHz VCO, only the post divider /4 -> /2,
++		 * Vproc 0.65 -> 0.78125 V), then what was asked (2000 MHz: OPP 4,
++		 * a new VCO, 0.8875 V); the second only if the first was done.
++		 */
++		uint32_t con0, con1, div;
++
++		if (mhz[0] > 1300u && ck_cpu_khz(1, &con0, &con1, &div) < 1274000u && !ck_cpu_ask(1, 1300u)) {
++			printf("A34 CLOCKS: CPU L (cpu6-7, Cortex-A78): the first step (1300 MHz) was not done; %u MHz not asked\n",
++			    mhz[0]);
++		} else {
++			(void)ck_cpu_ask(1, mhz[0]);
++		}
+ 	}
+ 	if (mhz[1] != 0) {
+-		ck_cpu_ask(0, mhz[1]);
++		(void)ck_cpu_ask(0, mhz[1]);
+ 	}
+ 	if (mhz[2] != 0) {
+ 		printf("A34 CLOCKS: CPU CCI: not asked: the firmware sets it from the clusters' OPPs (its CCI map), "
