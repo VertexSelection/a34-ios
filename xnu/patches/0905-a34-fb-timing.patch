@@ -45,10 +45,19 @@ index ee7d11c..d84e2a9 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index cb886b9..7ba3987 100644
+index cb886b9..02db05c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -253,11 +253,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -207,6 +207,8 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -253,11 +255,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -64,7 +73,7 @@ index cb886b9..7ba3987 100644
  }
  
  void
-@@ -292,6 +295,12 @@ static uint32_t sweet_fb_dbg_logged;
+@@ -292,6 +297,12 @@ static uint32_t sweet_fb_dbg_logged;
  /* A34 (0904): read by the heartbeat in bsd/dev/a34_diag.c. */
  extern "C" uint64_t sweet_fb_swap_count;
  uint64_t sweet_fb_swap_count;
@@ -77,7 +86,7 @@ index cb886b9..7ba3987 100644
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-@@ -403,15 +412,20 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -403,15 +414,20 @@ AppleCLCD::present(const uint8_t *rec)
  			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
  			const uint32_t *srccp = (const uint32_t *)(src + s->offset +
  			    (uint64_t)(s->height / 2) * s->bytesPerRow + (uint64_t)(s->width / 2) * 4);
@@ -98,7 +107,7 @@ index cb886b9..7ba3987 100644
  			if (sweet_fb_dbg_logged < 8) {
  				sweet_fb_dbg_logged++;
  				IOLog("SWEET FB DBG: layer %u id %u src_va=%p dst_va=%p dst_pa=0x%llx w=%d h=%d src0=%08x srcc=%08x dst0=%08x dstc=%08x\n",
-@@ -425,7 +439,14 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -425,7 +441,14 @@ AppleCLCD::present(const uint8_t *rec)
  		s->release();
  	}
  	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
