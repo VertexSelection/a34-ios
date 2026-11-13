@@ -1,11 +1,11 @@
 name: a34metal
 
-# The Metal plug-in for the Galaxy A34's Mali-G68 under iOS 16.7.16 (docs/metal-plan.md,
-# userland/a34metal/README.md): A34Metal.bundle, which Metal.framework loads as its GPU driver,
-# and metal-probe, the test of that. Built by userland/a34metal/build.sh for arm64 iOS 16 and
-# ad-hoc signed; the plug-in's own logic is also run against the runner's Metal (macOS).
-# The artifact "a34metal" holds A34Metal.bundle/ (for /System/Library/Extensions on the phone),
-# a34/metal-probe (for /a34) and README.md.
+# HackiOS's Metal driver for the Mali (MIT; userland/a34metal/README.md, docs/metal-plan.md) on the
+# Galaxy A34's Mali-G68 under iOS 16.7.16. Builds Mesa as a34gl.yml does (userland/mesa/build.sh),
+# whose libgallium now carries the driver's compiler library (userland/mesa/air, patches 0006 and
+# 0007), then the plug-in A34Metal.bundle and its tests (userland/a34metal/build.sh). The artifact
+# "a34metal" holds A34Metal.bundle/ (for /System/Library/Extensions) and a34/ (for /a34: Mesa's
+# dylibs, mali-tri, metal_drv_test, metal-probe, metal_props), all ad-hoc signed.
 
 on:
   push:
@@ -20,13 +20,26 @@ permissions:
   contents: read
 
 env:
+  MESA_VERSION: 26.3.0
+  MESA_SHA256: 91d729aa68bb89e4ec857841300bbe922bcb3e52b1f97566ca83930d3b28343a
+  LIBDRM_VERSION: 2.4.134
+  LIBDRM_SHA256: ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95
   IOS_MIN: "16.0"
+  INSTALL_DIR: /a34
   WORK: ${{ github.workspace }}/work
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -38,13 +51,50 @@ jobs:
           xcodebuild -version
           echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
 
+      - name: Tools
+        run: |
+          brew install ccache bison pkgconf llvm spirv-llvm-translator spirv-tools
+          echo "llvm $(brew list --versions llvm), $(brew list --versions spirv-llvm-translator), $(brew list --versions spirv-tools)"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q meson==1.12.1 ninja==1.13.2 mako==1.4.3 pyyaml==6.0.3 packaging==26.3
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Source archives cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WORK }}/dl
+          key: mesa-ios-src-${{ env.MESA_VERSION }}-${{ env.LIBDRM_VERSION }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: a34metal-ccache-${{ env.MESA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            a34metal-ccache-${{ env.MESA_VERSION }}-
+            a34gl-ccache-${{ env.MESA_VERSION }}-
+            mesa-ios-ccache-${{ env.MESA_VERSION }}-
+
+      - name: Mesa (userland/mesa/build.sh)
+        run: |
+          ccache -z
+          userland/mesa/build.sh
+          ccache -s
+
       - name: a34metal (userland/a34metal/build.sh)
-        run: A34METAL_OUT="$WORK/a34metal-out" userland/a34metal/build.sh
+        run: MESA_OUT="$WORK/out" A34METAL_OUT="$WORK/a34metal-out" userland/a34metal/build.sh
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: a34metal-ccache-${{ env.MESA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Logs
         if: failure()
         run: |
-          for f in "$WORK"/a34metal-build/*.log; do
+          for f in "$WORK"/*.log "$WORK"/build-*/meson-logs/meson-log.txt "$WORK"/a34metal-build/*.log "$WORK"/build-ios.log; do
             [ -f "$f" ] && { echo "=== $f"; tail -n 200 "$f"; }
           done
           true

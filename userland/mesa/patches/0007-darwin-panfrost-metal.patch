@@ -1,0 +1,221 @@
+Darwin: panfrost for the Metal driver (userland/a34metal).
+
+From HackiOS's Mali Metal driver (MIT, Copyright 2026 Darwin on redwood contributors;
+github.com/oosexgang/hakios-xnu-kernel, branch mtk, tools/mesa/panfrost-darwin.patch and
+panfrost-redwood-perf.patch), ported to Mesa 26.3 and to Valhall:
+
+- counters of batch submissions and draw-time shader variants that air_metal.c reads
+  (rwa_submit_profile);
+- 256 bytes of slack after every transient pool allocation (their G52's fragment preload
+  wrote past one);
+- no transaction elimination (CRC) on Darwin: IOSurface memory changes behind a resource;
+- 16-bit UBO loads widened to 32-bit, for the Metal driver's shaders only (label "air";
+  boot-arg widen16=0 turns it off).
+
+Not taken (performance only, to come once the Metal path draws right): pushing every UBO
+(pushubo) with panfrost_emit_const_buf reading resource-backed UBOs, and a shader's scratch
+arrays into registers (scratchregs). Their Bifrost-v7-only build switches are not taken
+either: our build keeps every architecture panfrost has.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c	2026-11-13 23:52:23.849642992 +0300
++++ b/src/gallium/drivers/panfrost/pan_job.c	2026-11-13 23:52:58.731354111 +0300
+@@ -17,6 +17,7 @@
+ #include "pan_context.h"
+ #include "pan_trace.h"
+ #include "pan_util.h"
++#include "util/os_time.h"
+ 
+ #define foreach_batch(ctx, idx)                                                \
+    BITSET_FOREACH_SET(idx, ctx->batches.active, PAN_MAX_BATCHES)
+@@ -712,6 +713,10 @@
+ {
+    PAN_TRACE_FUNC(PAN_TRACE_GL_JOB);
+ 
++   /* A34 (from HackiOS): what submitting batches costs the processor, for the Metal
++    * driver's profile (air_metal.c, rwa_submit_profile) */
++   extern uint64_t redwood_pan_submit_ns, redwood_pan_submits;
++   int64_t redwood_began = os_time_get_nano();
+    struct pipe_screen *pscreen = ctx->base.screen;
+    struct panfrost_screen *screen = pan_screen(pscreen);
+    bool has_frag = panfrost_has_fragment_job(batch);
+@@ -776,8 +781,14 @@
+ 
+ out:
+    panfrost_batch_cleanup(ctx, batch);
++   redwood_pan_submit_ns += os_time_get_nano() - redwood_began;
++   redwood_pan_submits++;
+ }
+ 
++/* A34 (from HackiOS): counters the Metal driver reads (air_metal.c, rwa_submit_profile) */
++uint64_t redwood_pan_submit_ns, redwood_pan_submits, redwood_pan_blend_compiles;
++uint64_t redwood_pan_variant_compiles, redwood_pan_variant_ns;
++
+ void
+ panfrost_flush_batch(struct panfrost_batch *batch, const char *reason)
+ {
+--- a/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-13 23:52:23.851643034 +0300
++++ b/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-13 23:52:58.731354111 +0300
+@@ -152,17 +152,25 @@
+    }
+ #endif
+ 
++   /* A34 (from HackiOS, Darwin on redwood): 256 bytes of slack after every allocation. On
++    * their Mali-G52 the fragment preload (jm_preload_fb_v7) was seen writing up to 0x110
++    * bytes past the end of one of its descriptor allocations -- past the end of a 64 KB pool
++    * buffer twice, a fault in the window server drawing through Metal; what it overruns now
++    * is its own slack. Whether Valhall's preload does the same is not known; the slack is
++    * kept for it. */
++   size_t slack = sz + 256;
++
+    /* If we don't fit, allocate a new backing */
+-   if (unlikely(bo == NULL || (offset + sz) >= pool->base.slab_size)) {
++   if (unlikely(bo == NULL || (offset + slack) >= pool->base.slab_size)) {
+       bo = panfrost_pool_alloc_backing(
+-         pool, ALIGN_POT(MAX2(pool->base.slab_size, sz), 4096));
++         pool, ALIGN_POT(MAX2(pool->base.slab_size, slack), 4096));
+       if (!bo)
+          return (struct pan_ptr){0};
+ 
+       offset = 0;
+    }
+ 
+-   pool->transient_offset = offset + sz;
++   pool->transient_offset = offset + slack;
+ 
+    struct pan_ptr ret = {
+       .cpu = bo->ptr.cpu + offset,
+--- a/src/gallium/drivers/panfrost/pan_resource.c	2026-11-13 23:52:23.852643054 +0300
++++ b/src/gallium/drivers/panfrost/pan_resource.c	2026-11-13 23:52:58.731354111 +0300
+@@ -795,6 +795,17 @@
+     * size of the writeback buffer, so don't checksum formats
+     * that use too much space. */
+ 
++#ifdef __APPLE__
++   /* A34 (from HackiOS, Darwin on redwood): no transaction elimination. A tile is not
++    * written back when its checksum matches the one kept from this resource's last render,
++    * and the memory of an IOSurface changes behind that resource -- other textures over the
++    * same surface, copies, the processor -- so tiles of an older frame stayed on the
++    * screen. */
++   (void)dev;
++   (void)pres;
++   return false;
++#endif
++
+    unsigned bytes_per_pixel_max = (dev->arch == 6) ? 6 : 4;
+ 
+    unsigned bytes_per_pixel = MAX2(pres->base.nr_samples, 1) *
+--- a/src/gallium/drivers/panfrost/pan_shader.c	2026-11-13 23:52:23.850643013 +0300
++++ b/src/gallium/drivers/panfrost/pan_shader.c	2026-11-13 23:52:58.731354111 +0300
+@@ -21,6 +21,7 @@
+ #include "compiler/bifrost/bifrost_compile.h"
+ #include "panfrost/compiler/midgard/midgard_quirks.h"
+ #include "shader_enums.h"
++#include "util/os_time.h"
+ 
+ static struct panfrost_uncompiled_shader *
+ panfrost_alloc_shader(const nir_shader *nir)
+@@ -381,8 +382,14 @@
+       .stream_output = uncompiled->stream_output,
+    };
+ 
++   /* A34 (from HackiOS): shader variants compiled at draw time, for the Metal driver's profile */
++   extern uint64_t redwood_pan_variant_compiles, redwood_pan_variant_ns;
++   int64_t redwood_began = os_time_get_nano();
++
+    panfrost_shader_get(ctx->base.screen, &ctx->shaders, &ctx->descs, uncompiled,
+                        &ctx->base.debug, prog, 0);
++   redwood_pan_variant_compiles++;
++   redwood_pan_variant_ns += os_time_get_nano() - redwood_began;
+ 
+    prog->earlyzs = pan_earlyzs_analyze(&prog->info, dev->arch);
+ 
+--- a/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-13 23:52:23.854643096 +0300
++++ b/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-13 23:52:58.731354111 +0300
+@@ -19,6 +19,68 @@
+ #include "compiler.h"
+ #include "../kraid/kraid.h"
+ 
++#ifdef __APPLE__
++#include <string.h>
++#include <sys/sysctl.h>
++
++/*
++ * A34 (from HackiOS, Darwin on redwood, tools/mesa/panfrost-redwood-perf.patch): a 16-bit
++ * UBO load at a constant offset as a 32-bit load and a shift and truncation per half.
++ * Only for shaders of the Metal driver (nir->info.label "air", set by the AIR frontend);
++ * boot-arg widen16=0 leaves them as they are.
++ */
++static bool
++redwood_widen_ubo16(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   (void)data;
++   if (intr->intrinsic != nir_intrinsic_load_ubo || intr->def.bit_size != 16 ||
++       !nir_src_is_const(intr->src[1]))
++      return false;
++
++   uint32_t at = nir_src_as_uint(intr->src[1]);
++   unsigned comps = intr->def.num_components;
++   uint32_t first = at & ~3u, words = ((at & 3u) + 2 * comps + 3) / 4;
++
++   if (words > 4)
++      return false;
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *w = nir_load_ubo(b, words, 32, intr->src[0].ssa, nir_imm_int(b, first),
++                             .align_mul = 4, .align_offset = 0, .range_base = 0,
++                             .range = nir_intrinsic_range(intr));
++   nir_def *halves[NIR_MAX_VEC_COMPONENTS];
++
++   for (unsigned i = 0; i < comps; i++) {
++      unsigned byte = (at & 3u) + 2 * i;
++      nir_def *word = nir_channel(b, w, byte / 4);
++
++      /* (a shift and a truncation: the unpack_32_2x16 opcodes are lowered by now) */
++      halves[i] = nir_u2u16(b, (byte & 2) ? nir_ushr_imm(b, word, 16) : word);
++   }
++   nir_def_replace(&intr->def, nir_vec(b, halves, comps));
++   return true;
++}
++
++static bool
++redwood_is_metal_shader(const nir_shader *nir)
++{
++   return nir->info.label != NULL && strcmp(nir->info.label, "air") == 0;
++}
++
++static bool
++redwood_widen16_off(void)
++{
++   static int off = -1;
++
++   if (off < 0) {
++      char args[1024] = "";
++      size_t n = sizeof(args) - 1;
++
++      off = sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0 && strstr(args, "widen16=0") != NULL;
++   }
++   return off;
++}
++#endif
++
+ static bool
+ bi_use_kraid(nir_shader *nir, unsigned arch)
+ {
+@@ -1483,6 +1545,18 @@
+ 
+    bi_optimize_late(nir, arch, info);
+ 
++#ifdef __APPLE__
++   if (redwood_is_metal_shader(nir) && !redwood_widen16_off()) {
++      bool widened = false;
++
++      NIR_PASS(widened, nir, nir_shader_intrinsics_pass, redwood_widen_ubo16, nir_metadata_control_flow, NULL);
++      if (widened) {
++         NIR_PASS(_, nir, nir_opt_cse);
++         NIR_PASS(_, nir, nir_opt_dce);
++      }
++   }
++#endif
++
+    /* Lower constants to scalar but then immediately fold so we get minimum-
+     * width vectors instead of scalars
+     */

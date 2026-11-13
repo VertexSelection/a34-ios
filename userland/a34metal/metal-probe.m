@@ -10,7 +10,7 @@
  *                          (-initWithAcceleratorPort:) and register it with Metal's own
  *                          MTLAddDevice -- the same assertions, limits and feature
  *                          queries -- then ask MTLCreateSystemDefaultDevice() again
- *   metal-probe --any      PASS for any device (default: only for class A34MetalDevice)
+ *   metal-probe --any      PASS for any device (default: only for class RedwoodMetalDevice)
  *   metal-probe --next     after the verdict, also ask for a command queue and a buffer
  *                          (milestone 2's first questions; not judged)
  *
@@ -265,8 +265,8 @@ main(int argc, char **argv)
 			say("FAIL: a device, but without the MTLDevice protocol or a name");
 			return 3;
 		}
-		if (!any && strcmp(class_name, "A34MetalDevice") != 0) {
-			say("FAIL: a device, but of class %s, not A34MetalDevice (--any accepts it)", class_name);
+		if (!any && strcmp(class_name, "RedwoodMetalDevice") != 0) {
+			say("FAIL: a device, but of class %s, not RedwoodMetalDevice (--any accepts it)", class_name);
 			return 2;
 		}
 		say("PASS: Metal's default device is %s \"%s\"", class_name, [name UTF8String]);

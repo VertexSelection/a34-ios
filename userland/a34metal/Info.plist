@@ -15,12 +15,15 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>0.2</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>iPhoneOS</string>
 	</array>
+	<!-- HackiOS's driver class (redwoodmetal.m). Kernel 0920 names MetalPluginClassName
+	     "A34MetalDevice", which -[NSBundle classNamed:] does not find in this bundle;
+	     Metal then takes -principalClass, which is this. -->
 	<key>NSPrincipalClass</key>
-	<string>A34MetalDevice</string>
+	<string>RedwoodMetalDevice</string>
 </dict>
 </plist>

@@ -83,6 +83,10 @@ sources() {
 	rm -rf "$SRC" "$WORK/libdrm-$LIBDRM_VERSION"
 	tar -xJf "$mesa_tar" -C "$WORK"
 	tar -xJf "$drm_tar" -C "$WORK" "libdrm-$LIBDRM_VERSION/xf86drm.h"
+	# the AIR frontend and the Metal driver's library (HackiOS's, MIT; userland/a34metal):
+	# src/compiler/air, which patch 0006 builds into libgallium
+	rm -rf "$SRC/src/compiler/air"
+	cp -R "$HERE/air" "$SRC/src/compiler/air"
 	for p in "$HERE"/patches/*.patch; do
 		echo "patch: $(basename "$p")"
 		patch -p1 --no-backup-if-mismatch --forward -d "$SRC" <"$p"
@@ -298,13 +302,23 @@ check() {
 		nm -gU "$OUT/libGLESv2.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libGLESv2 lacks $sym"; bad=1; }
 	done
 	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait drmPrimeFDToHandle redwood_drm_mmap redwood_drm_munmap \
-		redwood_drm_surface redwood_drm_stats redwood_drm_queued; do
+		redwood_drm_surface redwood_drm_stats redwood_drm_queued redwood_drm_last_seq redwood_drm_wait_seq \
+		redwood_drm_surface_seq; do
 		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
 	done
 	# panfrost maps BOs through the user client (patch 0002) and sizes IOSurface imports by it (0003)
 	for sym in redwood_drm_mmap redwood_drm_munmap redwood_drm_surface; do
 		nm -u "$OUT/libgallium-$MESA_VERSION.dylib" | grep "^_$sym\$" >/dev/null || { echo "error: libgallium does not call $sym"; bad=1; }
 	done
+	# the Metal driver's library in libgallium (0006, userland/a34metal looks these up) and its
+	# counters in panfrost (0007)
+	for sym in rwa_device_open rwa_render_create rwa_render_draw rwa_texture_from_surface rwa_finish \
+		rwa_wait_seq; do
+		nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libgallium lacks $sym (0006)"; bad=1; }
+	done
+	nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep -E ' _redwood_pan_submits$' >/dev/null ||
+		nm "$OUT/libgallium-$MESA_VERSION.dylib" | grep -E ' _redwood_pan_submits$' >/dev/null ||
+		echo "note: redwood_pan_submits not found by name (0007's counters; stripped?)"
 	# a context taken over from another thread: this thread's GL thread-locals cleared (0004)
 	nm -u "$OUT/libEGL.1.dylib" | grep "^__mesa_glapi_set_context\$" >/dev/null || { echo "error: libEGL does not call _mesa_glapi_set_context (0004)"; bad=1; }
 	# EGL_IOSURFACE_A34 (0003)

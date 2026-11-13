@@ -288,6 +288,17 @@ static pthread_cond_t sync_changed = PTHREAD_COND_INITIALIZER;
 static struct syncobj *syncobjs;        /* handle n is syncobjs[n - 1] */
 static uint32_t syncobj_count;
 static uint64_t known_done;             /* (sync_lock) every job of ours up to this number is done */
+static uint64_t last_queued_seq;        /* (atomic) the number of our last queued job: redwood_drm_last_seq() */
+
+static void
+note_last_seq(uint64_t seq)
+{
+	uint64_t was = __atomic_load_n(&last_queued_seq, __ATOMIC_RELAXED);
+
+	while (seq > was && !__atomic_compare_exchange_n(&last_queued_seq, &was, seq, false, __ATOMIC_RELEASE,
+	    __ATOMIC_RELAXED)) {
+	}
+}
 
 /* With sync_lock held. */
 static struct syncobj *
@@ -722,6 +733,7 @@ submit(unsigned selector, void *data, size_t size)
 		const uint32_t *bos = (const uint32_t *)(uintptr_t)request.bo_handles;
 
 		__atomic_fetch_add(&stats.queued_jobs, 1, __ATOMIC_RELAXED);
+		note_last_seq(seq);
 		for (uint32_t i = 0; bos != NULL && i < request.bo_handle_count; i++) {
 			note_handle_seq(bos[i], seq);
 		}
@@ -732,6 +744,43 @@ submit(unsigned selector, void *data, size_t size)
 	} else if (out_sync != 0) {
 		syncobj_set(&out_sync, 1, true);
 	}
+	return 0;
+}
+
+/*
+ * For the Metal driver (HackiOS's air_metal.c: rwa_flush_seq, rwa_wait_seq, rwa_surface_seq;
+ * userland/a34metal). Their libdrm stand-in answers these over their kernel's requests 0x7d
+ * and 0x7c; here they are this client's queued jobs (kernel 0919):
+ *
+ *   redwood_drm_last_seq()          the number of the last job queued, 0 when jobs are
+ *                                   synchronous (every one done when its SUBMIT returned)
+ *   redwood_drm_wait_seq(seq, ns)   0 once every job up to seq is done, waiting `ns` at most
+ *                                   (< 0: no limit; 0: only asked); else -1 with errno
+ *   redwood_drm_surface_seq(id, s)  their kernel's 0x7c, which tells the display that a surface
+ *                                   is being drawn on the driver's own thread (s = ~0) or which
+ *                                   job finishes it: not here. Our kernel waits for the queued
+ *                                   jobs that name a surface by itself; a frame the driver has
+ *                                   not yet sent is not known to it (their rwm_async=1 only).
+ */
+EXPORT uint64_t
+redwood_drm_last_seq(void)
+{
+	return queued ? __atomic_load_n(&last_queued_seq, __ATOMIC_ACQUIRE) : 0;
+}
+
+EXPORT int
+redwood_drm_wait_seq(uint64_t seq, int64_t relative_ns)
+{
+	if (!queued || seq == 0) {
+		return 0;
+	}
+	return wait_seq(seq, relative_ns < 0 ? INT64_MAX : (int64_t)monotonic_ns() + relative_ns);
+}
+
+EXPORT int
+redwood_drm_surface_seq(uint32_t surface, uint64_t seq)
+{
+	note("surface_seq(%u, %#llx): not told to this kernel", surface, (unsigned long long)seq);
 	return 0;
 }
 

@@ -1,0 +1,64 @@
+Darwin: the AIR frontend and the Metal driver's library in libgallium (userland/a34metal).
+
+src/compiler/air is userland/mesa/air, copied in by build.sh: HackiOS's AIR frontend (Apple's
+shader bitcode into NIR) and air_metal.c, the C library its Metal plug-in calls ("AIR in, a
+pipeline out", air_metal.h), ported to Mesa 26.3 (MIT, Copyright 2026 Darwin on redwood
+contributors; github.com/oosexgang/hakios-xnu-kernel, branch mtk, tools/mesa/air). HackiOS
+built air_metal.c into libOSMesa, which Mesa 26 no longer has; here it goes into libgallium,
+which holds panfrost, and the plug-in dlopens that.
+
+--- a/src/compiler/meson.build	2026-11-13 23:52:15.071460702 +0300
++++ b/src/compiler/meson.build	2026-11-13 23:52:15.077460827 +0300
+@@ -65,6 +65,12 @@
+ 
+ subdir('spirv')
+ 
++# A34 (userland/a34metal): the AIR frontend -- Metal's shader bitcode into NIR -- from HackiOS
++# (MIT), copied here from userland/mesa/air by build.sh
++if host_machine.system() == 'darwin'
++  subdir('air')
++endif
++
+ if with_clc
+   subdir('clc')
+ endif
+--- a/src/gallium/targets/dri/meson.build	2026-11-13 23:52:15.072460723 +0300
++++ b/src/gallium/targets/dri/meson.build	2026-11-13 23:52:15.077460827 +0300
+@@ -39,13 +39,26 @@
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
++# A34 (userland/a34metal): the Metal driver's library (src/compiler/air/air_metal.c, from
++# HackiOS's tools/mesa/air, MIT: Metal shaders through the AIR frontend into Gallium, behind
++# the C contract air_metal.h) goes into libgallium on Darwin, where panfrost already is; the
++# plug-in dlopens libgallium and looks the rwa_* functions up (they have default visibility).
++gallium_dri_air_sources = []
++gallium_dri_air_deps = []
++gallium_dri_air_includes = []
++if host_machine.system() == 'darwin'
++  gallium_dri_air_sources += files('../../../compiler/air/air_metal.c')
++  gallium_dri_air_deps += [idep_air, idep_nir]
++  gallium_dri_air_includes += [inc_gallium_winsys_sw]
++endif
++
+ libgallium_dri = shared_library(
+   libgallium_name,
+-  files('dri_target.c'),
++  [files('dri_target.c')] + gallium_dri_air_sources,
+   include_directories : [
+     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+-  ],
++  ] + gallium_dri_air_includes,
+   gnu_symbol_visibility : 'hidden',
+   link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+   link_depends : gallium_dri_link_depends,
+@@ -62,7 +75,7 @@
+     driver_tegra, driver_i915, driver_svga, driver_virgl,
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+     driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+-  ],
++  ] + gallium_dri_air_deps,
+   install : true,
+   name_suffix : libname_suffix,
+ )

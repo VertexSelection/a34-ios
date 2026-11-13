@@ -1,93 +1,78 @@
-# a34metal: a Metal device for the Mali-G68
+# a34metal: HackiOS's Metal driver on the Mali-G68
 
-The Metal plug-in for iOS 16.7.16 on the Galaxy A34: the bundle `Metal.framework` loads as its
-GPU driver. **Milestone 1** of [`docs/metal-plan.md`](../../docs/metal-plan.md): Metal finds the
-plug-in, loads it, registers its device, and the device says what it is. It makes no buffer,
-texture, queue or pipeline yet (milestones 2 to 5). Nothing here has run on the phone so far.
+A port of **HackiOS's Metal driver for the Mali** (OOSEX GANG, MIT;
+[hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel), branch `mtk` at `a962798`,
+the Infinix Hot 20's Mali-G52), on which CoreAnimation draws through Metal there. Nothing of it
+has run on our phone yet. Built by `.github/workflows/a34metal.yml` (branch `metal`, artifact
+**`a34metal`**). The plan and how Metal loads a driver: [`docs/metal-plan.md`](../../docs/metal-plan.md).
 
-Built by `.github/workflows/a34metal.yml` (branch `metal`, artifact **`a34metal`**), or on a Mac
-with `userland/a34metal/build.sh`.
+| here | theirs (`mtk`) | what |
+| --- | --- | --- |
+| `redwoodmetal.m` | `userland/src/redwoodmetal.m` | the plug-in: `RedwoodMetalDevice` (a `_MTLDevice` subclass) and every object it hands out |
+| `metal/*.cpp`, `metal/*.h` | `userland/src/metal/` | the driver's core in C++: queues, command buffers, encoders, textures, IOSurfaces, pipelines, CoreAnimation's pipeline library by label, the worker thread |
+| `metal_drv_test.m` | `userland/src/metal_drv_test.m` | the driver's test: device, compute, draws, textures, through Metal's own objects |
+| `metal_props.c` | `userland/src/metal_props.c` | puts `MetalPluginName`/`ClassName` on `IOAcceleratorES` at run time (needs `IOAcceleratorES::setProperties`, which our kernel has not; kernel 0920's boot-arg does the same) |
+| `../mesa/air/` | `tools/mesa/air/` | the AIR frontend (Metal's shader bitcode into NIR) and `air_metal.c`, the C library the core calls (`air_metal.h`) |
+| `../mesa/patches/0006`, `0007` | `air-frontend.patch`, `panfrost-osmesa-air.patch`, `panfrost-darwin.patch`, `panfrost-redwood-perf.patch` | the library built into libgallium; panfrost's counters, pool slack, no CRC, 16-bit UBO loads widened |
+| `metal-probe.m`, `a34_watch.c` | ours | Metal's discovery as a program sees it; a console witness linked into the tests |
 
-| file | what |
-| --- | --- |
-| `A34Metal.m`, `Info.plist` | `A34Metal.bundle`: class `A34MetalDevice`, a subclass of Metal's private `_MTLDevice` |
-| `metal-probe.m` | `metal-probe`: asks Metal for its device and prints what it is; `PASS` / `FAIL` |
-| `a34metal_iokit.h` | the IOKit calls used, for SDKs without IOKit headers |
-| `hosttest.m` | build-time check of the plug-in against the build machine's Metal (not for the phone) |
-| `build.sh` | builds both for arm64 iOS 16, signs ad hoc, checks, packages |
+## What changed in the port
 
-## How Metal loads it
+- **Mesa 26.3 instead of 25.0.7.** NIR: `nir_def_instr()`, `mesa_shader_stage`, the builder's
+  `fp_math_ctrl` for `exact`, `nir_block_create(impl)`, `nir_shader_create` without `si`.
+  Gallium: no `create_surface` (a framebuffer's surfaces are templates, kept with each texture),
+  `clear` with masks, `nir_options[]`/`compute_caps` for the old queries, `driParseConfigFiles`
+  parameters. The frontend and `air_metal.c` compile against 26.3 on a Linux host (softpipe);
+  the panfrost branch only in CI.
+- **libgallium instead of libOSMesa** (gone in Mesa 26): `air_metal.c` is built into
+  `/a34/libgallium-26.3.0.dylib`, which the plug-in `dlopen`s (`metal/air.cpp`).
+- **Valhall v9 instead of Bifrost v7.** Their Bifrost-only build switches are not taken. Their
+  compiler passes run in `bifrost_nir.c`, which serves both; of them only the 16-bit UBO widening
+  is taken, and only for the Metal driver's shaders. Not taken yet (performance): every UBO pushed
+  (`pushubo`) and scratch arrays into registers (`scratchregs`).
+- **Our kernel.** Their `RedwoodMali` speaks the same panfrost uAPI as ours; where theirs differs
+  (a queued SUBMIT's number in `jc`, waits by `0x7d`, a surface's pending mark `0x7c`), our
+  libdrm stand-in answers `air_metal.c` over our 0919 queue (`redwood_drm_last_seq`,
+  `redwood_drm_wait_seq`; `redwood_drm_surface_seq` is a no-op). Their synchronous mode (the
+  default; `rwm_async=1` is the other) needs nothing more of the kernel.
+- **Paths.** `/a34/libgallium-26.3.0.dylib` for their `/redwood/lib/libredwoodair.dylib`; the
+  bundle at `/System/Library/Extensions/A34Metal.bundle` (kernel 0920's name) with their class as
+  its principal class; QuartzCore's own `default.metallib` (our root has it); `MTLAddDevice` by
+  name in `metal_drv_test` (their addresses are 16.5's).
 
-Read off Metal 306.6.6 in our dyld cache (the plan's section 1 has the addresses):
-`MTLCreateSystemDefaultDevice` looks up every `IOAcceleratorES` service, reads its properties
-`MetalPluginName` and `MetalPluginClassName`, loads
-`/System/Library/Extensions/<MetalPluginName>.bundle`, takes the class of that name (else the
-principal class), requires a subclass of `_MTLDevice`, sends `-initWithAcceleratorPort:`, and
-gives the result to `MTLAddDevice`, which asserts the protocols `MTLDevice` and `MTLDeviceSPI`
-and has `_MTLDevice` fill its limits from the subclass's `-featureProfile` and
-`-maxBufferLength`. No user client of `IOAcceleratorES` is opened by anything in that path;
-the GPU is reached through `RedwoodMali`, as Mesa reaches it.
+## On the phone (first run)
 
-So the kernel's `IOAcceleratorES` (patch 0907, without properties today) has to name the
-plug-in: `MetalPluginName` = `A34Metal`, `MetalPluginClassName` = `A34MetalDevice`, behind
-boot-arg `a34metal` (the snippet is in the plan). Until a kernel has that,
-`metal-probe --direct` loads the bundle itself and registers the device through Metal's own
-`MTLAddDevice`, which runs the same assertions and limits.
-
-## Who gets the device
-
-Once the kernel names the plug-in, every process that asks Metal loads it: no injection is
-needed, which is how apps get a device (`liba34gl` reaches backboardd only). A device that
-cannot draw must not be given to programs that would then draw with it, so the plug-in
-answers per program, and "no" unless:
-
-| | |
-| --- | --- |
-| `A34METAL=1` / `A34METAL=0` in the environment | yes / no, whatever else says |
-| the program is `metal-probe` or `a34metal-*` | yes |
-| `/a34/A34Metal.clients` has a line with the program's name, or `*` | yes |
-| boot-arg `a34metal=2` | yes, except backboardd |
-| boot-arg `a34metal=3` | yes |
-
-`A34METAL_PROFILE=N` or boot-arg `a34metal_profile=N` sets `-featureProfile` (0, 1, 4...9;
-default 1), the number `_MTLDevice` derives the limits and GPU families from. The plug-in
-writes to stderr as `a34metal[program pid]: ...`; a message of `MTLDevice`/`MTLDeviceSPI` that
-is not implemented is answered with zero and named once.
-
-## On the phone
-
-With the root mounted at `/mnt` (TWRP, or the image on the host) and the artifact unpacked in
-`a34metal/`:
+Do **not** boot with `a34metal=1` yet: with the plug-in named on `IOAcceleratorES`, every program
+that asks Metal gets this device, backboardd included, and CoreAnimation then needs HackiOS's
+`camtl` hooks (their `inject.c`), which are not ported. The test registers the device itself. The second line copies `a34/` (Mesa's dylibs with the
+Metal library in libgallium, the tests) into `/a34`, replacing a34gl's Mesa there with the same
+Mesa plus patches 0006/0007 (which also turn panfrost's CRC off for GL):
 
 ```
 tools/root-add-job.py --copy /mnt /System/Library/Extensions/A34Metal.bundle a34metal/A34Metal.bundle
-tools/root-add-job.py /mnt works.kry.a34metal.probe /a34 a34metal/a34 metal-probe --direct --next
+tools/root-add-job.py /mnt com.a34.metaldrvtest /a34 a34metal/a34 metal_drv_test --bundle
+tools/root-add-job.py --env /mnt com.a34.metaldrvtest REDWOOD_DRM_ASYNC=0
 ```
 
-The job runs once at boot with its output in the kernel log (`tools/pull-log.sh`). Expected
-with today's kernel: the registry lines (`IOAcceleratorES ... has no MetalPluginName`),
-`MTLCreateSystemDefaultDevice() = 0x0`, the `direct:` lines, the device's class, name
-(`Mali-G68 (A34Metal)` with `a34mali=1`), the GPU families `-featureProfile` 1 claims, and
-`PASS`. With a kernel that names the plug-in (`a34metal=1`), plain `metal-probe` passes
-without `--direct`. Exit status: 0 `PASS`, 1 no device, 2 another class's device, 3 a device
-Metal would not take. The plug-in is new code in every process that asks Metal: leave
-`a34metal` at 1 until milestone 4.
+Boot-args as today with `a34mali=1` (no `a34metal`). `metal_drv_test --bundle` asks Metal for a
+device, loads the bundle, makes `RedwoodMetalDevice`, registers it with `MTLAddDevice`, lists
+what the device still owes, then compiles and runs the functions of
+`/System/Library/VideoDecoders/AV1SW.metallib` (other modes: `--draw`, `--draw-all`, `--time`, see
+the top of the file). `a34watch:` lines give the main thread's backtrace every 5 s and the exit.
+`REDWOOD_DRM_ASYNC=0` keeps every GPU job synchronous, as HackiOS's known-good runs were.
 
-## Credits
+## Credits and licence
 
-The scheme (a direct `_MTLDevice` subclass, `MTLDeviceSPI` stated at run time, the methods the
-registration needs, refusals named once, the device shown to chosen programs) was worked out
-by **HackiOS** (OOSEX GANG): `hakios-metal/plugin/HakiosMetal.m` in
-<https://github.com/oosexgang/hakios-xnu-kernel>, and `userland/src/redwoodmetal.m` on its
-branch `mtk` (the Mali-G52 port), both under the MIT License. The code here is written for
-this port; the facts about `targetDeviceInfo`, the feature profiles and the object that must
-not be released are theirs and are marked in `A34Metal.m`.
+HackiOS (OOSEX GANG) wrote everything here but `metal-probe.m` and `a34_watch.c`, and the
+changes listed above; the AIR sources carry their own header (Copyright 2026 Darwin on redwood
+contributors, MIT). HackiOS's userland is under the MIT License:
 
 ```
 MIT License
 
 Copyright (c) 2026 OOSEX GANG
 Copyright (c) 2025-2026 the HakiOS authors
+Copyright (c) 2026 Darwin on redwood contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -107,3 +92,5 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+Mesa (MIT) is fetched at build time; the patches are under Mesa's licence.
