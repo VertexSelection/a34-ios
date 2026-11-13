@@ -282,8 +282,8 @@ main(int argc, char **argv)
 {
 	EGLint major = 0, minor = 0, count = 0;
 	EGLConfig config;
-	EGLContext context;
-	EGLSurface pbuffer;
+	EGLContext context = EGL_NO_CONTEXT;
+	EGLSurface pbuffer = EGL_NO_SURFACE;
 	IOSurfaceRef a, b;
 	GLuint ta, tb, fa, own, fown, colour_program, texture_program;
 	int bx0, by0, bx1, by1;
@@ -306,7 +306,7 @@ main(int argc, char **argv)
 	}
 
 	/* EGL and OpenGL ES, as liba34gl has them (gl_egl.c) */
-	display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+	display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
 	if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) {
 		printf("EGL: no display (error %#x): is the RedwoodMali service there?\nFAIL\n", eglGetError());
 		return 2;

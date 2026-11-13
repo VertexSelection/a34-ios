@@ -111,7 +111,7 @@ display_start(void)
 	EGLint major = 0, minor = 0, count = 0;
 	const char *extensions;
 
-	display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+	display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
 	if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) {
 		a34gl_say("a34gl: EGL (surfaceless) does not start: %s -- is the RedwoodMali service there?\n",
 		    egl_error(eglGetError()));

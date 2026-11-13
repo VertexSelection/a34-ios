@@ -19,18 +19,20 @@
  #endif
 --- a/src/egl/drivers/dri2/egl_dri2.c
 +++ b/src/egl/drivers/dri2/egl_dri2.c
-@@ -41,6 +41,10 @@
+@@ -41,6 +41,12 @@
  #ifdef HAVE_LIBDRM
  #include <xf86drm.h>
  #include "drm-uapi/drm_fourcc.h"
 +#ifdef __APPLE__
 +#include <redwood_drm.h> /* libdrm's Darwin stand-in (a34-ios userland/mesa/redwood-drm) */
-+#include <EGL/eglmesaext.h>
++#ifndef EGL_IOSURFACE_A34
++#define EGL_IOSURFACE_A34 0x3A34 /* EGL/eglmesaext.h */
++#endif
 +#endif
  #endif
  #include <GL/gl.h>
  #include "mesa_interface.h"
-@@ -2629,6 +2633,82 @@
+@@ -2629,6 +2635,82 @@
  
  #endif
  
@@ -113,7 +115,7 @@
  _EGLImage *
  dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
                        EGLClientBuffer buffer, const EGLint *attr_list)
-@@ -2649,6 +2729,10 @@
+@@ -2649,6 +2731,10 @@
  #ifdef HAVE_LIBDRM
     case EGL_LINUX_DMA_BUF_EXT:
        return dri2_create_image_dma_buf(disp, ctx, buffer, attr_list);
