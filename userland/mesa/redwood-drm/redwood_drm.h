@@ -80,6 +80,26 @@ REDWOOD_DRM_ASSERT(offsetof(struct redwood_drm_surface, planes) == 36, "0x7e lay
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
 
 /*
+ * Requests answered here instead of by the kernel (REDWOOD_DRM_LOCAL, default 1; 0: none):
+ *
+ *   WAIT_BO   The kernel runs a job chain to its end inside SUBMIT, so a buffer of this
+ *             process's own is idle whenever none of the process's threads is inside a
+ *             SUBMIT: then the answer is "ready" at once. With a SUBMIT in flight, and for
+ *             an IOSurface's buffer (0x7e: other programs' jobs may use it), the kernel is
+ *             asked as before.
+ *   MADVISE   The kernel never purges; DONTNEED only tells it to leave a cacheable buffer
+ *             out of its per-job CPU cache upkeep while Mesa has no use for it. A buffer the
+ *             CPU maps write-combined gets no upkeep at all, and for it MADVISE means
+ *             nothing: answered here ("retained") -- for the buffers the kernel has said are
+ *             such, with REDWOOD_DRM_CREATE_BO_WC in the `pad` that comes back from
+ *             CREATE_BO (0x42). A kernel that does not say so (pad 0, as Linux leaves it)
+ *             gets every MADVISE, as before. REDWOOD_DRM_LOCAL=2, for a measurement: every
+ *             buffer made here is taken to be write-combined (a cacheable one then stays in
+ *             the kernel's upkeep while it sits in Mesa's cache: slower, never wrong).
+ */
+#define REDWOOD_DRM_CREATE_BO_WC        0x1u
+
+/*
  * The requests made of the kernel so far, for profiling (liba34gl's glprof): calls and time
  * (mach_absolute_time units) by selector -- 0x40 SUBMIT, whose time is the GPU's, the job chain
  * running to its end before it returns; 0x42 CREATE_BO; 0x09 GEM_CLOSE; ... -- and the client
@@ -90,6 +110,7 @@ struct redwood_drm_stats {
 	uint64_t ticks[256];
 	uint64_t maps, map_ticks;
 	uint64_t unmaps, unmap_ticks;
+	uint64_t local_waits, local_madvises;   /* WAIT_BO and MADVISE answered here, without the kernel */
 };
 
 void redwood_drm_stats(struct redwood_drm_stats *stats);

@@ -610,9 +610,11 @@ prof_report(unsigned frame)
 			    (double)calls / n, ticks_us(drm.ticks[sel] - prof.drm.ticks[sel]) / n);
 		}
 	}
-	used += (size_t)snprintf(text + used, sizeof(text) - used, " map %.1f (%.0f us) unmap %.1f (%.0f us)",
+	used += (size_t)snprintf(text + used, sizeof(text) - used, " map %.1f (%.0f us) unmap %.1f (%.0f us); answered "
+	    "without the kernel: wait_bo %.1f madvise %.1f",
 	    (double)(drm.maps - prof.drm.maps) / n, ticks_us(drm.map_ticks - prof.drm.map_ticks) / n,
-	    (double)(drm.unmaps - prof.drm.unmaps) / n, ticks_us(drm.unmap_ticks - prof.drm.unmap_ticks) / n);
+	    (double)(drm.unmaps - prof.drm.unmaps) / n, ticks_us(drm.unmap_ticks - prof.drm.unmap_ticks) / n,
+	    (double)(drm.local_waits - prof.drm.local_waits) / n, (double)(drm.local_madvises - prof.drm.local_madvises) / n);
 	say_always("a34gl-prof:   kernel requests a frame (redwood-drm):%s\n", text);
 	used = 0;
 	for (unsigned i = 0; i < 8 && prof.threads[i].tid != 0; i++) {

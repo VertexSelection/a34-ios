@@ -23,8 +23,14 @@
  * and the kernel makes a GEM handle of the surface's memory: selector 0x7e, ios-topaz's
  * "surface" request (struct redwood_drm_surface in redwood_drm.h). Export is not supported.
  *
+ * Also answered here, when that is sure to be the kernel's answer (redwood_drm.h,
+ * REDWOOD_DRM_LOCAL): WAIT_BO for a buffer of the process's own while none of its SUBMITs
+ * is running, and MADVISE for the buffers the kernel has said it keeps no upkeep of.
+ *
  * Environment: REDWOOD_DRM_SERVICE (default "RedwoodMali"), REDWOOD_DRM_MINOR (default
- * 1), REDWOOD_DRM_DEBUG=1 (every call on stderr), REDWOOD_DRM_NODE (default /dev/null).
+ * 1), REDWOOD_DRM_DEBUG=1 (every call on stderr), REDWOOD_DRM_NODE (default /dev/null),
+ * REDWOOD_DRM_LOCAL (default 1; 0: every WAIT_BO and MADVISE goes to the kernel; 2: see
+ * redwood_drm.h).
  *
  * Adapted from ios-topaz's userland/mesa/redwood-drm (MIT, which is based on HackiOS's
  * user space, MIT, Copyright (c) 2026 OOSEX GANG): see ../README.md.
@@ -189,6 +195,8 @@ redwood_drm_stats(struct redwood_drm_stats *out)
 	out->map_ticks = __atomic_load_n(&stats.map_ticks, __ATOMIC_RELAXED);
 	out->unmaps = __atomic_load_n(&stats.unmaps, __ATOMIC_RELAXED);
 	out->unmap_ticks = __atomic_load_n(&stats.unmap_ticks, __ATOMIC_RELAXED);
+	out->local_waits = __atomic_load_n(&stats.local_waits, __ATOMIC_RELAXED);
+	out->local_madvises = __atomic_load_n(&stats.local_madvises, __ATOMIC_RELAXED);
 }
 
 /* A request to the kernel driver: 0, or -1 with errno set. */
@@ -422,6 +430,44 @@ get_cap(uint64_t capability, uint64_t *value)
 	}
 }
 
+/*
+ * What is known of a GEM handle, for the requests answered here: HANDLE_SURFACE, an IOSurface's
+ * memory (0x7e); HANDLE_WC, a buffer the kernel keeps no CPU cache upkeep of. Forgotten at
+ * GEM_CLOSE. Handles past the table are unknown (0): everything about them goes to the kernel.
+ */
+#define HANDLE_SURFACE  1u
+#define HANDLE_WC       2u
+#define HANDLES         65536u
+
+static uint8_t handle_kinds[HANDLES];
+static int submits_running;             /* threads of this process inside a SUBMIT */
+
+static unsigned
+handle_kind(uint32_t handle)
+{
+	return handle < HANDLES ? __atomic_load_n(&handle_kinds[handle], __ATOMIC_RELAXED) : 0;
+}
+
+static void
+set_handle_kind(uint32_t handle, unsigned kind)
+{
+	if (handle < HANDLES) {
+		__atomic_store_n(&handle_kinds[handle], (uint8_t)kind, __ATOMIC_RELAXED);
+	}
+}
+
+/* REDWOOD_DRM_LOCAL: 0 nothing is answered here; 1 (default); 2 every buffer made here taken to be write-combined */
+static int
+local_answers(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		mode = atoi(setting("REDWOOD_DRM_LOCAL", "1"));
+	}
+	return mode;
+}
+
 /* DRM_IOCTL_PANFROST_SUBMIT: the kernel is given no syncobjs (they are this file's), and runs the chain to its end. */
 static int
 submit(unsigned selector, void *data, size_t size)
@@ -449,11 +495,67 @@ submit(unsigned selector, void *data, size_t size)
 	request.in_syncs = 0;
 	request.in_sync_count = 0;
 	request.out_sync = 0;
+	__atomic_fetch_add(&submits_running, 1, __ATOMIC_SEQ_CST);
 	ret = call(selector, &request, size);
+	__atomic_fetch_sub(&submits_running, 1, __ATOMIC_SEQ_CST);
 	if (ret == 0 && out_sync != 0) {
 		syncobj_set(&out_sync, 1, true);
 	}
 	return ret;
+}
+
+/*
+ * A request of the driver's own (0x40 + n): SUBMIT as above; WAIT_BO and MADVISE answered here
+ * where that is the kernel's answer (redwood_drm.h); CREATE_BO noted. 0, or -1 with errno.
+ */
+static int
+driver_request(unsigned nr, void *data, size_t size)
+{
+	int ret;
+
+	switch (nr - DRM_COMMAND_BASE) {
+	case DRM_PANFROST_SUBMIT:
+		return submit(nr, data, size);
+	case DRM_PANFROST_WAIT_BO: {
+		const struct drm_panfrost_wait_bo *request = data;
+
+		/* no job of this process is running, and no other program's job uses this buffer: idle */
+		if (size >= sizeof(*request) && local_answers() >= 1 && !(handle_kind(request->handle) & HANDLE_SURFACE) &&
+		    __atomic_load_n(&submits_running, __ATOMIC_SEQ_CST) == 0) {
+			__atomic_fetch_add(&stats.local_waits, 1, __ATOMIC_RELAXED);
+			return 0;
+		}
+		break;
+	}
+	case DRM_PANFROST_MADVISE: {
+		struct drm_panfrost_madvise *madvise = data;
+		unsigned kind = size >= sizeof(*madvise) ? handle_kind(madvise->handle) : 0;
+
+		/* a buffer without cache upkeep: nothing for the kernel to note, nothing is ever purged */
+		if ((kind & HANDLE_WC) && madvise->madv <= PANFROST_MADV_DONTNEED) {
+			madvise->retained = 1;
+			__atomic_fetch_add(&stats.local_madvises, 1, __ATOMIC_RELAXED);
+			return 0;
+		}
+		break;
+	}
+	case DRM_PANFROST_CREATE_BO: {
+		struct drm_panfrost_create_bo *create = data;
+
+		ret = call(nr, data, size);
+		if (ret == 0 && size >= sizeof(*create)) {
+			bool wc = (create->pad & REDWOOD_DRM_CREATE_BO_WC) != 0 ||
+			    (local_answers() >= 2 && !(create->flags & PANFROST_BO_HEAP));
+
+			set_handle_kind(create->handle, local_answers() >= 1 && wc ? HANDLE_WC : 0);
+			create->pad = 0;        /* (as Linux leaves it) */
+		}
+		return ret;
+	}
+	default:
+		break;
+	}
+	return call(nr, data, size);
 }
 
 EXPORT int
@@ -464,13 +566,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
 
 	(void)fd;
 	if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
-		if (nr == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT) {
-			return submit(nr, arg, size);
-		}
-		return call(nr, arg, size);
+		return driver_request(nr, arg, size);
 	}
 	switch (request) {
 	case DRM_IOCTL_GEM_CLOSE:
+		set_handle_kind(((const struct drm_gem_close *)arg)->handle, 0);
 		return call(nr, arg, size);
 	case DRM_IOCTL_VERSION: {
 		struct drm_version *v = arg;
@@ -506,7 +606,7 @@ command(unsigned long index, void *data, unsigned long size)
 	if (nr >= DRM_COMMAND_END) {
 		return -EINVAL;
 	}
-	if (nr == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT ? submit(nr, data, size) : call(nr, data, size)) {
+	if (driver_request(nr, data, size)) {
 		return -errno;
 	}
 	return 0;
@@ -907,6 +1007,7 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 		errno = EIO;
 		return -1;
 	}
+	set_handle_kind(request.handle, HANDLE_SURFACE);
 	*handle = request.handle;
 	return 0;
 }
