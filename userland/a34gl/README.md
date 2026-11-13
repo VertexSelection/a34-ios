@@ -263,7 +263,9 @@ IOSurface.framework (rows of a multiple of 64 bytes); describes them through `0x
 them with `EGL_IOSURFACE_A34`; (1) draws into surface A through a framebuffer (clear, scissored
 clear, triangle) and checks the pixels with `glReadPixels` and in the surface's memory as the CPU
 sees it; (2) samples surface B, filled by the CPU, into a texture of the GPU's own; (3) blits that
-into A and checks A's memory. `PASS` / exit 0; 1 wrong pixels; 2 no EGL/GLES; 3 the surface could
+into A and checks A's memory; (4) moves the context to a second thread and back (patch 0004:
+the second thread takes it over and draws, the first takes it back and checks, the second,
+stale now, lets go, and the first draws again). `PASS` / exit 0; 1 wrong pixels; 2 no EGL/GLES; 3 the surface could
 not be imported. `-v` turns on `REDWOOD_DRM_DEBUG` and `EGL_LOG_LEVEL=debug`.
 
 ## Open points
