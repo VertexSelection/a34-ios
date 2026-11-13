@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index f72b864..8fff864 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -297,6 +297,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+ 	void freeBo(struct a34_bo *b);
++	void flushBuffers(void);
+ 	void releaseAll(void);
+ 	void describeFault(uint64_t va);
+ 	IOReturn createBo(struct a34_create_bo *req);
+@@ -338,6 +339,25 @@ RedwoodMaliUserClient::start(IOService *provider)
+ }
+ 
+ /* With the lock held. */
++/*
++ * A34 (0911): buffers are cacheable for the CPU and the GPU is not coherent:
++ * clean+invalidate every buffer of this client (the tiler heap is the
++ * GPU's alone) around each job.
++ */
++void
++RedwoodMaliUserClient::flushBuffers(void)
++{
++	if (fBos == NULL) {
++		return;
++	}
++	for (uint32_t i = 0; i < A34_BOS; i++) {
++		struct a34_bo *b = &fBos[i];
++		if (b->mem != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
++			a34_mali_cpu_flush((uintptr_t)b->mem->getBytesNoCopy(), b->backed);
++		}
++	}
++}
++
+ struct a34_bo *
+ RedwoodMaliUserClient::lookup(uint32_t handle)
+ {
+@@ -443,13 +463,20 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		IOLog("A34 MALI UC: %s: all %u handles in use\n", fName, A34_BOS);
+ 		return kIOReturnNoResources;
+ 	}
++	/*
++	 * A34 (0911): cacheable, not write-combined. Making the buffer
++	 * write-combined (vm_object_change_wimg_mode) flushed a page whose
++	 * physical address is outside the kernel's RAM and panicked
++	 * (phystokv_range, 0x94a7c000). Instead every job is bracketed by a
++	 * clean+invalidate of the client's buffers (flushBuffers()).
++	 */
+ 	mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t)backed, PAGE_SIZE);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)backed, PAGE_SIZE);
+ 	if (mem == NULL) {
+ 		IOLog("A34 MALI UC: %s: no memory for a buffer of %llu KB\n", fName, (unsigned long long)(backed >> 10));
+ 		return kIOReturnNoMemory;
+ 	}
+-	/* Zeroed through a cached mapping before it became write-combined: nothing of that may stay in a cache. */
++	/* Zeroed through the cache: to memory before the GPU sees it. */
+ 	a34_mali_cpu_flush((uintptr_t)mem->getBytesNoCopy(), backed);
+ 	va = a34_mali_va_alloc(vasize, (req->flags & PANFROST_BO_NOEXEC) == 0);
+ 	if (va == 0) {
+@@ -504,7 +531,7 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, I
+ 	if (b != NULL && (b->flags & PANFROST_BO_HEAP) == 0) {
+ 		b->mem->retain();               /* given to the mapping */
+ 		*memory = b->mem;
+-		*options = 0;                   /* the buffer's own cache mode: write-combined */
++		*options = 0;                   /* the buffer's own cache mode: cacheable (0911) */
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
+@@ -616,7 +643,10 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		job.jc = r->submit.jc;
+ 		job.requirements = r->submit.requirements;
+ 		n = ++fSubmits;
+-		if (!a34_mali_submit(&job)) {
++		flushBuffers();                 /* the program's writes to memory for the GPU */
++		bool done = a34_mali_submit(&job);
++		flushBuffers();                 /* and no stale lines over what the GPU wrote */
++		if (!done) {
+ 			fFailed++;
+ 			IOLog("A34 MALI UC: %s: job chain %u at 0x%llx (%s) failed after %llu us: JOB_INT 0x%08x JS_STATUS 0x%08x MMU_INT 0x%08x\n",
+ 			    fName, n, (unsigned long long)job.jc, (job.requirements & PANFROST_JD_REQ_FS) ? "fragment" : "vertex/tiler/compute",
