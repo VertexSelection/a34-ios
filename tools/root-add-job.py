@@ -59,6 +59,25 @@ def main():
     os.chmod(path, st.st_mode & 0o7777)
     print('launchd job', label, '->', jobs[key]['ProgramArguments'])
 
+    # The per-device jetsam table gives every daemon a 6 MB limit
+    # (Version4/Daemon/Override/Global) that wins over the job's own
+    # JetsamProperties; exempt ours the way com.apple.datamigrator is.
+    for jp in ('com.apple.jetsamproperties.D22.plist', 'com.apple.jetsamproperties.D221.plist'):
+        jpath = os.path.join(root, 'System/Library/LaunchDaemons', jp)
+        if not os.path.exists(jpath):
+            continue
+        jst = os.stat(jpath)
+        with open(jpath, 'rb') as f:
+            jt = plistlib.load(f)
+        jt['Version4']['Daemon']['Override'][label] = {
+            'JetsamPriority': 180, 'ActiveSoftMemoryLimit': -1, 'InactiveHardMemoryLimit': -1,
+        }
+        with open(jpath, 'wb') as f:
+            plistlib.dump(jt, f, fmt=plistlib.FMT_BINARY)
+        os.chown(jpath, jst.st_uid, jst.st_gid)
+        os.chmod(jpath, jst.st_mode & 0o7777)
+        print('jetsam override for', label, 'in', jp)
+
 
 if __name__ == '__main__':
     main()

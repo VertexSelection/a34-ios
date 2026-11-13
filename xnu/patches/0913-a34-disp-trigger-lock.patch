@@ -1,0 +1,137 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7b5f391..bd1826c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -200,6 +200,9 @@ a34_dsi_wait_idle(uint64_t *ticks)
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" uint32_t a34_dsi_rd(uint32_t off);
++extern "C" int a34_dsi_lock(void);
++extern "C" void a34_dsi_unlock(void);
++extern "C" void a34_dsi_recover(void);
+ extern "C" uint32_t a34_mutex_rd(uint32_t off);
+ 
+ /*
+@@ -257,14 +260,32 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 	(void)owner;
+ 	(void)sender;
+ 
++	/* A34 (0913): wait-for-idle and start under the console's lock too. */
++	if (!a34_dsi_lock()) {
++		a34_kick_stats[5]++;
++		return;
++	}
+ 	if (!a34_dsi_wait_idle(&wait)) {
+ 		a34_kick_stats[5]++;
++		a34_disp_dump("busy for 1 s before a start");
++		a34_dsi_recover();
+ 	}
+ 	a34_dsi_trigger();
++	a34_dsi_unlock();
+ 	IODelay(50);
+ 	if (!a34_dsi_wait_idle(&xfer)) {
+ 		a34_kick_stats[5]++;
+ 		a34_disp_dump("transfer did not finish in 1 s");
++		if (a34_dsi_lock()) {
++			a34_dsi_recover();
++			a34_dsi_trigger();
++			a34_dsi_unlock();
++			IODelay(50);
++			uint64_t again;
++			bool ok = a34_dsi_wait_idle(&again);
++			IOLog("A34 DISP: after mutex/DSI reset and a new start: %s in %llu us (DSI_INTSTA 0x%08x)\n",
++			    ok ? "transfer done" : "still busy", again / 13, a34_dsi_rd(0x0c));
++		}
+ 	}
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index bd729ab..30642be 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -728,12 +728,51 @@ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+  */
+ static volatile uint32_t *fbcon_dsi, *fbcon_mutex;
+ 
++/*
++ * A34 (0913): one trigger at a time. The text console (every new line, from
++ * whichever CPU printed it) and the GUI's kick work loop both start frames;
++ * a start while another frame is still in flight wedged the display pipe for
++ * good (DSI busy forever from the first GUI frame on). Both paths now take
++ * this flag around "wait until idle, start"; the console only tries, and
++ * stops starting frames once the GUI has muted it.
++ */
++extern int sweet_console_muted;         /* osfmk/console/serial_console.c */
++static volatile uint32_t a34_disp_lockword;
++
++static int
++a34_disp_trylock(void)
++{
++	return __sync_bool_compare_and_swap(&a34_disp_lockword, 0u, 1u);
++}
++
++int a34_dsi_lock(void);
++int
++a34_dsi_lock(void)
++{
++	for (unsigned int i = 0; i < 50000000u; i++) {
++		if (a34_disp_trylock()) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void a34_dsi_unlock(void);
++void
++a34_dsi_unlock(void)
++{
++	__sync_lock_release(&a34_disp_lockword);
++}
++
+ static void
+ fbcon_kick(void)
+ {
+ 	if (fbcon_dsi == NULL || (fbcon_dsi[0x14 / 4] & 3)) {
+ 		return;
+ 	}
++	if (sweet_console_muted || !a34_disp_trylock()) {
++		return;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	/* A34 (0905): was 2,000,000 reads (~200 ms when the busy bit stays up,
+ 	 * which stalled every GUI frame); a frame transfer takes < 20 ms. */
+@@ -749,6 +788,33 @@ fbcon_kick(void)
+ 	fbcon_dsi[0] = 0;
+ 	fbcon_dsi[0] = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	a34_dsi_unlock();
++}
++
++/*
++ * A34 (0913): get a wedged pipe going again: reset every display mutex
++ * that has modules (MUTEX_RST, 0x28 + 0x20 n) and the DSI engine
++ * (DSI_CON_CTRL bit 0, as Linux's mtk_dsi_reset_engine); the caller holds
++ * the lock and starts a frame afterwards.
++ */
++void a34_dsi_recover(void);
++void
++a34_dsi_recover(void)
++{
++	if (fbcon_dsi == NULL || fbcon_mutex == NULL) {
++		return;
++	}
++	for (unsigned int n = 0; n < 16; n++) {
++		if (fbcon_mutex[(0x30 + 0x20 * n) / 4]) {
++			fbcon_mutex[(0x28 + 0x20 * n) / 4] = 1;
++			__asm__ volatile("dsb sy" ::: "memory");
++			fbcon_mutex[(0x28 + 0x20 * n) / 4] = 0;
++		}
++	}
++	fbcon_dsi[0x10 / 4] |= 1u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fbcon_dsi[0x10 / 4] &= ~1u;
++	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ /*
