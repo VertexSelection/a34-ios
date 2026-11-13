@@ -1,0 +1,21 @@
+# Never commit: Samsung firmware, device dumps and logs (serial numbers and
+# IMEI-adjacent data live in recon/), third-party binaries and references.
+/firmware/
+/recon/
+/build/
+/ref/
+/tools/platform-tools/
+/tools/samloader/
+/tools/heimdall/
+/tools/twrp/
+/tools/gh/
+/tools/magisk/
+/tools/src/
+
+# Build products
+*.o
+*.elf
+*.bin
+*.img
+*.pyc
+__pycache__/
