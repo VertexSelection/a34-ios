@@ -70,6 +70,7 @@
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -161,7 +162,8 @@ static long eagl_missing(void *context, unsigned offset);
 #include "eagl_gen.h"
 #undef EAGL_GEN_DECLARATIONS
 
-#define say a34gl_say
+#define say a34gl_say                    /* rate-limited per message (log.c) */
+#define say_always a34gl_say_always      /* what a switch asked for, and the periodic summaries */
 
 static void
 eagl_trace(const char *format, ...)
@@ -238,6 +240,7 @@ struct eagl {
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct a34gl *gl;
+	pthread_t owner;                /* the thread that made it current last (eagl_enter()) */
 	unsigned long api;
 	struct image images[256];
 	unsigned image_count;
@@ -373,10 +376,12 @@ static void census_report(void);
 static void clear_now(struct eagl *e);
 
 /*
- * EGL lets a context be current on one thread at a time (OSMesa, behind topaz's, did not care).
- * A context that cannot be made this thread's is asked for again at the next call; the calls in
- * between go nowhere. Once that has happened (a34gl_contended()), or with boot-arg glrelease=1,
- * a thread lets the context go at the end of every frame (eagl_let_go()).
+ * EGL lets a context be current on one thread at a time (OSMesa, behind topaz's, did not care);
+ * our Mesa (patch 0004) instead gives a context to the last thread that makes it current, as
+ * EAGL does. Should that fail anyway, a context that cannot be made this thread's is asked for
+ * again at the next call; the calls in between go nowhere. Once that has happened
+ * (a34gl_contended()), or with boot-arg glrelease=1, a thread lets the context go at the end
+ * of every frame (eagl_let_go()).
  */
 static int release_frames;
 static unsigned lost_calls;
@@ -384,9 +389,18 @@ static unsigned lost_calls;
 static void
 eagl_enter(struct eagl *e, unsigned offset)
 {
-	if (current != e) {
+	pthread_t self = pthread_self();
+
+	/*
+	 * CoreAnimation uses a context from several threads in turn (EAGL lets it). The thread
+	 * that last made it current has it: another thread's first call makes it its own again
+	 * (Mesa patch 0004 takes an EGL context over from the thread it is current on), even
+	 * when this thread's own note says it is current here already.
+	 */
+	if (current != e || !pthread_equal(__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE), self)) {
 		if (a34gl_make_current(e->gl)) {
 			current = e;
+			__atomic_store_n(&e->owner, self, __ATOMIC_RELEASE);
 		} else if (lost_calls++ < 16) {
 			say("a34gl: the context cannot be made this thread's: entry %#x goes nowhere\n", offset);
 		}
@@ -421,7 +435,7 @@ eagl_leave(struct eagl *e, unsigned offset)
 
 		/* "tl: slow NAME US at US, frame N": a call that took long, and when it ended (tools/frames.py) */
 		if (now - call_began_us >= slow_calls_us) {
-			say("tl: slow %s %llu at %llu, frame %u%s\n", eagl_slot_name(offset), now - call_began_us, now, e->frames + 1,
+			say_always("tl: slow %s %llu at %llu, frame %u%s\n", eagl_slot_name(offset), now - call_began_us, now, e->frames + 1,
 			    e->in_frame ? "" : " (before its first draw)");
 		}
 	}
@@ -513,7 +527,7 @@ summary(struct eagl *e)
 {
 	unsigned frames = e->frames ? e->frames : 1;
 
-	say("a34gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
+	say_always("a34gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
 	    "%u calls, %u triangles; %llu us a frame, of which %llu handing the commands on, %llu waiting for the picture "
 	    "to be drawn and %llu copying it out, and before each %llu making textures of IOSurfaces; %u IOSurfaces were "
 	    "the textures' memory, %u had to be copied; %u shaders, %u programs; biggest texture %u x %u; %u errors\n",
@@ -532,19 +546,19 @@ summary(struct eagl *e)
 				}
 			}
 		}
-		say("a34gl: profile: %llu us a frame in GL calls, %llu outside them; frames ended on big cores %llu, little %llu; "
+		say_always("a34gl: profile: %llu us a frame in GL calls, %llu outside them; frames ended on big cores %llu, little %llu; "
 		    "most time: %s %llu, %s %llu, %s %llu, %s %llu, %s %llu us\n", e->gl_us / frames, (e->frame_us - e->gl_us) / frames,
 		    e->frames_on_p, e->frames_on_e, eagl_slot_name(top[0] * 8), slot_us[top[0]], eagl_slot_name(top[1] * 8),
 		    slot_us[top[1]], eagl_slot_name(top[2] * 8), slot_us[top[2]], eagl_slot_name(top[3] * 8), slot_us[top[3]],
 		    eagl_slot_name(top[4] * 8), slot_us[top[4]]);
 	}
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
-		say("a34gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
+		say_always("a34gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
 		    formats[i].format, formats[i].type, formats[i].count, formats[i].widest, formats[i].tallest);
 	}
 	for (unsigned offset = 8; offset < SLOTS * 8; offset += 8) {
 		if (slot_calls[offset / 8]) {
-			say("a34gl:   %-28s %u\n", eagl_slot_name(offset), slot_calls[offset / 8]);
+			say_always("a34gl:   %-28s %u\n", eagl_slot_name(offset), slot_calls[offset / 8]);
 		}
 	}
 }
@@ -805,7 +819,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 		for (size_t at = 0; at < size; at++) {
 			set[at & 3] += base[at] != 0;
 		}
-		say("gl-at: frame %u: texture %u filled from surface %u (pixel format %#x, %d x %d, %zu bytes a row, %zu a pixel by the "
+		say_always("gl-at: frame %u: texture %u filled from surface %u (pixel format %#x, %d x %d, %zu bytes a row, %zu a pixel by the "
 		    "surface, %u by the texture: internal format %#x, format %#x, type %#x): of %zu bytes as they go to the texture, "
 		    "not zero: %zu %zu %zu %zu (first, second, third, fourth of every four)\n", e->frames + 1, image->texture,
 		    IOSurfaceGetID(surface),
@@ -821,7 +835,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 
 				used += (size_t)snprintf(entries + used, sizeof(entries) - used, " %u/%u", base[at], base[at + 1]);
 			}
-			say("gl-at:     a table; sixteen of its entries, first to last:%s\n", entries);
+			say_always("gl-at:     a table; sixteen of its entries, first to last:%s\n", entries);
 		}
 	}
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
@@ -1046,7 +1060,7 @@ frame_end(struct eagl *e, bool finished)
 	e->frames++;
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
-		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
+		say_always("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
 	}
 	if (frame_lines) {
 		/*
@@ -1056,7 +1070,7 @@ frame_end(struct eagl *e, bool finished)
 		 * scissor box -- CoreAnimation draws only what has changed, inside that box, and leaves the
 		 * rest of the surface as it was --; and the draws of the blur whose radius varies.
 		 */
-		say("a34gl: f %u at %llu.%03llu s: %u draws, %u clears; display surface %u, %u draws into it, box %s %d,%d %dx%d; "
+		say_always("a34gl: f %u at %llu.%03llu s: %u draws, %u clears; display surface %u, %u draws into it, box %s %d,%d %dx%d; "
 		    "vrd %u vrb %u; %u in place, %u copied; spans %u solid %u blended, ends %u %u; other %u %u\n", e->frames,
 		    after / 1000000, after / 1000 % 1000, e->draws, e->clears, e->line.surface, e->line.into_display, e->line.boxed ? "on" : "off", e->line.box[0], e->line.box[1],
 		    e->line.box[2], e->line.box[3], e->line.vrd, e->line.vrb, in_place, copied, e->line.solid_spans, e->line.blended_spans,
@@ -1097,14 +1111,14 @@ frame_end(struct eagl *e, bool finished)
 	if (e->triangles > e->most_triangles) {
 		e->most_triangles = e->triangles;
 	}
-	if (e->frames <= 40 || e->frames % 20 == 0) {
-		say("a34gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
+	if (e->frames <= 40 || e->frames % 600 == 0) {        /* (topaz: every 20th) */
+		say_always("a34gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
 		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
 		    after - waited, e->attaching);
 	}
-	if (e->frames == 30 || e->frames % 200 == 0) {
+	if (e->frames == 30 || e->frames % 3600 == 0) {      /* (topaz: every 200th) */
 		summary(e);
 	}
 	census_report();
@@ -1400,7 +1414,7 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 	glGetIntegerv(GL_BLEND_SRC_RGB, &blend[0]);
 	glGetIntegerv(GL_BLEND_DST_RGB, &blend[1]);
 	glGetIntegerv(GL_SCISSOR_BOX, scissor);
-	say("gl-at: frame %u draw %u into %u (texture %u): %s of %d from %g,%g to %g,%g; program %u; textures%s; colour %g %g %g "
+	say_always("gl-at: frame %u draw %u into %u (texture %u): %s of %d from %g,%g to %g,%g; program %u; textures%s; colour %g %g %g "
 	    "%g; in the texture at %g,%g; blend %s %#x %#x; scissor %s %d,%d %dx%d\n", e->frames + 1, e->draws, e->framebuffer,
 	    e->colour, mode == GL_TRIANGLES ? "triangles" : mode == 1 ? "lines" : "strips", count, (double)low[0], (double)low[1],
 	    (double)high[0], (double)high[1], e->program, textures, (double)colour[0], (double)colour[1], (double)colour[2],
@@ -1429,7 +1443,7 @@ trace_placed_look(struct eagl *e)
 	px = view[0] + (int)((x / w + 1) / 2 * (float)view[2]);
 	py = view[1] + (int)((y / w + 1) / 2 * (float)view[3]);
 	glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
-	say("gl-at:     it left %u %u %u %u (red green blue alpha) at %d,%d of the framebuffer%s\n", pixel[0], pixel[1], pixel[2],
+	say_always("gl-at:     it left %u %u %u %u (red green blue alpha) at %d,%d of the framebuffer%s\n", pixel[0], pixel[1], pixel[2],
 	    pixel[3], px, py, glGetError() ? " (not readable)" : "");
 }
 
@@ -2125,7 +2139,7 @@ frame_functions(struct eagl *e)
 	}
 	group_covered = group_laid = group_flattened = 0;
 	if (used != 0 && strcmp(text, said) != 0) {
-		say("a34gl: f %u functions:%s\n", e->frames, text);
+		say_always("a34gl: f %u functions:%s\n", e->frames, text);
 	}
 	memcpy(said, text, used + 1);
 	bzero(frame_refused, sizeof(frame_refused));
@@ -2171,8 +2185,8 @@ census_report(void)
 		c->refused_lately = 0;
 	}
 	if (lately[0] != 0) {
-		say("a34gl: census: in the last ten seconds:%s\n", lately);
-		say("a34gl: census: since the start:%s\n", all);
+		say_always("a34gl: census: in the last ten seconds:%s\n", lately);
+		say_always("a34gl: census: since the start:%s\n", all);
 	}
 }
 
@@ -3080,7 +3094,7 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
-		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
+		say_always("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
 		    pixels ? "" : " (empty)", now_us() - began, began);
 	}
 	EAGL_LEAVE(e, 0x970);
@@ -3379,7 +3393,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 static void
 say_long(const char *what, const char *text)
 {
-	say("a34gl: %s:\n", what);
+	say_always("a34gl: %s:\n", what);
 	for (size_t at = 0, length = strlen(text); at < length; at += 900) {
 		write(a34gl_log_fd(), text + at, length - at < 900 ? length - at : 900);
 	}
@@ -3404,7 +3418,7 @@ my_glCompileShader(void *context, GLuint shader)
 			say_long("its text", e->sources[shader % 64]);
 		}
 	} else if ((e->shaders <= 2 || all_shaders) && e->sources[shader % 64] != NULL) {
-		say("a34gl: shader %u:\n", shader);
+		say_always("a34gl: shader %u:\n", shader);
 		say_long(all_shaders ? "a shader" : "the first shaders, for the record", e->sources[shader % 64]);
 	}
 	EAGL_LEAVE(e, 0x12a8);

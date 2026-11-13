@@ -34,8 +34,11 @@ maintenance of surface memory?); 2 no EGL/GLES at all.
 
 ## 2. backboardd
 
+Either the kernel (patch 0914) inserts the loader -- boot-arg
+`a34inject=/a34/liba34gl-inject.dylib,backboardd`, nothing else to do; environment for
+backboardd then goes into `/a34/backboardd.env` -- or the launchd job runs a wrapper:
+
     python3 -I tools/root-add-job.py --wrap /mnt com.apple.backboardd /a34/a34gl-bbd
-    python3 -I tools/root-add-job.py --env  /mnt com.apple.backboardd A34GL_LOG=/var/mobile/a34gl.log
 
 The first makes backboardd's job (`System/Library/xpc/launchd.plist`) run `/a34/a34gl-bbd`, with
 the real program in `A34GL_REAL`; the wrapper adds `/a34/liba34gl-inject.dylib` to
@@ -51,5 +54,7 @@ Off again: boot-arg `a34gl=0`, or `A34GL_OFF=1` in `/a34/backboardd.env`, or
 
     python3 -I tools/root-add-job.py --unwrap /mnt com.apple.backboardd
 
-The log (`A34GL_LOG`) says what was loaded, which IOSurfaces became texture memory, and a line
-for the first 40 frames and every 20th after.
+The log (stderr: the kernel copies backboardd's into its own log as `|backboardd| ...`; or the
+file `A34GL_LOG` names) says what was loaded, which IOSurfaces became texture memory, and a
+line for the first 40 frames and every 600th after. Each message is rate-limited (32 times,
+then once in 10 s).

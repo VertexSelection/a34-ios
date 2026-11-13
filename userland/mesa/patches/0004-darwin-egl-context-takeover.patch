@@ -1,0 +1,300 @@
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -81,6 +81,7 @@
+ #include "util/u_atomic.h"
+ #include "util/u_call_once.h"
+ #include "util/u_math.h"
++#include "util/simple_mtx.h"
+ #include "util/u_vector.h"
+ #include "egl_dri2.h"
+ #include "egldefines.h"
+@@ -1431,11 +1432,11 @@
+ }
+ 
+ /**
+- * Called via eglMakeCurrent(), drv->MakeCurrent().
++ * Called via eglMakeCurrent(), drv->MakeCurrent(): dri2_make_current() below.
+  */
+ static EGLBoolean
+-dri2_make_current(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
+-                  _EGLContext *ctx)
++dri2_make_current_locked(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
++                         _EGLContext *ctx)
+ {
+    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+    struct dri2_egl_context *dri2_ctx = dri2_egl_context(ctx);
+@@ -1447,6 +1448,21 @@
+    struct dri_drawable *ddraw, *rdraw;
+    struct dri_context *cctx;
+    EGLint egl_error = EGL_SUCCESS;
++#if DETECT_OS_APPLE
++   /*
++    * a34-ios: a context current to another thread is taken over (EAGL's semantics; see
++    * _eglBindContext in eglcontext.c), and a thread whose context was taken over finds that
++    * out here. Asked before _eglBindContext changes the bindings:
++    *   old_stale  this thread's previous context is another thread's now
++    *   taking     the context asked for is bound to another thread (or claims this one
++    *              without this thread having bound it)
++    */
++   _EGLThreadInfo *t = _eglGetCurrentThread();
++   const bool old_stale = t->CurrentContext && t->CurrentContext->Binding != t;
++   const bool taking = ctx && ctx->Binding && (ctx->Binding != t || t->CurrentContext != ctx);
++#else
++   const bool old_stale = false, taking = false;
++#endif
+ 
+    if (!dri2_dpy)
+       return _eglError(EGL_NOT_INITIALIZED, "eglMakeCurrent");
+@@ -1455,14 +1471,27 @@
+    if (!_eglBindContext(ctx, dsurf, rsurf, &old_ctx, &old_dsurf, &old_rsurf))
+       return EGL_FALSE;
+ 
+-   if (old_ctx == ctx && old_dsurf == dsurf && old_rsurf == rsurf) {
++   if (!old_stale && !taking && old_ctx == ctx && old_dsurf == dsurf && old_rsurf == rsurf) {
+       _eglPutSurface(old_dsurf);
+       _eglPutSurface(old_rsurf);
+       _eglPutContext(old_ctx);
+       return EGL_TRUE;
+    }
+ 
+-   if (old_ctx) {
++   if (old_stale) {
++      /*
++       * The context this thread had is another thread's now: none of its state is undone
++       * here (no flush, no unbind: that is the other thread's context and drawables). Only
++       * this thread's GL thread-locals, which still name it, are cleared -- without that,
++       * the next st_api_make_current() on this thread would flush the context and let go of
++       * its window-system framebuffers (_mesa_make_current with it as the current one) while
++       * the other thread draws with it. The references this binding held are given back
++       * below, as for any previous binding.
++       */
++      old_disp = old_ctx->Resource.Display;
++      _mesa_glapi_set_dispatch(NULL);
++      _mesa_glapi_set_context(NULL);
++   } else if (old_ctx) {
+       struct dri_context *old_cctx = dri2_egl_context(old_ctx)->dri_context;
+       old_disp = old_ctx->Resource.Display;
+       old_dri2_dpy = dri2_egl_display(old_disp);
+@@ -1483,8 +1512,42 @@
+    rdraw = (rsurf) ? dri2_surface_get_dri_drawable(rsurf) : NULL;
+    cctx = (dri2_ctx) ? dri2_ctx->dri_context : NULL;
+ 
++   if (taking) {
++      /*
++       * The context still holds the drawables the other thread bound it to (dri_context's
++       * draw/read, references taken by dri_make_current): let go of them, as that thread's
++       * unbind would have. dri_unbind_context() leaves the GL state alone here, since the
++       * context is not this thread's current one (st_api_get_current() is this thread's,
++       * and was cleared or unbound above): the pipe context, its queued work and its state
++       * go with the GL context to this thread, unflushed -- one context, used by one thread
++       * at a time, needs no flush to change threads. The other thread's thread-locals still
++       * name the context until that thread calls eglMakeCurrent again (old_stale above).
++       */
++      driUnbindContext(cctx);
++   }
++
+    if (cctx) {
+-      if (!driBindContext(cctx, ddraw, rdraw)) {
++      const bool bound = driBindContext(cctx, ddraw, rdraw);
++
++      if (!bound && (old_stale || taking)) {
++         /*
++          * (a34-ios) Nothing to go back to: this thread's previous context is another
++          * thread's, or the one asked for has been taken from another thread. This thread is
++          * left with no context; the references of the failed binding are given back here,
++          * those of the previous one below.
++          */
++         _EGLContext *tmp_ctx;
++
++         egl_error = EGL_BAD_MATCH;
++         _eglBindContext(NULL, NULL, NULL, &tmp_ctx, &tmp_dsurf, &tmp_rsurf);
++         assert(tmp_ctx == ctx && tmp_dsurf == dsurf && tmp_rsurf == rsurf);
++         _eglPutSurface(dsurf);
++         _eglPutSurface(rsurf);
++         _eglPutContext(ctx);
++         _mesa_glapi_set_dispatch(NULL);
++         _mesa_glapi_set_context(NULL);
++         _eglLog(_EGL_WARNING, "DRI2: a context taken over could not be bound");
++      } else if (!bound) {
+          _EGLContext *tmp_ctx;
+ 
+          /* driBindContext failed. We cannot tell for sure why, but
+@@ -1573,6 +1636,32 @@
+    return EGL_TRUE;
+ }
+ 
++/*
++ * eglMakeCurrent() calls the driver without the display's lock (egl_relax), which is right
++ * when a context is only ever bound and unbound by the thread that has it. (a34-ios) With
++ * contexts taken over from other threads, a binding is looked at and changed by two threads:
++ * every make-current of the process is one at a time.
++ */
++#if DETECT_OS_APPLE
++static simple_mtx_t dri2_make_current_mutex = SIMPLE_MTX_INITIALIZER;
++#endif
++
++static EGLBoolean
++dri2_make_current(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
++                  _EGLContext *ctx)
++{
++   EGLBoolean ret;
++
++#if DETECT_OS_APPLE
++   simple_mtx_lock(&dri2_make_current_mutex);
++#endif
++   ret = dri2_make_current_locked(disp, dsurf, rsurf, ctx);
++#if DETECT_OS_APPLE
++   simple_mtx_unlock(&dri2_make_current_mutex);
++#endif
++   return ret;
++}
++
+ struct dri_drawable *
+ dri2_surface_get_dri_drawable(_EGLSurface *surf)
+ {
+--- a/src/egl/main/eglcontext.c
++++ b/src/egl/main/eglcontext.c
+@@ -873,8 +873,11 @@
+     * "at most one context may be bound to a particular surface at a given
+     * time"
+     */
++#if !DETECT_OS_APPLE
+    if (ctx->Binding && ctx->Binding != t)
+       return _eglError(EGL_BAD_ACCESS, "eglMakeCurrent");
++#endif
++   /* (a34-ios, Darwin: a context current to another thread is taken over, _eglBindContext) */
+    if (draw && draw->CurrentContext && draw->CurrentContext != ctx) {
+       if (draw->CurrentContext->Binding != t)
+          return _eglError(EGL_BAD_ACCESS, "eglMakeCurrent");
+@@ -908,6 +911,91 @@
+  * unsurprisingly undoes the first call, except for the resource reference
+  * counts.
+  */
++#if DETECT_OS_APPLE
++/*
++ * a34-ios (Darwin): EAGL's semantics, which iOS's CoreAnimation relies on and OSMesa never
++ * enforced against: a context may move from thread to thread, and the last thread to make it
++ * current has it (using it on two threads at the same time is the application's error). EGL
++ * says EGL_BAD_ACCESS instead; here a context current to another thread is taken over:
++ *
++ *  - the context's binding moves to this thread (ctx->Binding), and the surfaces the other
++ *    thread had bound it to let go of it;
++ *  - the other thread's binding goes stale: its CurrentContext still names the context and
++ *    its references (the context's, its surfaces', the display's) are still held, because
++ *    nothing of that thread's -- its thread-local state, which may be gone with the thread --
++ *    is touched from here. A thread finds out at its next eglMakeCurrent/eglReleaseThread:
++ *    its previous context's Binding is not itself (it is "stale"), and then nothing of that
++ *    context and its surfaces is undone, only the references are given back (by the caller,
++ *    as for any previous binding). _eglGetCurrentContext() is NULL on such a thread.
++ *
++ * A context whose Binding is this thread although this thread has not bound it (a thread
++ * that ended while it had the context, and whose thread-local storage is now this thread's)
++ * is taken over in the same way.
++ */
++EGLBoolean
++_eglBindContext(_EGLContext *ctx, _EGLSurface *draw, _EGLSurface *read,
++                _EGLContext **old_ctx, _EGLSurface **old_draw,
++                _EGLSurface **old_read)
++{
++   _EGLThreadInfo *t = _eglGetCurrentThread();
++   _EGLContext *prev_ctx = t->CurrentContext;
++   _EGLSurface *prev_draw = prev_ctx ? t->CurrentDraw : NULL;
++   _EGLSurface *prev_read = prev_ctx ? t->CurrentRead : NULL;
++   bool prev_stale = prev_ctx && prev_ctx->Binding != t;
++
++   if (!_eglCheckMakeCurrent(ctx, draw, read))
++      return EGL_FALSE;
++
++   /* increment refcounts before binding */
++   _eglGetContext(ctx);
++   _eglGetSurface(draw);
++   _eglGetSurface(read);
++
++   /* take the context over from the thread that has it */
++   if (ctx && ctx->Binding && (ctx->Binding != t || prev_ctx != ctx)) {
++      if (ctx->DrawSurface && ctx->DrawSurface->CurrentContext == ctx)
++         ctx->DrawSurface->CurrentContext = NULL;
++      if (ctx->ReadSurface && ctx->ReadSurface->CurrentContext == ctx)
++         ctx->ReadSurface->CurrentContext = NULL;
++      ctx->DrawSurface = NULL;
++      ctx->ReadSurface = NULL;
++      ctx->Binding = NULL;
++   }
++
++   /* break this thread's previous bindings, unless another thread has its context now */
++   if (prev_ctx && !prev_stale) {
++      if (prev_draw && prev_draw->CurrentContext == prev_ctx)
++         prev_draw->CurrentContext = NULL;
++      if (prev_read && prev_read->CurrentContext == prev_ctx)
++         prev_read->CurrentContext = NULL;
++      prev_ctx->DrawSurface = NULL;
++      prev_ctx->ReadSurface = NULL;
++      prev_ctx->Binding = NULL;
++   }
++
++   /* establish new bindings */
++   t->CurrentContext = ctx;
++   t->CurrentDraw = ctx ? draw : NULL;
++   t->CurrentRead = ctx ? read : NULL;
++   if (ctx) {
++      if (draw)
++         draw->CurrentContext = ctx;
++      if (read)
++         read->CurrentContext = ctx;
++
++      ctx->DrawSurface = draw;
++      ctx->ReadSurface = read;
++      ctx->Binding = t;
++   }
++
++   assert(old_ctx && old_draw && old_read);
++   *old_ctx = prev_ctx;
++   *old_draw = prev_draw;
++   *old_read = prev_read;
++
++   return EGL_TRUE;
++}
++#else
+ EGLBoolean
+ _eglBindContext(_EGLContext *ctx, _EGLSurface *draw, _EGLSurface *read,
+                 _EGLContext **old_ctx, _EGLSurface **old_draw,
+@@ -962,3 +1050,4 @@
+ 
+    return EGL_TRUE;
+ }
++#endif
+--- a/src/egl/main/eglcurrent.c
++++ b/src/egl/main/eglcurrent.c
+@@ -34,6 +34,7 @@
+ #include "util/u_string.h"
+ #include "util/u_thread.h"
+ 
++#include "eglcontext.h"
+ #include "eglcurrent.h"
+ #include "eglglobals.h"
+ #include "egllog.h"
+@@ -84,6 +85,11 @@
+ _eglGetCurrentContext(void)
+ {
+    _EGLThreadInfo *t = _eglGetCurrentThread();
++#if DETECT_OS_APPLE
++   /* (a34-ios) taken over by another thread since: none is current here (eglcontext.c) */
++   if (t->CurrentContext && t->CurrentContext->Binding != t)
++      return NULL;
++#endif
+    return t->CurrentContext;
+ }
+ 
+--- a/src/egl/main/eglcurrent.h
++++ b/src/egl/main/eglcurrent.h
+@@ -49,6 +49,10 @@
+    bool inited;
+    EGLint LastError;
+    _EGLContext *CurrentContext;
++   /* The surfaces this thread made current with CurrentContext. (a34-ios, Darwin: a context
++    * another thread has taken over says only what that thread bound; see eglcontext.c.)
++    */
++   _EGLSurface *CurrentDraw, *CurrentRead;
+    EGLenum CurrentAPI;
+    EGLLabelKHR Label;
+ 

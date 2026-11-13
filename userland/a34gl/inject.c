@@ -1,6 +1,6 @@
 /*
- * liba34gl-inject.dylib: inserted into backboardd (DYLD_INSERT_LIBRARIES, set by a34gl-bbd,
- * bbd.c). When the kernel has published the GPU's service (RedwoodMali), it loads the OpenGL
+ * liba34gl-inject.dylib: inserted into backboardd (DYLD_INSERT_LIBRARIES: the kernel's boot-arg
+ * a34inject=/a34/liba34gl-inject.dylib,backboardd, or a34gl-bbd, bbd.c). When the kernel has published the GPU's service (RedwoodMali), it loads the OpenGL
  * ES library that stands behind EAGLContext (liba34gl.dylib, eagl.c + gl_egl.c), so that
  * CoreAnimation's window server draws with the Mali-G68 instead of its software renderer.
  * Boot-arg a34gl=0, or A34GL_OFF=1 in the environment: never.
@@ -35,6 +35,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #endif
 #define A34GL_LIBRARY   A34GL_DIR "/liba34gl.dylib"
 #define GPU_SERVICE     "RedwoodMali"
+#define ENVFILE         A34GL_DIR "/backboardd.env"
 
 /*
  * CoreAnimation's OpenGL ES renderer hands a "function"'s numbers (a colour matrix, ...) to
@@ -143,10 +144,10 @@ where(const char *what, void *addr)
 	Dl_info info;
 
 	if (dladdr(addr, &info) && info.dli_fname != NULL) {
-		say("a34gl-crash: %s %p = %s+0x%lx (%s)\n", what, addr, info.dli_fname,
+		a34gl_say_always("a34gl-crash: %s %p = %s+0x%lx (%s)\n", what, addr, info.dli_fname,
 		    (unsigned long)((char *)addr - (char *)info.dli_fbase), info.dli_sname ? info.dli_sname : "?");
 	} else {
-		say("a34gl-crash: %s %p (no image)\n", what, addr);
+		a34gl_say_always("a34gl-crash: %s %p (no image)\n", what, addr);
 	}
 }
 
@@ -157,7 +158,7 @@ crashed(int sig, siginfo_t *si, void *uc_)
 	void *frames[16];
 	int n;
 
-	say("a34gl-crash: backboardd[%d]: signal %d at address %p\n", getpid(), sig, si ? si->si_addr : NULL);
+	a34gl_say_always("a34gl-crash: backboardd[%d]: signal %d at address %p\n", getpid(), sig, si ? si->si_addr : NULL);
 	if (uc != NULL && uc->uc_mcontext != NULL) {
 		where("pc", (void *)uc->uc_mcontext->__ss.__pc);
 		where("lr", (void *)uc->uc_mcontext->__ss.__lr);
@@ -184,6 +185,35 @@ crash_handlers(void)
 	}
 }
 
+/*
+ * /a34/backboardd.env (KEY=VALUE lines, # comments), as a34gl-bbd reads it: when the kernel
+ * inserts this library (boot-arg a34inject=...) there is no wrapper, and this is the way to
+ * give backboardd A34GL=..., A34GL_LOG=..., PAN_MESA_DEBUG=... . What the environment has
+ * already (the job's, the wrapper's) stays.
+ */
+static void
+environment_file(void)
+{
+	FILE *f = fopen(ENVFILE, "r");
+	char line[512];
+
+	if (f == NULL) {
+		return;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *eq = strchr(line, '='), *nl = strchr(line, '\n');
+
+		if (nl != NULL) {
+			*nl = 0;
+		}
+		if (eq != NULL && line[0] != '#' && eq != line) {
+			*eq = 0;
+			setenv(line, eq + 1, 0);
+		}
+	}
+	fclose(f);
+}
+
 __attribute__((constructor))
 static void
 a34gl_inject(void)
@@ -199,8 +229,11 @@ a34gl_inject(void)
 	if (name == NULL || strcmp(name, "backboardd") != 0) {
 		return;
 	}
-	if ((off != NULL && strcmp(off, "1") == 0) ||
-	    (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "a34gl=0") != NULL)) {
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "a34gl=0") == NULL) {
+		environment_file();
+		off = getenv("A34GL_OFF");
+	}
+	if ((off != NULL && strcmp(off, "1") == 0) || strstr(args, "a34gl=0") != NULL) {
 		say("a34gl-inject: backboardd[%d]: switched off: CoreAnimation keeps its software renderer\n", getpid());
 		return;
 	}

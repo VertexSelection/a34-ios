@@ -34,16 +34,64 @@ profile patch; OSMesa was removed from Mesa in 25.1):
 - **context**: OpenGL ES 3 for whatever API CoreAnimation asks (it asks for 3; eagl.c's own
   programs are GLSL ES 3.00), current with a 16x16 pbuffer. CoreAnimation draws only into its
   own framebuffers, whose colour textures are IOSurfaces.
-- **threads**: EGL lets a context be current on one thread at a time (OSMesa did not care). A
-  context is let go after `-initWithAPI:` (the creating thread need not be the drawing one);
-  if a thread ever finds it held by another, every frame end lets it go from then on
-  (`glrelease=1` forces that from the start).
+- **threads**: CoreAnimation uses one context from several threads in turn, as EAGL allows; EGL
+  does not (see "Threads" below: Mesa patch 0004). eagl.c remembers which thread made a
+  context current last and makes it current again on any other thread's first call.
 - **IOSurfaces**: `eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_IOSURFACE_A34,
   (EGLClientBuffer)(uintptr_t)IOSurfaceGetID(s), NULL)`, then `glEGLImageTargetTexture2DOES` on
   the texture CoreAnimation bound, then the image is destroyed (the texture keeps the memory).
   Where that fails (a format, layout or kernel that does not allow it) eagl.c falls back to
   topaz's copies: the texture is filled from the surface when its seed or contents change and
   read back into it at the frame's end.
+
+### Threads (Mesa patch 0004)
+
+EAGL lets a context move between threads: whichever thread last called `+setCurrentContext:`
+has it (using it on two threads at the same time is the application's error), and
+CoreAnimation's render server does move its context. OSMesa, behind topaz's library, kept no
+note of threads at all. Mesa's EGL does: `eglMakeCurrent` of a context current to another
+thread fails with `EGL_BAD_ACCESS` (`_eglCheckMakeCurrent`), and on the phone that error came at
+nearly every GL call (the screen stayed black). Patch 0004 gives EGL contexts EAGL's semantics
+on Darwin -- the context is **taken over** -- and has to do it from the taking thread only:
+
+- **EGL** (`eglcontext.c` `_eglBindContext`): the context's `Binding` moves to this thread and
+  the surfaces the other thread bound it to let go of it. Nothing of the other thread is
+  touched: its `_EGLThreadInfo` is thread-local storage that may already be gone with the
+  thread. Its binding goes *stale*: `CurrentContext` still names the context, and the
+  references that binding took (context, surfaces, `dri2_dpy->ref_count`) are still held, so
+  the context cannot be freed under it. Each thread now keeps the surfaces it bound
+  (`CurrentDraw/CurrentRead`), because the context no longer says. `_eglGetCurrentContext()`
+  answers NULL on a thread whose context was taken.
+- **DRI/gallium, taking thread** (`dri2_make_current`): `driUnbindContext()` of the taken
+  context lets go of the drawables the other thread bound it to (`dri_context->draw/read`
+  references). `dri_unbind_context()` touches the GL state only when the context is the
+  *calling* thread's current one (`st_api_get_current()` is thread-local), which it is not
+  here -- so the pipe context, its unflushed work and all GL state go with the context. One
+  context used by one thread at a time needs no flush to change threads. Then
+  `driBindContext()` binds it here as usual (`st_api_make_current` -> `_mesa_make_current`,
+  whose current context on this thread is none at that point, so nothing is flushed or let go).
+- **DRI/gallium, the thread it was taken from**, at its next `eglMakeCurrent`/`eglReleaseThread`:
+  its previous context is found stale. Then nothing of that context is undone (no
+  `driUnbindContext`, no flush: it is another thread's now). Only this thread's GL
+  thread-locals, which still name it, are cleared (`_mesa_glapi_set_dispatch(NULL)`,
+  `_mesa_glapi_set_context(NULL)`). Left as they were, the next `_mesa_make_current` on this
+  thread would treat the context as its own current one: flush it and drop its window-system
+  framebuffers while the other thread draws with it -- the dangling state that would crash.
+  The stale references are then given back as for any previous binding.
+- **Serialisation**: `eglMakeCurrent` calls the driver without the display lock (`egl_relax`).
+  Upstream that is safe because only the owning thread changes a binding; with takeover two
+  threads do, so `dri2_make_current` takes one process-wide mutex on Darwin.
+- **Left as is**: a thread that ends while it has a context keeps its references, so the
+  context leaks instead of being freed under a dangling pointer. A context whose `Binding` is
+  the calling thread although that thread never bound it (thread-local storage reused by a new
+  thread) is taken over like any other. GL calls made on a thread after its context was taken,
+  without making it current again, still reach that context through the stale thread-locals.
+  That is OSMesa's behaviour, and the application's error if two threads draw at once.
+  eagl.c makes the context current again whenever a call comes from another thread than the
+  last one.
+
+Without 0004 (an older Mesa), eagl.c falls back to letting the context go at every frame end
+once it has seen `EGL_BAD_ACCESS` (`glrelease=1` forces it).
 
 ### `EGL_IOSURFACE_A34` (Mesa patch 0003)
 
@@ -120,15 +168,22 @@ What topaz did, in its kernel and root (`xnu/patches/0902`, `0919`, `0947`; `use
    (0919: the kernel adds `DYLD_INSERT_LIBRARIES=LIB` to the environment of programs by name,
    from a sysctl or the boot-arg `topaz_inject`).
 
-Here: the wrapper, without moving Apple's binary. `tools/root-add-job.py --wrap /mnt
+Here, two ways (both need the dyld answer below; kernel patch 0914 has it, boot-arg
+`a34dyld=0` turns it off):
+
+- **the kernel** (0914, like topaz 0919): boot-arg
+  `a34inject=/a34/liba34gl-inject.dylib,backboardd` adds `DYLD_INSERT_LIBRARIES` to
+  backboardd's environment at exec. Nothing in the root changes. The loader then reads
+  `/a34/backboardd.env` itself, so `A34GL=...`, `PAN_MESA_DEBUG=...` and the like go there.
+- **the wrapper**, without moving Apple's binary. `tools/root-add-job.py --wrap /mnt
 com.apple.backboardd /a34/a34gl-bbd` changes backboardd's job in `launchd.plist`
 (`ProgramArguments[0]` = the wrapper, `EnvironmentVariables.A34GL_REAL` = `/usr/libexec/backboardd`;
 `--unwrap` undoes it); the wrapper reads `/a34/backboardd.env`, sets `DYLD_INSERT_LIBRARIES` and
 execs the real program, which keeps the pid, the Mach services and its own signature and
 entitlements. Everything that is not `DYLD_*` can also go into the job with `--env`.
 
-**Kernel prerequisite** (not in this branch; for `xnu/patches`): a policy named `"AMFI"` that
-answers dyld, in `bsd/kern/sweet_amfi.c` next to the existing two (after topaz 0902, APSL 2.0):
+**Kernel prerequisite**, now in `xnu/patches/0914` (boot-arg `a34dyld`, default on): a policy
+named `"AMFI"` that answers dyld, as below (after topaz 0902, APSL 2.0):
 
 ```c
 static int
@@ -157,6 +212,22 @@ static mac_policy_handle_t a34_amfi_mac_handle;
 
 Without it nothing is injected and backboardd runs as before (the wrapper is harmless).
 
+## The log
+
+Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
+and the kernel's "devnull tee" (ios-sweet patch 0048, boot-arg `sweetnull`, default
+`backboardd,SpringBoard`) copies what backboardd writes there into the console and the
+persistent log as `|backboardd| ...`. That is where the lines are with kernel injection, and
+the recommended place. With `A34GL_LOG=/var/mobile/a34gl.log` (in `/a34/backboardd.env` or the
+job's environment) they go to that file instead, and not to the kernel's log.
+
+Every message is rate-limited (`log.c`): the first 32 of each are written, then at most one
+every 10 s, with the count so far. A message repeating at every GL call costs a few lines.
+Not limited: what a switch asks for (`gltrace`, `glframes`, `glslow`, `glcensus`,
+`glshaders`, `gltrace_place`) and the periodic lines. Those are now a frame line for the first
+40 frames and every 600th (topaz: every 20th), and the summary at frame 30 and every 3600th
+(topaz: every 200th).
+
 ## Switches
 
 As in topaz, from the kernel's boot-args, and here also from the environment variable `A34GL`
@@ -164,13 +235,11 @@ As in topaz, from the kernel's boot-args, and here also from the environment var
 every IOSurface instead of sharing its memory, `glblit=0` draw straight into the display's surface
 (default: into a texture of ours, blitted into the surface at the frame's end), `glwait=0|1`
 (who waits for the GPU before a frame is shown; the default waits here unless the display
-driver sets `RedwoodWaitsForGPU`), `glrelease=1`, `glframes=1` (a line a frame), `glcensus=1`,
+driver sets `RedwoodWaitsForGPU`), `glrelease=1` (let the context go at every frame end), `glframes=1` (a line a frame), `glcensus=1`,
 `glshaders=1`, `gltrace=FIRST-LAST`, `gltrace_at=`, `gltrace_draws=`, `gltrace_function=N[,K]`,
 `gltrace_frames=`, `gltrace_place=X0,Y0,X1,Y1`, `gltrace_look=1`, `gltrace_lit=1`, `glslow=US`,
 `glshow=TEXTURE`, `glplain=0|2|3`, `glfetch=0`, `glgroup=0`, `glprecision=0`, `vblur=0|2`,
-`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`). The log goes to `A34GL_LOG`
-(e.g. `/var/mobile/a34gl.log`; `/dev/console` is writable by `mobile` and lands in the kernel's
-log), else to stderr, which launchd discards for backboardd.
+`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`). The log: see "The log".
 
 ## Checked against our iOS 16.7.16 cache
 

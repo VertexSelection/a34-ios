@@ -305,6 +305,8 @@ check() {
 	for sym in redwood_drm_mmap redwood_drm_munmap redwood_drm_surface; do
 		nm -u "$OUT/libgallium-$MESA_VERSION.dylib" | grep "^_$sym\$" >/dev/null || { echo "error: libgallium does not call $sym"; bad=1; }
 	done
+	# a context taken over from another thread: this thread's GL thread-locals cleared (0004)
+	nm -u "$OUT/libEGL.1.dylib" | grep "^__mesa_glapi_set_context\$" >/dev/null || { echo "error: libEGL does not call _mesa_glapi_set_context (0004)"; bad=1; }
 	# EGL_IOSURFACE_A34 (0003)
 	nm -u "$OUT/libEGL.1.dylib" | grep "^_redwood_drm_surface\$" >/dev/null || { echo "error: libEGL does not call redwood_drm_surface"; bad=1; }
 	grep -q 'EGL_IOSURFACE_A34' "$OUT/include/EGL/eglmesaext.h" || { echo "error: eglmesaext.h lacks EGL_IOSURFACE_A34"; bad=1; }

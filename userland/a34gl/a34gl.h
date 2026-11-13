@@ -37,8 +37,9 @@ A34GL_EXPORT void a34gl_function_values(void *context, unsigned function, unsign
     const float *values);
 A34GL_EXPORT void a34gl_function_refused(unsigned function);
 
-/* The log (A34GL_LOG, else stderr): a line or more, as written. */
-void a34gl_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+/* The log (A34GL_LOG, else stderr): a line or more, as written (log.c). */
+void a34gl_say(const char *format, ...) __attribute__((format(printf, 1, 2)));         /* rate-limited per message */
+void a34gl_say_always(const char *format, ...) __attribute__((format(printf, 1, 2)));  /* not */
 int a34gl_log_fd(void);
 
 /*

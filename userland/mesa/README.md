@@ -11,6 +11,7 @@ client speaks Linux's panfrost DRM uAPI. Built by `.github/workflows/mesa-ios.ym
 | `build.sh` | the whole build: host tools, libdrm stand-in, Mesa, `mali-tri`, packaging |
 | `patches/0001-meson-darwin-drm.patch` | Darwin + panfrost builds as a DRM system (drm DRI platform, EGL, libdrm via pkg-config) |
 | `patches/0002-panfrost-darwin-bo-map.patch` | BO mmap/munmap through the user client; no `sched_setscheduler` on Darwin |
+| `patches/0004-darwin-egl-context-takeover.patch` | EAGL's thread semantics for EGL contexts: the last thread to make a context current has it, instead of `EGL_BAD_ACCESS` (see `../a34gl/README.md`, "Threads") |
 | `patches/0003-darwin-iosurface-egl-image.patch` | IOSurfaces as EGLImages: target `EGL_IOSURFACE_A34` (buffer = IOSurface ID), imported as a dma-buf whose "fd" is the ID; `DRM_CAP_PRIME` asked on Darwin; the BO size of an import from selector `0x7e` (see `../a34gl/README.md`) |
 | `redwood-drm/` | `libdrm.2.dylib`: the libdrm functions Mesa calls, carried to `RedwoodMali` |
 | `mali-tri/mali-tri.c` | test: 256x256 pbuffer, clear, one triangle, `glReadPixels`, check |
