@@ -79,6 +79,21 @@ REDWOOD_DRM_ASSERT(offsetof(struct redwood_drm_surface, planes) == 36, "0x7e lay
  */
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
 
+/*
+ * The requests made of the kernel so far, for profiling (liba34gl's glprof): calls and time
+ * (mach_absolute_time units) by selector -- 0x40 SUBMIT, whose time is the GPU's, the job chain
+ * running to its end before it returns; 0x42 CREATE_BO; 0x09 GEM_CLOSE; ... -- and the client
+ * memory mappings made and taken away. Counted always (two clock reads a request).
+ */
+struct redwood_drm_stats {
+	uint64_t calls[256];
+	uint64_t ticks[256];
+	uint64_t maps, map_ticks;
+	uint64_t unmaps, unmap_ticks;
+};
+
+void redwood_drm_stats(struct redwood_drm_stats *stats);
+
 #ifdef __cplusplus
 }
 #endif

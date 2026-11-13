@@ -42,7 +42,10 @@ profile patch; OSMesa was removed from Mesa in 25.1):
   the texture CoreAnimation bound, then the image is destroyed (the texture keeps the memory).
   Where that fails (a format, layout or kernel that does not allow it) eagl.c falls back to
   topaz's copies: the texture is filled from the surface when its seed or contents change and
-  read back into it at the frame's end.
+  read back into it at the frame's end. A surface CoreAnimation draws into is drawn as a
+  texture of ours that the GPU copies into the surface at the frame's end (`glblit=0`: straight
+  into the surface); that texture starts with the surface's pixels copied in by the GPU at
+  `-attachImage:` (topaz: by the CPU, 11 MB for the display's surface).
 
 ### Threads (Mesa patch 0004)
 
@@ -239,7 +242,25 @@ driver sets `RedwoodWaitsForGPU`), `glrelease=1` (let the context go at every fr
 `glshaders=1`, `gltrace=FIRST-LAST`, `gltrace_at=`, `gltrace_draws=`, `gltrace_function=N[,K]`,
 `gltrace_frames=`, `gltrace_place=X0,Y0,X1,Y1`, `gltrace_look=1`, `gltrace_lit=1`, `glslow=US`,
 `glshow=TEXTURE`, `glplain=0|2|3`, `glfetch=0`, `glgroup=0`, `glprecision=0`, `vblur=0|2`,
-`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`). The log: see "The log".
+`glenv=NAME=VALUE` (see the comment at the top of `eagl.c`); a34gl's own: `glprof=N` (below),
+`glsum=0` (an IOSurface that is copied into a texture is refilled when its seed moves, never
+because its memory adds up differently -- that check reads the whole surface every frame),
+`glerrors=0|1` (`glGetError` after every call never | always; default the first 120 frames).
+The log: see "The log".
+
+### Profiling: `glprof=N`
+
+Every N frames (`glprof=1`: 60) four lines `a34gl-prof:` give, a frame's worth on average:
+wall time from the frame's first draw to its end, the drawing thread's CPU time in that span,
+the time inside our GL entries, and backboardd's CPU time over all its threads (the
+difference to the entries is CoreAnimation's own work between calls). Then the entry time by
+kind (draw, uniform, texture, framebuffer, program, flush, query, state) with call counts; and
+what eagl.c does inside those entries, timed apart: Mesa's draw calls themselves, IOSurface
+sums, CPU uploads, GPU copies in, copies out, EGLImages made, IOSurfaceLock/Unlock,
+`eglMakeCurrent`, `glGetError` checks, shader compiles and program links. Then the requests to
+the kernel, counted by redwood-drm by selector (`submit` -- synchronous, so its time is the
+GPU's --, `create_bo`, `gem_close`, `madvise`, `bo_offset`, `iosurface` (0x7e), client memory
+maps), and the threads that called GL with their calls a frame. Off, it costs a test per call.
 
 ## Checked against our iOS 16.7.16 cache
 

@@ -56,7 +56,7 @@ log "liba34gl.dylib (EAGLContext on Mesa: eagl.c, gl_egl.c)"
 "${CC[@]}" "${INCLUDES[@]}" -Wno-unused-parameter -dynamiclib -install_name "$INSTALL_DIR/liba34gl.dylib" \
 	-Wl,-exported_symbol,_a34gl_function_values -Wl,-exported_symbol,_a34gl_function_refused \
 	-o "$A/liba34gl.dylib" "$HERE/eagl.c" "$HERE/gl_egl.c" "$HERE/log.c" \
-	"$MESA_OUT/libEGL.1.dylib" "$MESA_OUT/libGLESv2.2.dylib" \
+	"$MESA_OUT/libEGL.1.dylib" "$MESA_OUT/libGLESv2.2.dylib" "$MESA_OUT/libdrm.2.dylib" \
 	-framework CoreFoundation -framework IOSurface -framework IOKit -lobjc 2>&1 | tee "$BUILD/liba34gl.log"
 [ "${PIPESTATUS[0]}" = 0 ]
 echo "compiler warnings: $(grep -c 'warning:' "$BUILD/liba34gl.log" || true)"
