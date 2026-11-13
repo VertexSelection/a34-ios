@@ -22,7 +22,7 @@ IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CLANG=$(xcrun -f clang)
 FLAGS=(-fno-objc-arc -O2 -g -Wall -Wextra -Wno-unused-parameter)
 IOS=("$CLANG" -target "arm64-apple-ios$IOS_MIN" -isysroot "$IOS_SDK" "${FLAGS[@]}")
-HOST=("$CLANG" "${FLAGS[@]}")
+HOST=("$CLANG" -isysroot "$(xcrun --sdk macosx --show-sdk-path)" "${FLAGS[@]}")
 FRAMEWORKS=(-framework Metal -framework Foundation -framework CoreFoundation -framework IOKit)
 # Metal's private base class, if an SDK's Metal.tbd does not list it: looked up when the bundle
 # is loaded (Metal exports it: IOGPU and the AGX drivers bind to the same symbol)
