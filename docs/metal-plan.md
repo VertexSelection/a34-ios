@@ -25,7 +25,7 @@ that cache; "HackiOS main" is `oosexgang/hakios-xnu-kernel@63fc2b4`, "HackiOS mt
 - **Our root has QuartzCore's `default.metallib`** (141 functions), which HackiOS's 16.5 root
   lacked and had to assemble on a Mac. One library is all CoreAnimation loads.
 - **Started:** `userland/a34metal` (milestone 1: the plug-in and `metal-probe`), built by
-  `.github/workflows/a34metal.yml`.
+  `.github/workflows/a34metal.yml` for arm64 iOS 16; not yet run on the phone.
 
 ## 1. How Metal finds and loads a driver
 
@@ -95,8 +95,9 @@ means three things have to hold before the device is shown to everyone:
 `bsd/kern/sweet_amfi.c:400`, so `iokit-open` is not filtered; to verify from an app); the
 kernel service must stand many clients (it has one GPU address space for all and runs jobs
 one at a time, `iokit/Kernel/arm/A34Mali.cpp:26-40` of the patched tree, and each Mesa screen
-takes a tiler heap of which `a34maliheap` = 64 MB gets memory); and a device that cannot do what a program asks ends that
-program, so the plug-in decides per program (`A34Metal.clients`, boot-arg `a34metal=1|2|3`).
+takes a tiler heap of which `a34maliheap` = 64 MB gets memory); and a device that cannot do
+what a program asks ends that program, so the plug-in decides per program
+(`A34Metal.clients`, boot-arg `a34metal=1|2|3`).
 HackiOS found two that must be refused even with a working device: SpringBoard (Siri's
 set-up makes a Metal Performance Shaders kernel, and MPS has no device for a foreign GPU
 below family Apple2) and chronod/widgets (RenderBox wants a drawable) (mtk
@@ -161,8 +162,9 @@ all 456 of 16.5 with LLVM 22.1.8).
 specializes its uber shaders with function constants at run time ("Specializing shader
 function %s for %s with constant values %s" in `CA::OGL::MetalContext`), and apps bring their
 own libraries. The host's part is the test: every function of the libraries below translated
-in CI and, later, drawn on softpipe and compared. A cache of compiled shaders on disk is a
-speed matter for M4 (HackiOS saw 13-19 s for one specialized uber shader on the G52's CPU).
+by a local script (Apple's files stay off CI), and shaders of our own drawn on softpipe in CI
+and compared. A cache of compiled shaders on disk is a speed matter for M4 (HackiOS saw
+13-19 s for one specialized uber shader, `redwoodmetal.m:1051`).
 
 **The libraries.** The root has 143 `.metallib` and 15 `.pipelinelib` (77 under
 PrivateFrameworks, 44 under Frameworks). What draws the interface:
@@ -209,7 +211,10 @@ synchronous job submission in the kernel; one GPU address space for all programs
 ## 5. What CoreAnimation needs, and what apps need
 
 **CoreAnimation** (read off the `CA::OGL::Metal...` and `CAMetalLayer` functions of QuartzCore,
-which send 253 distinct selectors, Foundation's included; the lists below are from those):
+which send 253 distinct selectors through `objc_msgSend` stubs, Foundation's included. The
+lists below are from those; what it calls through cached method pointers (`methodForSelector:`
+is used 15 times in QuartzCore; vertex buffer binding and indexed draws do not show up as
+stubs) is missing here and needs the plug-in's log):
 
 - *Start-up*: `CAMetalContextCreate` (`0x18838421c`) waits for an `IOAcceleratorES` service
   and calls `MTLCreateSystemDefaultDevice`. Then a command queue (HackiOS: a failure there
@@ -221,8 +226,8 @@ which send 253 distinct selectors, Foundation's included; the lists below are fr
   `supportsYCBCRFormats12`, `supportsNativeHardwareFP16`, `supportsTileShaders`,
   `supportsSIMDGroup`, `iosurfaceReadOnlyTextureAlignmentBytes`, `supportsFeatureSet:`,
   `supportsExtendedXR10Formats`.
-- *Resources*: `newTextureWithDescriptor:iosurface:plane:` (five call sites: the destination,
-  layer surfaces, drawables), `newTextureWithDescriptor:`, `newTextureViewWithPixelFormat:`,
+- *Resources*: `newTextureWithDescriptor:iosurface:plane:` (HackiOS counts five call sites in
+  16.5's QuartzCore: the destination, layer surfaces, drawables), `newTextureWithDescriptor:`, `newTextureViewWithPixelFormat:`,
   `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`,
   `newTextureWithBytesNoCopy:...`, `replaceRegion:...`, `getBytes:...`,
   `newBufferWithLength:options:`, `newBufferWithBytesNoCopy:...`, `newHeapWithDescriptor:`,
@@ -236,7 +241,7 @@ which send 253 distinct selectors, Foundation's included; the lists below are fr
   Blending per attachment, write masks, **framebuffer fetch** (the library is compiled with
   `air.compile.framebuffer_fetch_enable`; panfrost has it).
 - *Encoding*: render encoder with viewport, scissor, cull, winding, depth bias, depth/stencil
-  state, `setVertexBuffer`/`setFragmentBuffer:offset:atIndex:`,
+  state, `setFragmentBuffer:offset:atIndex:`,
   `setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:` (SPI),
   `drawPrimitives:...instanceCount:`, visibility result mode; blit encoder (texture and buffer
   copies, `generateMipmapsForTexture:`); compute encoder; `commit`,
@@ -253,8 +258,8 @@ which send 253 distinct selectors, Foundation's included; the lists below are fr
 
 **Apps and games** need the breadth CoreAnimation skips: vertex descriptors with every
 format, indexed and indirect draws, depth and stencil everywhere, MSAA with resolve, mipmapped
-and compressed textures (what the GPU's `TEXTURE_FEATURES` say: ASTC and ETC2 on a Mali), cube/array/3D
-textures, argument buffers (tier 1 at least), compute with textures, heaps, events,
+and compressed textures (what the GPU's `TEXTURE_FEATURES` say: ASTC and ETC2 on a Mali),
+cube/array/3D textures, argument buffers (tier 1 at least), compute with textures, heaps, events,
 `MTKView`/`CAMetalLayer` pacing, shader compilation from source (`newLibraryWithSource:` needs
 Apple's compiler service; out of scope), MPS and MetalFX (Apple GPUs only). Expect "the
 system's own Metal clients, then simple apps"; games built for A-series features (tile
@@ -284,7 +289,7 @@ Sizes are guesses from HackiOS's line counts; "cycles" are boots of the phone.
 
 | | build | test on the phone | kernel | size, risk |
 | --- | --- | --- | --- | --- |
-| **M1** a device | **written, builds in CI**: `A34Metal.bundle` (a `_MTLDevice` subclass answering the registration and the device's facts, everything else zero and named once), `metal-probe` | `root-add-job.py --copy /mnt /System/Library/Extensions/A34Metal.bundle a34metal/A34Metal.bundle`; job `metal-probe --direct --next` (registers through `MTLAddDevice` on today's kernel); then with `a34metal=1`, plain `metal-probe`. `PASS` and the families each profile claims in the kernel log | section 8 (two properties, boot-arg); none for `--direct` | 0.6k lines, written. Risk: 306.6.6 asks something 306.6.4 did not (1-2 cycles) |
+| **M1** a device | **written; builds in CI, and on the runner's own Metal (macOS 15) the class loads, states both protocols, makes a device and answers an unimplemented message with nil**: `A34Metal.bundle` (a `_MTLDevice` subclass answering the registration and the device's facts, everything else zero and named once), `metal-probe` | `root-add-job.py --copy /mnt /System/Library/Extensions/A34Metal.bundle a34metal/A34Metal.bundle`; job `metal-probe --direct --next` (registers through `MTLAddDevice` on today's kernel); then with `a34metal=1`, plain `metal-probe`. `PASS` and the families each profile claims in the kernel log | section 8 (two properties, boot-arg); none for `--direct` | 0.6k lines, written. Risk: 306.6.6 asks something 306.6.4 did not (1-2 cycles) |
 | **M2** clear | queue, command buffer, render encoder (load/store actions only), texture, `newTextureWithDescriptor:iosurface:plane:`, blit read-back, on Metal's base classes; Mesa patch 0005: the core's first calls (`device_open`, `texture_from_surface`, `render_clear`, `texture_read`, `finish`) | `metal-clear`: an IOSurface as `a34gl-surftest` makes it, cleared through Metal, checked in the surface's memory and through `getBytes:` | none expected (the `0x7e` import and client mapping exist); `RedwoodMali` open from a second process while backboardd draws | ~2.5k lines, mostly ported; 1-2 weeks. Risks: Mesa 25.0 -> 26.3 internal API drift; two screens in one process (EGL's and ours) sharing one `io_connect_t` in redwood-drm |
 | **M3** triangle | Mesa patch 0006: `src/compiler/air`; `rwa_render_create`/`draw`; pipeline state, vertex buffers, viewport/scissor; a small `.metallib` of our own shaders as test data (built in CI by Xcode's `metal`) | `metal-tri`: pixels checked, as `mali-tri`. Before that, in CI: our own shaders translated and drawn on softpipe; on the host, by a local script (Apple's files stay off CI): all 141 QuartzCore functions through the front end | none | ~12k ported lines; 2-3 weeks. Risks: NIR from the front end on Valhall's compiler (HackiOS patched panfrost for its Bifrost: `scratchregs`, `widen16`, `pushubo`); 16-bit ops on softpipe |
 | **M4** CoreAnimation | everything of section 5: formats, samplers, blending, framebuffer fetch, function constants, texture views, compute kernels, the pipeline library by label, handlers and fences; the worker thread; `A34Metal.clients` = backboardd, liba34gl off (`a34gl=0`) | boot to the lock screen on Metal; `glprof`-like counters in the plug-in; compare screenshots with the GL path | `a34metal=1`; likely asynchronous submit with fences in `RedwoodMali` (today a SUBMIT returns when the job is done) and growing tiler heaps | the bulk: 4-8 weeks. Risks: correctness under asynchrony (HackiOS is not right there yet); pipeline build times; we already have ~30 fps on GL, so M4 must beat a working system |
