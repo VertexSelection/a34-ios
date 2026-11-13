@@ -1,0 +1,986 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 05f426e..4c12ac2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/ruby_keys.c			standard
+ bsd/dev/a34_touch.c			standard
+ bsd/dev/a34_diag.c			standard
+ bsd/dev/a34_mali.c			standard
++bsd/dev/a34_clocks.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+new file mode 100644
+index 0000000..e3c2c9d
+--- /dev/null
++++ b/bsd/dev/a34_clocks.c
+@@ -0,0 +1,778 @@
++/*
++ * A34 (0921): the MT6877's clocks and voltages: what the boot loader leaves
++ * them at, said at every boot (read only), and the GPU's clock raised from
++ * there when asked (boot-arg a34gpumhz=N, default off).
++ *
++ * The approach is HackiOS's (bsd/dev/redwood_mtkkeys.c of hakios-mt6768,
++ * github.com/oosexgang/hakios-mt6768, Apple Public Source License 2.0),
++ * which raises an MT6768's processors and Mali from the kernel because
++ * nothing else does: the voltages first (the SRAM rail before the logic
++ * rail), then the PLL, and nothing touched unless every register reads what
++ * the boot loader is known to leave. What this SoC needs comes from
++ * Samsung's A34 kernel (github.com/Fede2782/android_kernel_samsung_a34x,
++ * A346BXXSADYG1), read, not copied; the tables are data:
++ *
++ *   drivers/gpu/mediatek/gpufreq/v2_legacy/gpufreq_mt6877.c and
++ *   include/gpufreq_mt6877.h: the OPP table, the order (up: voltages, VSRAM
++ *   before VGPU, then the clock), the springboard that keeps 0 <= VSRAM -
++ *   VGPU <= 200 mV at every step, the settle times, the PCW formula, the
++ *   clock parked while MFGPLL1's CON1 is written with PCW_CHG;
++ *   arch/arm64/boot/dts/mediatek/mt6877.dts: VGPU is the MT6359P's VPROC2
++ *   buck, VSRAM_GPU its VSRAM_MD LDO, MFGPLL1 at 0x13fa0000 with its FHCTL at
++ *   +0xe00; the CPU clusters' Vproc are MT6315 bucks on SPMI;
++ *   drivers/regulator/mt6359p-regulator.c, include/linux/mfd/mt6359p/
++ *   registers.h: the rails' registers (set value in ELR, the value put out
++ *   in DA_*_VOSEL); drivers/soc/mediatek/mtk-pmic-wrap.c: the MT6877
++ *   wrapper's write (PWRAP_CAP_ARB_V3); drivers/clk/mediatek/
++ *   clk-fmeter-mt6877.c: the MFG PLLs' frequency meter;
++ *   drivers/misc/mediatek/cpufreq_v2/src/plat_k6877: the CPU PLLs and
++ *   dividers.
++ *
++ * Report (a34clocks=0: none of this file runs): each CPU cluster's PLL and
++ * divider and the rate they make, MFGPLL1/MFGPLL4, the GPU clock mux and
++ * MFGPLL1's frequency hopping (only with MFG0 on: those registers are in the
++ * GPU's always-on domain), and VGPU, VSRAM_GPU, VSRAM_PROC1/2 from the
++ * MT6359P through the PMIC wrapper. The CPU Vproc rails are not read: they
++ * are MT6315 bucks on SPMI, not behind the wrapper.
++ *
++ * GPU (a34gpumhz=N, called by bsd/dev/a34_mali.c while no job runs, before
++ * programs get the GPU): the table's OPP at or below N (902 MHz at most:
++ * the 950 MHz of the MT6877T segment needs the segment efuse, not read
++ * here), from the state the boot loader is known to leave (MFGPLL1 CON1
++ * 0x031d9d89, 385 MHz; the mux on MFGPLL1; no frequency hopping; both rails
++ * on, settled, inside the table's range and within 200 mV of each other).
++ * Then MediaTek's commit for a higher frequency: the rails to the OPP's
++ * voltages through the springboard (every value written is a table value,
++ * read back set and put out), checking that VSRAM_PROC1/2 do not move with
++ * them; then the clock parked on 26 MHz, CON1 with PCW_CHG, 20 us, back to
++ * MFGPLL1; CON1 read back and the PLL measured by its frequency meter. Any
++ * mismatch: everything put back as it was, in reverse order. The
++ * voltages are the highest of the table's three PTPOD variants for that
++ * OPP (the same in all three from 670 MHz up; the variant is chosen by an
++ * efuse not read here); no voltage ever exceeds the table's.
++ *
++ * CPUs: not raised. Their Vproc rails sit on MT6315 PMICs behind SPMI,
++ * which the preloader-started MCUPM firmware drives ("cpuhvfs": Android's
++ * kernel only fills tables in its CSRAM and asks it by IPI); writing ARMPLL
++ * and the dividers directly would mean an SPMI driver of our own and racing
++ * that firmware. a34cpufreq=N only says so.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++#include "ruby_hal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++void a34_clocks_init(void);             /* bsd/dev/sweet_ufs.c, at boot */
++bool a34_clocks_gpu_wanted(void);       /* bsd/dev/a34_mali.c */
++bool a34_clocks_gpu_raise(void);
++void a34_clocks_gpu_restore(void);
++
++/* ---- where things are ---- */
++
++#define CK_TOP_PA               0x10000000u     /* topckgen */
++#define CK_SPM_PA               0x10006000u
++#define CK_APMIXED_PA           0x1000c000u
++#define CK_PWRAP_PA             0x10026000u
++#define CK_MCUCFG_PA            0x0c53a000u     /* mcucfg 0x0c530000 + 0xa000: the CPU clock dividers */
++#define CK_GPUPLL_PA            0x13fa0000u     /* GPU_PLL_CTRL ("mfg_ao"), in MFG0 */
++#define CK_PAGE                 0x1000u
++
++/* topckgen CLK_CFG_20 (clk-mt6877.c; as bsd/dev/a34_mali.c) */
++#define TOP_CLK_CFG_20          0x120u
++#define TOP_CLK_CFG_20_SET      0x124u
++#define TOP_CLK_CFG_20_CLR      0x128u
++#define TOP_MFG_PLL1            (1u << 18)      /* mfg_internal2_sel: 1 MFGPLL1, 0 mfg_internal1 */
++#define TOP_MFG_INT1_PLL4       (1u << 19)      /* mfg_internal1_sel: 1 MFGPLL4, 0 26 MHz */
++
++/* SPM: MFG0 (the GPU's always-on part) powered, bit 0 of both */
++#define SPM_XPU_PWR_STATUS      0xef8u
++#define SPM_XPU_PWR_STATUS_2ND  0xefcu
++
++/* APMIXED (clk-mt6877.c) and mcucfg (cpufreq_v2 plat_k6877): CON0 bit 0 on; CON1 [26:24] posdiv, [21:0] PCW */
++#define ARMPLL_LL_CON0          0x208u
++#define ARMPLL_BL_CON0          0x218u
++#define CCIPLL_CON0             0x238u
++#define CKDIV1_LL               0x2a0u          /* MP0_PLL_DIVIDER: [21:17] divider, [10:9] source */
++#define CKDIV1_L                0x2a4u          /* MP1_PLL_DIVIDER */
++#define CKDIV1_CCI              0x2e0u          /* BUS_PLL_DIVIDER */
++
++/* GPU_PLL_CTRL (gpufreq_mt6877.h, clk-fmeter-mt6877.c, clk-fhctl-pll.c) */
++#define MFGPLL1_CON0            0x008u          /* bit 0: on */
++#define MFGPLL1_CON1            0x00cu          /* bit 31 PCW_CHG, [26:24] posdiv, [21:0] PCW */
++#define MFGPLL1_CON3            0x014u          /* bit 0 power on, bit 1 isolation */
++#define MFGPLL4_CON0            0x038u
++#define MFGPLL4_CON1            0x03cu
++#define PLL4H_FQMTR_CON0        0x200u
++#define PLL4H_FQMTR_CON1        0x204u
++#define GPU_FHCTL_HP_EN         0xe00u          /* bit 0: MFGPLL1 driven by frequency hopping */
++#define GPU_FHCTL0_CFG          0xe3cu          /* [2:0]: SSC, DVFS, hopping enables of MFGPLL1 */
++#define CON1_PCW_CHG            (1u << 31)
++#define CON1_POSDIV_SHIFT       24
++#define CON1_RATE_MASK          0x073fffffu     /* posdiv and PCW */
++#define POSDIV_POWER_4          2u              /* /4: 375..950 MHz, every OPP of the table */
++#define MFGPLL1_LK_CON1         0x031d9d89u     /* what the boot loader leaves: VCO 3080 MHz / 8 = 385 MHz */
++
++/* The PMIC wrapper's channel for the processor (SWINF 2; bsd/dev/ruby_hal.c reads, a34_touch.c writes) */
++#define PW_ACC                  0x880u
++#define PW_WDATA                0x884u
++#define PW_STA                  0x8a8u
++#define PW_FSM(v)               (((v) >> 1) & 7u)
++#define PW_INIT_DONE            (1u << 15)
++#define PW_SPINS                100000u
++
++/* MT6359P (mt6359p-regulator.c, registers.h) */
++#define VPROC2_CON0             0x1788u         /* RG_BUCK_VPROC2_EN, bit 0 */
++#define VPROC2_DBG0             0x17a6u         /* DA_VPROC2_VOSEL [6:0]: what it puts out */
++#define VPROC2_DBG1             0x17a8u         /* DA_VPROC2_EN, bit 0 */
++#define VPROC2_ELR0             0x17b2u         /* RG_BUCK_VPROC2_VOSEL [6:0]: what it is set to */
++#define VSRAM_PROC1_ELR         0x1b44u
++#define VSRAM_PROC2_ELR         0x1b46u
++#define VSRAM_MD_ELR            0x1b4au         /* RG_LDO_VSRAM_MD_VOSEL [6:0] */
++#define VSRAM_PROC1_CON0        0x1e88u
++#define VSRAM_PROC1_MON         0x1e8cu
++#define VSRAM_PROC1_VOSEL1      0x1e90u         /* DA_VSRAM_PROC1_VOSEL [14:8] */
++#define VSRAM_PROC2_CON0        0x1ea8u
++#define VSRAM_PROC2_MON         0x1eacu
++#define VSRAM_PROC2_VOSEL1      0x1eb0u
++#define VSRAM_MD_CON0           0x1f2eu         /* RG_LDO_VSRAM_MD_EN, bit 0 */
++#define VSRAM_MD_MON            0x1f32u         /* DA_VSRAM_MD_B_EN, bit 0 */
++#define VSRAM_MD_VOSEL1         0x1f36u         /* DA_VSRAM_MD_VOSEL [14:8] */
++#define VOSEL_MASK              0x7fu
++
++/* ---- the PMIC wrapper ---- */
++
++static LCK_GRP_DECLARE(a34_pmic_grp, "a34_pmic");
++static LCK_MTX_DECLARE(a34_pmic_mtx, &a34_pmic_grp);
++
++static vm_offset_t ck_top, ck_spm, ck_apmixed, ck_pwrap, ck_mcucfg, ck_gpupll;
++static bool ck_started;
++static uint32_t ck_gpu_want_mhz;        /* a34gpumhz */
++
++/* The wrapper's channel is one command at a time: ruby_keys.c's poll, a34_touch.c and this take turns. */
++void
++a34_pmic_lock(void)
++{
++	lck_mtx_lock(&a34_pmic_mtx);
++}
++
++void
++a34_pmic_unlock(void)
++{
++	lck_mtx_unlock(&a34_pmic_mtx);
++}
++
++static bool
++ck_pmic_read(uint16_t reg, uint16_t *val)
++{
++	int err;
++
++	a34_pmic_lock();
++	err = ruby_pwrap_read(ck_pwrap, reg, val);
++	a34_pmic_unlock();
++	return err == 0;
++}
++
++static bool
++ck_pwrap_idle(void)
++{
++	for (uint32_t i = 0; i < PW_SPINS; i++) {
++		if (PW_FSM(ruby_rd32(ck_pwrap, PW_STA)) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Linux's pwrap_write16() for this wrapper: idle, the data, the command with the write bit, idle again. */
++static bool
++ck_pmic_write(uint16_t reg, uint16_t val)
++{
++	bool ok = false;
++
++	a34_pmic_lock();
++	if ((ruby_rd32(ck_pwrap, PW_STA) & PW_INIT_DONE) && ck_pwrap_idle()) {
++		ruby_wr32(ck_pwrap, PW_WDATA, val);
++		ruby_wr32(ck_pwrap, PW_ACC, (1u << 29) | reg);
++		ok = ck_pwrap_idle();
++	}
++	a34_pmic_unlock();
++	return ok;
++}
++
++/* ---- the rails ---- */
++
++struct ck_rail {
++	const char *name;
++	uint16_t en, da_en, set, out;   /* enable (bit 0), on (bit 0), set value [6:0], value put out */
++	uint32_t out_shift;             /* of the value put out */
++	uint32_t base_uv;               /* at 0; 6.25 mV a step */
++};
++
++enum { RAIL_VGPU, RAIL_VSRAM_GPU, RAIL_VSRAM_PROC1, RAIL_VSRAM_PROC2, RAIL_N };
++
++static const struct ck_rail ck_rails[RAIL_N] = {
++	{ "VGPU (MT6359P VPROC2)", VPROC2_CON0, VPROC2_DBG1, VPROC2_ELR0, VPROC2_DBG0, 0, 400000 },
++	{ "VSRAM_GPU (VSRAM_MD)", VSRAM_MD_CON0, VSRAM_MD_MON, VSRAM_MD_ELR, VSRAM_MD_VOSEL1, 8, 500000 },
++	{ "VSRAM_PROC1", VSRAM_PROC1_CON0, VSRAM_PROC1_MON, VSRAM_PROC1_ELR, VSRAM_PROC1_VOSEL1, 8, 500000 },
++	{ "VSRAM_PROC2", VSRAM_PROC2_CON0, VSRAM_PROC2_MON, VSRAM_PROC2_ELR, VSRAM_PROC2_VOSEL1, 8, 500000 },
++};
++
++struct ck_rail_state {
++	bool on;
++	uint16_t set_reg;               /* the whole set register, to put back */
++	uint32_t set, out;              /* steps */
++};
++
++static bool
++ck_rail_read(unsigned which, struct ck_rail_state *s)
++{
++	const struct ck_rail *r = &ck_rails[which];
++	uint16_t en = 0, da_en = 0, set = 0, out = 0;
++
++	if (!ck_pmic_read(r->en, &en) || !ck_pmic_read(r->da_en, &da_en) || !ck_pmic_read(r->set, &set) ||
++	    !ck_pmic_read(r->out, &out)) {
++		return false;
++	}
++	s->on = (en & 1u) && (da_en & 1u);
++	s->set_reg = set;
++	s->set = set & VOSEL_MASK;
++	s->out = ((uint32_t)out >> r->out_shift) & VOSEL_MASK;
++	return true;
++}
++
++static uint32_t
++ck_uv(unsigned which, uint32_t step)
++{
++	return ck_rails[which].base_uv + step * 6250u;
++}
++
++static void
++ck_rail_say(unsigned which, const char *when)
++{
++	struct ck_rail_state s;
++
++	if (!ck_rail_read(which, &s)) {
++		printf("A34 CLOCKS: %s%s: the PMIC does not answer\n", ck_rails[which].name, when);
++		return;
++	}
++	printf("A34 CLOCKS: %s%s: %s, set %u uV, puts out %u uV (step %u)\n", ck_rails[which].name, when,
++	    s.on ? "on" : "OFF", ck_uv(which, s.set), ck_uv(which, s.out), s.out);
++}
++
++/* ---- the report ---- */
++
++/* A CPU divider (pll_to_clk() of plat_k6877): 8, 16, 24: /1; 9-11: 3/4..1/4; 17-20: 4/5..1/5; 25-29: 5/6..1/6. */
++static uint32_t
++ck_cpu_divide(uint32_t khz, uint32_t sel)
++{
++	if (sel >= 9 && sel <= 11) {
++		return khz * (12 - sel) / 4;
++	}
++	if (sel >= 17 && sel <= 20) {
++		return khz * (21 - sel) / 5;
++	}
++	if (sel >= 25 && sel <= 29) {
++		return khz * (30 - sel) / 6;
++	}
++	return khz;
++}
++
++static void
++ck_cpu_report(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t con0, div;
++	} c[3] = {
++		{ "LL (cpu0-5, Cortex-A55)", ARMPLL_LL_CON0, CKDIV1_LL },
++		{ "L (cpu6-7, Cortex-A78)", ARMPLL_BL_CON0, CKDIV1_L },
++		{ "CCI", CCIPLL_CON0, CKDIV1_CCI },
++	};
++	static const char *const src[4] = { "26 MHz", "its ARMPLL", "MAINPLL", "UNIVPLL" };
++
++	for (unsigned i = 0; i < 3; i++) {
++		uint32_t con0 = ruby_rd32(ck_apmixed, c[i].con0), con1 = ruby_rd32(ck_apmixed, c[i].con0 + 4u);
++		uint32_t div = ruby_rd32(ck_mcucfg, c[i].div), mux = (div >> 9) & 3u, sel = (div >> 17) & 0x1fu;
++		uint32_t posdiv = (con1 >> CON1_POSDIV_SHIFT) & 7u;
++		uint32_t vco = (uint32_t)((((uint64_t)(con1 & 0x3fffffu) * 26u) >> 14) * 1000u);    /* kHz, as _cpu_freq_calc() */
++		uint32_t pll = vco >> (posdiv > 4 ? 4 : posdiv);
++		uint32_t khz = mux == 1 ? ck_cpu_divide(pll, sel) : (mux == 0 ? 26000 : 0);
++
++		printf("A34 CLOCKS: CPU %s: PLL CON0 0x%08x CON1 0x%08x (%s, VCO %u MHz / %u = %u MHz), "
++		    "divider 0x%08x (from %s, divider %u): %u MHz%s\n", c[i].name, con0, con1, (con0 & 1u) ? "on" : "OFF",
++		    vco / 1000, 1u << (posdiv > 4 ? 4 : posdiv), pll / 1000, div, src[mux], sel, khz / 1000,
++		    mux >= 2 ? " (rate of that PLL not read)" : "");
++	}
++}
++
++static uint32_t
++ck_mfgpll_khz(uint32_t con1)
++{
++	/* __gpufreq_get_real_fgpu(): (((PCW * 10 + 5) * 26) >> 14) / 2^posdiv * 100 */
++	uint64_t pcw = con1 & 0x3fffffu;
++
++	return (uint32_t)(((((pcw * 10u + 5u) * 26u) >> 14) >> ((con1 >> CON1_POSDIV_SHIFT) & 7u)) * 100u);
++}
++
++static bool
++ck_mfg0_on(void)
++{
++	return (ruby_rd32(ck_spm, SPM_XPU_PWR_STATUS) & 1u) && (ruby_rd32(ck_spm, SPM_XPU_PWR_STATUS_2ND) & 1u);
++}
++
++static void
++ck_gpu_report(const char *when)
++{
++	uint32_t cfg20 = ruby_rd32(ck_top, TOP_CLK_CFG_20), con1, con4;
++
++	if (!ck_mfg0_on()) {
++		printf("A34 CLOCKS: GPU%s: MFG0 is off: its PLLs not read; CLK_CFG_20 0x%08x\n", when, cfg20);
++		return;
++	}
++	con1 = ruby_rd32(ck_gpupll, MFGPLL1_CON1);
++	con4 = ruby_rd32(ck_gpupll, MFGPLL4_CON1);
++	printf("A34 CLOCKS: GPU%s: MFGPLL1 CON0 0x%08x CON1 0x%08x CON3 0x%08x (%u kHz), MFGPLL4 CON0 0x%08x CON1 0x%08x "
++	    "(%u kHz), CLK_CFG_20 0x%08x: the GPU on %s, MFGPLL1 hopping HP_EN 0x%08x CFG 0x%08x\n", when,
++	    ruby_rd32(ck_gpupll, MFGPLL1_CON0), con1, ruby_rd32(ck_gpupll, MFGPLL1_CON3), ck_mfgpll_khz(con1),
++	    ruby_rd32(ck_gpupll, MFGPLL4_CON0), con4, ck_mfgpll_khz(con4), cfg20,
++	    (cfg20 & TOP_MFG_PLL1) ? "MFGPLL1" : ((cfg20 & TOP_MFG_INT1_PLL4) ? "MFGPLL4" : "26 MHz"),
++	    ruby_rd32(ck_gpupll, GPU_FHCTL_HP_EN), ruby_rd32(ck_gpupll, GPU_FHCTL0_CFG));
++}
++
++void
++a34_clocks_init(void)
++{
++	uint32_t on = 1, cpu = 0;
++
++	if (ck_started) {
++		return;
++	}
++	ck_started = true;
++	(void)PE_parse_boot_argn("a34clocks", &on, (int)sizeof(on));
++	if (on == 0) {
++		printf("A34 CLOCKS: nothing read or changed (a34clocks=0)\n");
++		return;
++	}
++	ck_top = ml_io_map(CK_TOP_PA, CK_PAGE);
++	ck_spm = ml_io_map(CK_SPM_PA, CK_PAGE);
++	ck_apmixed = ml_io_map(CK_APMIXED_PA, CK_PAGE);
++	ck_pwrap = ml_io_map(CK_PWRAP_PA, CK_PAGE);
++	ck_mcucfg = ml_io_map(CK_MCUCFG_PA, CK_PAGE);
++	ck_gpupll = ml_io_map(CK_GPUPLL_PA, CK_PAGE);
++	if (!ck_top || !ck_spm || !ck_apmixed || !ck_pwrap || !ck_mcucfg || !ck_gpupll) {
++		ck_pwrap = 0;           /* (a34_clocks_gpu_wanted(): no) */
++		printf("A34 CLOCKS: MMIO mapping failed\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("a34gpumhz", &ck_gpu_want_mhz, (int)sizeof(ck_gpu_want_mhz));
++	if (ck_gpu_want_mhz > 10000u) {
++		ck_gpu_want_mhz = 10000u;       /* (only "the most there is"; no overflow in kHz) */
++	}
++	ck_cpu_report();
++	ck_gpu_report(" (as the boot loader left it)");
++	for (unsigned i = 0; i < RAIL_N; i++) {
++		ck_rail_say(i, "");
++	}
++	printf("A34 CLOCKS: the CPU clusters' Vproc (MT6315 bucks on SPMI) are not read\n");
++	if (PE_parse_boot_argn("a34cpufreq", &cpu, (int)sizeof(cpu)) && cpu != 0) {
++		printf("A34 CLOCKS: a34cpufreq=%u: the CPU clocks stay as they are: their Vproc rails are MT6315 bucks on SPMI, "
++		    "driven by the MCUPM firmware the preloader starts (Android asks it through its CSRAM and IPIs); "
++		    "there is no direct path to raise them safely\n", cpu);
++	}
++	if (ck_gpu_want_mhz != 0) {
++		printf("A34 CLOCKS: a34gpumhz=%u: the GPU's clock is raised before programs get the GPU (a34_mali.c)\n",
++		    ck_gpu_want_mhz);
++	}
++}
++
++/* ---- the GPU ---- */
++
++/*
++ * gpufreq_mt6877.h's OPPs of the MT6877 segment (signed OPPs 4..37; the
++ * MT6877T's 950..914 need the segment efuse): kHz, VGPU and VSRAM_GPU in
++ * 10 uV (gpufreq's mV x 100). The voltage is the highest of the three PTPOD
++ * variants (g_opp_table_segment_1..3, by efuse ptpod28 [15:14]); they are
++ * the same from 670 MHz up.
++ */
++struct ck_gpu_opp {
++	uint32_t khz, vgpu, vsram;
++};
++
++static const struct ck_gpu_opp ck_gpu_opps[] = {
++	{ 902000, 75625, 75625 },       /*  4 */
++	{ 890000, 75000, 75000 },       /*  5 sign-off */
++	{ 876000, 74375, 75000 },
++	{ 862000, 73750, 75000 },
++	{ 848000, 73125, 75000 },
++	{ 835000, 72500, 75000 },
++	{ 821000, 71875, 75000 },       /* 10 */
++	{ 807000, 71250, 75000 },
++	{ 793000, 70625, 75000 },
++	{ 780000, 70000, 75000 },
++	{ 766000, 69375, 75000 },
++	{ 752000, 68750, 75000 },       /* 15 */
++	{ 738000, 68125, 75000 },
++	{ 725000, 67500, 75000 },
++	{ 711000, 66875, 75000 },
++	{ 697000, 66250, 75000 },
++	{ 683000, 65625, 75000 },       /* 20 */
++	{ 670000, 65000, 75000 },       /* 21 sign-off */
++	{ 652000, 65000, 75000 },       /* (64375/65000/65000) */
++	{ 634000, 64375, 75000 },       /* (63750/64375/64375) */
++	{ 616000, 64375, 75000 },       /* (63125/63750/64375) */
++	{ 598000, 63750, 75000 },       /* 25 (62500/63125/63750) */
++	{ 580000, 63750, 75000 },       /* (61875/63125/63750) */
++	{ 563000, 63125, 75000 },       /* (61250/62500/63125) */
++	{ 545000, 63125, 75000 },       /* (60625/61875/63125) */
++	{ 527000, 62500, 75000 },       /* (60000/61250/62500) */
++	{ 509000, 62500, 75000 },       /* 30 (59375/61250/62500) */
++	{ 491000, 61875, 75000 },       /* (58750/60625/61875) */
++	{ 474000, 61875, 75000 },       /* (58125/60000/61875) */
++	{ 456000, 61250, 75000 },       /* (57500/59375/61250) */
++	{ 438000, 61250, 75000 },       /* (56875/59375/61250) */
++	{ 420000, 60625, 75000 },       /* 35 (56250/58750/60625) */
++	{ 402000, 60625, 75000 },       /* (55625/58125/60625) */
++	{ 385000, 60000, 75000 },       /* 37 sign-off (55000/57500/60000) */
++};
++
++#define CK_GPU_OPPS             ((unsigned)(sizeof(ck_gpu_opps) / sizeof(ck_gpu_opps[0])))
++#define CK_BUCK_DIFF_MAX        20000u  /* VSRAM - VGPU <= 200 mV (MAX_BUCK_DIFF) */
++#define CK_VGPU_LOW             55000u  /* the table's lowest VGPU (segment 1, 385 MHz) */
++#define CK_VGPU_TOP             78125u  /* the table's highest (950 MHz) */
++#define CK_VSRAM_LOW            75000u
++#define CK_VSRAM_TOP            78125u
++
++/* What was changed, to put back in reverse order: the rails' set registers, MFGPLL1's CON1. */
++struct ck_undo {
++	unsigned rail;
++	uint16_t set_reg;
++};
++
++static struct ck_undo ck_undo[16];
++static unsigned ck_undo_n;
++static uint32_t ck_saved_con1;
++static bool ck_pll_changed, ck_gpu_raised;
++
++static uint32_t
++ck_cv(unsigned which, uint32_t step)     /* 10 uV */
++{
++	return ck_uv(which, step) / 10u;
++}
++
++static uint32_t
++ck_step(unsigned which, uint32_t cv)
++{
++	return (cv * 10u - ck_rails[which].base_uv) / 6250u;
++}
++
++static bool
++ck_rails_ok(uint32_t vgpu, uint32_t vsram)
++{
++	return vsram >= vgpu && vsram - vgpu <= CK_BUCK_DIFF_MAX;
++}
++
++/*
++ * One rail to a step: written, then the set value read back and, after the
++ * ramp (gpufreq_mt6877.c: VGPU 10 mV/us up and 5 down plus 9 us, VSRAM 12.5
++ * and 5 plus 8: here 5 mV/us both ways, doubled, plus 20 us), the value put
++ * out, for 1 ms more at most.
++ */
++static bool
++ck_rail_set(unsigned which, uint32_t from, uint32_t to)
++{
++	const struct ck_rail *r = &ck_rails[which];
++	struct ck_rail_state s = { false, 0, 0, 0 };
++	uint32_t delta = (from > to ? from - to : to - from) * 6250u;
++
++	if (!ck_rail_read(which, &s) || s.set != from || s.out != from || ck_undo_n >= 16u) {
++		printf("A34 CLOCKS: GPU: %s is not at step %u before it is set (set %u, out %u)\n", r->name, from, s.set, s.out);
++		return false;
++	}
++	ck_undo[ck_undo_n].rail = which;
++	ck_undo[ck_undo_n].set_reg = s.set_reg;
++	ck_undo_n++;
++	if (!ck_pmic_write(r->set, (uint16_t)((s.set_reg & ~VOSEL_MASK) | to))) {
++		printf("A34 CLOCKS: GPU: %s: the PMIC wrapper did not take the write\n", r->name);
++		return false;
++	}
++	delay((int)(2u * (delta / 5000u + 9u) + 20u));
++	for (unsigned i = 0; i < 100; i++) {
++		if (ck_rail_read(which, &s) && s.set == to && s.out == to) {
++			printf("A34 CLOCKS: GPU: %s %u -> %u uV\n", r->name, ck_uv(which, from), ck_uv(which, to));
++			return true;
++		}
++		delay(10);
++	}
++	printf("A34 CLOCKS: GPU: %s set to %u uV reads set %u uV, puts out %u uV\n", r->name, ck_uv(which, to),
++	    ck_uv(which, s.set), ck_uv(which, s.out));
++	return false;
++}
++
++/* The rails, put back as they were, last change first. */
++static void
++ck_rails_undo(void)
++{
++	while (ck_undo_n > 0) {
++		struct ck_undo *u = &ck_undo[--ck_undo_n];
++
++		if (!ck_pmic_write(ck_rails[u->rail].set, u->set_reg)) {
++			printf("A34 CLOCKS: GPU: %s could not be put back\n", ck_rails[u->rail].name);
++		}
++		delay(200);
++	}
++	ck_rail_say(RAIL_VGPU, " put back");
++	ck_rail_say(RAIL_VSRAM_GPU, " put back");
++}
++
++/*
++ * The rails to OPP t, as __gpufreq_generic_commit_gpu() moves them: up
++ * through the springboard (each step to the highest OPP whose VSRAM is
++ * within 200 mV of VGPU now, no higher than t; VSRAM first, then VGPU),
++ * down the other way round (VGPU first). Every value written is a table
++ * value, and every state on the way keeps 0 <= VSRAM - VGPU <= 200 mV.
++ */
++static bool
++ck_gpu_rails_to(unsigned t, uint32_t *gpu, uint32_t *sram)
++{
++	const struct ck_gpu_opp *o = &ck_gpu_opps[t];
++
++	for (unsigned step = 0; step < 6; step++) {
++		uint32_t vg = ck_cv(RAIL_VGPU, *gpu), vs = ck_cv(RAIL_VSRAM_GPU, *sram);
++		const struct ck_gpu_opp *p;
++		unsigned i;
++
++		if (vg == o->vgpu && vs == o->vsram) {
++			return true;
++		}
++		if (o->vgpu >= vg) {
++			for (i = 0; i < CK_GPU_OPPS && ck_gpu_opps[i].vsram > vg + CK_BUCK_DIFF_MAX; i++) {
++			}
++			if (i == CK_GPU_OPPS) {
++				printf("A34 CLOCKS: GPU: no OPP's VSRAM is within 200 mV of VGPU %u uV\n", vg * 10u);
++				return false;
++			}
++			p = &ck_gpu_opps[i > t ? i : t];
++			if (!ck_rails_ok(vg, p->vsram) || !ck_rails_ok(p->vgpu, p->vsram)) {
++				return false;
++			}
++			if (p->vsram != vs) {
++				if (!ck_rail_set(RAIL_VSRAM_GPU, *sram, ck_step(RAIL_VSRAM_GPU, p->vsram))) {
++					return false;
++				}
++				*sram = ck_step(RAIL_VSRAM_GPU, p->vsram);
++			}
++			if (p->vgpu != vg) {
++				if (!ck_rail_set(RAIL_VGPU, *gpu, ck_step(RAIL_VGPU, p->vgpu))) {
++					return false;
++				}
++				*gpu = ck_step(RAIL_VGPU, p->vgpu);
++			}
++		} else {
++			for (i = CK_GPU_OPPS; i-- > 0 && (ck_gpu_opps[i].vgpu > vs || vs - ck_gpu_opps[i].vgpu > CK_BUCK_DIFF_MAX);) {
++			}
++			if (i >= CK_GPU_OPPS) {
++				printf("A34 CLOCKS: GPU: no OPP's VGPU is within 200 mV under VSRAM %u uV\n", vs * 10u);
++				return false;
++			}
++			p = &ck_gpu_opps[i < t ? i : t];
++			if (!ck_rails_ok(p->vgpu, vs) || !ck_rails_ok(p->vgpu, p->vsram)) {
++				return false;
++			}
++			if (!ck_rail_set(RAIL_VGPU, *gpu, ck_step(RAIL_VGPU, p->vgpu))) {
++				return false;
++			}
++			*gpu = ck_step(RAIL_VGPU, p->vgpu);
++			if (p->vsram != vs) {
++				if (!ck_rail_set(RAIL_VSRAM_GPU, *sram, ck_step(RAIL_VSRAM_GPU, p->vsram))) {
++					return false;
++				}
++				*sram = ck_step(RAIL_VSRAM_GPU, p->vsram);
++			}
++		}
++	}
++	printf("A34 CLOCKS: GPU: the rails did not reach the OPP in 6 steps\n");
++	return false;
++}
++
++/*
++ * MFGPLL1 measured by the GPU PLL block's own frequency meter, exactly as
++ * mt6877_get_subsys_freq() does it (only the meter's registers are
++ * written); kHz, 0 if it did not finish.
++ */
++static uint32_t
++ck_mfgpll1_meter(void)
++{
++	vm_offset_t b = ck_gpupll;
++	uint32_t i, count;
++	bool done;
++
++	ruby_wr32(b, PLL4H_FQMTR_CON0, ruby_rd32(b, PLL4H_FQMTR_CON0) & 0xffff7fffu);
++	ruby_wr32(b, PLL4H_FQMTR_CON0, ruby_rd32(b, PLL4H_FQMTR_CON0) | 0x8000u);
++	ruby_wr32(b, PLL4H_FQMTR_CON0, ruby_rd32(b, PLL4H_FQMTR_CON0) & 0x00fffff8u);   /* clock 0: MFGPLL1 */
++	ruby_wr32(b, PLL4H_FQMTR_CON1, (ruby_rd32(b, PLL4H_FQMTR_CON1) & 0xfc00ffffu) | (0x3ffu << 16));
++	ruby_wr32(b, PLL4H_FQMTR_CON0, (ruby_rd32(b, PLL4H_FQMTR_CON0) & 0x00ffffffu) | (3u << 24));
++	ruby_wr32(b, PLL4H_FQMTR_CON0, (ruby_rd32(b, PLL4H_FQMTR_CON0) & 0xffff8007u) | 0x1000u);
++	ruby_wr32(b, PLL4H_FQMTR_CON0, ruby_rd32(b, PLL4H_FQMTR_CON0) | 0x10u);
++	for (i = 0; i < 30 && (ruby_rd32(b, PLL4H_FQMTR_CON0) & 0x10u); i++) {
++		delay(10);
++	}
++	done = !(ruby_rd32(b, PLL4H_FQMTR_CON0) & 0x10u);
++	count = ruby_rd32(b, PLL4H_FQMTR_CON1) & 0xffffu;
++	ruby_wr32(b, PLL4H_FQMTR_CON0, 0x8000u);
++	return done ? count * 26000u / 1024u * 4u : 0;
++}
++
++/*
++ * MFGPLL1 to a new rate as __gpufreq_freq_scale_gpu() does it: the GPU's
++ * clock parked (here on 26 MHz, as a34_mali.c parks it around shader power
++ * changes: mfg_internal1 on 26 MHz, the GPU on mfg_internal1), CON1 with
++ * PCW_CHG, 20 us for the PLL, the GPU back on MFGPLL1. No job runs.
++ */
++static void
++ck_mfgpll1_write(uint32_t con1)
++{
++	ruby_wr32(ck_top, TOP_CLK_CFG_20_CLR, TOP_MFG_INT1_PLL4);
++	ruby_wr32(ck_top, TOP_CLK_CFG_20_CLR, TOP_MFG_PLL1);
++	delay(2);
++	ruby_wr32(ck_gpupll, MFGPLL1_CON1, con1);
++	delay(30);
++	ruby_wr32(ck_top, TOP_CLK_CFG_20_SET, TOP_MFG_PLL1);
++	ruby_wr32(ck_top, TOP_CLK_CFG_20_CLR, TOP_MFG_INT1_PLL4);
++}
++
++bool
++a34_clocks_gpu_wanted(void)
++{
++	return ck_gpu_want_mhz != 0 && ck_pwrap != 0;
++}
++
++bool
++a34_clocks_gpu_raise(void)
++{
++	struct ck_rail_state g, s, p1, p2, q1 = { false, 0, 0, 0 }, q2 = { false, 0, 0, 0 };
++	const struct ck_gpu_opp *o;
++	uint32_t con0, con1, con3, cfg20, hp, fcfg, pcw, want, got, before, after, gpu, sram;
++	unsigned t;
++
++	if (!a34_clocks_gpu_wanted() || ck_gpu_raised) {
++		return false;
++	}
++	for (t = 0; t < CK_GPU_OPPS && ck_gpu_opps[t].khz > ck_gpu_want_mhz * 1000u; t++) {
++	}
++	if (t == CK_GPU_OPPS) {
++		printf("A34 CLOCKS: GPU: a34gpumhz=%u is below the table's lowest OPP (385 MHz): left as it is\n", ck_gpu_want_mhz);
++		return false;
++	}
++	o = &ck_gpu_opps[t];
++	if (ck_gpu_want_mhz * 1000u > ck_gpu_opps[0].khz) {
++		printf("A34 CLOCKS: GPU: a34gpumhz=%u: 902 MHz at most (the MT6877T segment's 950 MHz needs its efuse)\n",
++		    ck_gpu_want_mhz);
++	}
++
++	/* 1. exactly as the boot loader leaves it, or nothing is touched */
++	if (!ck_mfg0_on()) {
++		printf("A34 CLOCKS: GPU: MFG0 is off: left as it is\n");
++		return false;
++	}
++	con0 = ruby_rd32(ck_gpupll, MFGPLL1_CON0);
++	con1 = ruby_rd32(ck_gpupll, MFGPLL1_CON1);
++	con3 = ruby_rd32(ck_gpupll, MFGPLL1_CON3);
++	cfg20 = ruby_rd32(ck_top, TOP_CLK_CFG_20);
++	hp = ruby_rd32(ck_gpupll, GPU_FHCTL_HP_EN);
++	fcfg = ruby_rd32(ck_gpupll, GPU_FHCTL0_CFG);
++	if (!ck_rail_read(RAIL_VGPU, &g) || !ck_rail_read(RAIL_VSRAM_GPU, &s) || !ck_rail_read(RAIL_VSRAM_PROC1, &p1) ||
++	    !ck_rail_read(RAIL_VSRAM_PROC2, &p2)) {
++		printf("A34 CLOCKS: GPU: the PMIC does not answer: left as it is\n");
++		return false;
++	}
++	printf("A34 CLOCKS: GPU: a34gpumhz=%u -> OPP %u kHz at VGPU %u uV, VSRAM_GPU %u uV; now MFGPLL1 CON0 0x%08x "
++	    "CON1 0x%08x CON3 0x%08x (%u kHz), CLK_CFG_20 0x%08x, hopping 0x%08x/0x%08x, VGPU %s set %u out %u uV, "
++	    "VSRAM_GPU %s set %u out %u uV\n", ck_gpu_want_mhz, o->khz, o->vgpu * 10u, o->vsram * 10u, con0, con1, con3,
++	    ck_mfgpll_khz(con1), cfg20, hp, fcfg, g.on ? "on" : "OFF", ck_uv(RAIL_VGPU, g.set), ck_uv(RAIL_VGPU, g.out),
++	    s.on ? "on" : "OFF", ck_uv(RAIL_VSRAM_GPU, s.set), ck_uv(RAIL_VSRAM_GPU, s.out));
++	if ((con1 & ~CON1_PCW_CHG) != MFGPLL1_LK_CON1 || !(con0 & 1u) || (con3 & 3u) != 1u) {
++		printf("A34 CLOCKS: GPU: MFGPLL1 is not as the boot loader leaves it (CON1 0x%08x): left as it is\n",
++		    MFGPLL1_LK_CON1);
++		return false;
++	}
++	if ((cfg20 & (TOP_MFG_PLL1 | TOP_MFG_INT1_PLL4)) != TOP_MFG_PLL1 || (hp & 1u) || (fcfg & 7u)) {
++		printf("A34 CLOCKS: GPU: the GPU is not on MFGPLL1 alone, or MFGPLL1 hops: left as it is\n");
++		return false;
++	}
++	if (!g.on || !s.on || g.set != g.out || s.set != s.out ||
++	    ck_cv(RAIL_VGPU, g.out) < CK_VGPU_LOW || ck_cv(RAIL_VGPU, g.out) > CK_VGPU_TOP ||
++	    ck_cv(RAIL_VSRAM_GPU, s.out) < CK_VSRAM_LOW || ck_cv(RAIL_VSRAM_GPU, s.out) > CK_VSRAM_TOP ||
++	    !ck_rails_ok(ck_cv(RAIL_VGPU, g.out), ck_cv(RAIL_VSRAM_GPU, s.out))) {
++		printf("A34 CLOCKS: GPU: the rails are not on, settled, inside the table's range (VGPU %u..%u, VSRAM %u..%u uV) "
++		    "and within 200 mV of each other: left as it is\n", CK_VGPU_LOW * 10u, CK_VGPU_TOP * 10u,
++		    CK_VSRAM_LOW * 10u, CK_VSRAM_TOP * 10u);
++		return false;
++	}
++	before = ck_mfgpll1_meter();
++	printf("A34 CLOCKS: GPU: MFGPLL1 measures %u kHz before\n", before);
++
++	/* 2. the voltages, through the springboard; VSRAM_PROC1/2 must not follow (no tracking) */
++	ck_undo_n = 0;
++	gpu = g.out;
++	sram = s.out;
++	if (!ck_gpu_rails_to(t, &gpu, &sram) || !ck_rail_read(RAIL_VSRAM_PROC1, &q1) ||
++	    !ck_rail_read(RAIL_VSRAM_PROC2, &q2) || q1.out != p1.out || q2.out != p2.out) {
++		printf("A34 CLOCKS: GPU: the voltages did not go as planned (VSRAM_PROC1 step %u -> %u, PROC2 %u -> %u): "
++		    "all put back\n", p1.out, q1.out, p2.out, q2.out);
++		ck_rails_undo();
++		return false;
++	}
++
++	/* 3. the clock: CON1 with PCW_CHG while parked, as gpufreq; read back and measured */
++	pcw = (uint32_t)((((uint64_t)(o->khz / 100u) << POSDIV_POWER_4 << 14) / 26u + 5u) / 10u);
++	want = CON1_PCW_CHG | (POSDIV_POWER_4 << CON1_POSDIV_SHIFT) | pcw;
++	ck_saved_con1 = con1;
++	ck_pll_changed = true;
++	ck_mfgpll1_write(want);
++	got = ruby_rd32(ck_gpupll, MFGPLL1_CON1);
++	after = ck_mfgpll1_meter();
++	printf("A34 CLOCKS: GPU: MFGPLL1 CON1 0x%08x written, reads 0x%08x (%u kHz), measures %u kHz\n", want, got,
++	    ck_mfgpll_khz(got), after);
++	/* the meter is trusted only if it read the boot loader's 385 MHz within 3 % */
++	if ((got & CON1_RATE_MASK) != (want & CON1_RATE_MASK) || ck_mfgpll_khz(got) != o->khz ||
++	    (before >= 373000u && before <= 397000u &&
++	    (after < o->khz - o->khz / 33u || after > o->khz + o->khz / 33u))) {
++		printf("A34 CLOCKS: GPU: MFGPLL1 is not at %u kHz: all put back\n", o->khz);
++		ck_mfgpll1_write(ck_saved_con1 | CON1_PCW_CHG);
++		ck_pll_changed = false;
++		ck_rails_undo();
++		ck_gpu_report(" (put back)");
++		return false;
++	}
++	ck_gpu_raised = true;
++	ck_gpu_report(" (raised)");
++	ck_rail_say(RAIL_VGPU, " (raised)");
++	ck_rail_say(RAIL_VSRAM_GPU, " (raised)");
++	return true;
++}
++
++/* a34_mali.c: the GPU failed its job at the new clock; no job runs. Everything as the boot loader left it. */
++void
++a34_clocks_gpu_restore(void)
++{
++	if (!ck_gpu_raised) {
++		return;
++	}
++	if (ck_pll_changed) {
++		ck_mfgpll1_write(ck_saved_con1 | CON1_PCW_CHG);
++		ck_pll_changed = false;
++	}
++	ck_rails_undo();
++	ck_gpu_raised = false;
++	ck_gpu_report(" (put back after a failed job)");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index fce9552..1d3106e 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -49,6 +49,9 @@
+  * refuses identity mode); a34malipause=S sleeps S seconds (at most 60)
+  * between steps, so that the persistent log (written every 10 s) shows how
+  * far it got if a step hangs the phone; a34malipark=0 (see step 4).
++ * A34 (0921): a34gpumhz=N raises the GPU's clock from the boot loader's
++ * 385 MHz to the OPP at or below N (bsd/dev/a34_clocks.c) just before the
++ * service starts, then runs step 6's job once more ("step 8").
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /* The headers sweet_ufs.c is built with: it makes the same VM calls. */
+@@ -103,6 +106,9 @@ bool a34_mali_submit(struct a34_mali_job *job);
+ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ void a34_mali_cpu_clean(uintptr_t va, uint64_t size);
+ bool RedwoodMaliStart(void);            /* iokit/Kernel/arm/A34Mali.cpp */
++bool a34_clocks_gpu_wanted(void);       /* A34 (0921): bsd/dev/a34_clocks.c */
++bool a34_clocks_gpu_raise(void);
++void a34_clocks_gpu_restore(void);
+ 
+ /* ---- where things are ---- */
+ 
+@@ -837,6 +843,8 @@ am_bringup(void)
+ #define GPU_CORE_FEATURES       0x008u
+ #define GPU_MEM_FEATURES        0x010u
+ #define GPU_AFBC_FEATURES       0x04cu
++#define GPU_CYCLE_COUNT_LO      0x090u          /* A34 (0921) */
++#define GPU_CYCLE_COUNT_HI      0x094u
+ #define GPU_TIMESTAMP_LO        0x098u
+ #define GPU_TIMESTAMP_HI        0x09cu
+ #define GPU_THREAD_MAX_THREADS  0x0a0u
+@@ -1128,6 +1136,35 @@ am_rd64(uint32_t lo)
+ 	return am_rd(am_gpu, lo) | ((uint64_t)am_rd(am_gpu, lo + 4u) << 32);
+ }
+ 
++/*
++ * A34 (0921): the GPU's clock in MHz as its own cycle counter sees it over
++ * 2 ms of the processor's clock; 0: it did not count. (Low if the clock is
++ * gated while the GPU is idle.) Only while no job runs.
++ */
++static uint32_t
++am_gpu_mhz(void)
++{
++	uint64_t c[2], t[2], ns;
++	uint32_t hi, lo;
++
++	am_wr(am_gpu, GPU_CMD, GPU_CMD_CYCLE_COUNT_START);
++	delay(5);
++	for (unsigned i = 0; i < 2; i++) {
++		if (i == 1) {
++			delay(2000);
++		}
++		do {
++			hi = am_rd(am_gpu, GPU_CYCLE_COUNT_HI);
++			lo = am_rd(am_gpu, GPU_CYCLE_COUNT_LO);
++		} while (am_rd(am_gpu, GPU_CYCLE_COUNT_HI) != hi);
++		t[i] = mach_absolute_time();
++		c[i] = ((uint64_t)hi << 32) | lo;
++	}
++	am_wr(am_gpu, GPU_CMD, GPU_CMD_CYCLE_COUNT_STOP);
++	absolutetime_to_nanoseconds(t[1] - t[0], &ns);
++	return (ns == 0 || c[1] <= c[0]) ? 0 : (uint32_t)((c[1] - c[0]) * 1000u / ns);
++}
++
+ /* The GPU's TIMESTAMP (the system counter), with its cycle counter running as panfrost has it. */
+ static uint64_t
+ am_timestamp(void)
+@@ -1531,6 +1568,28 @@ am_uc_start(void)
+ 			return;
+ 		}
+ 	}
++	/*
++	 * A34 (0921): boot-arg a34gpumhz=N: the GPU's clock raised to the
++	 * table's OPP at or below N (bsd/dev/a34_clocks.c), now, while no job
++	 * runs, and step 6's job run once more at it ("step 8"). If that job
++	 * fails: the clock and voltages as the boot loader left them, the GPU
++	 * reset and set up as after any failed job, and the job once more.
++	 */
++	if (a34_clocks_gpu_wanted()) {
++		printf("A34 MALI UC: GPU clock by its cycle counter: %u MHz before\n", am_gpu_mhz());
++		if (a34_clocks_gpu_raise()) {
++			if (am_run_job(8, AM_GPU_VA, 0xc0ffee08u)) {
++				printf("A34 MALI UC: GPU clock by its cycle counter: %u MHz now\n", am_gpu_mhz());
++			} else {
++				a34_clocks_gpu_restore();
++				if (!am_gpu_reinit(true) || !am_run_job(8, AM_GPU_VA, 0xc0ffee18u)) {
++					printf("A34 MALI UC: the GPU did not come back at the boot loader's clock either, "
++					    "user client not started\n");
++					return;
++				}
++			}
++		}
++	}
+ 	l3[(AM_GPU_VA >> 12) & 511] = 0;
+ 	am_flush((vm_offset_t)&l3[(AM_GPU_VA >> 12) & 511], sizeof(uint64_t));
+ 	am_pt_dirty = true;
+diff --git a/bsd/dev/a34_touch.c b/bsd/dev/a34_touch.c
+index aaec1dc..8c6ff8e 100644
+--- a/bsd/dev/a34_touch.c
++++ b/bsd/dev/a34_touch.c
+@@ -423,9 +423,11 @@ a34_touch_init(void)
+ 	}
+ 
+ 	/* Touch power: vio28 at 3.0 V. Done here, before the key poll thread
+-	 * starts using the PMIC wrapper. */
++	 * starts using the PMIC wrapper. A34 (0921): with its lock (a34_clocks.c). */
++	a34_pmic_lock();
+ 	if (ruby_pwrap_read(at_pwrap, VIO28_CON0, &en) != 0 ||
+ 	    ruby_pwrap_read(at_pwrap, VIO28_ANA_CON0, &vosel) != 0) {
++		a34_pmic_unlock();
+ 		printf("A34 TOUCH: PMIC read failed\n");
+ 		return;
+ 	}
+@@ -436,6 +438,7 @@ a34_touch_init(void)
+ 		delay(3000);
+ 	}
+ 	(void)ruby_pwrap_read(at_pwrap, VIO28_MON, &mon);
++	a34_pmic_unlock();
+ 
+ 	/* Clocks (enable = write the bit to the gate's CLR register). */
+ 	ruby_wr32(at_top, AT_IFRAO_CLR1, 1u << 18);
+diff --git a/bsd/dev/ruby_hal.h b/bsd/dev/ruby_hal.h
+index ccd09a9..140f0fa 100644
+--- a/bsd/dev/ruby_hal.h
++++ b/bsd/dev/ruby_hal.h
+@@ -51,4 +51,12 @@ void ruby_field_set(uintptr_t base, uint32_t off, uint32_t shift,
+     uint32_t width, uint32_t val);
+ int ruby_pwrap_read(uintptr_t pwrap, uint16_t reg, uint16_t *val);
+ 
++/*
++ * A34 (0921), bsd/dev/a34_clocks.c: the PMIC wrapper's channel takes one
++ * command at a time; every user of it (ruby_keys.c's poll, a34_touch.c,
++ * a34_clocks.c) holds this around each read or write.
++ */
++void a34_pmic_lock(void);
++void a34_pmic_unlock(void);
++
+ #endif /* RUBY_HAL_H */
+diff --git a/bsd/dev/ruby_keys.c b/bsd/dev/ruby_keys.c
+index 9b48293..e1fa3fa 100644
+--- a/bsd/dev/ruby_keys.c
++++ b/bsd/dev/ruby_keys.c
+@@ -290,10 +290,13 @@ rk_thread(void *arg, wait_result_t result)
+ 
+ 	for (;;) {
+ 		uint16_t mem1 = 0xffffu, top = 0xffffu;
+-		bool pmic_ok =
+-		    ruby_pwrap_read(rk_pwrap, RK_MT6359_TOPSTATUS, &top) == 0;
++		bool pmic_ok;
+ 		bool now[3];
+ 
++		a34_pmic_lock();        /* A34 (0921): the wrapper's channel is shared (a34_clocks.c) */
++		pmic_ok = ruby_pwrap_read(rk_pwrap, RK_MT6359_TOPSTATUS, &top) == 0;
++		a34_pmic_unlock();
++
+ 		if (rk_kpd)
+ 			mem1 = ruby_rd16(rk_kpd, RK_KPD_MEM1);
+ 		now[0] = pmic_ok ? !(top & RK_TOP_PWRKEY_DEB) : rk_keys[0].down;
+@@ -348,7 +351,9 @@ ruby_keys_init(void)
+ 		printf("RUBY KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
++	a34_pmic_lock();
+ 	pmic_ok = ruby_pwrap_read(rk_pwrap, RK_MT6359_TOPSTATUS, &top) == 0;
++	a34_pmic_unlock();
+ 	printf("RUBY KEYS: start kpd=%d pwrap=%d top-ok=%d top=%04x mem1=%04x\n",
+ 	    rk_kpd != 0, rk_pwrap != 0, pmic_ok, top,
+ 	    rk_kpd ? ruby_rd16(rk_kpd, RK_KPD_MEM1) : 0xffffu);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 40b7308..9b19d93 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void ruby_keys_init(void);
+ extern void a34_touch_init(void);
+ extern void a34_diag_init(void);
+ extern void a34_mali_init(void);
++extern void a34_clocks_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -708,6 +709,7 @@ sweet_ufs_init(void)
+ 	/* A34 (0903): touch first, it powers the chip through the PMIC wrapper
+ 	 * before the key poll thread starts using it. */
+ 	a34_touch_init();
++	a34_clocks_init();      /* 0921: clocks and voltages as the boot loader left them; a34gpumhz */
+ 	a34_diag_init();
+ 	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
+ 	int keys = 0;
