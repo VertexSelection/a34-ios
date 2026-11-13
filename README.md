@@ -11,10 +11,10 @@ usable as a daily system, and installing it erases the phone.
 | --- | --- |
 | Boot | Samsung LK → our loader in `recovery` → XNU 8796 (ruby-ios-bringup patch set + `xnu/patches/09xx`) |
 | Userland | launchd → backboardd → SpringBoard → **lock screen** |
-| Display | LK's framebuffer, command-mode DSI panel kicked after every frame; CPU rendering (no GPU) |
+| Display | LK's framebuffer; frames copied by the CPU (~3 ms) and sent to the command-mode DSI panel from a separate kick work loop (~7.6 ms per transfer); CPU rendering (no GPU) |
 | Touch | Goodix GT9895 on I2C0, polled (patch 0903) |
 | Buttons | volume up/down, power (patch 0902) |
-| CPU | 1 core; 6 cores start but the system stalls after ~5 minutes (open) |
+| CPU | all 8 cores (6× Cortex-A55 at ~1.8 GHz, 2× Cortex-A78), one scheduler cluster |
 | Storage | iOS root (HFS+) at the start of `userdata` |
 | Not yet | GPU, Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
@@ -45,10 +45,12 @@ The kernel keeps a persistent log at the end of `userdata`;
 - Boot image: `tools/build-xnu.sh KERNEL "BOOT-ARGS"`, then
   `tools/run-test.sh build/xnu-recovery.img`.
 
-Boot args in use: `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0
+Boot args in use: `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
 ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1 sweethw=0 sweetgt=0
 launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt=-1
 wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_hz=30 rubkeys=1 a34touch=1`
+(`cpus=8`; `a34hb=10` adds a 10-second heartbeat with per-CPU interrupt counts and
+display timings to the kernel log)
 
 ## Layout
 
