@@ -35,6 +35,7 @@ static int watch_fd = -1;
 static uint64_t watch_start;
 static mach_timebase_info_data_t watch_timebase;
 static thread_t watch_main;
+static uintptr_t watch_stack_top, watch_stack_bottom;   /* the main thread's stack (the constructor runs on it) */
 
 static double
 watch_seconds(void)
@@ -65,9 +66,7 @@ watch_say(const char *format, ...)
 static unsigned
 watch_backtrace(uintptr_t *pcs, unsigned max)
 {
-	pthread_t main_pthread = pthread_main_thread_np();
-	uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(main_pthread);
-	uintptr_t bottom = top - pthread_get_stacksize_np(main_pthread);
+	uintptr_t top = watch_stack_top, bottom = watch_stack_bottom;
 	arm_thread_state64_t state;
 	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
 	unsigned n = 0;
@@ -162,6 +161,8 @@ watch_start_up(void)
 	mach_timebase_info(&watch_timebase);
 	watch_start = mach_absolute_time();
 	watch_main = mach_thread_self();
+	watch_stack_top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+	watch_stack_bottom = watch_stack_top - pthread_get_stacksize_np(pthread_self());
 	watch_fd = open("/dev/console", O_WRONLY | O_NOCTTY | O_APPEND | O_CLOEXEC);
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	atexit(watch_exit);
