@@ -1,0 +1,97 @@
+name: mesa-ios
+
+# Mesa's panfrost (EGL surfaceless + OpenGL ES 2/3) for the iOS 16 arm64 user space on the
+# Galaxy A34's Mali-G68, talking to the kernel through the RedwoodMali IOKit user client:
+# userland/mesa/README.md. Builds libdrm.2.dylib (redwood-drm), libgallium, libEGL,
+# libGLESv2 and the mali-tri test, uploaded as the artifact "mesa-ios".
+
+on:
+  push:
+    branches: [mesa-ios]
+  workflow_dispatch:
+
+concurrency:
+  group: mesa-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MESA_VERSION: 26.3.0
+  MESA_SHA256: 91d729aa68bb89e4ec857841300bbe922bcb3e52b1f97566ca83930d3b28343a
+  LIBDRM_VERSION: 2.4.134
+  LIBDRM_SHA256: ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95
+  IOS_MIN: "16.0"
+  WORK: ${{ github.workspace }}/work
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: Tools
+        run: |
+          brew install ccache bison pkgconf llvm spirv-llvm-translator spirv-tools
+          echo "llvm $(brew list --versions llvm), $(brew list --versions spirv-llvm-translator), $(brew list --versions spirv-tools)"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q meson==1.12.1 ninja==1.13.2 mako==1.4.3 pyyaml==6.0.3 packaging==26.3
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Source archives cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WORK }}/dl
+          key: mesa-ios-src-${{ env.MESA_VERSION }}-${{ env.LIBDRM_VERSION }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: mesa-ios-ccache-${{ env.MESA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: mesa-ios-ccache-${{ env.MESA_VERSION }}-
+
+      - name: Build
+        run: |
+          ccache -z
+          userland/mesa/build.sh
+          ccache -s
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: mesa-ios-ccache-${{ env.MESA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Logs
+        if: failure()
+        run: |
+          for f in "$WORK"/*.log "$WORK"/build-*/meson-logs/meson-log.txt; do
+            [ -f "$f" ] && { echo "=== $f"; tail -n 200 "$f"; }
+          done
+          true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mesa-ios
+          path: ${{ env.WORK }}/out
+          if-no-files-found: error

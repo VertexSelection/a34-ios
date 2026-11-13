@@ -1,0 +1,75 @@
+--- a/src/panfrost/lib/kmod/panfrost_kmod.c
++++ b/src/panfrost/lib/kmod/panfrost_kmod.c
+@@ -11,6 +11,11 @@
+ #include <xf86drm.h>
+ #include <sys/eventfd.h>
+ #include <sys/timerfd.h>
++#ifdef __APPLE__
++/* libdrm's Darwin stand-in (a34-ios userland/mesa/redwood-drm), which also provides
++ * the eventfd/timerfd headers above as stubs: perf counter sessions do not start. */
++#include <redwood_drm.h>
++#endif
+ 
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+@@ -549,6 +554,12 @@
+ panfrost_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags,
+                       void *host_addr)
+ {
++#ifdef __APPLE__
++   /* There is no DRM file to mmap() on Darwin: the kernel driver's IOKit user client
++    * maps the BO itself, as its client memory of the type that is the GEM handle. */
++   return redwood_drm_mmap(host_addr, bo->size, prot, flags, bo->dev->fd,
++                           bo->handle);
++#else
+    off_t mmap_offset;
+ 
+    mmap_offset = panfrost_kmod_bo_get_mmap_offset(bo);
+@@ -556,6 +567,7 @@
+       return MAP_FAILED;
+ 
+    return os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, mmap_offset);
++#endif
+ }
+ 
+ static bool
+@@ -898,7 +910,14 @@
+    /* This is best effort. If we can't make the thread RT because we don't
+     * have CAP_SYS_NICE, we keep going.
+     */
++#ifdef __APPLE__
++   /* Darwin has no sched_setscheduler(); this thread's own policy is the same thing. */
++   int ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &rt_params);
++   if (ret)
++      errno = ret;
++#else
+    int ret = sched_setscheduler(0, SCHED_FIFO, &rt_params);
++#endif
+    if (ret)
+       mesa_logw("Can't make the perfcnt thread RT (err=%d)", errno);
+ 
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -8,6 +8,9 @@
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <xf86drm.h>
++#ifdef __APPLE__
++#include <redwood_drm.h> /* libdrm's Darwin stand-in (a34-ios userland/mesa/redwood-drm) */
++#endif
+ 
+ #include "pan_bo.h"
+ #include "pan_device.h"
+@@ -330,7 +333,12 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   /* mapped by the IOKit user client (panfrost_kmod_bo_mmap), unmapped by it too */
++   if (redwood_drm_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
++#endif
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
