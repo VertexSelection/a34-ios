@@ -6,6 +6,27 @@ sources, and Mesa 26.3.0. **Nothing in this document has run on the phone.** Add
 that cache; "HackiOS main" is `oosexgang/hakios-xnu-kernel@63fc2b4`, "HackiOS mtk" its branch
 `mtk@a962798`. How to repeat the readings: [section 9](#9-how-the-readings-were-made).
 
+## Change of approach (14 November 2026): port HackiOS's driver
+
+The milestones below were planned from first principles. Since then the work ports HackiOS's
+Metal driver for the Mali wholesale (`userland/a34metal`, `userland/mesa/air`, Mesa patches 0006
+and 0007; what changed in the port is in `userland/a34metal/README.md`). The first phone test is
+their `metal_drv_test --bundle` with `REDWOOD_DRM_ASYNC=0`, on today's kernel without
+`a34metal=1` (with it every program would get the device, backboardd included, and CoreAnimation
+on Metal needs their `camtl` hooks in `inject.c`, not ported yet). What the kernel would add for
+their asynchronous mode and run-time discovery switch (0x7c, `setProperties`) is a proposed
+patch kept outside the repository.
+
+**Boot 31 (metal-probe, kernel 0918):** silent for 30 s inside `MTLCreateSystemDefaultDevice()`,
+then the GPU opened and closed and nothing more was printed. Metal 306.6.6 has no timeout on that
+path (no semaphore, group wait, sleep or timer is reachable from `MTLDeviceArrayInitialize`); what
+it does there that leaves the process is preferences: `[NSUserDefaults standardUserDefaults]`,
+`_CFXPreferencesRegisterDefaultValues`, `CFPreferencesGetAppBooleanValue("UseMetalTelemetry",
+"com.apple.Metal")` (`initWrapperType`), all of which talk to cfprefsd, and no `exec cfprefsd`
+appears anywhere in that boot's log. A guess, not a finding: the tests now carry `a34_watch.c`,
+which prints the main thread's backtrace every 5 s on its own console descriptor and says how the
+program ends, so the next run shows where it waits and whether it lives.
+
 ## Summary
 
 - **Loading is small and fully known.** Metal looks for `IOAcceleratorES` services, reads two
