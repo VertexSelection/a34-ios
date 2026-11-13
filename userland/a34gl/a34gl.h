@@ -8,6 +8,7 @@
 #ifndef A34GL_H
 #define A34GL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct a34gl;
@@ -26,6 +27,15 @@ const char *a34gl_library(void);                /* for the log */
  * filled and read back with OpenGL ES calls.
  */
 int a34gl_surface_texture(struct a34gl *gl, uint32_t surface);
+
+/*
+ * What liba34gl.dylib exports (everything else is hidden): inject.c looks these two up with dlsym()
+ * and calls them from its CA::OGL::GLESContext hooks (eagl.c, "the census" and the function values).
+ */
+#define A34GL_EXPORT __attribute__((visibility("default")))
+A34GL_EXPORT void a34gl_function_values(void *context, unsigned function, unsigned index, size_t components, size_t count,
+    const float *values);
+A34GL_EXPORT void a34gl_function_refused(unsigned function);
 
 /* The log (A34GL_LOG, else stderr): a line or more, as written. */
 void a34gl_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
