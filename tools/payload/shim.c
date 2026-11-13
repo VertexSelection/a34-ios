@@ -15,6 +15,11 @@
 // Addresses: recon/android-DYG1/live.dts and LK's own log in expdb.
 
 #include <stdint.h>
+#include "a34ufs.h"
+
+#ifndef BCB_WRITE
+#define BCB_WRITE 0     // 0: only read and report the misc bootloader message
+#endif
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -182,7 +187,7 @@ u64 shim_main(u64 dtb, u64 load)
     int have_out = find_placeholder(dtb);
 
     if (have_out) {
-        put_str("v3");
+        put_str("v4");
         put_str("-E"); put_hex(SYSREG(CurrentEL) >> 2, 1);
         put_str("-S"); put_hex(SYSREG(sctlr_el1), 8);
         put_str("-L"); put_hex(load, 8);
@@ -201,6 +206,21 @@ u64 shim_main(u64 dtb, u64 load)
         put_hex(rd32(RDMA0 + 0xf00), 8);              // MEM_START_ADDR
     }
     mark_scanned_buffer();
+
+    // UFS: open the host LK left running, then look at (and maybe clear) the
+    // misc bootloader message.
+    u32 hcs = 0, err = 0;
+    u32 uo = ufs_open(&hcs);
+    u32 bcb = ufs_bcb_clear(BCB_WRITE, &err);
+    if (have_out) {
+        put_str("-U"); put_hex(uo, 3); put('_'); put_hex(hcs, 2);
+        put_str("-B"); put_hex(BCB_WRITE, 1); put_hex(bcb, 1); put('_'); put_hex(err, 3);
+        put('_'); put_hex(ufs_diag.head, 8);
+        put_str("-V"); put_hex(ufs_diag.tur1, 3); put('_'); put_hex(ufs_diag.sense1, 6);
+        put('_'); put_hex(ufs_diag.ssu, 3); put('_'); put_hex(ufs_diag.tur2, 3);
+        put('_'); put_hex(ufs_diag.sense, 6);
+        put('_'); put_hex(ufs_diag.resp6, 8);
+    }
 
     // Copy the payload Image to the next 2 MiB boundary after the blob.
     u64 src = load + PAYLOAD_OFF;

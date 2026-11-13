@@ -1,0 +1,2 @@
+Files copied unchanged from https://github.com/dipa-studio/ios-sweet at commit 45263bee51df4a0f55cdf9c649af886399488ddb (MIT License, see LICENSE).
+A34-specific versions live under tools/; diff against these to see what changed.
