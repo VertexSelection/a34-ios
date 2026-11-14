@@ -318,6 +318,23 @@ memory. A picture that becomes (nearly) all black is logged ("is BLACK", with fr
 and so is the next one that is not. A black flash on the screen that never shows up here is
 made after a34gl, in the display's copy. `glblack=0`: not looked at.
 
+Black in parts of the picture (boot 45: black lines, the clock a black box, during animations;
+no whole frame black, and the kernel's display copy is ruled out):
+- For every IOSurface a draw reads, once a frame, 16 points of its memory are looked at.
+  'BGRA' or no format, opaque black where there was none the last time it was looked at is
+  logged with the surface, its name, whether its memory is the texture or a copy, its seed, and
+  the draw (`glsrcblack=0`: off).
+- A surface whose memory is the texture has its seed taken at the frame's first draw that reads
+  it. On the seed queue, after a read-only IOSurfaceLock has waited for the jobs naming it, the
+  seed is compared again. Moved means its owner wrote it while a job of ours that reads it was
+  queued or running: a half-made picture in that frame (`glsrccheck=0`: off).
+- `glseedbump=0`: no seed lock/unlock on the display's two surfaces. Those were the kernel's
+  "IOSurfaceLocks of one the display holds": write locks (options 0), one per frame, whose
+  lock/unlock keep the CPU caches of all 11 MB. The black check goes with them.
+- Mesa's own switches, for backboardd (and anything a34gl is in): `glenv=PAN_MESA_DEBUG=nocrc`
+  (no transaction elimination), `glenv=PAN_MESA_DEBUG=noafbc` (no AFBC), both:
+  `glenv=PAN_MESA_DEBUG=nocrc,noafbc`. `glasync=0`: synchronous jobs.
+
 ## The log
 
 Without `A34GL_LOG` everything goes to stderr. For backboardd, launchd makes that `/dev/null`,
@@ -361,6 +378,16 @@ bar's), `gltarget=0`, `glblack=0` (see "Copied surfaces"),
 The log: see "The log".
 
 ### Draws with no program, and the variable blur
+
+The App Library's pods (boot 44, the frame after a vrb, followed whole): their backgrounds are
+function 45, "vcm" (a colour matrix over what is behind), drawn with our program before the vrb.
+The matrix's fourth row makes opacity of luminance, and our program wrote it into the screen's
+picture: 0x35-0xd3 there, 0xff everywhere else. CoreAnimation reads that opacity. The fade
+under the search field adds a copy of the band with `ONE_MINUS_DST_ALPHA, ONE`, so a pod that is
+not opaque gets brighter. The finished picture also goes to the display with that opacity in it.
+The vcm program, and the group program that does the same, now keep the opacity that was there
+(the colour as before). `glvcmalpha=1`: the matrix's opacity, as before. `glskip=45` (the pods'
+backgrounds not drawn) shows whether the white is theirs.
 
 CoreAnimation's GL renderer draws the functions it has no shader for with no program at all;
 eagl.c draws them with programs of its own. The first draw of each function in each way now

@@ -1,0 +1,471 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 1d3106e..9a50158 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -878,6 +878,15 @@ am_bringup(void)
+ #define AM_JOB_TIMEOUT_NS       (2ull * NSEC_PER_SEC)
+ 
+ static bool am_uc_ready, am_dead, am_pt_dirty, am_tls_said;
++/* A34 (0928): am_wait_job() */
++#define AM_SPIN_GAP_NS          1000u                   /* between two looks at JOB_INT_RAWSTAT while spinning */
++#define AM_SPIN_MAX_US          20000u
++#define AM_NAP_US               100u                    /* asleep this long at a time after the spin */
++static uint32_t am_spin_us = 2000;                      /* boot-arg a34malispin; 0: 0915's polling */
++static uint64_t am_spin_gap;                            /* AM_SPIN_GAP_NS in mach time */
++extern uint32_t a34_mali_napped;
++uint32_t a34_mali_napped;                               /* jobs that outlasted the spin (A34Mali.cpp's log) */
++uint32_t a34_mali_spin_us(void);
+ static uint64_t am_as0_tab;                     /* step 6's level-0 table */
+ static uint32_t am_as0_cfg;                     /* and its TRANSCFG */
+ static uint64_t *am_pt_l1, *am_pt_l2[4], *am_pt_l3[2048];        /* kernel addresses of the tables below 4 GB */
+@@ -1102,34 +1111,66 @@ am_as0_flush(void)
+ 
+ /*
+  * Until a bit of mask is set in JOB_INT_RAWSTAT or AS0 faults, for at most
+- * 2 s: polled for the first half millisecond, then asleep 200 us at a time,
+- * so that a long job does not keep a processor busy. The bits seen (0: none).
++ * 2 s. The bits seen (0: none).
++ *
++ * A34 (0928): watched closely. delay() never spins on this phone: it spins
++ * only for less than the processor's idle latency, which SweetCPU does not
++ * give (cpu_idle_latency 0: ml_delay_should_spin() is false), so 0915's
++ * "polled every 10 us" was a 10 us sleep each time, a switch out and a
++ * timer back in, and after 50 of those 200 us naps: a job was seen done
++ * tens to hundreds of microseconds after it was, and the next one waited
++ * for that. Now the registers are read every AM_SPIN_GAP_NS, spinning on
++ * the clock, for the first am_spin_us of a job (boot-arg a34malispin,
++ * microseconds, default 2000, at most 20000; 0: as before), then asleep
++ * AM_NAP_US at a time. The thread that runs queued jobs spins on a little
++ * core (a34malicpu, A34Mali.cpp).
+  */
+ static uint32_t
+ am_wait_job(uint32_t mask, uint32_t *mmu)
+ {
+-	uint64_t deadline, nap;
++	uint64_t deadline, nap, now, spin_end, until, t;
+ 	uint32_t seen, polls = 0;
++	bool napped = false;
+ 
++	now = mach_absolute_time();
+ 	nanoseconds_to_absolutetime(AM_JOB_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
++	deadline += now;
++	nanoseconds_to_absolutetime((uint64_t)am_spin_us * NSEC_PER_USEC, &t);
++	spin_end = now + t;
+ 	for (;;) {
+ 		seen = am_rd(am_gpu, JOB_INT_RAWSTAT) & mask;
+ 		*mmu = am_rd(am_gpu, MMU_INT_RAWSTAT) & MMU_INT_AS0;
+-		if (seen != 0 || *mmu != 0 || mach_absolute_time() > deadline) {
++		now = mach_absolute_time();
++		if (seen != 0 || *mmu != 0 || now > deadline) {
++			if (napped) {
++				a34_mali_napped++;
++			}
+ 			return seen;
+ 		}
+-		if (polls < 50) {
++		if (am_spin_us != 0 && now < spin_end) {
++			until = now + am_spin_gap;
++			while (mach_absolute_time() < until) {
++				__asm__ volatile ("yield");
++			}
++		} else if (am_spin_us == 0 && polls < 50) {
+ 			polls++;
+ 			delay(10);
+ 		} else {
+-			clock_interval_to_deadline(200, (uint32_t)NSEC_PER_USEC, &nap);
++			napped = true;
++			clock_interval_to_deadline(am_spin_us != 0 ? AM_NAP_US : 200, (uint32_t)NSEC_PER_USEC, &nap);
+ 			(void)assert_wait_deadline(&am_sleep_chan, THREAD_UNINT, nap);
+ 			(void)thread_block(THREAD_CONTINUE_NULL);
+ 		}
+ 	}
+ }
+ 
++/* A34 (0928): for A34Mali.cpp's log */
++uint32_t
++a34_mali_spin_us(void)
++{
++	return am_spin_us;
++}
++
+ static uint64_t
+ am_rd64(uint32_t lo)
+ {
+@@ -1643,6 +1684,11 @@ a34_mali_init(void)
+ 	if (am_pause_s > 60) {
+ 		am_pause_s = 60;
+ 	}
++	(void)PE_parse_boot_argn("a34malispin", &am_spin_us, (int)sizeof(am_spin_us));    /* A34 (0928) */
++	if (am_spin_us > AM_SPIN_MAX_US) {
++		am_spin_us = AM_SPIN_MAX_US;
++	}
++	nanoseconds_to_absolutetime(AM_SPIN_GAP_NS, &am_spin_gap);
+ 	if (kernel_thread_start(am_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 562994c..d5eeebb 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -105,6 +105,27 @@
+  * has its queued jobs dropped and its running one waited for; and a
+  * surface's CPU side (IOSurfaceLock, the panel's copy) waits for the jobs
+  * that name the surface. See "queued jobs" below.
++ *
++ * A34 (0928): what a job costs the thread that runs it, and less of it.
++ * The "cache upkeep" of the log (the marking of the job's buffers and
++ * upkeep() before and after it) was ~85 us a job with nothing cleaned:
++ * upkeep() walked all 4096 handles of the client twice a job, 320 KB of
++ * struct a34_bo, though with write-combined buffers there is nothing to do
++ * for any of them. It now walks a list of the handles that can need
++ * something (upkeepList()), made again only after a buffer was made or
++ * closed (boot-arg a34maliscan=1: every handle, as before). "job" is from
++ * the start to when the job was seen done: the GPU's time, its caches
++ * cleaned and invalidated at both ends of the chain (JS_CONFIG, as
++ * panfrost; that is how what it wrote reaches memory for the CPU and the
++ * panel, and nothing the CPU wrote is read stale), and how late it was
++ * seen: see am_wait_job() in bsd/dev/a34_mali.c (a34malispin). The thread
++ * that runs queued jobs is bound to a little core (a34malicpu, default 5;
++ * 8 or more: not bound): it spins while a job runs. Not done: putting the
++ * next chain in the slot's _NEXT registers while one runs. Fragment chains
++ * run on slot 0 and the rest on slot 1, a fragment chain reads what the
++ * vertex/tiler chain before it wrote, and the hardware orders chains only
++ * within a slot; so only a chain on the slot of the one before could
++ * wait there, and the summary counts those.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -145,8 +166,11 @@ void a34_mali_unmap(uint64_t va, uint64_t size);
+ bool a34_mali_submit(struct a34_mali_job *job);
+ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ void a34_mali_cpu_clean(uintptr_t va, uint64_t size);     /* A34 (0915): dc cvac */
++uint32_t a34_mali_spin_us(void);                         /* A34 (0928): a34malispin */
++extern uint32_t a34_mali_napped;                         /* A34 (0928): jobs that outlasted the spin */
+ 
+ bool RedwoodMaliStart(void);
++bool a34_thread_bind_cpu(int cpu);                       /* A34 (0928): osfmk/kern/sched_prim.c */
+ }
+ 
+ /* The requests: Linux's include/uapi/drm/panfrost_drm.h and drm.h (as of Linux 7.x, Mesa 26). */
+@@ -363,6 +387,11 @@ static uint32_t gA34MaliSurfaces = 1;           /* A34 (0914): boot-arg a34malis
+  */
+ static uint32_t gA34MaliWC = 1;
+ 
++/* A34 (0928): see "what a job costs" at the top */
++static uint32_t gA34MaliScan;                   /* boot-arg a34maliscan=1: upkeep() walks every handle */
++static uint32_t gA34MaliCPU = 5;                /* boot-arg a34malicpu: the job thread's processor (>= 8: any) */
++static int gA34MaliLastSlot = -1;               /* the worker's: slot of the queued job run last */
++
+ /*
+  * A34 (0919): queued jobs.
+  *
+@@ -373,17 +402,16 @@ static uint32_t gA34MaliWC = 1;
+  * thread (worker()) takes the jobs of every such client in the order they
+  * were queued and runs each as a synchronous SUBMIT runs: gA34MaliLock held
+  * for the cache upkeep before, a34_mali_submit() (start, wait, recover) and
+- * the upkeep and accounts after. That call waits as it always did: polled
+- * every 10 us for the first half millisecond of a job, then asleep 200 us
+- * at a time; between jobs the lock is free, and with no job queued the
+- * thread sleeps. (Not the GPU's JOB interrupt, INTID 487. It could be
++ * the upkeep and accounts after. That call waits as it always did (0928:
++ * spinning for the first 2 ms, am_wait_job() in bsd/dev/a34_mali.c);
++ * between jobs the lock is free, and with no job queued the thread sleeps. (Not the GPU's JOB interrupt, INTID 487. It could be
+  * taken: RubyGICInterruptController registers a level SPI for a service
+  * that carries IOInterruptControllers/IOInterruptSpecifiers, as SweetKPD
+  * does. But it is a level interrupt that the handler has to quiet at the
+  * GPU, JOB_INT_MASK is 0 and every reset and recovery would have to keep
+  * it, the GIC's line 487 has never been programmed here, and a mistake in
+- * any of that is an interrupt storm, a phone that hangs. Polling adds at
+- * most 10 us to a job and is what the phone has run so far.)
++ * any of that is an interrupt storm, a phone that hangs. Polling is what
++ * the phone has run so far; 0928 made it as close as it was meant to be.)
+  *
+  * Other clients' SUBMITs stay synchronous and take the lock as before;
+  * every job of one client is either queued or not (SET_MODE back to 0
+@@ -592,6 +620,8 @@ RedwoodMaliStart(void)
+ 	(void)PE_parse_boot_argn("a34malisurf", &gA34MaliSurfaces, sizeof(gA34MaliSurfaces));
+ 	(void)PE_parse_boot_argn("a34maliwc", &gA34MaliWC, sizeof(gA34MaliWC));
+ 	(void)PE_parse_boot_argn("a34maliasync", &gA34MaliAsync, sizeof(gA34MaliAsync));
++	(void)PE_parse_boot_argn("a34maliscan", &gA34MaliScan, sizeof(gA34MaliScan));     /* A34 (0928) */
++	(void)PE_parse_boot_argn("a34malicpu", &gA34MaliCPU, sizeof(gA34MaliCPU));
+ 	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
+ 		/* A34 (0919): the queue and the thread that runs it */
+ 		IOLock *qlock = IOLockAlloc();
+@@ -634,6 +664,9 @@ RedwoodMaliStart(void)
+ 	    "write-combined");
+ 	IOLog("A34 MALI UC: queued jobs (SET_MODE 0x7a, WAIT_SEQ 0x7b) %s\n", gA34MaliAsync ? "on request" :
+ 	    "refused (a34maliasync=0 or no thread)");
++	IOLog("A34 MALI UC: cache upkeep visits %s (a34maliscan); a job is watched spinning for %u us, then in 100 us "
++	    "naps (a34malispin)\n", gA34MaliScan ? "every handle" : "only the handles that can need it",
++	    a34_mali_spin_us());
+ 	return true;
+ }
+ 
+@@ -748,12 +781,19 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint64_t fFailFirst, fFailLast;         /* failed jobs WAIT_SEQ has not told of: the first, the last */
+ 	uint64_t fBusyAllSeq;                   /* place in the order of its last job that named every buffer */
+ 	char fName[32];
++	/* A34 (0928), with gA34MaliLock: handles upkeep() visits (upkeepList()); remade when a buffer comes or goes */
++	uint16_t *fUpkeep;
++	uint32_t fUpkeepCount;
++	bool fUpkeepStale;
++	uint32_t fWinQSame;                     /* A34 (0928): window's queued jobs on the slot of the job before */
++	uint32_t fNappedSeen;
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+ 	void detachBo(struct a34_bo *b);
+ 	IOReturn closeBo(uint32_t handle);
+ 	bool markListed(user_addr_t list, uint32_t count);
+ 	uint64_t upkeep(bool before, bool all);
++	void upkeepList(void);
+ 	void upkeepLog(uint32_t n, uint32_t requirements, uint64_t before, uint64_t after, uint64_t ticks, uint64_t jobNs);
+ 	IOReturn runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q);
+ 	void runQueued(struct a34_qjob *j);
+@@ -795,6 +835,9 @@ RedwoodMaliUserClient::start(IOService *provider)
+ 		IOLog("A34 MALI UC: no memory for a client's handles\n");
+ 		return false;
+ 	}
++	fUpkeep = (uint16_t *)IOMallocData(A34_BOS * sizeof(uint16_t));    /* A34 (0928): NULL: upkeep() walks every handle */
++	fUpkeepCount = 0;
++	fUpkeepStale = true;
+ 	proc_selfname(fName, sizeof(fName));
+ 	a34_gpu_lock();
+ 	fOpen = true;
+@@ -873,9 +916,17 @@ uint64_t
+ RedwoodMaliUserClient::upkeep(bool before, bool all)
+ {
+ 	uint64_t bytes = 0;
++	bool walk = gA34MaliScan != 0 || fUpkeep == NULL;      /* A34 (0928) */
++	uint32_t n = A34_BOS;
+ 
+-	for (uint32_t i = 0; i < A34_BOS; i++) {
+-		struct a34_bo *b = &fBos[i];
++	if (!walk) {
++		if (fUpkeepStale) {
++			upkeepList();
++		}
++		n = fUpkeepCount;
++	}
++	for (uint32_t k = 0; k < n; k++) {
++		struct a34_bo *b = &fBos[walk ? k : fUpkeep[k]];
+ 		bool named = (b->state & A34_BO_LISTED) != 0, listed = all || named;
+ 		uintptr_t va;
+ 
+@@ -915,6 +966,32 @@ RedwoodMaliUserClient::upkeep(bool before, bool all)
+ 	return bytes;
+ }
+ 
++/*
++ * With the lock held. A34 (0928): the handles upkeep() can have something
++ * to do for: a buffer of its own memory that is not write-combined and not
++ * a heap, and every surface (mapped or not, named or not: upkeep() looks
++ * at that, as it did). What decides it is set when a buffer is made and
++ * kept until it is closed, and the list is made again after any buffer is
++ * made or closed (createBo(), surfaceBo(), detachBo()). The others are not
++ * visited: an A34_BO_LISTED left on one of them is never looked at, and a
++ * handle made anew starts with its state cleared.
++ */
++void
++RedwoodMaliUserClient::upkeepList(void)
++{
++	uint32_t n = 0;
++
++	for (uint32_t i = 0; i < A34_BOS; i++) {
++		const struct a34_bo *b = &fBos[i];
++
++		if ((b->mem != NULL && (b->state & A34_BO_WC) == 0 && (b->flags & PANFROST_BO_HEAP) == 0) || b->surface != NULL) {
++			fUpkeep[n++] = (uint16_t)i;
++		}
++	}
++	fUpkeepCount = n;
++	fUpkeepStale = false;
++}
++
+ /*
+  * With the lock held. A34 (0915): job n's cache upkeep for the log: a line
+  * for each of the first A34_LOGGED_SUBMITS jobs, then a summary per
+@@ -964,13 +1041,18 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 
+ 			absolutetime_to_nanoseconds(fWinQWait, &qwait);
+ 			absolutetime_to_nanoseconds(fWinQWaitMax, &qmost);
++			uint32_t napped = a34_mali_napped;
++
+ 			IOLog("A34 MALI UC: %s: %u of them queued: %llu jobs ahead of each on average (most %u), done %llu us after "
+-			    "their SUBMIT on average (most %llu us)\n", fName, fWinQJobs, (unsigned long long)(fWinQDepth / fWinQJobs),
+-			    fWinQDepthMax, (unsigned long long)(qwait / 1000 / fWinQJobs), (unsigned long long)(qmost / 1000));
++			    "their SUBMIT on average (most %llu us); %u on the slot of the job before; %u jobs (anyone's) outlasted "
++			    "the %u us spin\n", fName, fWinQJobs, (unsigned long long)(fWinQDepth / fWinQJobs),
++			    fWinQDepthMax, (unsigned long long)(qwait / 1000 / fWinQJobs), (unsigned long long)(qmost / 1000),
++			    fWinQSame, napped - fNappedSeen, a34_mali_spin_us());
++			fNappedSeen = napped;
+ 		}
+ 		fWinJobs = 0;
+ 		fWinUpkeep = fWinUpkeepMax = fWinJobNs = fWinBytes = 0;
+-		fWinQJobs = fWinQDepthMax = 0;
++		fWinQJobs = fWinQDepthMax = fWinQSame = 0;
+ 		fWinQDepth = fWinQWait = fWinQWaitMax = 0;
+ 	}
+ }
+@@ -1000,7 +1082,12 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ 	ticks += mach_absolute_time() - t0;
+ 	if (q != NULL) {
+ 		uint64_t waited = mach_absolute_time() - q->queued;
++		int slot = (job->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
+ 
++		if (slot == gA34MaliLastSlot) {
++			fWinQSame++;            /* A34 (0928): could have waited in the slot's _NEXT registers */
++		}
++		gA34MaliLastSlot = slot;
+ 		fWinQJobs++;
+ 		fWinQDepth += q->depth;
+ 		if (q->depth > fWinQDepthMax) {
+@@ -1054,6 +1141,13 @@ RedwoodMaliUserClient::runQueued(struct a34_qjob *j)
+ void
+ RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
+ {
++	/* A34 (0928): it spins while a job runs (am_wait_job()): on a little core, not one of the UI's (a34big) */
++	if (gA34MaliCPU < 8) {
++		bool bound = a34_thread_bind_cpu((int)gA34MaliCPU);
++
++		IOLog("A34 MALI UC: the thread that runs queued jobs %s cpu%u (a34malicpu)\n", bound ? "is bound to" :
++		    "could not be bound to", gA34MaliCPU);
++	}
+ 	for (;;) {
+ 		struct a34_qjob *j;
+ 		RedwoodMaliUserClient *c;
+@@ -1449,6 +1543,7 @@ RedwoodMaliUserClient::detachBo(struct a34_bo *b)
+ {
+ 	a34_mali_unmap(b->va, b->backed);
+ 	a34_mali_va_free(b->va, b->vasize);
++	fUpkeepStale = true;            /* A34 (0928): the handle is cleared after this, still with the lock held */
+ 	fBoCount--;
+ 	if (b->surface != NULL) {
+ 		fSurfaceBos--;
+@@ -1724,6 +1819,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	b->backed = backed;
+ 	b->flags = req->flags;
+ 	b->state = state;
++	fUpkeepStale = true;            /* A34 (0928) */
+ 	mem = NULL;                     /* (the handle's now) */
+ 	wc = NULL;
+ 	fNextBo = handle % A34_BOS;
+@@ -1908,6 +2004,7 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	b->backed = size;
+ 	b->flags = PANFROST_BO_NOEXEC;
+ 	b->state = 0;
++	fUpkeepStale = true;            /* A34 (0928) */
+ 	fNextBo = handle % A34_BOS;
+ 	fBoCount++;
+ 	fSurfaceBos++;
+@@ -2172,6 +2269,10 @@ RedwoodMaliUserClient::free(void)
+ 		IODelete(fBos, struct a34_bo, A34_BOS);
+ 		fBos = NULL;
+ 	}
++	if (fUpkeep != NULL) {
++		IOFreeData(fUpkeep, A34_BOS * sizeof(uint16_t));
++		fUpkeep = NULL;
++	}
+ 	IOUserClient::free();
+ }
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eaf0bfd..860775e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -136,6 +136,7 @@ public:
+ 	uint32_t      fPresentingSwapID;        /* being copied by present() */
+ 	SweetSurface *fPendingHeld[SWEET_FB_LAYERS];
+ 	bool          fHold;                    /* a34fbhold: SwapWait waits for them */
++	bool          fFlushCopy;               /* A34 (0928): the copy is flushed to memory (the panel's mapping is cacheable) */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -364,6 +365,18 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hold = 1;
+ 	(void)PE_parse_boot_argn("a34fbhold", &hold, sizeof(hold));
+ 	fHold = hold != 0;
++	/*
++	 * A34 (0928): the panel's memory is a physical surface, mapped in the
++	 * kernel write-combined (SweetSurface::kernelAddress(): neither a
++	 * buffer of its own nor a task's memory), as the boot console maps it
++	 * (pe_serial.c, ml_io_map_wcomb()): no cacheable mapping of it exists,
++	 * so the copy goes to memory without a cache flush (~0.4 ms a present
++	 * in boot 44); the dsb after it is kept. Boot-arg a34fbflush=1: flushed
++	 * as before.
++	 */
++	uint32_t flushCopy = 0;
++	(void)PE_parse_boot_argn("a34fbflush", &flushCopy, sizeof(flushCopy));
++	fFlushCopy = flushCopy != 0 || fSurface->wrapped || fSurface->mapCache != kIOMapWriteCombineCache;
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -409,8 +422,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(accel);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u; SwapWait %s "
+-	    "(a34fbhold)\n", fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fHold ? "waits for the vsync's copy" : "answers at once");
++	    "(a34fbhold); the copy %s (a34fbflush)\n", fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fHold ? "waits for the vsync's copy" : "answers at once",
++	    fFlushCopy ? "is flushed from the cache" : "is write-combined, not flushed");
+ 	return true;
+ }
+ 
+@@ -809,9 +823,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (size_t)w * 4);
+ 			}
+ 			uint64_t t_flush = mach_absolute_time();
+-			/* ruby: the DSI scanout reads DRAM; flush the CPU copy to it. */
+-			flush_dcache64((addr64_t)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
+-			    (uint32_t)((uint64_t)h * fRowBytes), FALSE);
++			/* ruby: the DSI scanout reads DRAM; flush the CPU copy to it (A34 (0928): when cacheable) */
++			if (fFlushCopy) {
++				flush_dcache64((addr64_t)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
++				    (uint32_t)((uint64_t)h * fRowBytes), FALSE);
++			}
+ 			__asm__ __volatile__("dsb sy" ::: "memory");
+ 			uint64_t t_done = mach_absolute_time();
+ 			a34_fb_stats[1] += t_flush - t_copy;
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index c293e9b..79c0bbd 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -355,6 +355,7 @@ extern char *proc_name_address(struct proc *p);
+ void a34_big_init(void);
+ void a34_big_report(void);
+ static processor_t a34_big_choose(thread_t thread, processor_t processor);
++bool a34_thread_bind_cpu(int cpu);      /* A34 (0928): iokit/Kernel/arm/A34Mali.cpp */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ uint64_t        sched_one_second_interval;
+@@ -9235,4 +9236,29 @@ a34_big_report(void)
+ 	    (unsigned long long)(cpu_ns[6] / NSEC_PER_MSEC), (unsigned long long)(cpu_ns[7] / NSEC_PER_MSEC),
+ 	    (unsigned long long)busiest_tid, busiest_pri, (unsigned long long)(ns / NSEC_PER_MSEC), busiest_cpu);
+ }
++
++/*
++ * A34 (0928): the calling thread bound to processor `cpu` (thread_bind(),
++ * taking effect at the block here). For iokit/Kernel/arm/A34Mali.cpp's job
++ * thread, which spins while the GPU runs a job: unbound, at kernel priority
++ * on a Cortex-A78, it would keep that core from the UI threads a34big sends
++ * there (a34_big_choose() takes a big core only from a lower priority).
++ * False: no such processor, or it is not available; the thread stays unbound.
++ */
++bool
++a34_thread_bind_cpu(int cpu)
++{
++	processor_t processor;
++
++	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || cpu > ml_get_max_cpu_number()) {
++		return false;
++	}
++	processor = processor_array[cpu];
++	if (processor == PROCESSOR_NULL || processor->state < PROCESSOR_IDLE) {
++		return false;
++	}
++	(void)thread_bind(processor);
++	thread_block(THREAD_CONTINUE_NULL);
++	return current_processor() == processor;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

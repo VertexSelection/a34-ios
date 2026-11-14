@@ -1,0 +1,563 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 183d007..562994c 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -814,6 +814,7 @@ bool
+ RedwoodMaliUserClient::markListed(user_addr_t list, uint32_t count)
+ {
+ 	uint32_t chunk[A34_SUBMIT_BOS_CHUNK], done = 0;
++	bool shown = false;     /* A34 (0927): see enqueue() */
+ 
+ 	if (list == 0 || count == 0 || count > A34_SUBMIT_BOS_MAX) {
+ 		return false;
+@@ -829,10 +830,14 @@ RedwoodMaliUserClient::markListed(user_addr_t list, uint32_t count)
+ 
+ 			if (b != NULL) {
+ 				b->state |= A34_BO_LISTED;
++				shown = shown || (b->surface != NULL && b->surface->displayHeld > 0);
+ 			}
+ 		}
+ 		done += n;
+ 	}
++	if (shown) {
++		OSIncrementAtomic(&sweet_surface_held_touch[0]);
++	}
+ 	return true;
+ }
+ 
+@@ -1149,11 +1154,14 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 		j->queued = mach_absolute_time();
+ 		j->depth = gA34MaliQDepth + (gA34MaliQRunning != NULL ? 1 : 0);
+ 		/* what it names is busy until it is done: GEM_CLOSE, WAIT_BO, IOSurfaceLock and the panel's copy wait for that */
++		bool shown = false;     /* A34 (0927): it names a surface the display has not copied yet */
++
+ 		if (j->all) {
+ 			fBusyAllSeq = j->gseq;
+ 			for (uint32_t i = 0; i < A34_BOS; i++) {
+ 				if (fBos[i].surface != NULL) {
+ 					fBos[i].surface->gpuBusySeq = j->gseq;
++					shown = shown || fBos[i].surface->displayHeld > 0;
+ 				}
+ 			}
+ 		} else {
+@@ -1166,10 +1174,14 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 					b->busySeq = j->gseq;
+ 					if (b->surface != NULL) {
+ 						b->surface->gpuBusySeq = j->gseq;
++						shown = shown || b->surface->displayHeld > 0;
+ 					}
+ 				}
+ 			}
+ 		}
++		if (shown) {
++			OSIncrementAtomic(&sweet_surface_held_touch[0]);
++		}
+ 		if (gA34MaliQTail != NULL) {
+ 			gA34MaliQTail->next = j;
+ 		} else {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index aec1026..eaf0bfd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -29,6 +29,20 @@
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
++ * A34 (0927): SwapWait answers. CoreAnimation (CA::WindowServer::
++ * IOMFBDisplay::can_update_) asks SwapWait whether the swap that showed a
++ * buffer is done before it draws into that buffer again: options bit 0
++ * set, only asked (kIOReturnBusy while not done); clear, waited for. A swap
++ * is done when the vsync's copy of it into the panel memory has finished,
++ * or when a later swap replaced it before it was copied; until then its
++ * surfaces are held (retained, SweetSurface displayHeld). SwapWait used to
++ * say "done" at once, so CoreAnimation cleared and redrew a buffer the
++ * vsync was about to copy, or was copying: black lines and boxes on the
++ * panel. Boot-arg a34fbhold=0: the old answer (the holds are still kept
++ * and counted). Every 10 s a line: swaps, copied, replaced, SwapWait asked
++ * and waited, and GPU jobs or IOSurfaceLocks of a surface the display
++ * still holds.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -117,12 +131,18 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* A34 (0927), with fLock: the swaps the display still needs (0: none) and their surfaces, held */
++	uint32_t      fPendingSwapID;           /* in fPending, not yet taken by the vsync */
++	uint32_t      fPresentingSwapID;        /* being copied by present() */
++	SweetSurface *fPendingHeld[SWEET_FB_LAYERS];
++	bool          fHold;                    /* a34fbhold: SwapWait waits for them */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	IOReturn swapWait(uint32_t id, uint32_t options);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -341,6 +361,9 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	uint32_t hold = 1;
++	(void)PE_parse_boot_argn("a34fbhold", &hold, sizeof(hold));
++	fHold = hold != 0;
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -385,13 +408,84 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u; SwapWait %s "
++	    "(a34fbhold)\n", fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fHold ? "waits for the vsync's copy" : "answers at once");
+ 	return true;
+ }
+ 
+ extern "C" uint64_t a34_fb_stats[6];     /* A34 (0905), defined below */
+ 
++/*
++ * A34 (0927): the display's holds. Counts for the 10 s line: swaps ended,
++ * copied, replaced before being copied, SwapWait asked, of them busy,
++ * waited for, of them timed out, longest wait (mach ticks).
++ */
++static uint64_t sweet_fb_hold_stats[8];
++static uint64_t sweet_fb_hold_last[8];
++static SInt32 sweet_fb_touch_last[2];
++#define SWEET_FB_SWAP_WAIT_MS           1000    /* longer than present()'s 500 ms wait for GPU jobs */
++#define SWEET_FB_HOLD_LOG_TICKS         600     /* vsyncs: 10 s */
++
++/* The surfaces of a swap's enabled layers, retained and marked held. */
++static void
++sweet_fb_hold(const uint8_t *rec, SweetSurface *held[SWEET_FB_LAYERS])
++{
++	uint32_t mask, id;
++
++	memcpy(&mask, rec + 0x104, 4);
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		held[layer] = NULL;
++		memcpy(&id, rec + 0x54 + 4 * layer, 4);
++		if ((mask & (1u << layer)) != 0 && id != 0) {
++			held[layer] = sweet_surface_copy(id);
++			if (held[layer] != NULL) {
++				OSIncrementAtomic(&held[layer]->displayHeld);
++			}
++		}
++	}
++}
++
++static void
++sweet_fb_unhold(SweetSurface *held[SWEET_FB_LAYERS])
++{
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if (held[layer] != NULL) {
++			OSDecrementAtomic(&held[layer]->displayHeld);
++			held[layer]->release();
++			held[layer] = NULL;
++		}
++	}
++}
++
++/* Every 10 s from the vsync work loop, when anything happened. */
++static void
++sweet_fb_hold_log(void)
++{
++	uint64_t d[8], ms;
++	SInt32 t[2] = { sweet_surface_held_touch[0], sweet_surface_held_touch[1] };
++	bool any = false;
++
++	for (unsigned i = 0; i < 8; i++) {
++		d[i] = sweet_fb_hold_stats[i] - (i == 7 ? 0 : sweet_fb_hold_last[i]);
++		sweet_fb_hold_last[i] = sweet_fb_hold_stats[i];
++		any = any || (i != 7 && d[i] != 0);
++	}
++	sweet_fb_hold_stats[7] = 0;
++	absolutetime_to_nanoseconds(d[7], &ms);
++	if (!any && t[0] == sweet_fb_touch_last[0] && t[1] == sweet_fb_touch_last[1]) {
++		return;
++	}
++	IOLog("A34 FB HOLD: 10 s: %llu swaps, %llu copied, %llu replaced before their copy; SwapWait asked %llu "
++	    "(busy %llu), waited %llu (timed out %llu, longest %llu ms); GPU jobs naming a surface the display "
++	    "holds %d, IOSurfaceLocks of one %d\n", (unsigned long long)d[0], (unsigned long long)d[1],
++	    (unsigned long long)d[2], (unsigned long long)d[3], (unsigned long long)d[4], (unsigned long long)d[5],
++	    (unsigned long long)d[6], (unsigned long long)(ms / NSEC_PER_MSEC), (int)(t[0] - sweet_fb_touch_last[0]),
++	    (int)(t[1] - sweet_fb_touch_last[1]));
++	sweet_fb_touch_last[0] = t[0];
++	sweet_fb_touch_last[1] = t[1];
++}
++
+ 
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -411,13 +505,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if ((count % SWEET_FB_HOLD_LOG_TICKS) == 0) {
++		sweet_fb_hold_log();
++	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
++		SweetSurface *dropped[SWEET_FB_LAYERS];
++
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
++		/* A34 (0927): off, nothing is copied: the swap waiting is done (fPending stays, for "on") */
++		memcpy(dropped, fb->fPendingHeld, sizeof(dropped));
++		bzero(fb->fPendingHeld, sizeof(fb->fPendingHeld));
++		if (fb->fPendingSwapID != 0) {
++			fb->fPendingSwapID = 0;
++			sweet_fb_hold_stats[2]++;
++			IOLockWakeup(fb->fLock, &fb->fPendingSwapID, false);
++		}
+ 		IOLockUnlock(fb->fLock);
++		sweet_fb_unhold(dropped);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -431,11 +539,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	SweetSurface *presenting[SWEET_FB_LAYERS] = { NULL, NULL, NULL, NULL };
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			/* A34 (0927): the swap is the one being copied now; its surfaces stay held until that is done */
++			fb->fPresentingSwapID = fb->fPendingSwapID;
++			fb->fPendingSwapID = 0;
++			memcpy(presenting, fb->fPendingHeld, sizeof(presenting));
++			bzero(fb->fPendingHeld, sizeof(fb->fPendingHeld));
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -446,6 +560,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		/* A34 (0927): copied: the swap is done, its surfaces free for CoreAnimation again */
++		IOLockLock(fb->fLock);
++		fb->fPresentingSwapID = 0;
++		sweet_fb_hold_stats[1]++;
++		IOLockWakeup(fb->fLock, &fb->fPendingSwapID, false);
++		IOLockUnlock(fb->fLock);
++		sweet_fb_unhold(presenting);
+ 	}
+ }
+ 
+@@ -498,15 +619,71 @@ uint64_t a34_fb_stats[6];
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	SweetSurface *held[SWEET_FB_LAYERS], *dropped[SWEET_FB_LAYERS];
++	uint32_t id;
++
++	sweet_fb_hold(rec, held);                       /* A34 (0927) */
++	memcpy(&id, rec + 0x50, 4);
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	/* A34 (0927): a swap not yet copied is replaced: it will never be, it is done */
++	memcpy(dropped, fPendingHeld, sizeof(dropped));
++	memcpy(fPendingHeld, held, sizeof(held));
++	sweet_fb_hold_stats[0]++;
++	if (fPendingSwapID != 0) {
++		sweet_fb_hold_stats[2]++;
++		IOLockWakeup(fLock, &fPendingSwapID, false);
++	}
++	fPendingSwapID = id;
+ 	IOLockUnlock(fLock);
++	sweet_fb_unhold(dropped);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++/*
++ * A34 (0927): SwapWait(id, options): done when the display no longer needs
++ * that swap (see the top of the file). Options bit 0: only asked.
++ */
++IOReturn
++AppleCLCD::swapWait(uint32_t id, uint32_t options)
++{
++	uint64_t deadline, t0;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(fLock);
++	bool busy = id != 0 && (id == fPendingSwapID || id == fPresentingSwapID);
++	if ((options & 1u) != 0) {
++		sweet_fb_hold_stats[3]++;
++		if (busy) {
++			sweet_fb_hold_stats[4]++;
++			ret = kIOReturnBusy;
++		}
++	} else if (busy) {
++		sweet_fb_hold_stats[5]++;
++		t0 = mach_absolute_time();
++		clock_interval_to_deadline(SWEET_FB_SWAP_WAIT_MS, kMillisecondScale, &deadline);
++		while (id == fPendingSwapID || id == fPresentingSwapID) {
++			int res = IOLockSleepDeadline(fLock, &fPendingSwapID, deadline, THREAD_ABORTSAFE);
++
++			if (res != THREAD_AWAKENED && (id == fPendingSwapID || id == fPresentingSwapID)) {
++				ret = res == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
++				if (res == THREAD_TIMED_OUT) {
++					sweet_fb_hold_stats[6]++;
++				}
++				break;
++			}
++		}
++		if (mach_absolute_time() - t0 > sweet_fb_hold_stats[7]) {
++			sweet_fb_hold_stats[7] = mach_absolute_time() - t0;
++		}
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
+ /* A34: command-mode DSI panel, see pexpert/arm/pe_serial.c fbcon_kick(). */
+ extern "C" void a34_display_kick(void);
+ /* A34 (0914): bsd/dev/a34_mali.c, dc civac over a kernel range (no state: no lock needed) */
+@@ -811,6 +988,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/* A34 (0927): scalars [swap id, options, timeout] (kern_SwapWait, kern_SwapWaitWithTimeout) */
++		if (fFB->fHold && args->scalarInputCount >= 2) {
++			ret = fFB->swapWait((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1]);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ea0d0fa..0c2c945 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -93,6 +93,7 @@ enum {
+ #define SWEET_SURFACE_STATE_YCBCR       0x24    /* u32 */
+ #define SWEET_SURFACE_STATE_VSIZE       0x28    /* u32 room the values need when fetched, 0: none */
+ #define SWEET_SURFACE_STATE_BULK        0x30    /* 0x70 bytes of bulk attachments */
++#define SWEET_SURFACE_STATE_USE         0x18    /* A34 (0927): u64, non-zero: IOSurfaceIsInUse() */
+ #define SWEET_SURFACE_BULK_SIZE         0x70
+ #define SWEET_SURFACE_ZOMBIES           256     /* released views whose state page stays mapped */
+ #define kIOSurfaceLockReadOnly          0x1
+@@ -117,6 +118,19 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+  */
+ static uint32_t      sweet_surface_row_align = SWEET_SURFACE_ROW_ALIGN;
+ static uint32_t      sweet_surface_row_fix;
++/*
++ * A34 (0927): use counts (traps 0/1, boot-arg a34surfuse, default 1).
++ * IOSurface.framework counts IOSurfaceIncrementUseCount per process and
++ * calls trap 0 on 0 -> 1 (trap 1 on 1 -> 0) per category; IOSurfaceIsInUse()
++ * is "the u64 at +0x18 of the state page is not 0", the kernel's count of
++ * all of them. CoreAnimation's render server counts each surface it draws
++ * from (CA::Render::Surface), and an application reuses a backing-store
++ * buffer only while it is not in use (CABackingStore buffer_is_unused): with
++ * no count, applications drew into what backboardd was still compositing.
++ * Counted per client view, so a client that goes takes its counts along.
++ */
++static uint32_t      sweet_surface_use_on = 1;
++SInt32               sweet_surface_held_touch[2];
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -539,21 +553,49 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint32_t      uses[2];      /* A34 (0927): this client's use counts of the surface, per category */
+ 	bool          detached;     /* A34 (0914, topaz 0136): trap 4 seen, the framework is releasing this view */
+ 	bool          released;     /* A34 (0914, topaz 0137): released, only its state page stays mapped (fZombies) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { detached = false; released = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { uses[0] = uses[1] = 0; detached = false; released = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
++	void dropUses(void);
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+ 
++/* A34 (0927): the surface's use count by delta, and its "in use" word in the state page with it. */
++static void
++sweet_surface_use_add(SweetSurface *s, int32_t delta)
++{
++	IOLockLock(sweet_surface_lock);
++	s->useCount += delta;
++	if (s->useCount < 0) {
++		s->useCount = 0;
++	}
++	*(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) = (uint64_t)s->useCount;
++	IOLockUnlock(sweet_surface_lock);
++}
++
++/* A34 (0927): the view goes: its counts go with it. */
++void
++SweetSurfaceRef::dropUses(void)
++{
++	uint32_t n = uses[0] + uses[1];
++
++	uses[0] = uses[1] = 0;
++	if (surface != NULL && n != 0) {
++		sweet_surface_use_add(surface, -(int32_t)n);
++	}
++}
++
+ void
+ SweetSurfaceRef::free()
+ {
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++		dropUses();
+ 		if (!released) {
+ 			sweet_surface_put(surface);
+ 		}
+@@ -586,11 +628,13 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		sweet_surface_row_align = align;
+ 	}
+ 	(void)PE_parse_boot_argn("a34surfrowfix", &sweet_surface_row_fix, sizeof(sweet_surface_row_fix));
++	(void)PE_parse_boot_argn("a34surfuse", &sweet_surface_use_on, sizeof(sweet_surface_use_on));
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered: rows and offsets aligned to %u bytes (a34surfalign), "
+-	    "rows the creator gives %s (a34surfrowfix)\n", sweet_surface_row_align,
+-	    sweet_surface_row_fix ? "rounded up to that for 32-bit single-plane surfaces" : "kept");
++	    "rows the creator gives %s (a34surfrowfix), use counts %s (a34surfuse)\n", sweet_surface_row_align,
++	    sweet_surface_row_fix ? "rounded up to that for 32-bit single-plane surfaces" : "kept",
++	    sweet_surface_use_on ? "kept: IOSurfaceIsInUse works" : "ignored");
+ 	return true;
+ }
+ 
+@@ -619,7 +663,9 @@ public:
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCountBy(void *id, void *category, int32_t delta);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1389,11 +1435,47 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ }
+ 
++/* A34 (0927): traps 0/1, see sweet_surface_use_on. */
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::useCountBy(void *id, void *category, int32_t delta)
+ {
+-	return kIOReturnSuccess;
++	uint32_t cat = (uint32_t)(uintptr_t)category;
++	SweetSurfaceRef *ref;
++
++	if (sweet_surface_use_on == 0) {
++		return kIOReturnSuccess;
++	}
++	if (cat > 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, NULL, true);
++	}
++	if (ref != NULL && ref->surface != NULL) {
++		if (delta > 0) {
++			ref->uses[cat]++;
++			sweet_surface_use_add(ref->surface, 1);
++		} else if (ref->uses[cat] > 0) {
++			ref->uses[cat]--;
++			sweet_surface_use_add(ref->surface, -1);
++		}
++	}
++	IOLockUnlock(fLock);
++	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCountBy(id, category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCountBy(id, category, -1);
+ }
+ 
+ static IOReturn
+@@ -1433,6 +1515,9 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->displayHeld > 0) {
++		OSIncrementAtomic(&sweet_surface_held_touch[1]);       /* A34 (0927): locked while the display holds it */
++	}
+ 	sweet_surface_cpu_begin(s);     /* A34 (0915): what the GPU wrote, visible to the CPU */
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+@@ -1498,6 +1583,7 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		 * now, not when the view leaves the list).
+ 		 */
+ 		OSSafeReleaseNULL(ref->data);
++		ref->dropUses();                /* A34 (0927) */
+ 		sweet_surface_put(ref->surface);
+ 		OSSafeReleaseNULL(ref->surface);
+ 		ref->released = true;
+@@ -1514,8 +1600,8 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 827e82a..2d6151c 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,8 +58,12 @@ public:
+ 	SInt32                    cpuSeen;
+ 	/* A34 (0919): place in the order of queued GPU jobs of the last one that names the surface (A34Mali.cpp) */
+ 	uint64_t                  gpuBusySeq;
++	/* A34 (0927): swaps the display has not copied yet that show it (SweetFramebuffer.cpp); OSIncrementAtomic */
++	SInt32                    displayHeld;
++	/* A34 (0927): IOSurfaceIncrementUseCount of every client, the "in use" of the state page (+0x18) */
++	SInt32                    useCount;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -101,5 +105,12 @@ extern SInt64 sweet_surface_sync_stats[4];
+  */
+ bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
+ 
++/*
++ * A34 (0927): the display-hold detector, read by AppleCLCD's 10 s line: [0]
++ * GPU jobs queued that name a surface the display has not copied yet
++ * (A34Mali.cpp), [1] IOSurfaceLocks of such a surface. OSIncrementAtomic.
++ */
++extern SInt32 sweet_surface_held_touch[2];
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
