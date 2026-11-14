@@ -43,23 +43,41 @@ has run on our phone yet. Built by `.github/workflows/a34metal.yml` (branch `met
 ## On the phone (first run)
 
 Do **not** boot with `a34metal=1` yet: with the plug-in named on `IOAcceleratorES`, every program
-that asks Metal gets this device, backboardd included, and CoreAnimation then needs HackiOS's
-`camtl` hooks (their `inject.c`), which are not ported. The test registers the device itself. The second line copies `a34/` (Mesa's dylibs with the
-Metal library in libgallium, the tests) into `/a34`, replacing a34gl's Mesa there with the same
-Mesa plus patches 0006/0007 (which also turn panfrost's CRC off for GL):
+that asks Metal gets this device, backboardd included, and CoreAnimation on Metal needs HackiOS's
+`camtl` hooks (their `inject.c`), which are not ported. The tests register the device themselves
+(`MTLAddDevice`), in their own processes only. With the root at `/mnt` and the artifact in
+`a34metal/`:
 
 ```
 tools/root-add-job.py --copy /mnt /System/Library/Extensions/A34Metal.bundle a34metal/A34Metal.bundle
+tools/root-add-job.py /mnt com.a34.metalprobe /a34 a34metal/a34 metal-probe --direct --next
+tools/root-add-job.py --env /mnt com.a34.metalprobe REDWOOD_DRM_ASYNC=0
 tools/root-add-job.py /mnt com.a34.metaldrvtest /a34 a34metal/a34 metal_drv_test --bundle
 tools/root-add-job.py --env /mnt com.a34.metaldrvtest REDWOOD_DRM_ASYNC=0
 ```
 
-Boot-args as today with `a34mali=1` (no `a34metal`). `metal_drv_test --bundle` asks Metal for a
-device, loads the bundle, makes `RedwoodMetalDevice`, registers it with `MTLAddDevice`, lists
-what the device still owes, then compiles and runs the functions of
-`/System/Library/VideoDecoders/AV1SW.metallib` (other modes: `--draw`, `--draw-all`, `--time`, see
-the top of the file). `a34watch:` lines give the main thread's backtrace every 5 s and the exit.
-`REDWOOD_DRM_ASYNC=0` keeps every GPU job synchronous, as HackiOS's known-good runs were.
+The second line also copies `a34/` into `/a34`: Mesa's four dylibs (the same Mesa as a34gl's, plus
+patches 0006/0007, which also turn panfrost's CRC off for GL), `mali-tri`, `metal-probe`,
+`metal_drv_test`, `metal_props`. Boot-args as today (`a34mali=1`, no `a34metal`).
+`REDWOOD_DRM_ASYNC=0` keeps the tests' GPU jobs synchronous, as HackiOS's known-good runs were.
+
+What a good run puts in the kernel log (stdout of both jobs goes to the console):
+
+- `metal-probe`: `registry: ... has no MetalPluginName`, `MTLCreateSystemDefaultDevice() = 0x0`,
+  `direct: ... loaded, principal class RedwoodMetalDevice`, `redwoodmetal[metal-probe N]: the
+  compiler library Mali-G68 ...`, `direct: registered`, the device's name and families, `PASS:
+  Metal's default device is RedwoodMetalDevice "..."`, then `next: newCommandQueue = 0x...` and
+  `next: newBufferWithLength:4096 = 0x...` (exit 0; 1 no device, 2 another class, 3 not as Metal
+  wants it).
+- `metal_drv_test --bundle`: `drvtest: step 4 isSubclassOfClass:_MTLDevice PASSES`, `step 5 gave
+  RedwoodMetalDevice`, `MTLAddDevice returned`, `MTLCreateSystemDefaultDevice() =
+  RedwoodMetalDevice`, `it calls itself "..."`, what the device still owes, then the eleven
+  kernels of `/System/Library/VideoDecoders/AV1SW.metallib` compiled for the Mali (`drvtest: of 11
+  functions, N compiled and M were refused`) and dispatched. Other modes (`--draw`, `--draw-all`,
+  `--time`): the top of `metal_drv_test.m`.
+- Both: `a34watch: PROGRAM[PID] T s: alive; main thread: ...` every 5 s and `exit()` at the end,
+  on the program's own console descriptor (boot 31's metal-probe went silent for 30 s inside
+  `MTLCreateSystemDefaultDevice()` and then printed nothing more).
 
 ## Credits and licence
 
