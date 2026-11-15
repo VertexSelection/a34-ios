@@ -305,6 +305,15 @@ attributes, name, version). The FS semantics checked: writes grow the RAM copy, 
 ranges, the two missing files are missing on Android too. Next: what the first-boot clear wipes
 (non-zero words per region, counts only) and a34cellclear to leave groups uncleared.
 
+Thirteenth runs (`1013-cell3-clear`, `1013-cell3-keepcache`): before the clear nearly every
+region held leftover RAM from the previous session (runtime data, debug areas 95-100 % non-zero,
+NVRAM_CACHE 59 %), not data LK prepared; leaving NVRAM_CACHE and RAW_DHL/MDM uncleared changes
+nothing (same eLNA assert). The last runtime difference: the SBP code. ccci_mdinit (arm64, read
+out) takes the CIP file's value, else the project's MTK_MD_SBP_CUSTOM_VALUE (not set in this
+vendor), else the AP NVRAM record APCFG/APRDCL/MD_SBP (u32 at +0 for md1); we sent 0. Now that
+record is read in place from nvdata and sent (`xnu-boot-1013-cell3-sbp`); the log says its size
+and whether a value is used.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
