@@ -217,6 +217,14 @@ feature 0 (BOOT_INFO) as MUST and every other one as optional, version 0, so the
 offers all it can and nothing cuts the runtime data; CCCI_FAST_HEADER stays off.
 CCIF_CLK_REQUEST answers -16 and MD_CHECK_FLAG 1 on this firmware (Android ignores both).
 
+Fourth run (`0991-cell3`, log build/logs/0991-cell3-a): HS1 answered (868 bytes of runtime
+data, SRAM reply v2.1), rings built, the file server served 246 requests (nvdata, protect1,
+protect2 mounted read only; 87 opens, 2 not found; 18 files moved to RAM), then the modem
+raised its exception bits (CCIF 16, 17, 18, 19) after RPCs we answered with -1: GET_GPIO_NUM
+x8, GET_EINT_ATTR x18, DTSI_QUERY, GET_GPIO_ADC. Those four are now answered as Android's
+port_rpc.c does (device tree and read-only hardware), and the modem's exception overview is
+logged when it asserts (`xnu-boot-0995-cell3`).
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
