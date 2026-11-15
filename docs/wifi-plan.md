@@ -458,6 +458,16 @@ message 20011, as HakiOS's `net_test.m`, MIT), which also publishes the router a
 the rest of iOS; it needs `com.apple.configd` running. `a34wifi tcp HOST [PORT]` then tries a TCP
 connection and an HTTP HEAD.
 
+**Built in CI**: `xnu-a34` on branch `wifi` with every patch through 0980 (0963-0966 applied in
+numeric order before 0970/0971/0980; they also apply on top of them):
+[43718845503](https://github.com/VertexSelection/a34-ios/actions/runs/43718845503); 0964 alone
+[43716869237](https://github.com/VertexSelection/a34-ios/actions/runs/43716869237), 0965
+[43717483182](https://github.com/VertexSelection/a34-ios/actions/runs/43717483182). No warnings of
+our own (only the kinds XNU's macros give every file). `a34wifi`:
+[43717560704](https://github.com/VertexSelection/a34-ios/actions/runs/43717560704).
+`tools/wifi-host-check`: everything above on the host (the open join against a simulated firmware
+and AP, EAPOL and data both ways, the token reports, PHY_ACTION from the real `WIFI`), 195 WPA checks.
+
 **The M3 test** (kernel with 0963-0966 on top of main's patches, 0966 off; `a34bt=1` may stay):
 
 1. On the host, once: write the network file and install it readable by root only, e.g.
