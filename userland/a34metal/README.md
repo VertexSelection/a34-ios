@@ -131,6 +131,13 @@ it could not build, surfaces copied back). Boot 63's first sign: SpringBoard's 1
 (rows of 4512 bytes, not a multiple of 64) is drawn by Metal into a texture of Mesa's and copied
 back by the processor, 11 MB, after each command buffer that draws into it.
 
+Where the threads spend an animation (boot-arg `rwm_sample=1`, with camprof=N): CoreAnimation's
+render thread (the one that commits) and the driver's worker are stopped 1000 times a second
+(`rwm_sample=N`: N) while a burst is recorded, their pc, lr and frame-pointer chain read, and at
+the burst's end `rwm sample <thread>` lines say how often each was running, by image, and its
+functions self and inclusive (dladdr's names; `image+0x...` where there is none). About 1% of
+each thread (`metal/sample.cpp`).
+
 Pipelines ahead of time: `metal-probe --post-recipes 180` (a job) has every process with the driver
 write its pipelines' recipes into the log three minutes into the boot (`rwr ...` lines);
 `tools/rwm-recipes.py LOG` makes `build/rwm-recipes.txt` of them; as `/a34/rwm-recipes.txt` the

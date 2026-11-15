@@ -43,6 +43,7 @@ main_loop(void *)
 {
 	pthread_setname_np("rwm worker");       /* (redwood_drm tells its waits apart by this name) */
 	rwm_bind_big(2);
+	rwm_sample_thread("worker");
 	for (;;) {
 		job j;
 

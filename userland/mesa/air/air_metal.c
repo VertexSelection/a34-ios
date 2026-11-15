@@ -5614,22 +5614,28 @@ static void
 index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigned *min_out,
             unsigned *max_out)
 {
+   /* (A34: read in copies of 1 KB onto the stack and scanned there. The indices are a GPU
+    * buffer's mapping, write-combined, where every load goes to memory -- a word at a time,
+    * 4 KB took 9 us (boot 0981's "rwm pan memory") -- and a copy loads 16 or 32 bytes at once.) */
    unsigned min = UINT32_MAX, max = 0;
-   for (unsigned i = 0; i < count; i++) {
-      unsigned v;
+   uint8_t chunk[1024] __attribute__((aligned(16)));
+   const size_t total = (size_t)count * index_size;
+   for (size_t at = 0; at < total; at += sizeof(chunk)) {
+      const size_t n = MIN2(sizeof(chunk), total - at);
+      memcpy(chunk, indices + at, n);
       if (index_size == 2) {
-         uint16_t u;
-         memcpy(&u, indices + (size_t)i * 2, sizeof(u));
-         v = u;
+         const uint16_t *v = (const uint16_t *)chunk;
+         for (size_t i = 0; i < n / 2; i++) {
+            min = MIN2(min, (unsigned)v[i]);
+            max = MAX2(max, (unsigned)v[i]);
+         }
       } else {
-         uint32_t u;
-         memcpy(&u, indices + (size_t)i * 4, sizeof(u));
-         v = u;
+         const uint32_t *v = (const uint32_t *)chunk;
+         for (size_t i = 0; i < n / 4; i++) {
+            min = MIN2(min, v[i]);
+            max = MAX2(max, v[i]);
+         }
       }
-      if (v < min)
-         min = v;
-      if (v > max)
-         max = v;
    }
    *min_out = min;
    *max_out = max;
@@ -8282,6 +8288,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * the draw at the bottom reads one field and not a flag plus a field.
     */
    unsigned index_size = 0, index_start = 0;
+   bool index_bounds = true;   /* min_index..max_index known (A34: not read when nothing checks it) */
    unsigned min_index = draw->vertex_start;
    unsigned max_index = draw->vertex_start + draw->vertex_count - 1;
    if (!draw->index_buffer) {
@@ -8339,9 +8346,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
       }
       index_start = (unsigned)(draw->index_buffer_offset / index_size);
-      index_range((const uint8_t *)rwa_buffer_map(draw->index_buffer) +
-                  draw->index_buffer_offset, draw->vertex_count, index_size, &min_index,
-                  &max_index);
+      /* (A34: the range is read only for a check that needs it -- the generated quad's corners, or a
+       * vertex stream bounded per vertex below; otherwise the driver is told it has no bounds, which
+       * Gallium drivers take (st/mesa passes none for glDrawElements) and panfrost on Valhall never
+       * asks for) */
+      const struct rwa_vertex_state *bounded = &render->vstate;
+      if (render->generated_vertex || (bounded->count && (bounded->per_vertex & bounded->stream_mask))) {
+         index_range((const uint8_t *)rwa_buffer_map(draw->index_buffer) +
+                     draw->index_buffer_offset, draw->vertex_count, index_size, &min_index,
+                     &max_index);
+         index_bounds = true;
+      } else {
+         index_bounds = false;
+      }
       /* The generated vertex stage's own quad has four corners and this library owns the
        * buffer they are in, so an index past it is not the application's mistake to make
        * -- it is a fetch outside a resource of ours, and both back ends answer one with
@@ -8427,14 +8444,18 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
    unsigned w = 0, h = 0;
+   /* (A34: the names, made once -- an snprintf per attachment was ~1 us of every draw) */
+   static const char *const attachment_names[] = {
+      "colour attachment 0", "colour attachment 1", "colour attachment 2", "colour attachment 3",
+      "colour attachment 4", "colour attachment 5", "colour attachment 6", "colour attachment 7",
+   };
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
-      char what[48];
       if (!t) {
          say(why, why_size, "colour attachment %u is not a texture", i);
          return -1;
       }
-      snprintf(what, sizeof(what), "colour attachment %u", i);
+      const char *what = i < ARRAY_SIZE(attachment_names) ? attachment_names[i] : "a colour attachment";
       if (!attachment_shape_fits(t, samples, what, why, why_size))
          return -1;
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
@@ -8947,7 +8968,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * caller's rwa_buffer, which outlives this draw and may be drawn with again.
        */
       struct pipe_draw_info info = {
-         .mode = prim, .index_bounds_valid = true,
+         .mode = prim, .index_bounds_valid = index_bounds,
          .index_size = (uint16_t)index_size,
          .min_index = min_index, .max_index = max_index,
          .instance_count = instances,

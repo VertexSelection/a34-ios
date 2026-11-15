@@ -136,6 +136,8 @@ unsigned rwm_camprof(void);
 uint64_t rwm_ns(void);
 uint64_t rwm_thread_cpu_ns(void);
 void rwm_perf_report(uint64_t now);
+/* A34: the calling thread sampled during animation bursts as `role` (boot-arg rwm_sample=1; src/metal/sample.cpp) */
+void rwm_sample_thread(const char *role);
 
 /*
  * The compiler library's calls. Required: device_open, compute_create, dispatch, texture_create,

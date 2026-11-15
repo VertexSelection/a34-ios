@@ -188,6 +188,7 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 		if (!rwm_worker_on()) {
 			rwm_bind_big(1);
 		}
+		rwm_sample_thread("render");
 	}
 	if (label != nullptr) {
 		commit_label = label;
