@@ -1,0 +1,131 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a0c6c1e..5872703 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -80,6 +80,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,   /* A34 (1000): HackiOS's kFBMethodGetBlock; block 0x40, the current mode */
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -221,6 +222,8 @@ public:
+ 	bool panelHzSend(bool to120);
+ 	uint32_t vsyncUS(void);
+ 	void publishRefresh(uint32_t hz);
++	void publishModes(uint32_t hz);
++	bool          fModes;                   /* A34 (1000): a34fbmodes=1: TimingElements/ColorElements published */
+ 	void kickFlip(void);
+ 	bool kickOne(void);
+ 	int32_t drawTarget(bool full, bool *seed);
+@@ -1034,6 +1037,11 @@ AppleCLCD::start(IOService *provider)
+ 	if (iomfbHz != 0) {
+ 		publishRefresh(iomfbHz);
+ 	}
++	uint32_t modes = 0;
++	(void)PE_parse_boot_argn("a34fbmodes", &modes, sizeof(modes));       /* A34 (1000) */
++	if (modes != 0) {
++		publishModes(iomfbHz != 0 ? iomfbHz : (fPanelHz != 0 ? fPanelHz : 60));
++	}
+ 	if (iomfbHz != 0 && fPanelHz > iomfbHz && fPanelHz % iomfbHz == 0) {
+ 		fFlipEvery = fPanelHz / iomfbHz;        /* A34 (0998) */
+ 		IOLog("A34 FB 120: a34iomfbhz=%u with the panel at %u Hz: a frame shows for %u TEs at least\n", iomfbHz,
+@@ -1940,6 +1948,79 @@ AppleCLCD::vsyncUS(void)
+ 	return (uint32_t)(ns / NSEC_PER_USEC);
+ }
+ 
++/*
++ * A34 (1000), boot-arg a34fbmodes=1: the display's modes as IOMobileFramebuffer
++ * clients read them (research/120hz/plan.md stage 3; HackiOS's publishModes(),
++ * MIT; ios-a50's MiniIOMobileFramebuffer.cpp): TimingElements, one timing of
++ * the presented size at `hz` (SyncRate and PreciseSyncRate in 16.16 Hz), and
++ * ColorElements, one 8-bit RGB mode; block 0x40 of GetBlock (selector 79,
++ * which backboardd calls and was answered with zeros) gives their IDs as the
++ * current mode. Until now only IOMFBDisplayRefresh said 120: with no timing
++ * CoreAnimation is said to make its built-in display a fixed 60 Hz one (the
++ * a50 port: "internal_panel (fixed)", UIScreen maximumFramesPerSecond 60).
++ */
++#define SWEET_FB_TIMING_ID      1u
++#define SWEET_FB_COLOR_ID       1u
++
++static void
++sweet_fb_set_number(OSDictionary *dict, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber((unsigned long long)value, 32);
++
++	if (n != NULL) {
++		dict->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(uint32_t hz)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8), *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4), *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1), *colors = OSArray::withCapacity(1);
++	uint64_t rate = (uint64_t)hz << 16;
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_fb_set_number(color, "PixelEncoding", 0);         /* RGB 4:4:4 */
++		sweet_fb_set_number(color, "Depth", 8);
++		sweet_fb_set_number(color, "Colorimetry", 1);
++		sweet_fb_set_number(color, "EOTF", 1);
++		sweet_fb_set_number(color, "DynamicRange", 0);
++		sweet_fb_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_set_number(horizontal, "Active", fLogicalW);
++		sweet_fb_set_number(horizontal, "Total", fLogicalW);
++		sweet_fb_set_number(horizontal, "SyncRate", rate);
++		sweet_fb_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_fb_set_number(vertical, "Active", fLogicalH);
++		sweet_fb_set_number(vertical, "Total", fLogicalH);
++		sweet_fb_set_number(vertical, "SyncRate", rate);
++		sweet_fb_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_fb_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_fb_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		fModes = true;
++		IOLog("A34 FB 120: a34fbmodes: TimingElements %ux%u at %u Hz (SyncRate 0x%llx), ColorElements 8-bit RGB; "
++		    "GetBlock 0x40 answers them\n", fLogicalW, fLogicalH, hz, (unsigned long long)rate);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ /*
+  * A34 (0937) stage 3, boot-arg a34iomfbhz=120: IOMFBDisplayRefresh on this
+  * service before backboardd starts (QuartzCore reads it once, at its start:
+@@ -3223,6 +3304,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
++	case kSweetFBGetBlock:
++		/* A34 (1000): block 0x40, the current mode: its colour and timing IDs at +4 (HackiOS); the rest zeros (below) */
++		if (fFB->fModes && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 &&
++		    args->structureOutputDescriptor == NULL && args->structureOutput != NULL && args->structureOutputSize >= 12) {
++			uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++
++			bzero(args->structureOutput, args->structureOutputSize);
++			memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			return kIOReturnSuccess;
++		}
++		break;
+ 	case kSweetFBSwapWait:
+ 		/* A34 (0927): scalars [swap id, options, timeout] (kern_SwapWait, kern_SwapWaitWithTimeout) */
+ 		if (fFB->fHold && args->scalarInputCount >= 2) {
