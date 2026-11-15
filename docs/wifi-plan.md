@@ -620,7 +620,10 @@ type is one to answer next), MobileGestalt's `IONameMatch wlan -> ` the service.
 Wi-Fi: the switch, the networks around (wifid's scans: `scan for iOS`), the joined network ticked;
 joining another network with a typed passphrase (`iOS asks us to join "..."`, then JOINED).
 
-### 0997: the registry goes quiet (stuck at the logo with wifid: `build/logs/0995-wifi-a`)
+### 0999: the registry goes quiet (stuck at the logo with wifid: `build/logs/0995-wifi-a`)
+
+(Built on the branch as 0997; on main it is `xnu/patches/0999-a34-iokit-quiet.patch`, main's 0997
+and 0998 being the Mali job lock and the display pacing.)
 
 With wifid started (0995 and the setup script) the phone stayed at the Apple logo. The kernel's
 sampler (baseline patch 0054, `SMP` lines; symbolized with `ipsw dyld a2s` against
@@ -637,7 +640,7 @@ registry never went quiet, configd's interface namer never said "quiet", wifid w
 "IOKit never quiesced, wifid hung boot".) Without wifid, MobileWiFi's open failed at once, which
 is why every boot before reached the home screen.
 
-0997 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
+0999 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
 baseline's 0021/0022/0083): on this board the hold is not taken (boot-arg `a34iokithold=1` takes
 it as XNU does), and `iokitDaemonLaunched` gives back only a hold that was taken (built in CI with
 every patch of main: [43733929245](https://github.com/VertexSelection/a34-ios/actions/runs/43733929245)). Expected in the
