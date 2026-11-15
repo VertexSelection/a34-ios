@@ -1,15 +1,15 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 70c2540..5133589 100644
+index 70c2540..a939ee2 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -115,6 +115,7 @@ bsd/dev/a34_clocks.c			standard
- bsd/dev/a34_connsys.c			standard
- bsd/dev/a34_bt.c			standard
- bsd/dev/a34_wifi.c			standard
-+bsd/dev/a34_wpa.c			standard
+@@ -118,6 +118,7 @@ bsd/dev/a34_wifi.c			standard
  bsd/dev/ruby_hal.c			standard
  bsd/dev/ruby_eint.c			standard
  bsd/dev/ruby_irq.c			standard
++bsd/dev/a34_wpa.c			standard
+ bsd/dev/ruby_spi3.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_goodix_spi.c		standard
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
 index 076e5c5..0fba26b 100644
 --- a/bsd/dev/a34_wifi.c
