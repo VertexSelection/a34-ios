@@ -1,0 +1,132 @@
+Darwin: which written-back targets are sampled again in the same work, for the profile.
+
+A34 (local to this port; nothing here goes upstream). In boot 1001-120-a every pass wrote its
+colour target back (3932 write-backs for 3932 passes). A write-back nothing reads is one a
+DontCare store could save. In a process drawing through Metal, the targets written back in a
+span of work are kept with their size (patch 0019's re-entry table, moved to file scope), and
+panfrost_batch_read_rsrc marks one as sampled when a later batch reads it. When the span ends,
+those not sampled after (IOSurfaces left out: they are shown, or another process's) are counted
+with their KB, and the others too; the traced pass that wrote one says "sampled after" or "not
+sampled after in this work". Something CoreAnimation keeps for a later frame (a layer rendered
+once) shows as not sampled here, so this is where to look, not a list of what to drop.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -228,13 +228,54 @@
+ extern uint64_t redwood_drm_last_seq(void) __attribute__((weak_import));
+ #endif
+ 
++/*
++ * (patch 0021) The targets written back in this span of work, and whether anything sampled them
++ * after (panfrost_batch_read_rsrc): a target written out and never read again in the same work,
++ * and not an IOSurface (shown, or another process's), is one whose write-back a DontCare store
++ * would have saved -- unless it is read in a later frame (a layer CoreAnimation keeps). Counted when
++ * the span ends; the traced pass that wrote it says "read later" when one did.
++ */
++static struct {
++   const void *res;
++   uint64_t kb;
++   bool shared, read;
++   int trace_slot;
++} redwood_written[64];
++static unsigned redwood_nwritten;
++static uint64_t redwood_written_span = ~0ull;
++
++static void
++redwood_pan_written_tally(void)
++{
++   for (unsigned k = 0; k < redwood_nwritten; k++) {
++      if (!redwood_written[k].shared && !redwood_written[k].read) {
++         redwood_pan_prof[RWP_WB_UNREAD]++;
++         redwood_pan_prof[RWP_WB_UNREAD_KB] += redwood_written[k].kb;
++      } else if (!redwood_written[k].shared) {
++         redwood_pan_prof[RWP_WB_READ]++;
++      }
++   }
++   redwood_nwritten = 0;
++}
++
++static void
++redwood_pan_note_read(const struct panfrost_resource *rsrc)
++{
++   for (unsigned k = 0; k < redwood_nwritten; k++) {
++      if (redwood_written[k].res == &rsrc->base) {
++         redwood_written[k].read = true;
++         int slot = redwood_written[k].trace_slot;
++         if (slot >= 0 && slot < (int)redwood_pan_trace_n)
++            redwood_pan_trace[slot].read_later = true;
++         return;
++      }
++   }
++}
++
+ /* the trace slot the batch went into, or -1 */
+ static int
+ redwood_pan_count_pass(const struct panfrost_batch *batch, const struct pan_fb_info *fb)
+ {
+-   static const void *written[64];       /* targets written back in this span */
+-   static unsigned nwritten;
+-   static uint64_t written_span = ~0ull;
+    uint64_t area = fb->draw_extent.maxx >= fb->draw_extent.minx && fb->draw_extent.maxy >= fb->draw_extent.miny
+                       ? (uint64_t)(fb->draw_extent.maxx - fb->draw_extent.minx + 1) *
+                            (fb->draw_extent.maxy - fb->draw_extent.miny + 1)
+@@ -244,10 +285,11 @@
+       .why = redwood_pan_why ? redwood_pan_why : "(no reason given)",
+    };
+ 
+-   if (written_span != redwood_pan_span) {
+-      nwritten = 0;
+-      written_span = redwood_pan_span;
++   if (redwood_written_span != redwood_pan_span) {
++      redwood_pan_written_tally();
++      redwood_written_span = redwood_pan_span;
+    }
++   int slot_next = redwood_pan_trace_on && redwood_pan_trace_n < RWP_TRACE ? (int)redwood_pan_trace_n : -1;
+    if (fb->draw_extent.maxx >= fb->draw_extent.minx && fb->draw_extent.maxy >= fb->draw_extent.miny) {
+       rec.extent_w = fb->draw_extent.maxx - fb->draw_extent.minx + 1;
+       rec.extent_h = fb->draw_extent.maxy - fb->draw_extent.miny + 1;
+@@ -273,8 +315,8 @@
+          redwood_pan_prof[RWP_PRELOADS]++;
+          redwood_pan_prof[RWP_PRELOAD_KB] += kb;
+          moved += kb;
+-         for (unsigned k = 0; k < nwritten; k++) {
+-            if (written[k] == res) {
++         for (unsigned k = 0; k < redwood_nwritten; k++) {
++            if (redwood_written[k].res == res) {
+                reentry = true;
+                redwood_pan_prof[RWP_REENTRY_PRELOADS]++;
+                redwood_pan_prof[RWP_REENTRY_KB] += kb;
+@@ -286,11 +328,19 @@
+          redwood_pan_prof[RWP_WRITEBACKS]++;
+          redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
+          moved += kb;
+-         bool known = false;
+-         for (unsigned k = 0; k < nwritten; k++)
+-            known |= written[k] == res;
+-         if (!known && nwritten < ARRAY_SIZE(written))
+-            written[nwritten++] = res;
++         unsigned k;
++         for (k = 0; k < redwood_nwritten && redwood_written[k].res != res; k++)
++            ;
++         if (k == redwood_nwritten && redwood_nwritten < ARRAY_SIZE(redwood_written))
++            redwood_nwritten++;
++         if (k < redwood_nwritten) {
++            /* new contents: not read yet, and the pass that wrote them is this one */
++            redwood_written[k].res = res;
++            redwood_written[k].kb = kb;
++            redwood_written[k].shared = shared;
++            redwood_written[k].read = false;
++            redwood_written[k].trace_slot = i == 0 ? slot_next : -1;
++         }
+       }
+       if (fb->rts[i].clear)
+          redwood_pan_prof[RWP_CLEARS]++;
+@@ -600,6 +650,8 @@
+ panfrost_batch_read_rsrc(struct panfrost_batch *batch,
+                          struct panfrost_resource *rsrc)
+ {
++   if (redwood_pan_metal && redwood_nwritten)
++      redwood_pan_note_read(rsrc);   /* (A34, patch 0021) */
+    /* Recursive call to panfrost_batch_read_rsrc() to add all planes.
+     * The max recursion depth should be 3.
+     */

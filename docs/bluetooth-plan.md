@@ -63,6 +63,16 @@ Status (2026-11-15):
   done, logs every non-zero controller status and the bridge's last 24 packets when bluetoothd leaves.
   33077 `bt:` lines flooded that boot's log: `liba34bt-btd` is quiet now (errors, restarts, the last 30
   lines at an exit, a count every 10 s; `/a34/bluetoothd.verbose` for everything).
+- **Boot 0975-modes120-a**: `long frames (AP DMA): ... whole (3 ms)`: the DMA works. 712 again (16 runs), and
+  0975's lines name it: bluetoothd's first LE_Set_Scan_Parameters of each run (`01 0b 20 07 00 e0 01 30 00
+  01 00`) answered 0x0C with nothing scanning (a34bt's scan ended at bluetoothd's HCI_Reset, LE reports
+  stopped, no enable after it), so 0975's wrap never applied. Between that reset and the refusal the only LE
+  command of the Core spec's extended set is LE_Read_Periodic_Advertiser_List_Size (0x204A, bluetoothd's HCI
+  init); after one, a controller refuses legacy advertising/scanning/connection commands (Vol 4 Part E 3.1.1),
+  and a34bt's own 0x200B with no 0x204A before it was taken. 0976 answers 0x204A in the kernel (16, the
+  MT6635's own value) so the controller stays legacy (LE_Create_Connection, for pairing, is legacy too); if
+  0x200B is refused anyway, the kernel carries bluetoothd's scanning over LE_Set_Extended_Scan_Parameters /
+  _Enable and hands back extended reports of legacy PDUs as legacy reports.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
