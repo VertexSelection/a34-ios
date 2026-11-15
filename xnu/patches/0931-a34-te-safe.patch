@@ -1,0 +1,409 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bbea5aa..a533de6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -157,10 +157,16 @@ public:
+ 	volatile uint32_t *fOvl[2];             /* OVL0_2L, OVL0 */
+ 	uint32_t      fOvlFlip[2];              /* their enabled layers that read picture 0 at start, a bit each */
+ 	uint64_t      fTELast, fTEPeriod;       /* mach time of the last TE seen, the TE period */
++	bool          fTEBitWanted;             /* A34 (0931): a34fbte=2 and TE only with EXT_TE_EN: set it at the first kick */
++	bool          fTEBit;                   /* ... it is set by us: a transfer that does not end clears it */
++	bool          fTEMissSaid;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void flipStart(void);
+ 	bool teWait(uint64_t *waited);
++	uint32_t teCount(uint32_t ms, uint64_t *period);
++	void teProbe(uint32_t *asFound, uint32_t *withBit, bool *bitFound);
++	void teBitOff(const char *why);
+ 	void kickFlip(void);
+ 	int32_t drawTarget(bool full);
+ 	void drawDone(int32_t target);
+@@ -254,13 +260,15 @@ static uint64_t sweet_fb_flip_last[10];
+ #define SWEET_FB_TE_MAX_MS      40u             /* a TE wait gives up after this (2.4 periods at 60 Hz) */
+ #define SWEET_FB_TE_WAKE_US     2500u           /* a TE wait sleeps until this long before the TE it expects, then spins */
+ #define SWEET_FB_DRAW_WAIT_MS   100u            /* present() waits so long at most for a transfer of the picture it draws into */
++#define SWEET_FB_TE_PROBE_MS    100u            /* A34 (0931): the TE probe watches so long, each way */
++#define SWEET_FB_TE_XFER_MS     100u            /* ... with EXT_TE_EN set by us, a transfer longer than this clears it */
+ 
+ static bool
+-a34_dsi_wait_idle(uint64_t *ticks)
++a34_dsi_wait_idle(uint64_t *ticks, uint32_t ms)
+ {
+ 	uint64_t t0 = mach_absolute_time(), limit;
+ 
+-	nanoseconds_to_absolutetime(NSEC_PER_SEC, &limit);
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &limit);     /* A34 (0931): was always 1 s */
+ 	/* Poll without sleeping: 0905 saw the busy bit set at every kick even
+ 	 * 10 s after the previous one, so the idle windows may be short. */
+ 	while (a34_dsi_busy()) {
+@@ -346,7 +354,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 		a34_kick_stats[5]++;
+ 		return;
+ 	}
+-	if (!a34_dsi_wait_idle(&wait)) {
++	if (!a34_dsi_wait_idle(&wait, 1000)) {
+ 		a34_kick_stats[5]++;
+ 		a34_disp_dump("busy for 1 s before a start");
+ 		a34_dsi_recover();
+@@ -354,7 +362,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 	a34_dsi_trigger();
+ 	a34_dsi_unlock();
+ 	IODelay(50);
+-	if (!a34_dsi_wait_idle(&xfer)) {
++	if (!a34_dsi_wait_idle(&xfer, 1000)) {
+ 		a34_kick_stats[5]++;
+ 		a34_disp_dump("transfer did not finish in 1 s");
+ 		if (a34_dsi_lock()) {
+@@ -363,7 +371,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 			a34_dsi_unlock();
+ 			IODelay(50);
+ 			uint64_t again;
+-			bool ok = a34_dsi_wait_idle(&again);
++			bool ok = a34_dsi_wait_idle(&again, 1000);
+ 			IOLog("A34 DISP: after mutex/DSI reset and a new start: %s in %llu us (DSI_INTSTA 0x%08x)\n",
+ 			    ok ? "transfer done" : "still busy", again / 13, a34_dsi_rd(0x0c));
+ 		}
+@@ -823,14 +831,28 @@ AppleCLCD::swapWait(uint32_t id, uint32_t options)
+  * reads it. A swap is still done when its copy is (0927). Kernel text
+  * (the console unmuted, a panic) is drawn into picture 0 and shows only
+  * while picture 0 is the one shown.
++ *
++ * A34 (0931): 0930 froze the boot at AppleCLCD's start (the console's last
++ * line "SWEET AKS: ...": it wraps, the newest lines are at the top) with
++ * a34fbflip=1 alone too. Without a34fbflip/a34fbte/a34fbteprobe nothing
++ * here touches the hardware now (0930 read OVL and DSI registers at every
++ * start); with them, a line before each step that does, and only the
++ * registers the loader itself reads (SRC_CON, then the enabled layers'
++ * addresses). The TE is probed first (teProbe(): a34fbte, or
++ * a34fbteprobe=1 alone) and used only if seen: a34fbte=1 without changing
++ * DSI_TXRX_CTRL, a34fbte=2 also when it comes only with EXT_TE_EN, which is
++ * then set at the first kick (after the console's kicks) and cleared again
++ * when a transfer does not end in SWEET_FB_TE_XFER_MS. pe_serial.c's
++ * console path waits for no TE and never sets the bit.
+  */
+ void
+ AppleCLCD::flipStart(void)
+ {
+ 	static const uint32_t ovlPA[2] = { SWEET_FB_OVL0_2L, SWEET_FB_OVL0 };
++	static const unsigned ovlLayers[2] = { 2, 4 };
+ 	static const char *const ovlName[2] = { "OVL0_2L", "OVL0" };
+-	uint32_t flip = 0, te = 0, txrx, size = fRowBytes * fHeight;
+-	bool cmdMode = (a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL) & 3u) == 0;
++	uint32_t flip = 0, te = 0, probe = 0, size = fRowBytes * fHeight, mode, asFound = 0, withBit = 0;
++	bool bitFound = false;
+ 
+ 	fShown = 0;
+ 	fQueued = fTaken = fWriting = -1;
+@@ -840,40 +862,45 @@ AppleCLCD::flipStart(void)
+ 	fDrawPA = fPhys;
+ 	(void)PE_parse_boot_argn("a34fbflip", &flip, sizeof(flip));
+ 	(void)PE_parse_boot_argn("a34fbte", &te, sizeof(te));
+-	for (unsigned o = 0; o < 2; o++) {
+-		fOvl[o] = (volatile uint32_t *)ml_io_map(ovlPA[o], 0x1000);
+-		fOvlFlip[o] = 0;
+-		if (fOvl[o] == NULL) {
+-			continue;
+-		}
+-		uint32_t en = fOvl[o][SWEET_FB_OVL_SRC_CON / 4];
+-		for (unsigned n = 0; n < 4; n++) {
+-			if ((en & (1u << n)) != 0 && fOvl[o][SWEET_FB_OVL_ADDR(n) / 4] == (uint32_t)fPhys) {
+-				fOvlFlip[o] |= 1u << n;
+-			}
+-		}
+-		IOLog("A34 FB FLIP: %s EN 0x%08x SRC_CON 0x%08x, layer addresses 0x%08x 0x%08x 0x%08x 0x%08x: layers 0x%x "
+-		    "read picture 0\n", ovlName[o], fOvl[o][SWEET_FB_OVL_EN / 4], en, fOvl[o][SWEET_FB_OVL_ADDR(0) / 4],
+-		    fOvl[o][SWEET_FB_OVL_ADDR(1) / 4], fOvl[o][SWEET_FB_OVL_ADDR(2) / 4], fOvl[o][SWEET_FB_OVL_ADDR(3) / 4],
+-		    fOvlFlip[o]);
++	(void)PE_parse_boot_argn("a34fbteprobe", &probe, sizeof(probe));
++	if (flip == 0 && te == 0 && probe == 0) {
++		return;                 /* A34 (0931): no register read or written, nothing mapped: as 0929 */
+ 	}
+-	txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
+-	IOLog("A34 FB FLIP: DSI MODE_CTRL 0x%08x TXRX_CTRL 0x%08x (EXT_TE_EN %u) INTEN 0x%08x INTSTA 0x%08x (TE_RDY %u)\n",
+-	    a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL), txrx, (txrx & SWEET_FB_EXT_TE_EN) != 0, a34_dsi_rd(SWEET_FB_DSI_INTEN),
+-	    a34_dsi_rd(SWEET_FB_DSI_INTSTA), (a34_dsi_rd(SWEET_FB_DSI_INTSTA) & SWEET_FB_TE_RDY) != 0);
++	/* A34 (0931): a line before each step that touches the hardware: the last one on the screen tells */
++	IOLog("A34 FB FLIP: step 1: DSI_MODE_CTRL (a34fbflip=%u a34fbte=%u a34fbteprobe=%u)\n", flip, te, probe);
++	mode = a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL);
+ 	fFlipLock = IOLockAlloc();
+-	if (fFlipLock == NULL || !cmdMode || txrx == 0xdeadbeefu) {
+-		if (flip != 0 || te != 0) {
+-			IOLog("A34 FB FLIP: a34fbflip/a34fbte not done (%s)\n", fFlipLock == NULL ? "no lock" :
+-			    "the DSI is not a command-mode one here");
+-		}
++	if (fFlipLock == NULL || mode == 0xdeadbeefu || (mode & 3u) != 0) {
++		IOLog("A34 FB FLIP: nothing done (%s, DSI_MODE_CTRL 0x%08x)\n", fFlipLock == NULL ? "no lock" :
++		    "not a command-mode DSI", mode);
+ 		return;
+ 	}
++	if (te != 0 || probe != 0) {
++		IOLog("A34 FB FLIP: step 2: TE probe, %u ms each way, no transfer started\n", SWEET_FB_TE_PROBE_MS);
++		teProbe(&asFound, &withBit, &bitFound);
++	}
+ 	if (flip != 0) {
++		/* the loader's own reads (tools/payload/a34boot.c find_fbs()): SRC_CON, then each enabled layer's address */
++		for (unsigned o = 0; o < 2; o++) {
++			IOLog("A34 FB FLIP: step 3: %s at 0x%08x\n", ovlName[o], ovlPA[o]);
++			fOvl[o] = (volatile uint32_t *)ml_io_map(ovlPA[o], 0x1000);
++			fOvlFlip[o] = 0;
++			if (fOvl[o] == NULL) {
++				continue;
++			}
++			uint32_t en = fOvl[o][SWEET_FB_OVL_SRC_CON / 4];
++			for (unsigned n = 0; n < ovlLayers[o]; n++) {
++				if ((en & (1u << n)) != 0 && fOvl[o][SWEET_FB_OVL_ADDR(n) / 4] == (uint32_t)fPhys) {
++					fOvlFlip[o] |= 1u << n;
++				}
++			}
++			IOLog("A34 FB FLIP: %s SRC_CON 0x%08x: layers 0x%x read picture 0\n", ovlName[o], en, fOvlFlip[o]);
++		}
+ 		if (fPhys != SWEET_FB_LK_FB || SWEET_FB_SECOND + size > SWEET_FB_LK_FB_END || (fOvlFlip[0] | fOvlFlip[1]) == 0) {
+ 			IOLog("A34 FB FLIP: not flipping: picture 0 at 0x%llx, %u bytes, no OVL layer reads it or picture 1 "
+ 			    "would not fit in LK's reservation\n", fPhys, size);
+ 		} else {
++			IOLog("A34 FB FLIP: step 4: picture 1 at 0x%llx mapped write-combined\n", SWEET_FB_SECOND);
+ 			fBufVA[1] = (uintptr_t)ml_io_map_wcomb((vm_offset_t)SWEET_FB_SECOND,
+ 			    (vm_size_t)(((uint64_t)size + 0x3fffu) & ~(uint64_t)0x3fffu));
+ 			fBufPA[1] = SWEET_FB_SECOND;
+@@ -881,40 +908,120 @@ AppleCLCD::flipStart(void)
+ 		}
+ 	}
+ 	if (te != 0) {
+-		if ((txrx & SWEET_FB_EXT_TE_EN) == 0 && te >= 2) {
+-			a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, txrx | SWEET_FB_EXT_TE_EN);
+-			txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
+-		}
+-		if ((txrx & SWEET_FB_EXT_TE_EN) == 0) {
+-			IOLog("A34 FB FLIP: no TE: EXT_TE_EN is clear in DSI_TXRX_CTRL 0x%08x (a34fbte=2 sets it)\n", txrx);
+-		} else {
+-			uint64_t w1 = 0, w2 = 0, first;
+-
++		if (asFound >= 2) {
++			fTE = true;             /* the TE comes as the DSI is: nothing changed */
++		} else if (withBit >= 2 && te >= 2 && !bitFound) {
+ 			fTE = true;
+-			fTELast = 0;
+-			fTEPeriod = 0;
+-			if (teWait(&w1)) {
+-				first = fTELast;
+-				if (teWait(&w2)) {
+-					fTEPeriod = fTELast - first;
+-				}
+-			}
+-			if (fTEPeriod == 0) {
+-				fTE = false;
+-				IOLog("A34 FB FLIP: no TE seen in %u ms with EXT_TE_EN set (TXRX_CTRL 0x%08x): transfers not timed "
+-				    "by it\n", SWEET_FB_TE_MAX_MS, txrx);
+-			} else {
+-				uint64_t ns;
+-
+-				absolutetime_to_nanoseconds(fTEPeriod, &ns);
+-				IOLog("A34 FB FLIP: the panel's TE every %llu us: transfers start at it\n",
+-				    (unsigned long long)(ns / NSEC_PER_USEC));
+-			}
++			fTEBitWanted = true;    /* set at the first kick, after the console's last (kickFlip()) */
++		} else {
++			IOLog("A34 FB FLIP: TE not used: %s\n", withBit >= 2 ? "it comes only with EXT_TE_EN set, a34fbte=2 sets it" :
++			    "the probe saw none");
+ 		}
+ 	}
+ 	fNewPath = fFlip || fTE;
+-	IOLog("A34 FB FLIP: %s, %s (a34fbflip=%u, a34fbte=%u)\n", fFlip ? "two pictures, at 0x74180000 and 0x74b54000" :
+-	    "one picture", fTE ? "transfers at the TE" : "transfers at once", flip, te);
++	IOLog("A34 FB FLIP: %s, %s\n", fFlip ? "two pictures, at 0x74180000 and 0x74b54000" : "one picture",
++	    fTE ? (fTEBitWanted ? "transfers at the TE (EXT_TE_EN set at the first kick)" : "transfers at the TE") :
++	    "transfers at once");
++}
++
++/*
++ * A34 (0931): TE_RDY rises in `ms` milliseconds (bounded by mach time; a
++ * rise within 2 ms of the last one is the same TE and only cleared);
++ * *period: the mean time between them, 0 with fewer than two.
++ */
++uint32_t
++AppleCLCD::teCount(uint32_t ms, uint64_t *period)
++{
++	uint64_t t0 = mach_absolute_time(), now, limit, dead, first = 0, last = 0;
++	uint32_t n = 0;
++
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &limit);
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &dead);
++	*period = 0;
++	a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);
++	for (now = t0; now - t0 < limit; now = mach_absolute_time()) {
++		if ((a34_dsi_rd(SWEET_FB_DSI_INTSTA) & SWEET_FB_TE_RDY) == 0) {
++			continue;
++		}
++		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);
++		if (n != 0 && now - last < dead) {
++			continue;
++		}
++		if (n == 0) {
++			first = now;
++		}
++		last = now;
++		n++;
++	}
++	if (n >= 2) {
++		*period = (last - first) / (n - 1);
++	}
++	return n;
++}
++
++/*
++ * A34 (0931): whether the panel's TE reaches the DSI, before anything uses
++ * it (AppleCLCD::start only; never the console's path): TE_RDY counted for
++ * SWEET_FB_TE_PROBE_MS with DSI_TXRX_CTRL as found and, if its EXT_TE_EN is
++ * clear, again with it set, then TXRX_CTRL put back. No transfer is
++ * started: the DSI must be idle, the console's kicks only try the display
++ * lock held here, and the kick work loop does not exist yet.
++ */
++void
++AppleCLCD::teProbe(uint32_t *asFound, uint32_t *withBit, bool *bitFound)
++{
++	uint64_t idle = 0, period = 0, period2 = 0, ns;
++	uint32_t txrx, after;
++	bool idleAfter;
++
++	*asFound = *withBit = 0;
++	*bitFound = false;
++	if (!a34_dsi_lock()) {
++		IOLog("A34 FB FLIP: TE probe: the display lock is held: not probed\n");
++		return;
++	}
++	if (!a34_dsi_wait_idle(&idle, SWEET_FB_TE_PROBE_MS)) {
++		a34_dsi_unlock();
++		IOLog("A34 FB FLIP: TE probe: the DSI busy for %u ms: not probed\n", SWEET_FB_TE_PROBE_MS);
++		return;
++	}
++	txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
++	*bitFound = (txrx & SWEET_FB_EXT_TE_EN) != 0;
++	*asFound = teCount(SWEET_FB_TE_PROBE_MS, &period);
++	if (!*bitFound) {
++		a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, txrx | SWEET_FB_EXT_TE_EN);
++		*withBit = teCount(SWEET_FB_TE_PROBE_MS, &period2);
++		a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, txrx);
++	}
++	after = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
++	idleAfter = a34_dsi_wait_idle(&idle, SWEET_FB_TE_PROBE_MS);
++	a34_dsi_unlock();
++	fTEPeriod = period != 0 ? period : period2;
++	absolutetime_to_nanoseconds(fTEPeriod, &ns);
++	IOLog("A34 FB FLIP: TE probe: TXRX_CTRL 0x%08x (EXT_TE_EN %u): %u TE in %u ms as found, %u with EXT_TE_EN set%s; "
++	    "TE period %llu us; TXRX_CTRL 0x%08x after, the DSI %s\n", txrx, *bitFound, *asFound, SWEET_FB_TE_PROBE_MS,
++	    *withBit, *bitFound ? " (it was)" : "", (unsigned long long)(ns / NSEC_PER_USEC), after,
++	    idleAfter ? "idle" : "BUSY");
++}
++
++/*
++ * A34 (0931): the kick's: EXT_TE_EN, set by us (a34fbte=2), cleared again
++ * because a transfer did not end with it (no TE: the frame waits for one);
++ * the pipe reset and the frame started again; TE no longer used.
++ */
++void
++AppleCLCD::teBitOff(const char *why)
++{
++	if (a34_dsi_lock()) {
++		a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL) & ~SWEET_FB_EXT_TE_EN);
++		a34_dsi_recover();
++		a34_dsi_trigger();
++		a34_dsi_unlock();
++	}
++	fTEBit = false;
++	fTEBitWanted = false;
++	fTE = false;
++	IOLog("A34 FB FLIP: %s with EXT_TE_EN set: it is cleared, the pipe reset, TE no longer used\n", why);
+ }
+ 
+ /* A34 (0930): the kick's thread: until the panel's next TE (up to SWEET_FB_TE_MAX_MS); false if none came. */
+@@ -961,12 +1068,17 @@ AppleCLCD::kickFlip(void)
+ 	uint64_t wait = 0, xfer = 0, tew = 0;
+ 	int32_t t;
+ 
+-	if (!a34_dsi_wait_idle(&wait)) {
++	if (!a34_dsi_wait_idle(&wait, fTEBit ? SWEET_FB_TE_XFER_MS : 1000)) {
+ 		a34_kick_stats[5]++;
+-		a34_disp_dump("busy for 1 s before a start");
+-		if (a34_dsi_lock()) {
+-			a34_dsi_recover();
+-			a34_dsi_unlock();
++		if (fTEBit) {
++			teBitOff("the DSI busy before a start");     /* A34 (0931) */
++			(void)a34_dsi_wait_idle(&wait, 1000);
++		} else {
++			a34_disp_dump("busy for 1 s before a start");
++			if (a34_dsi_lock()) {
++				a34_dsi_recover();
++				a34_dsi_unlock();
++			}
+ 		}
+ 	}
+ 	IOLockLock(fFlipLock);
+@@ -978,15 +1090,28 @@ AppleCLCD::kickFlip(void)
+ 	fQueued = -1;
+ 	fTaken = t;
+ 	IOLockUnlock(fFlipLock);
++	if (fTEBitWanted && !fTEBit && a34_dsi_lock()) {
++		/* A34 (0931): a34fbte=2, the TE seen only with EXT_TE_EN (teProbe()): set now, the DSI idle */
++		a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL) | SWEET_FB_EXT_TE_EN);
++		a34_dsi_unlock();
++		fTEBit = true;
++		IOLog("A34 FB FLIP: EXT_TE_EN set (DSI_TXRX_CTRL 0x%08x)\n", a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL));
++	}
+ 	if (fTE) {
+ 		sweet_fb_flip_stats[7]++;
+ 		if (!teWait(&tew)) {
+ 			sweet_fb_flip_stats[9]++;
++			if (!fTEMissSaid) {
++				fTEMissSaid = true;
++				IOLog("A34 FB FLIP: no TE in %u ms: the transfer started without it (said once; counted every 10 s)\n",
++				    SWEET_FB_TE_MAX_MS);
++			}
+ 		}
+ 		sweet_fb_flip_stats[8] += tew;
+ 	}
+ 	if (!a34_dsi_lock()) {
+ 		a34_kick_stats[5]++;
++		IOLog("A34 FB FLIP: the display lock not got: picture %d stays queued\n", t);
+ 		IOLockLock(fFlipLock);
+ 		fTaken = -1;
+ 		if (fQueued < 0) {
+@@ -997,7 +1122,7 @@ AppleCLCD::kickFlip(void)
+ 		return;
+ 	}
+ 	uint64_t again = 0;
+-	(void)a34_dsi_wait_idle(&again);        /* (the console may have started one meanwhile) */
++	(void)a34_dsi_wait_idle(&again, fTEBit ? SWEET_FB_TE_XFER_MS : 1000);  /* (the console may have started one) */
+ 	if (t != fShown) {
+ 		for (unsigned o = 0; o < 2; o++) {
+ 			for (unsigned n = 0; n < 4; n++) {
+@@ -1016,15 +1141,21 @@ AppleCLCD::kickFlip(void)
+ 	a34_dsi_unlock();
+ 	sweet_fb_flip_stats[6]++;
+ 	IODelay(50);
+-	if (!a34_dsi_wait_idle(&xfer)) {
++	if (!a34_dsi_wait_idle(&xfer, fTEBit ? SWEET_FB_TE_XFER_MS : 1000)) {
+ 		a34_kick_stats[5]++;
+-		a34_disp_dump("transfer did not finish in 1 s");
+-		if (a34_dsi_lock()) {
+-			a34_dsi_recover();
+-			a34_dsi_trigger();
+-			a34_dsi_unlock();
++		if (fTEBit) {
++			teBitOff("a transfer did not end in 100 ms");      /* A34 (0931) */
+ 			IODelay(50);
+-			(void)a34_dsi_wait_idle(&again);
++			(void)a34_dsi_wait_idle(&again, 1000);
++		} else {
++			a34_disp_dump("transfer did not finish in 1 s");
++			if (a34_dsi_lock()) {
++				a34_dsi_recover();
++				a34_dsi_trigger();
++				a34_dsi_unlock();
++				IODelay(50);
++				(void)a34_dsi_wait_idle(&again, 1000);
++			}
+ 		}
+ 	}
+ 	a34_kick_stats[0]++;
