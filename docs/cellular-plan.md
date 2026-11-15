@@ -233,8 +233,11 @@ type 0x50): its CCB buffer manager. We had sent post_cfg_for_ccb's layout (three
 2 MiB at one base, 6 MiB in CCB_SHARE_MEMORY) without Android's later collect_ccb_info (DHL
 0x70000, MD_MONITOR 0x8000, META 0x104000, packed; total 0x17c000), and we never zeroed the regions Android clears at
 first boot (BOOT_WAITING_FOR_HS1: all of md1_noncacheable_tbl/md1_cacheable_tbl without
-SMF_NCLR_FIRST, incl. CCB data and CCB_CTRL). Both fixed in
-`xnu-boot-0996-cell3`.
+SMF_NCLR_FIRST, incl. CCB data and CCB_CTRL). Both fixed in `xnu-boot-0996-cell3`, which
+panicked at boot: the clear mapped the 7 MiB NVRAM_CACHE with ml_io_map, whose 8 MiB io_submap
+allocates with KMA_NOFAIL. Shared memory now comes from kernel_map (ml_io_map_unmappable): big
+regions only through 1 MiB windows unmapped after use, kept mappings capped at 1 MiB, LK's tag
+table and device tree unmapped once copied (`xnu-boot-0999-cell3`).
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
