@@ -91,7 +91,12 @@ const char *a34_wifi_net_name(void) { return "en9"; }
  * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
  * frame it put into the mailbox is taken and kept in `sent` (a copy each), as the firmware would.
  */
-static int sim_on, sim_ap;
+static int sim_on, sim_ap, sim_ap_ht;
+/* (0968) an HT AP's HT Capabilities (MCS 0-15, 40 MHz, SGI 20/40) and WMM Parameter element (BE AIFSN 3 CW 15-1023, VO AIFSN 2 CW 3-7) */
+static const uint8_t sim_ht_cap[28] = { 45, 26, 0xef, 0x09, 0x17, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const uint8_t sim_ht_op[24] = { 61, 22, 48, 0x05, 0x04, 0x00, 0x00, 0x00 };
+static const uint8_t sim_wmm[26] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 0x03, 0xa4, 0, 0, 0x27, 0xa4, 0, 0,
+	                             0x42, 0x43, 0x5e, 0, 0x62, 0x32, 0x2f, 0 };
 static uint8_t sent[64][CMD_FRAME_MOST];
 static uint32_t sent_len[64], nsent;
 static uint8_t sim_ap_addr[6];
@@ -162,7 +167,13 @@ static void sim_react(const uint8_t *t)
 	} else if (!cmd && (t[32] >> 4) == 0) {
 		fr[0] = 0x10; memcpy(fr + 4, t + 32 + 10, 6); memcpy(fr + 10, sim_ap_addr, 6); memcpy(fr + 16, sim_ap_addr, 6);
 		fr[24] = 0x21; fr[26] = 0; fr[28] = 0x05; fr[29] = 0xc0;   /* status 0, AID 5 (bits 14/15 set) */
-		rx_mgmt(fr, 30, 5);
+		if (sim_ap_ht) {
+			uint8_t big[30 + 28 + 24 + 26];
+			memcpy(big, fr, 30); memcpy(big + 30, sim_ht_cap, 28); memcpy(big + 58, sim_ht_op, 24); memcpy(big + 82, sim_wmm, 26);
+			rx_mgmt(big, sizeof(big), 48);
+		} else {
+			rx_mgmt(fr, 30, 5);
+		}
 	}
 }
 static void firmware_sim(void)
@@ -400,7 +411,8 @@ int main(int argc, char **argv)
 			const uint8_t *f = sent[assoc_at] + 32;
 			uint32_t n = sent_len[assoc_at] - 32;
 			failed |= f[24] != 0x21 || f[25] != 0x04 || f[26] != 10 || f[28] != 0 || f[29] != 15 || memcmp(f + 30, "veryCoolNetwork", 15) != 0 ||
-			    f[45] != 1 || f[46] != 8 || f[55] != 50 || n != 24 + 4 + 17 + 10 + 6;
+			    f[45] != 1 || f[46] != 8 || f[55] != 50 || n != 24 + 4 + 17 + 10 + 6 + 10 ||   /* (0968: + Extended Capabilities) */
+			    f[61] != 127 || f[63 + 2] != 0x08;
 		}
 		/* STA_REC state 3: 168 bytes, AID 5, WTBL 5, broadcast 0xff, rates 0x0fcf? (1 2 5.5 11 6 9 12 18 24 36 48 54) basic 0x000f */
 		{
@@ -556,6 +568,88 @@ int main(int argc, char **argv)
 		    net_link;
 		sim_on = 0;
 		printf("0967 action frames, DHCP TX status, leaving: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0968: a join with an HT + WMM AP on 5 GHz; a BSS transition request answered ---- */
+	{
+		static const uint8_t ap[6] = { 0xc4, 0x9a, 0x31, 0x2a, 0xc8, 0x5a };
+		uint8_t fr[256], ies[128];
+		int failed = 0;
+		uint32_t k = 0, n;
+		int assoc_at = -1, wmm_at = -1, bss_at = -1, sta3_at = -1;
+
+		bzero(&a34w_target, sizeof(a34w_target)); a34w_target.rssi = -128;
+		a34w_joining = true;
+		bzero(fr, sizeof(fr));
+		fr[0] = 0x80; memset(fr + 4, 0xff, 6); memcpy(fr + 10, ap, 6); memcpy(fr + 16, ap, 6);
+		fr[32] = 100; fr[34] = 0x11; fr[35] = 0x19;
+		k = 36;
+		fr[k++] = 0; fr[k++] = 15; memcpy(fr + k, "veryCoolNetwork", 15); k += 15;
+		fr[k++] = 1; fr[k++] = 8; memcpy(fr + k, "\x8c\x12\x98\x24\xb0\x48\x60\x6c", 8); k += 8;
+		memcpy(fr + k, sim_ht_cap, 28); k += 28; memcpy(fr + k, sim_ht_op, 24); k += 24; memcpy(fr + k, sim_wmm, 26); k += 26;
+		a34w_mgmt_in(fr, k, -74, 48);
+		a34w_joining = false;
+		a34w_net.psk_given = false;
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1; sim_ap = 1; sim_ap_ht = 1; memcpy(sim_ap_addr, ap, 6);
+		a34w_joined = false;
+		bool joined = a34w_connect();
+		firmware_sim();
+		sim_on = 0; sim_ap = 0; sim_ap_ht = 0;
+		for (uint32_t i = 0; i < nsent; i++) {
+			bool cmd = ((dw_of(sent[i], 1) >> 16) & 3u) == 1u;
+			if (!cmd && (sent[i][32] >> 4) == 0) assoc_at = (int)i;
+			if (cmd && sent[i][36] == 0x1d) wmm_at = (int)i;
+			if (cmd && sent[i][36] == 0x12 && bss_at < 0) bss_at = (int)i;
+			if (cmd && sent[i][36] == 0x13 && sent[i][64 + 20] == 2) sta3_at = (int)i;
+		}
+		printf("0968 HT join: %s; Association Request at %d, WMM parameters at %d, BSS info at %d, STA record (state 3) at %d\n",
+		    joined ? "joined" : "NOT JOINED", assoc_at, wmm_at, bss_at, sta3_at);
+		failed |= !joined || assoc_at < 0 || wmm_at < 0 || bss_at < 0 || sta3_at < 0 || wmm_at > bss_at;
+		if (assoc_at >= 0) {
+			const uint8_t *f = sent[assoc_at] + 32;
+			n = sent_len[assoc_at] - 32;
+			bzero(ies, sizeof(ies));
+			memcpy(ies, f + 28, n - 28 < sizeof(ies) ? n - 28 : sizeof(ies));
+			failed |= a34w_ie_in(ies, n - 28, 45, -1) == NULL || a34w_ie_in(ies, n - 28, 127, -1) == NULL ||
+			    a34w_ie_in(ies, n - 28, 221, 0) == NULL || a34w_ie_in(ies, n - 28, 45, -1)[2] != 0x2d;
+		}
+		if (sta3_at >= 0) {
+			const uint8_t *c = sent[sta3_at] + 64;
+			printf("  STA_REC: QoS %u, phy 0x%02x, MCS 0x%02x 0x%02x, HT cap info 0x%04x, A-MPDU 0x%02x, TX/RX A-MPDU %u/%u, BA %u/%u, RTS %u\n",
+			    c[18], c[13], c[24], c[25], c[40] | c[41] << 8, c[48], c[76], c[77], c[92], c[93], c[68]);
+			failed |= c[18] != 1 || c[13] != 0x18 || c[24] != 0xff || c[25] != 0xff || (c[40] | c[41] << 8) != (0x09ef & ~0x42) ||
+			    c[48] != 0x17 || c[76] != 1 || c[77] != 1 || c[92] != 64 || c[68] != 3;
+		}
+		if (bss_at >= 0) {
+			const uint8_t *c = sent[bss_at] + 64;
+			printf("  BSS_INFO: QBSS %u, phy 0x%02x, RLM HT info1 0x%02x info2 0x%02x protect %u\n", c[42], c[55], c[68 + 12], c[68 + 10],
+			    c[68 + 5]);
+			failed |= c[42] != 1 || c[55] != 0x18 || c[68 + 12] != 0x00 || c[68 + 10] != 0x04;
+		}
+		if (wmm_at >= 0) {
+			const uint8_t *c = sent[wmm_at] + 64;
+			printf("  WMM: BE CW %u-%u AIFSN %u, VO CW %u-%u AIFSN %u TXOP %u\n", c[0] | c[1] << 8, c[2] | c[3] << 8, c[6],
+			    c[30] | c[31] << 8, c[32] | c[33] << 8, c[36], c[34] | c[35] << 8);
+			failed |= (c[0] | c[1] << 8) != 15 || (c[2] | c[3] << 8) != 1023 || c[6] != 3 || (c[30] | c[31] << 8) != 3 ||
+			    (c[32] | c[33] << 8) != 7 || c[36] != 2 || (c[34] | c[35] << 8) != 0x2f || c[41] != 1;
+		}
+		/* a BSS transition request with an MBO element: answered with status 7 and an MBO reason */
+		bzero(fr, sizeof(fr));
+		fr[0] = 0xd0; memcpy(fr + 4, a34w_mac, 6); memcpy(fr + 10, ap, 6); memcpy(fr + 16, ap, 6);
+		fr[24] = 10; fr[25] = 7; fr[26] = 1; fr[27] = 0x01; fr[28] = 0; fr[29] = 0; fr[30] = 200;
+		memcpy(fr + 31, "\xdd\x07\x50\x6f\x9a\x16\x01\x01\x00", 9);
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1;
+		a34w_mgmt_in(fr, 40, -74, 48);
+		firmware_sim();
+		sim_on = 0;
+		printf("  BTM: %u frames; category %u action %u token %u status %u, %u bytes\n", nsent, sent[0][32 + 24], sent[0][32 + 25],
+		    sent[0][32 + 26], sent[0][32 + 27], sent_len[0] - 32);
+		failed |= nsent != 1 || sent[0][32 + 24] != 10 || sent[0][32 + 25] != 8 || sent[0][32 + 26] != 1 || sent[0][32 + 27] != 7 ||
+		    sent_len[0] - 32 != 24 + 5 + 9 || sent[0][32 + 29] != 221;
+		printf("0968 HT and WMM station, BSS transition answered: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 
