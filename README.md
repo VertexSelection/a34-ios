@@ -11,10 +11,10 @@ usable as a daily system, and installing it erases the phone.
 | --- | --- |
 | Boot | Samsung LK → our loader in `recovery` → XNU 8796 (ruby-ios-bringup patch set + `xnu/patches/09xx`) |
 | Userland | launchd → backboardd → SpringBoard → **lock screen** |
-| Display | LK's framebuffer at 60 Hz (`sweetfb_hz=60`): each presented frame copied by the CPU (~2.4 ms) and sent to the command-mode DSI panel from a separate kick work loop (~7.6 ms per transfer); a swap is released only after its copy (0927) |
+| Display | LK's framebuffer at 60 Hz (`sweetfb_hz=60`): each presented frame copied by the CPU (~2.4 ms) into the one of two pictures the panel is not being sent (`a34fbflip=1`, 0930–0933), and each ~7.6 ms command-mode DSI transfer started on the panel's TE signal (`a34fbte=1`): no tearing; a swap is released only after its copy (0927) |
 | Touch | Goodix GT9895 on I2C0, polled (patch 0903) |
 | Buttons | volume up/down, power (patch 0902) |
-| CPU | all 8 cores (6× Cortex-A55 at 1.8 GHz, 2× Cortex-A78), one scheduler cl| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up and a panfrost-style IOKit service with queued jobs (0908–0928, `a34mali=1`), raised from 385 to 670 MHz with MediaTek's table voltages (`a34gpumhz=670`, 0921), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected with `a34inject=`): **the UI is GPU-rendered, 45–58 fps in motion**; CoreImage works in SpringBoard; black patches still appear during some animations |Kit service (0908–0916, `a34mali=1`), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected into backboardd with `a34inject=/a34/liba34gl-inject.dylib,backboardd`): **the UI is GPU-rendered, ~20 fps**; some visual glitches |
+| CPU | all 8 cores (6× Cortex-A55 at 1.8 GHz, 2× Cortex-A78), one scheduler cl| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up and a panfrost-style IOKit service with queued jobs (0908–0928, `a34mali=1`), raised from 385 to 670 MHz with MediaTek's table voltages (`a34gpumhz=670`, 0921), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected with `a34inject=`): **the UI is GPU-rendered, 45–58 fps in motion**; CoreImage works in SpringBoard; the earlier black lines were display tearing, fixed by 0930–0933 |Kit service (0908–0916, `a34mali=1`), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected into backboardd with `a34inject=/a34/liba34gl-inject.dylib,backboardd`): **the UI is GPU-rendered, ~20 fps**; some visual glitches |
 | Boot time | empty `IOAcceleratorES` (0907, from ios-topaz) saves ~45 s; first frames ~65 s after XNU starts |
 | Not yet | Metal (HackiOS's Mali driver being ported on branch `metal`), Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
@@ -50,7 +50,7 @@ ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1 sweethw=0 sweetgt=0
 launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt=-1
 wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_hz=60 rubkeys=1 a34touch=1 a34mali=1
 a34inject=/a34/liba34gl-inject.dylib,backboardd,SpringBoard a34gpumhz=670 a34cpudvfs=1
-a34cpuopp=2000 a34surfrowfix=1 a34big=1`
+a34cpuopp=2000 a34big=1 a34fbflip=1 a34fbte=1`
 (`cpus=8`; `a34hb=10` adds a 10-second heartbeat with per-CPU interrupt counts and
 display timings to the kernel log)
 
