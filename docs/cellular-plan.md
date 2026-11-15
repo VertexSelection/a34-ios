@@ -189,6 +189,19 @@ First phone test (ready, not flashed):
   Then cell2: `SMC MD_KERNEL_BOOT_UP`, `CCIF from the modem: RCHNUM ...`, and
   `HS1 -- the modem is running and asks for the AP's features` with its 64 feature bytes.
 
+First run (2026-11-15, `0961-cell1`, log build/logs/0961-cell1-a): LK loaded the modem (tag
+table v3, 20 tags, load flag 1), MD1 on, CCIF clocks on, BROM PASS, boot status 0x5443000c (the
+DTS's expected value), md1rom `MOLY.NR15.R3.TC10.A34.PR.SP.V2.P58`. The LK tags are the legacy
+set (smem_layout at 0x8e000000/0x1e0000, nc_smem_info_ext x3, md1_bank4_cache_info at
+0x8a000000/0x2960000 with a 0x08000000 cache offset, hdr_tbl_inf: bank0 0xe0000000), so 0951
+takes the gen6297 fallback tables. SpringBoard then crashed on a UIKit asset lookup
+(BoundingPathBitmap-1125x2436...) in a GL boot that followed Metal boots of the same root.
+Checked since: none of LK's reserved regions on either path (normal: + ADSP, SPM, SCP, VPU,
+modem, shared memory) lies in XNU's 0x1_4000_0000-0x2_3FFF_F000; the loader now refuses/trims
+if one ever does, and 0950 logs them all with an overlap count. To tell boot path, kernel and
+root state apart: `xnu-recovery-0980-cell1.img` is the same kernel and boot-args through
+`recovery`.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
