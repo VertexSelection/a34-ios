@@ -249,6 +249,16 @@ size, 0xEEFF0011}, UL the same (from the vendor binaries' arm64 code). Our kerne
 after the clear; CCB_CTRL headers are logged before/after and at an exception, the CCB data
 areas only as counts of non-zero words (they hold modem logs).
 
+Seventh run (`1000-cell3`, log build/logs/1000-cell3-a): the CCB headers worked (the modem
+stamped 0xDDBBCCAA into them); the next assert is the L1 RF front end,
+`mml1_cdf_device_driver_fe_elna.c` line 899. Compared with Android: DTSI_QUERY answers
+0x0f0f0f0f there too (no md_attr_node in vendor_boot, dtbo or the live tree); the GPIO answers
+match gpio_usage_mapping. Two differences fixed: the AUXADC value Android hands the modem is
+calibrated with the devinfo efuse word at 0x1c4 (1938 -> 1951 on this phone), and
+md1_pmic_setting_on sets md-vdigrf (MT6359P VPU buck) to 700 mV before power-on.
+md-vmodem/md-vsram (MT6315 on SPMI, 825 mV) are not driven. VPU, the RF LDOs and
+GPIO_RF_PWREN_RST_PIN (GPIO 75) are logged before power-on and at an exception.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
