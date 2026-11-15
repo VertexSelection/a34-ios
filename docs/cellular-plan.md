@@ -295,6 +295,16 @@ modem's own boot-trace text (masked) is logged: it is its NVRAM layer's trace; t
 was used by file-operation lines, the first other lines being NVRAM init and a "default value"
 failure. Next: file-operation lines skipped, 128 KiB.
 
+Twelfth run (`1013-cell3-trace2`): the modem's NVRAM layer completes its core and post init; its
+only errors are its own record checks, not file-server failures (0 FS errors): a default value
+missing for LID 0xEF07 (file LD4D_007) and 0x985 (NR06_008), a multi-record read of an unknown
+LID 0xCC0, and a caller asking record 2 of the single-record LIDs 0x985 (NR06_008) and 0xD
+(UM15_000), whose writes it then rejects (ret 13). The LID -> file mapping comes from the
+modem's LID table in md1rom (40-byte entries: records << 16 | LID, record size, default,
+attributes, name, version). The FS semantics checked: writes grow the RAM copy, reads are byte
+ranges, the two missing files are missing on Android too. Next: what the first-boot clear wipes
+(non-zero words per region, counts only) and a34cellclear to leave groups uncleared.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
