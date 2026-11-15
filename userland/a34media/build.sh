@@ -78,7 +78,10 @@ for f in "$A"/*.dylib "$DRIVER/RedwoodAudio"; do
 		bad=1
 	fi
 	[ "$(lipo -archs "$f")" = arm64 ] || { echo "error: $name is $(lipo -archs "$f"), not arm64"; bad=1; }
-	codesign -v "$f" || { echo "error: $name: signature"; bad=1; }
+	# (the signature of the file as signed: inside the bundle codesign -v would want the bundle signed, with
+	# a _CodeSignature/CodeResources the HAL does not ask for)
+	codesign -v "$BUILD/$name" || { echo "error: $name: signature"; bad=1; }
+	cmp -s "$BUILD/$name" "$f" || { echo "error: $name is not the file signed"; bad=1; }
 done
 nm -gU "$DRIVER/RedwoodAudio" | grep ' _RedwoodAudio_Create$' >/dev/null || { echo "error: RedwoodAudio does not export RedwoodAudio_Create"; bad=1; }
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DRIVER/Info.plist")" = RedwoodAudio ] ||
