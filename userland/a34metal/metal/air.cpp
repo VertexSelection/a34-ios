@@ -85,6 +85,7 @@ load()
 		call("rwa_render_clear_attachments", &c.render_clear_attachments, false),
 		call("rwa_texture_view", &c.texture_view, false),
 		call("rwa_texture_probe", &c.texture_probe, false),
+		call("rwa_texture_probe_at", &c.texture_probe_at, false),
 		call("rwa_depth_read", &c.depth_read, false),
 		call("rwa_texture_destroy", &c.texture_destroy, false),
 		call("rwa_sampler_create", &c.sampler_create, true),

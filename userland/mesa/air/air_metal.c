@@ -2248,6 +2248,14 @@ int
 rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, uint8_t texel[16],
                   unsigned *width, unsigned *height, char *why, size_t why_size)
 {
+   return rwa_texture_probe_at(texture, level, layer, ~0u, ~0u, texel, width, height, why, why_size);
+}
+
+int
+rwa_texture_probe_at(struct rwa_texture *texture, unsigned level, unsigned layer, unsigned x,
+                     unsigned y, uint8_t texel[16], unsigned *width, unsigned *height, char *why,
+                     size_t why_size)
+{
    RWA_GUARD();
    struct pipe_resource *res = texture ? texture->res : NULL;
    struct pipe_transfer *transfer = NULL;
@@ -2264,7 +2272,8 @@ rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, u
       return -1;
    }
    unsigned w = u_minify(res->width0, level), h = u_minify(res->height0 ? res->height0 : 1, level);
-   u_box_3d(w / 2, h / 2, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
+   unsigned px = x == ~0u ? w / 2 : MIN2(x, w - 1), py = y == ~0u ? h / 2 : MIN2(y, h - 1);
+   u_box_3d(px, py, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
    const uint8_t *map = texture->device->pipe->texture_map(texture->device->pipe, res, level, PIPE_MAP_READ,
                                                          &box, &transfer);
    if (!map) {
