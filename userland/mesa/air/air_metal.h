@@ -205,6 +205,30 @@ int rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color
 		     size_t why_size);
 int rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
 		    size_t src_offset, size_t size, char *why, size_t why_size);
+/*
+ * A34 (metal-fx): a render pass that clears and draws nothing, each colour attachment with its
+ * own level and slice (MTLRenderPassAttachmentDescriptor.level/.slice; NULL: 0) and its own load
+ * action: the attachments in `clear_color_mask` are cleared, each to its own four floats in
+ * `clear_colors` (eight times four), the others kept. rwa_render_clear cleared every attachment
+ * to attachment 0's colour, at level 0.
+ */
+int rwa_render_clear_attachments(struct rwa_device *device, struct rwa_texture *const *color,
+				 unsigned color_count, const unsigned *color_level,
+				 const unsigned *color_slice, unsigned clear_color_mask,
+				 const float *clear_colors, struct rwa_texture *depth,
+				 const float *clear_depth, const unsigned *clear_stencil, char *why,
+				 size_t why_size);
+/*
+ * A34 (metal-fx): -newTextureViewWithPixelFormat:[textureType:levels:slices:]: another texture
+ * over the same memory, read and drawn as `pixel_format` (of the same size a texel), from
+ * `level_base` for `level_count` levels and from `slice_base` for `slice_count` slices of
+ * `texture` (itself a view or not). Destroyed with rwa_texture_destroy; the memory lives as
+ * long as either does. NULL and a sentence for what cannot be one.
+ */
+struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned pixel_format,
+				     unsigned type, unsigned level_base, unsigned level_count,
+				     unsigned slice_base, unsigned slice_count, char *why,
+				     size_t why_size);
 /* -generateMipmapsForTexture:: every level below the base, filtered from the one above it */
 int rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
 int rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t value,
@@ -1352,6 +1376,18 @@ struct rwa_draw {
 	 * a layer meant for one rectangle drew over the whole frame. */
 	const float *viewport;
 	const unsigned *scissor;
+
+	/* A34 (metal-fx), appended: each colour attachment's level and slice
+	 * (MTLRenderPassAttachmentDescriptor.level and .slice; NULL: level 0, slice 0 -- all
+	 * there was), and its own load action: a non-zero `clear_color_mask` clears exactly those
+	 * attachments, each to its own four floats of `clear_colors` (eight times four), and
+	 * `clear_color` is then not read. CoreAnimation's blurs draw their smaller copies into
+	 * the levels of one texture; drawn into level 0 instead, they wrote over the picture
+	 * they were made from and left the levels the blur reads empty. */
+	const unsigned *color_level;
+	const unsigned *color_slice;
+	unsigned clear_color_mask;
+	const float *clear_colors;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

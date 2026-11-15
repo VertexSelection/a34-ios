@@ -136,6 +136,34 @@ write its pipelines' recipes into the log three minutes into the boot (`rwr ...`
 `tools/rwm-recipes.py LOG` makes `build/rwm-recipes.txt` of them; as `/a34/rwm-recipes.txt` the
 driver builds those pipelines on a thread of its own at its next start (`rwm_warm=0`: not).
 
+## CoreAnimation's effects on Metal (metal-fx)
+
+Boots 63 and 65 (`camtl=1`) drew blurs black or not at all. QuartzCore's Metal renderer asks the
+device for three things this driver did not do. QuartzCore's own selectors list `setLevel:`,
+`setMipmapLevelCount:`, `generateMipmapsForTexture:` and `newTextureViewWithPixelFormat:`
+(research: `qc_metal_sels.txt`).
+
+- **Drawing into a level or slice.** A blur's smaller copies are drawn into the levels of one
+  texture (`MTLRenderPassAttachmentDescriptor.level`; the variable blur reads them back by level).
+  Every attachment was drawn at level 0, slice 0, so the copies were written over the picture
+  they were made from, and the levels the blur reads stayed empty. Now each colour attachment is
+  drawn at its own level and slice (`rwa_draw.color_level`/`color_slice`, render surfaces kept per
+  level). A slice of a 2D array or a face of a cube is a 2D target. Boot-arg `rwm_levels=0`:
+  level 0 as before. The first four such passes are logged ("a pass draws into level N").
+- **Each attachment's own load action.** Only attachment 0's clear was seen, and it cleared every
+  attachment to its colour. CoreAnimation draws into two. Now each attachment is cleared or kept
+  by its own load action, to its own colour, in a pass that draws and in one that only clears
+  (`rwa_render_clear_attachments`). Boot-arg `rwm_clears=0`: as before.
+- **Texture views.** `-newTextureViewWithPixelFormat:` (and the `textureType:levels:slices:`
+  forms) answered nil. They are now another texture over the same memory, the same size a texel
+  in another format, from its own first level and slice (`rwa_texture_view`). It is sampled,
+  drawn into, copied and mipmapped as such, and a view of a texture over a surface lies over it
+  too. Boot-arg `rwm_views=0`: nil as before. The first eight views are logged ("a texture
+  view: pixel format N as M").
+
+Files: `userland/mesa/air/air_metal.[ch]` (the library), `metal/render.cpp`, `draw.cpp`,
+`blit.cpp`, `texture.cpp`, `air.cpp`, `rwm.h`, `redwoodmetal.m` (attachments and views only).
+
 ## Credits and licence
 
 HackiOS (OOSEX GANG) wrote everything here but `metal-probe.m` and `a34_watch.c`, and the

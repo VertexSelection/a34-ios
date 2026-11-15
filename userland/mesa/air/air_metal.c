@@ -259,7 +259,76 @@ struct rwa_texture {
     * the whole picture loaded into the tiles and written back out, dozens of times a
     * frame */
    struct pipe_surface *rt;
+
+   /* A34 (metal-fx): a view (rwa_texture_view) is the same resource read and drawn as its own
+    * format, from its own first level and slice; a texture that is not one has none of it. And
+    * the render surfaces of the levels and slices other than the first, kept as `rt` is. */
+   bool is_view;
+   enum pipe_format view_format;
+   unsigned level_base, layer_base;
+   struct {
+      unsigned level, layer;
+      struct pipe_surface *surface;
+   } rt_more[16];
 };
+
+/* The format a texture is read and drawn as: a view's own, or the resource's. */
+static enum pipe_format
+texture_format(const struct rwa_texture *t)
+{
+   return t->is_view ? t->view_format : t->res->format;
+}
+
+/*
+ * The render surface of a texture's `level` and `layer` (its own, from a view's first): the
+ * first is `rt` as before; the others are kept beside it, so that the passes into one of them
+ * keep finding the same surface (A34 metal-fx: every attachment was level 0, slice 0).
+ */
+static struct pipe_surface *
+texture_surface(struct rwa_texture *t, unsigned level, unsigned layer)
+{
+   struct pipe_surface **slot = NULL;
+
+   if (level == 0 && layer == 0) {
+      slot = &t->rt;
+   } else {
+      for (unsigned i = 0; i < ARRAY_SIZE(t->rt_more); i++) {
+         if (t->rt_more[i].surface && t->rt_more[i].level == level && t->rt_more[i].layer == layer)
+            return t->rt_more[i].surface;
+      }
+      for (unsigned i = 0; i < ARRAY_SIZE(t->rt_more) && !slot; i++) {
+         if (!t->rt_more[i].surface) {
+            t->rt_more[i].level = level;
+            t->rt_more[i].layer = layer;
+            slot = &t->rt_more[i].surface;
+         }
+      }
+      if (!slot)
+         return NULL;
+   }
+   if (!*slot) {
+      *slot = rwa_surface_new(t->res);
+      if (*slot) {
+         (*slot)->format = texture_format(t);
+         (*slot)->level = t->level_base + level;
+         (*slot)->first_layer = (*slot)->last_layer = t->layer_base + layer;
+      }
+   }
+   return *slot;
+}
+
+/* The size of a texture's level (its own, from a view's first). */
+static void
+texture_level_size(const struct rwa_texture *t, unsigned level, unsigned *w, unsigned *h)
+{
+   if (level == 0) {
+      *w = t->shape.width;
+      *h = t->shape.height ? t->shape.height : 1;
+   } else {
+      *w = u_minify(t->res->width0, t->level_base + level);
+      *h = u_minify(t->res->height0 ? t->res->height0 : 1, t->level_base + level);
+   }
+}
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
@@ -1657,6 +1726,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
    /* by reference and not surface_destroy: a pass not yet sent still holds it */
    rwa_surface_free(&texture->rt);
+   for (unsigned i = 0; i < ARRAY_SIZE(texture->rt_more); i++)
+      rwa_surface_free(&texture->rt_more[i].surface);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -1695,8 +1766,9 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
    unsigned d = volume ? u_minify(res->depth0, level) : 1;
    unsigned s[3] = { size ? size[0] : w, size ? size[1] : h, size ? size[2] : d };
 
-   if (layer >= texture->layers) {
-      say(why, why_size, "slice %u of a texture with %u", layer, texture->layers);
+   if (layer < texture->layer_base || layer - texture->layer_base >= texture->layers) {
+      say(why, why_size, "slice %u of a texture with %u", layer - texture->layer_base,
+          texture->layers);
       return false;
    }
    if (!s[0] || !s[1] || !s[2]) {
@@ -1756,6 +1828,9 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    RWA_GUARD();
    struct pipe_box box;
    size_t row;
+
+   level += texture->level_base;      /* (a view's, from its first: 0 for a texture that is none) */
+   layer += texture->layer_base;
 
    if (!bytes) {
       say(why, why_size, "no bytes to write into a texture");
@@ -1839,6 +1914,10 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
       say(why, why_size, "a texture copy without two textures");
       return -1;
    }
+   dst_level += dst->level_base;      /* (views', from their first) */
+   dst_slice += dst->layer_base;
+   src_level += src->level_base;
+   src_slice += src->layer_base;
    struct pipe_context *pipe = dst->device->pipe;
    struct pipe_screen *screen = dst->device->screen;
    unsigned depth = MAX2(size[2], 1);
@@ -1880,12 +1959,12 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
  * nothing at all -- the clear was a property of a draw, and there was none). The attachments
  * become the framebuffer, are cleared, and stay bound for whatever comes next.
  */
-int
-rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsigned color_count,
-                 const float *clear_color, struct rwa_texture *depth, const float *clear_depth,
-                 const unsigned *clear_stencil, char *why, size_t why_size)
+static int
+render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsigned color_count,
+             const unsigned *color_level, const unsigned *color_slice, unsigned clear_color_mask,
+             const float *clear_colors, const float *clear_color, struct rwa_texture *depth,
+             const float *clear_depth, const unsigned *clear_stencil, char *why, size_t why_size)
 {
-   RWA_GUARD();
    struct pipe_context *pipe = device->pipe;
    struct pipe_framebuffer_state fb = { 0 };
    unsigned mask = 0;
@@ -1893,24 +1972,34 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
 
    for (unsigned i = 0; i < color_count && i < PIPE_MAX_COLOR_BUFS; i++) {
       struct rwa_texture *t = color[i];
+      unsigned level = color_level ? color_level[i] : 0;
+      unsigned layer = color_slice ? color_slice[i] : 0;
+      struct pipe_surface *surface;
 
       if (!t || !t->res)
          continue;
-      if (!t->rt)
-         t->rt = rwa_surface_new(t->res);
-      if (!t->rt) {
+      if (t->level_base + level > t->res->last_level || layer >= MAX2(t->layers, 1)) {
+         say(why, why_size, "colour attachment %u to clear is level %u, slice %u: not there", i,
+             level, layer);
+         return -1;
+      }
+      surface = texture_surface(t, level, layer);
+      if (!surface) {
          say(why, why_size, "no render surface of colour attachment %u to clear", i);
          return -1;
       }
-      fb.cbufs[i] = *t->rt;
+      fb.cbufs[i] = *surface;
       fb.nr_cbufs = i + 1;
-      fb.width = t->res->width0;
-      fb.height = t->res->height0;
+      texture_level_size(t, level, &fb.width, &fb.height);
    }
    if (depth && depth->res) {
-      if (!depth->rt)
-         depth->rt = rwa_surface_new(depth->res);
-      fb.zsbuf = *depth->rt;
+      struct pipe_surface *surface = texture_surface(depth, 0, 0);
+
+      if (!surface) {
+         say(why, why_size, "no render surface of the depth attachment to clear");
+         return -1;
+      }
+      fb.zsbuf = *surface;
       if (!fb.width) {
          fb.width = depth->res->width0;
          fb.height = depth->res->height0;
@@ -1918,7 +2007,9 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
    }
    if (!fb.width)
       return 0;
-   if (clear_color && fb.nr_cbufs) {
+   if (clear_color_mask && clear_colors && fb.nr_cbufs) {
+      /* (each attachment its own colour: cleared below, once the framebuffer is set) */
+   } else if (clear_color && fb.nr_cbufs) {
       mask |= PIPE_CLEAR_COLOR;
       for (unsigned c = 0; c < 4; c++)
          clear.f[c] = clear_color[c];
@@ -1928,10 +2019,124 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
    if (clear_stencil && fb.zsbuf.texture && format_has_stencil(depth->res->format))
       mask |= PIPE_CLEAR_STENCIL;
    pipe->set_framebuffer_state(pipe, &fb);
+   if (clear_color_mask && clear_colors) {
+      for (unsigned i = 0; i < fb.nr_cbufs; i++) {
+         union pipe_color_union one;
+
+         if (!(clear_color_mask & (1u << i)) || !fb.cbufs[i].texture)
+            continue;
+         for (unsigned c = 0; c < 4; c++)
+            one.f[c] = clear_colors[4 * i + c];
+         pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, 0xffffffffu, 0xff, NULL, &one, 0.0, 0);
+      }
+   }
    if (mask)
       pipe->clear(pipe, mask, 0xffffffffu, 0xff, NULL, &clear, clear_depth ? (double)*clear_depth : 0.0,
                   clear_stencil ? *clear_stencil & 0xff : 0);
    return 0;
+}
+
+int
+rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsigned color_count,
+                 const float *clear_color, struct rwa_texture *depth, const float *clear_depth,
+                 const unsigned *clear_stencil, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   return render_clear(device, color, color_count, NULL, NULL, 0, NULL, clear_color, depth, clear_depth,
+                       clear_stencil, why, why_size);
+}
+
+int
+rwa_render_clear_attachments(struct rwa_device *device, struct rwa_texture *const *color,
+                             unsigned color_count, const unsigned *color_level,
+                             const unsigned *color_slice, unsigned clear_color_mask,
+                             const float *clear_colors, struct rwa_texture *depth,
+                             const float *clear_depth, const unsigned *clear_stencil, char *why,
+                             size_t why_size)
+{
+   RWA_GUARD();
+   return render_clear(device, color, color_count, color_level, color_slice, clear_color_mask,
+                       clear_colors, NULL, depth, clear_depth, clear_stencil, why, why_size);
+}
+
+/* A Metal texture type as the Gallium target a view of it is read as (A34 metal-fx). */
+static enum pipe_texture_target
+texture_target_of(unsigned type, enum pipe_texture_target otherwise)
+{
+   switch (type) {
+   case RWA_TYPE_1D: return PIPE_TEXTURE_1D;
+   case RWA_TYPE_1D_ARRAY: return PIPE_TEXTURE_1D_ARRAY;
+   case RWA_TYPE_2D: case RWA_TYPE_2D_MULTISAMPLE: return PIPE_TEXTURE_2D;
+   case RWA_TYPE_2D_ARRAY: case RWA_TYPE_2D_MULTISAMPLE_ARRAY: return PIPE_TEXTURE_2D_ARRAY;
+   case RWA_TYPE_CUBE: return PIPE_TEXTURE_CUBE;
+   case RWA_TYPE_CUBE_ARRAY: return PIPE_TEXTURE_CUBE_ARRAY;
+   case RWA_TYPE_3D: return PIPE_TEXTURE_3D;
+   default: return otherwise;
+   }
+}
+
+struct rwa_texture *
+rwa_texture_view(struct rwa_texture *texture, unsigned view_pixel_format, unsigned type,
+                 unsigned level_base, unsigned level_count, unsigned slice_base,
+                 unsigned slice_count, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   const struct rwa_pixel_format *fmt = pixel_format(view_pixel_format);
+   struct pipe_resource *res = texture ? texture->res : NULL;
+
+   if (!res) {
+      say(why, why_size, "a view of no texture");
+      return NULL;
+   }
+   if (!fmt) {
+      say(why, why_size, "a view as pixel format %u, which is not served here", view_pixel_format);
+      return NULL;
+   }
+   if (util_format_get_blocksize(fmt->pipe) != util_format_get_blocksize(res->format)) {
+      say(why, why_size, "a view of %s as %s: texels of different sizes", texture->format_name,
+          fmt->name);
+      return NULL;
+   }
+   unsigned levels = MAX2(texture->shape.mip_levels, 1), layers = MAX2(texture->layers, 1);
+   if (level_count == 0)
+      level_count = levels - MIN2(level_base, levels);
+   if (slice_count == 0)
+      slice_count = layers - MIN2(slice_base, layers);
+   if (level_base + level_count > levels || slice_base + slice_count > layers || !level_count ||
+       !slice_count) {
+      say(why, why_size, "a view of levels %u..%u and slices %u..%u of a texture with %u and %u",
+          level_base, level_base + level_count, slice_base, slice_base + slice_count, levels,
+          layers);
+      return NULL;
+   }
+   struct rwa_texture *view = calloc(1, sizeof(*view));
+   if (!view) {
+      say(why, why_size, "out of memory making a view");
+      return NULL;
+   }
+   view->device = texture->device;
+   pipe_resource_reference(&view->res, res);
+   view->shape = texture->shape;
+   view->shape.pixel_format = view_pixel_format;
+   view->shape.type = type;
+   view->shape.mip_levels = level_count;
+   view->format_name = fmt->name;
+   view->shader_read = texture->shader_read;
+   view->shader_write = texture->shader_write;
+   view->is_view = true;
+   view->view_format = fmt->pipe;
+   view->level_base = texture->level_base + level_base;
+   view->layer_base = texture->layer_base + slice_base;
+   view->layers = slice_count;
+   view->shape.width = u_minify(res->width0, view->level_base);
+   view->shape.height = u_minify(res->height0 ? res->height0 : 1, view->level_base);
+   if (type == RWA_TYPE_2D_ARRAY || type == RWA_TYPE_1D_ARRAY)
+      view->shape.array_length = slice_count;
+   else if (type == RWA_TYPE_CUBE_ARRAY)
+      view->shape.array_length = slice_count / 6;
+   else
+      view->shape.array_length = 1;
+   return view;
 }
 
 int
@@ -1985,8 +2190,18 @@ rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
    if (res->last_level == 0)
       return 0;
    unsigned last_layer = res->target == PIPE_TEXTURE_3D ? 0 : util_max_layer(res, 0);
-   if (!util_gen_mipmap(texture->device->pipe, res, res->format, 0, res->last_level, 0, last_layer,
-                        PIPE_TEX_FILTER_LINEAR)) {
+   /* (a view's levels and slices: from its first, so many as it has) */
+   unsigned first_level = texture->level_base;
+   unsigned last_level = texture->is_view && texture->shape.mip_levels
+                            ? MIN2(res->last_level, first_level + texture->shape.mip_levels - 1)
+                            : res->last_level;
+   unsigned first_layer = texture->is_view ? texture->layer_base : 0;
+   if (texture->is_view && res->target != PIPE_TEXTURE_3D)
+      last_layer = MIN2(last_layer, texture->layer_base + texture->layers - 1);
+   if (last_level <= first_level)
+      return 0;
+   if (!util_gen_mipmap(texture->device->pipe, res, texture_format(texture), first_level, last_level,
+                        first_layer, last_layer, PIPE_TEX_FILTER_LINEAR)) {
       say(why, why_size, "the driver made no mipmaps for a %s texture", texture->format_name);
       return -1;
    }
@@ -2002,6 +2217,9 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
    struct pipe_context *pipe = texture->device->pipe;
    struct pipe_box box;
    size_t row;
+
+   level += texture->level_base;      /* (a view's, from its first) */
+   layer += texture->layer_base;
 
    if (!bytes) {
       say(why, why_size, "nowhere to read a texture into");
@@ -4106,7 +4324,17 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
           */
          if (!t->view) {
             struct pipe_sampler_view tmpl = { 0 };
-            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
+            u_sampler_view_default_template(&tmpl, t->res, texture_format(t));
+            if (t->is_view) {
+               /* a view: its own levels and slices, as its own kind of texture */
+               tmpl.target = texture_target_of(t->shape.type, t->res->target);
+               tmpl.u.tex.first_level = t->level_base;
+               tmpl.u.tex.last_level = t->level_base + MAX2(t->shape.mip_levels, 1) - 1;
+               if (t->res->target != PIPE_TEXTURE_3D) {
+                  tmpl.u.tex.first_layer = t->layer_base;
+                  tmpl.u.tex.last_layer = t->layer_base + MAX2(t->layers, 1) - 1;
+               }
+            }
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
                say(why, why_size, "%s would not make a sampler view of the %s bound at "
@@ -4122,7 +4350,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
       case AIR_RESOURCE_IMAGE:
          images[r->index] = (struct pipe_image_view){
             .resource = t->res,
-            .format = t->res->format,
+            .format = texture_format(t),
             /* what the shader does with it, from the metadata rather than assumed: a
              * read-write image told it is write-only reads zeros on some drivers.
              */
@@ -4130,10 +4358,10 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
                       (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                              (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
-            .u.tex.level = 0,
-            .u.tex.first_layer = 0,
-            .u.tex.last_layer = (t->shape.type == RWA_TYPE_3D ? t->res->depth0
-                                                              : t->layers) - 1,
+            .u.tex.level = t->level_base,
+            .u.tex.first_layer = t->layer_base,
+            .u.tex.last_layer = t->layer_base + (t->shape.type == RWA_TYPE_3D ? t->res->depth0
+                                                                              : t->layers) - 1,
          };
          num_images = MAX2(num_images, r->index + 1);
          break;
@@ -7135,7 +7363,11 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
                       char *why, size_t why_size)
 {
    unsigned want_type = samples > 1 ? RWA_TYPE_2D_MULTISAMPLE : RWA_TYPE_2D;
-   if (t->shape.type != want_type) {
+   /* (A34 metal-fx: one slice of a 2D array or one face of a cube is drawn as a 2D target) */
+   bool slice_of = samples <= 1 && (t->shape.type == RWA_TYPE_2D_ARRAY ||
+                                    t->shape.type == RWA_TYPE_CUBE ||
+                                    t->shape.type == RWA_TYPE_CUBE_ARRAY);
+   if (t->shape.type != want_type && !slice_of) {
       say(why, why_size, "%s is a %s and a pass of %u sample%s per pixel renders into a %s",
           what, texture_type_name(t->shape.type), samples, samples == 1 ? "" : "s",
           texture_type_name(want_type));
@@ -7380,8 +7612,21 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
              render->shape.color_format[i]);
          return -1;
       }
-      unsigned tw = t->shape.width;
-      unsigned th = t->shape.height ? t->shape.height : 1;
+      unsigned level = draw->color_level ? draw->color_level[i] : 0;
+      unsigned layer = draw->color_slice ? draw->color_slice[i] : 0;
+      if (t->level_base + level > t->res->last_level ||
+          (t->shape.mip_levels && level >= t->shape.mip_levels)) {
+         say(why, why_size, "colour attachment %u is level %u of a texture with %u", i, level,
+             MAX2(t->shape.mip_levels, 1));
+         return -1;
+      }
+      if (layer >= MAX2(t->layers, 1)) {
+         say(why, why_size, "colour attachment %u is slice %u of a texture with %u", i, layer,
+             MAX2(t->layers, 1));
+         return -1;
+      }
+      unsigned tw, th;
+      texture_level_size(t, level, &tw, &th);
       if (i == 0) {
          w = tw;
          h = th;
@@ -7465,9 +7710,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = (struct rwa_texture *)draw->color[i];
-      if (!t->rt)
-         t->rt = rwa_surface_new(t->res);
-      surf[i] = t->rt;
+      surf[i] = texture_surface(t, draw->color_level ? draw->color_level[i] : 0,
+                                draw->color_slice ? draw->color_slice[i] : 0);
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
@@ -7477,9 +7721,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    if (draw->depth) {
       struct rwa_texture *t = (struct rwa_texture *)draw->depth;
-      if (!t->rt)
-         t->rt = rwa_surface_new(t->res);
-      zsurf = t->rt;
+      zsurf = texture_surface(t, 0, 0);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
@@ -7675,7 +7917,18 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       unsigned mask = 0;
       for (unsigned c = 0; c < 4; c++)
          clear.f[c] = draw->clear_color ? draw->clear_color[c] : 0.0f;
-      if (draw->clear_color)
+      if (draw->clear_color_mask && draw->clear_colors) {
+         /* A34 (metal-fx): each attachment its own load action and its own colour */
+         for (unsigned i = 0; i < draw->color_count && i < PIPE_MAX_COLOR_BUFS; i++) {
+            union pipe_color_union one;
+
+            if (!(draw->clear_color_mask & (1u << i)))
+               continue;
+            for (unsigned c = 0; c < 4; c++)
+               one.f[c] = draw->clear_colors[4 * i + c];
+            pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, 0xffffffffu, 0xff, NULL, &one, 0.0, 0);
+         }
+      } else if (draw->clear_color)
          mask |= PIPE_CLEAR_COLOR;
       /* An aspect is cleared only if the attachment has it: clearing the stencil of a
        * Depth32Float buffer is a caller's mistake, but Gallium's clear would either

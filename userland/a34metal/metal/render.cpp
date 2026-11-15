@@ -44,6 +44,7 @@ record_targets(const struct rwm_render_state *s, struct rwm_work *w, bool first_
 void
 loaded(struct rwm_render_state *s)
 {
+	s->clear_mask = 0;
 	s->clears = false;
 	s->clears_depth = false;
 	s->clears_stencil = false;
@@ -73,15 +74,60 @@ rwm_render_begin(struct rwm_render_state *s, struct rwa_device *device)
  * 10.34) and resolves nothing, so the one-sample texture an application means to READ would come back holding what it
  * held before -- a pass that seems to have drawn nothing. (MTLStoreActionMultisampleResolve is 2, ...AndStore... 3.)
  */
+/*
+ * (metal-fx) Boot-arg rwm_levels=0: every attachment drawn at level 0, slice 0, as before; rwm_clears=0: attachment 0's
+ * load action and colour for all of them, as before. CoreAnimation draws the smaller copies of a blur into the levels
+ * of one texture (MTLRenderPassAttachmentDescriptor.level); drawn into level 0 they wrote over the picture they were
+ * made of, and the levels the blur reads stayed empty.
+ */
+static bool
+levels_on()
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = !rwm_boot_arg("rwm_levels=0");
+	}
+	return on != 0;
+}
+
+static bool
+clears_on()
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = !rwm_boot_arg("rwm_clears=0");
+	}
+	return on != 0;
+}
+
 extern "C" void
 rwm_render_color(struct rwm_render_state *s, unsigned index, void *object, struct rwm_texture *core, bool clears,
-		 const double color[4], unsigned long store, bool resolve_texture)
+		 const double color[4], unsigned long store, bool resolve_texture, unsigned long level,
+		 unsigned long slice)
 {
 	if (index >= 8 || object == nullptr) {
 		return;
 	}
 	s->color[index] = rwm_bound_texture{ object, core };
 	s->color_count = index + 1;
+	s->color_level[index] = levels_on() ? (unsigned)level : 0;
+	s->color_slice[index] = levels_on() ? (unsigned)slice : 0;
+	if ((level != 0 || slice != 0) && levels_on()) {
+		static unsigned said;
+
+		if (said++ < 4) {
+			rwm_print("a pass draws into level %lu, slice %lu of a texture (colour attachment %u); "
+				  "rwm_levels=0 draws every one into level 0 as before\n", level, slice, index);
+		}
+	}
+	if (clears && clears_on()) {
+		s->clear_mask |= 1u << index;
+		for (unsigned i = 0; i < 4; i++) {
+			s->clear_colors[index][i] = (float)color[i];
+		}
+	}
 	if (store == 2 || store == 3 || resolve_texture) {
 		rwm_print("colour attachment %u asks for a multisample "
 			  "resolve (storeAction %lu%s) and this driver resolves nothing: "
@@ -318,7 +364,12 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 	d->color_count = s->color_count;
 	for (unsigned i = 0; i < s->color_count; i++) {
 		d->color[i] = mesa_of(s->color[i].core);
+		d->color_level[i] = s->color_level[i];
+		d->color_slice[i] = s->color_slice[i];
 	}
+	d->color_levels = levels_on();
+	d->clear_color_mask = s->clear_mask;
+	memcpy(d->clear_colors, s->clear_colors, sizeof(d->clear_colors));
 	memcpy(w->clear_color, s->clear_color, sizeof(w->clear_color));
 	d->clear_color = s->clears ? w->clear_color : nullptr;
 	d->depth = mesa_of(s->depth.core);
@@ -388,7 +439,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 extern "C" bool
 rwm_render_end(struct rwm_render_state *s, struct rwm_work *w)
 {
-	if (!s->clears && !s->clears_depth && !s->clears_stencil) {
+	if (!s->clears && !s->clears_depth && !s->clears_stencil && s->clear_mask == 0) {
 		return false;
 	}
 
@@ -401,8 +452,12 @@ rwm_render_end(struct rwm_render_state *s, struct rwm_work *w)
 	b->device = s->device;
 	for (unsigned i = 0; i < s->color_count; i++) {
 		b->colors[i] = mesa_of(s->color[i].core);
+		b->color_level[i] = s->color_level[i];
+		b->color_slice[i] = s->color_slice[i];
 	}
 	b->color_count = s->color_count;
+	b->clear_color_mask = s->clear_mask;
+	memcpy(b->clear_colors, s->clear_colors, sizeof(b->clear_colors));
 	memcpy(w->clear_color, s->clear_color, sizeof(w->clear_color));
 	b->clear_color = s->clears ? w->clear_color : nullptr;
 	b->depth = mesa_of(s->depth.core);

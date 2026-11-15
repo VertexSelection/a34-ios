@@ -91,6 +91,8 @@ struct rwm_air {
 	__typeof__(&rwa_buffer_fill) buffer_fill;
 	__typeof__(&rwa_texture_mipmaps) texture_mipmaps;
 	__typeof__(&rwa_render_clear) render_clear;
+	__typeof__(&rwa_render_clear_attachments) render_clear_attachments;   /* optional (metal-fx) */
+	__typeof__(&rwa_texture_view) texture_view;                           /* optional (metal-fx) */
 	__typeof__(&rwa_depth_read) depth_read;
 	__typeof__(&rwa_texture_destroy) texture_destroy;
 	__typeof__(&rwa_sampler_create) sampler_create;
@@ -153,6 +155,11 @@ struct rwa_buffer *rwm_buffer_mesa(const struct rwm_buffer *buffer); /* the Mesa
 struct rwm_texture;
 
 struct rwm_texture *rwm_texture_new(struct rwa_texture *texture, const struct rwa_texture_shape *shape);
+/* (metal-fx) a view of `texture` (its own levels and slices from `level_base` and `slice_base`, so many, 0: the rest)
+ * as `pixel_format` and `type`; NULL when the library has none or refuses it (said) */
+struct rwm_texture *rwm_texture_view(struct rwm_texture *texture, unsigned pixel_format, unsigned type,
+				     unsigned level_base, unsigned level_count, unsigned slice_base,
+				     unsigned slice_count);
 void rwm_texture_free(struct rwm_texture *texture);
 struct rwa_texture *rwm_texture_mesa(const struct rwm_texture *texture);
 const struct rwa_texture_shape *rwm_texture_shape(const struct rwm_texture *texture);
@@ -203,6 +210,9 @@ struct rwm_blit {
 	struct rwa_device *device;
 	struct rwa_texture *colors[8];
 	unsigned color_count;
+	unsigned color_level[8], color_slice[8];   /* (metal-fx) */
+	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action and colour */
+	float clear_colors[8][4];
 	const float *clear_color;       /* NULL: the colours are not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -227,6 +237,10 @@ struct rwm_draw {
 	unsigned stream_count;          /* ... and the highest it fetches from, plus one */
 	struct rwa_texture *color[8];
 	unsigned color_count;
+	unsigned color_level[8], color_slice[8];   /* (metal-fx) each attachment's level and slice */
+	bool color_levels;                         /* ... given (rwm_levels=0: not) */
+	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action */
+	float clear_colors[8][4];
 	const float *clear_color;       /* NULL: kept, not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -346,6 +360,9 @@ struct rwm_render_state {
 	struct rwa_device *device;
 	struct rwm_bound_texture color[8];
 	unsigned color_count;
+	unsigned color_level[8], color_slice[8];      /* (metal-fx) each attachment's level and slice */
+	unsigned clear_mask;                          /* (metal-fx) the attachments whose load action clears */
+	float clear_colors[8][4];                     /* ... and each one's colour */
 	struct rwm_bound_texture depth;
 	float clear_color[4], clear_depth;
 	unsigned clear_stencil;
@@ -375,7 +392,8 @@ struct rwm_render_state {
  * carries both aspects; two different ones: said, neither) */
 void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,
-		      bool clears, const double color[4], unsigned long store_action, bool resolve_texture);
+		      bool clears, const double color[4], unsigned long store_action, bool resolve_texture,
+		      unsigned long level, unsigned long slice);
 void rwm_render_depth(struct rwm_render_state *state, void *depth, struct rwm_texture *depth_core, bool clears_depth,
 		      double clear_depth, void *stencil, struct rwm_texture *stencil_core, bool clears_stencil,
 		      unsigned clear_stencil);

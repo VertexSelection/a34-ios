@@ -154,6 +154,61 @@ rwm_texture_free(struct rwm_texture *texture)
 	delete texture;
 }
 
+/*
+ * (metal-fx) -newTextureViewWithPixelFormat:[textureType:levels:slices:]: the same memory as another texture of the
+ * library's, read and drawn as its own format from its own first level and slice. A view of a texture lying over a
+ * surface in place lies over it too. Boot-arg rwm_views=0: none (nil, as before).
+ */
+extern "C" struct rwm_texture *
+rwm_texture_view(struct rwm_texture *texture, unsigned pixel_format, unsigned type, unsigned level_base,
+		 unsigned level_count, unsigned slice_base, unsigned slice_count)
+{
+	static int on = -1;
+	char why[256] = {};
+
+	if (on < 0) {
+		on = !rwm_boot_arg("rwm_views=0");
+	}
+	if (!on || texture == nullptr || rwm_air()->texture_view == nullptr) {
+		return nullptr;
+	}
+	struct rwa_texture *view = rwm_air()->texture_view(texture->texture, pixel_format, type, level_base,
+							     level_count, slice_base, slice_count, why, sizeof(why));
+	if (view == nullptr) {
+		rwm_print("a texture view: %s\n", why);
+		return nullptr;
+	}
+
+	struct rwa_texture_shape shape = texture->shape;
+	const unsigned levels = shape.mip_levels != 0 ? shape.mip_levels : 1;
+
+	shape.pixel_format = pixel_format;
+	shape.type = type;
+	shape.mip_levels = level_count != 0 ? level_count : levels - (level_base < levels ? level_base : levels);
+	shape.width = shape.width >> level_base != 0 ? shape.width >> level_base : 1;
+	shape.height = shape.height >> level_base != 0 ? shape.height >> level_base : 1;
+	if (slice_count != 0 && (type == 3 || type == 1)) {          /* (2D array, 1D array) */
+		shape.array_length = slice_count;
+	} else if (slice_count != 0 && type == 6) {                  /* (cube array) */
+		shape.array_length = slice_count / 6;
+	} else if (type == 2 || type == 5) {                         /* (2D, cube) */
+		shape.array_length = 1;
+	}
+
+	struct rwm_texture *made = rwm_texture_new(view, &shape);
+
+	if (made != nullptr) {
+		made->in_place = texture->in_place;
+		static unsigned said;
+		if (said++ < 8) {
+			rwm_print("a texture view: pixel format %u as %u, levels %u+%u, slices %u+%u (%ux%u); rwm_views=0: "
+				  "none, as before\n", texture->shape.pixel_format, pixel_format, level_base,
+				  shape.mip_levels, slice_base, slice_count, shape.width, shape.height);
+		}
+	}
+	return made;
+}
+
 extern "C" struct rwa_texture *
 rwm_texture_mesa(const struct rwm_texture *texture)
 {

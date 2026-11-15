@@ -57,6 +57,14 @@ rwm_run_blit(const struct rwm_blit *blit, char *why, size_t why_size)
 					 blit->from_origin, blit->size, blit->to_contents + blit->to_offset,
 					 blit->row_bytes, why, why_size) == 0 ? 0 : -1;
 	case RWM_BLIT_CLEAR:
+		/* (metal-fx) each attachment at its own level and slice, cleared by its own load action */
+		if (air->render_clear_attachments != nullptr) {
+			return air->render_clear_attachments(blit->device, blit->colors, blit->color_count,
+							     blit->color_level, blit->color_slice,
+							     blit->clear_color_mask, &blit->clear_colors[0][0],
+							     blit->depth, blit->clear_depth, blit->clear_stencil, why,
+							     why_size) == 0 ? 0 : -1;
+		}
 		if (air->render_clear == nullptr) {
 			return 0;
 		}

@@ -597,6 +597,7 @@ gpu_param(io_connect_t gpu, uint32_t which, uint64_t *value)
 @interface RedwoodMetalTexture : _MTLResource {
 	RedwoodMetalDevice *_owner;
 	struct rwm_texture *_core; /* the texture, its shape, its surfaces: src/metal/texture.cpp */
+	id _parent;                /* (metal-fx) a view's texture, kept as long as the view is */
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 }
 @property (readonly) struct rwa_texture *mesaTexture;
@@ -2592,6 +2593,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	if (_core != NULL) {
 		rwm_texture_free(_core);
 	}
+	[_parent release];
 	[super dealloc];
 }
 
@@ -2735,10 +2737,16 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	return rwm_texture_read_depth(_core, origin, size, depth, stencil);
 }
 
-/* A view of a texture is another texture over the same memory, and the compiler library has
- * no call for that yet; nil is the honest answer, and it is better than a view that aliases
- * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
+/* (metal-fx) A view of a texture is another texture over the same memory (rwa_texture_view): the
+ * whole of it, as another pixel format of the same size a texel. QuartzCore asks for this one. */
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	const struct rwa_texture_shape *shape = rwm_texture_shape(_core);
+
+	return [self newTextureViewWithPixelFormat:format textureType:shape->type
+					    levels:NSMakeRange(0, shape->mip_levels ? shape->mip_levels : 1)
+					    slices:NSMakeRange(0, 0)];
+}
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
@@ -2754,10 +2762,20 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
-	return nil;
+	struct rwm_texture *core = rwm_texture_view(_core, rw_known_format((unsigned)format), (unsigned)type,
+						    (unsigned)levels.location, (unsigned)levels.length,
+						    (unsigned)slices.location, (unsigned)slices.length);
+	RedwoodMetalTexture *view;
+
+	if (core == NULL) {
+		RW_ONCE("a texture view was asked for and not made (the reason is above, or rwm_views=0); nil\n");
+		return nil;
+	}
+	view = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner core:core];
+	if (view != nil) {
+		view->_parent = [self retain];
+	}
+	return view;
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -3966,9 +3984,12 @@ rw_core_of(id texture)
 			continue;
 		}
 		c = [attachment clearColor];
+		/* (metal-fx) and the level and slice it draws into: CoreAnimation's blurs draw their smaller copies
+		 * into the levels of one texture */
 		rwm_render_color(&_state, i, texture, rw_core_of(texture), [attachment loadAction] == MTLLoadActionClear,
 				 (const double[4]){ c.red, c.green, c.blue, c.alpha }, [attachment storeAction],
-				 [attachment resolveTexture] != nil);
+				 [attachment resolveTexture] != nil, (unsigned long)[attachment level],
+				 (unsigned long)[attachment slice]);
 	}
 	/* the depth/stencil attachment: two descriptors over one texture, each aspect its own load action */
 	MTLRenderPassDepthAttachmentDescriptor *za = [descriptor depthAttachment];
