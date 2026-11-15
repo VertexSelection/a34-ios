@@ -1,0 +1,1102 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 70c2540..709b863 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/a34_mali.c			standard
+ bsd/dev/a34_clocks.c			standard
+ bsd/dev/a34_connsys.c			standard
+ bsd/dev/a34_bt.c			standard
++bsd/dev/a34_btsk.c			standard
+ bsd/dev/a34_wifi.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index b0ff996..9b8511f 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -26,6 +26,20 @@
+  * answered 04 0e 04 01 1a fc 00). Nothing is read from NVRAM. a34btaddr=0 keeps the firmware's. The raw
+  * channel takes HCI commands (0939 refused them: no length for packet type 1).
+  *
++ * A34 (0971), a34bt=2: the controller handed to iOS's own bluetoothd (docs/bluetooth-plan.md, sections 3-5). Its
++ * transport H4BC: the kernel control com.apple.uart.sk.bluetooth (stream, any user: bluetoothd runs as mobile; it
++ * sets option 0x800c5414 and reads the channel's UUID with 0x40105412) and the Skywalk kernel pipe behind it
++ * (a34_btsk.c); the registry's service "bluetooth" with local-mac-address (iokit/Kernel/arm/A34Bluetooth.cpp);
++ * /dev/btwake, /dev/btreset, /dev/btpoweroff (opened, nothing behind them). bluetoothd's bytes are cut into whole
++ * H4 packets here. Apple's vendor commands (OGF 0x3f, Broadcom's) never reach the controller -- MediaTek's own
++ * vendor commands share that space -- and are answered here with what their parsers read (the answers HackiOS
++ * found for iOS 16.5: 0xFD48 one byte, 0xFCE2/0x15 and /0x36 sixteen, 0xFD1B sixty-four, the rest none).
++ * Write_Default_Erroneous_Data_Reporting, unknown to the controller, is answered as done. Every command and event
++ * of the first a34btbrlog (600) is in the log ("br>" to the controller, "br<" from it, "br=" answered here), and
++ * every 10 s the LE advertising heard (counts only: how many Apple devices, how many AirPods-type "proximity
++ * pairing" adverts; no addresses). The raw channel keeps seeing everything; it may send only while bluetoothd is
++ * not connected. Ported in its scheme from HackiOS's redwood_mtkbt_skel.c (APSL 2.0 / MIT).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -52,6 +66,13 @@
+ #include <sys/proc.h>
+ #include <sys/fcntl.h>
+ #include <sys/random.h>
++#include <sys/conf.h>
++#include <sys/ioctl.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <uuid/uuid.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+@@ -75,6 +96,13 @@ extern uint64_t a34_connsys_emi_pa(void);
+ extern uint32_t a34_connsys_emi_size(void);
+ 
+ void a34_bt_init(void);                         /* bsd/dev/sweet_ufs.c, at boot */
++void a34_bt_host_send(const uint8_t *bytes, unsigned length);  /* a34_btsk.c, the control: bluetoothd's bytes */
++/* 0971 */
++extern void a34_btsk_init(void);
++extern bool a34_btsk_uuid(uuid_t out);
++extern void a34_btsk_deliver(const uint8_t *bytes, unsigned length);
++extern bool a34_btsk_connected(void);
++extern bool a34_bt_registry(const uint8_t *address);  /* iokit/Kernel/arm/A34Bluetooth.cpp */
+ 
+ /* ---- where things are (physical) ---- */
+ 
+@@ -140,6 +168,7 @@ static const char *const bt_fw_names[2] = { "soc5_0_ram_mcu_1_1_hdr.bin", "soc5_
+ 
+ static vm_offset_t bt_rgu, bt_cfg, bt_swirq, bt_hc, bt_bgf, bt_bgfinfo, bt_infra, bt_ccif, bt_btif;
+ static uint32_t bt_step_max = 99, bt_wait_s = 180, bt_sync = 1, bt_log_max = 48;
++static uint32_t bt_level;                       /* a34bt: 1 milestone 1, 2 also the bridge to bluetoothd (0971) */
+ static uint32_t bt_said_in, bt_said_out;
+ 
+ static uint8_t *bt_fw[2];
+@@ -568,6 +597,14 @@ bt_h4_length(const uint8_t *b, uint32_t have)
+ 	}
+ }
+ 
++static uint32_t last_byte_ms;                   /* when bt_receive last had a byte */
++
++static uint32_t
++bt_last_rx_ms(void)
++{
++	return last_byte_ms;
++}
++
+ /*
+  * One whole H4 packet from the controller into pkt within wait_ms: its length, or 0. Bytes that cannot
+  * begin a packet are dropped (and said, the first few times). Only one thread reads BTIF. Polled: while
+@@ -578,7 +615,7 @@ static uint32_t
+ bt_receive(uint8_t *pkt, uint32_t wait_ms)
+ {
+ 	static uint8_t buf[BT_PKT_MAX];
+-	static uint32_t have, dropped_said, last_byte_ms;
++	static uint32_t have, dropped_said;
+ 	uint32_t start = bt_ms(), want;
+ 	uint64_t spin_until, spin;
+ 	bool busy;
+@@ -933,6 +970,14 @@ bt_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *u
+ 	if (error == 0 && (n < 4 || pkt[0] == 4 || bt_h4_length(pkt, (uint32_t)n) != n)) {
+ 		error = EINVAL;
+ 	}
++	if (error == 0 && bt_level >= 2 && a34_btsk_connected()) {
++		static uint32_t said;
++
++		if (said++ < 4) {
++			printf("A34 BT: raw HCI channel: a packet refused, bluetoothd has the controller (the channel still listens)\n");
++		}
++		error = EBUSY;
++	}
+ 	if (error == 0) {
+ 		error = bt_send(pkt, (uint32_t)n);
+ 	}
+@@ -973,6 +1018,489 @@ bt_ctl_register(void)
+ 	return error == 0;
+ }
+ 
++/* ---- the bridge to iOS's bluetoothd (0971) ---- */
++
++#define BR_TXQ                  16384u
++static LCK_MTX_DECLARE(br_lock, &bt_lck_grp);
++static uint8_t br_txq[BR_TXQ];
++static unsigned br_txq_count;
++static uint32_t br_txq_dropped, br_log_max = 600, br_said;
++static kern_ctl_ref br_ctl_ref;
++
++/* what bluetoothd wrote (the Skywalk channel's TX, or the control socket): queued, cut into packets by the bridge */
++void
++a34_bt_host_send(const uint8_t *bytes, unsigned length)
++{
++	lck_mtx_lock(&br_lock);
++	if (length <= BR_TXQ - br_txq_count) {
++		memcpy(br_txq + br_txq_count, bytes, length);
++		br_txq_count += length;
++	} else {
++		br_txq_dropped += length;
++	}
++	lck_mtx_unlock(&br_lock);
++	thread_wakeup(&bt_sleep_chan);
++}
++
++static void
++br_dump(const char *dir, const uint8_t *b, uint32_t n)
++{
++	static uint32_t data_said;
++
++	if (b[0] == 2 || b[0] == 3 || b[0] == 5) {             /* data: only the first few */
++		if (data_said++ >= 32) {
++			return;
++		}
++	} else if (br_said++ >= br_log_max) {
++		return;
++	}
++	bt_dump(dir, b, n, &(uint32_t){ 0 });
++}
++
++/* an event from the controller, before bluetoothd sees it: the answers Apple's stack does not take as they are */
++static void
++br_quirks(uint8_t *p, uint32_t n)
++{
++	static bool commands_said;
++	static uint32_t unknown_said;
++	uint16_t op;
++
++	if (n >= 7 && p[0] == 0x04 && p[1] == 0x0e) {
++		op = (uint16_t)(p[4] | (p[5] << 8));
++		if (op == 0x0c5b && p[6] != 0) {                       /* Write_Default_Erroneous_Data_Reporting */
++			p[6] = 0;
++		} else if (op == 0x1002 && p[6] == 0 && n >= 7 + 1 + 28) {
++			/* Read_Local_Supported_Commands (octet k at p[7 + k]): the MT6631 left the LE commands out (HackiOS) */
++			if (!commands_said) {
++				commands_said = true;
++				printf("A34 BT: br: supported commands octets 24-28: %02x %02x %02x %02x %02x%s\n", p[7 + 24],
++				    p[7 + 25], p[7 + 26], p[7 + 27], p[7 + 28], p[7 + 25] == 0 ? " (LE ones added)" : "");
++			}
++			if (p[7 + 25] == 0) {
++				static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
++
++				for (unsigned i = 0; i < 4; i++) {
++					p[7 + 25 + i] |= le_commands[i];
++				}
++				p[7 + 24] |= 0x60;
++			}
++		} else if (p[6] == 0x01 && unknown_said++ < 32) {
++			printf("A34 BT: br: the controller does not know command %04x\n", op);
++		}
++	} else if (n >= 7 && p[0] == 0x04 && p[1] == 0x0f && p[3] == 0x01) {
++		op = (uint16_t)(p[5] | (p[6] << 8));
++		if (op == 0x0c5b) {                                   /* (as a Command Status) */
++			p[1] = 0x0e;
++			p[2] = 4;
++			p[3] = 1;
++			p[4] = 0x5b;
++			p[5] = 0x0c;
++			p[6] = 0;
++		} else if (unknown_said++ < 32) {
++			printf("A34 BT: br: the controller does not know command %04x\n", op);
++		}
++	}
++}
++
++/* Apple's (Broadcom's) vendor command, answered here: Command Complete, status 0, and what its parser reads */
++static void
++br_vsc(const uint8_t *cmd, uint32_t n)
++{
++	static uint32_t said;
++	uint16_t op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++	uint8_t sub = n > 4 ? cmd[4] : 0, ev[7 + 64];
++	unsigned extra = 0;
++
++	if (op == 0xfd1b) {
++		extra = 64;                                             /* BD_VSC_FACTORY_CAL_READ_TABLE */
++	} else if (op == 0xfce2 && (sub == 0x15 || sub == 0x36)) {
++		extra = 16;                                             /* OLYMPIC antenna preference, retain LE duplicates */
++	} else if (op == 0xfd48) {
++		extra = 1;
++	}
++	bzero(ev, sizeof(ev));
++	ev[0] = 0x04;
++	ev[1] = 0x0e;
++	ev[2] = (uint8_t)(4 + extra);
++	ev[3] = 1;
++	ev[4] = cmd[1];
++	ev[5] = cmd[2];
++	ev[6] = 0;
++	if (op == 0xfd1b) {
++		ev[7] = 0x51;
++	}
++	if (said++ < 64) {
++		printf("A34 BT: br: vendor command %04x (%u bytes, first %02x) answered here, %u byte(s) of data\n", op, n - 4, sub,
++		    extra);
++	}
++	br_dump("br=", ev, 7 + extra);
++	bt_deliver(ev, 7 + extra);
++	a34_btsk_deliver(ev, 7 + extra);
++}
++
++/* bluetoothd's packets out, whole; true if any went */
++static bool
++br_drain(void)
++{
++	static uint8_t pkt[BT_PKT_MAX];
++	bool did = false;
++
++	for (;;) {
++		unsigned have, n;
++
++		lck_mtx_lock(&br_lock);
++		have = br_txq_count;
++		if (have == 0) {
++			lck_mtx_unlock(&br_lock);
++			break;
++		}
++		if (br_txq[0] < 1 || br_txq[0] > 5 || br_txq[0] == 4) {
++			printf("A34 BT: br: %u bytes from bluetoothd begin with %02x, not a packet a host sends: dropped\n", have, br_txq[0]);
++			br_txq_count = 0;
++			lck_mtx_unlock(&br_lock);
++			break;
++		}
++		n = bt_h4_length(br_txq, have);
++		if (n > BT_PKT_MAX) {
++			printf("A34 BT: br: a packet of %u bytes from bluetoothd: dropped with the %u bytes queued\n", n, have);
++			br_txq_count = 0;
++			lck_mtx_unlock(&br_lock);
++			break;
++		}
++		if (n == 0 || n > have) {
++			lck_mtx_unlock(&br_lock);
++			break;
++		}
++		memcpy(pkt, br_txq, n);
++		memmove(br_txq, br_txq + n, have - n);
++		br_txq_count = have - n;
++		lck_mtx_unlock(&br_lock);
++		did = true;
++		bt_deliver(pkt, n);                                     /* (the raw channel sees bluetoothd's side too) */
++		if (pkt[0] == 0x01 && (pkt[2] >> 2) == 0x3f) {
++			br_vsc(pkt, n);
++			continue;
++		}
++		br_dump("br>", pkt, n);
++		(void)bt_btif_write(pkt, n);
++	}
++	return did;
++}
++
++/*
++ * What is heard over LE, every 10 s while anything is: advertising reports (legacy 0x3e/0x02 and extended
++ * 0x3e/0x0d), devices (a few dozen told apart by address, which is never said), Apple's (manufacturer data of company
++ * 0x004c) and Apple's "proximity pairing" adverts (type 0x07: AirPods and Beats, with their model bytes).
++ */
++static struct {
++	uint32_t reports, apple, proximity, start_ms;
++	uint32_t addrs[48], naddrs, apple_addrs[16], napple;
++	int best_rssi;
++	uint8_t model[2];
++	int model_rssi;
++} br_le;
++
++static void
++br_le_one(const uint8_t *addr, const uint8_t *data, uint32_t len, int rssi)
++{
++	uint32_t h = ((uint32_t)addr[0] | ((uint32_t)addr[1] << 8) | ((uint32_t)addr[2] << 16)) ^ ((uint32_t)addr[3] << 24) ^
++	    ((uint32_t)addr[4] << 4) ^ ((uint32_t)addr[5] << 12);
++	bool apple = false, seen = false;
++
++	br_le.reports++;
++	if (rssi != 127 && rssi > br_le.best_rssi) {
++		br_le.best_rssi = rssi;
++	}
++	for (uint32_t i = 0; i < br_le.naddrs; i++) {
++		seen |= br_le.addrs[i] == h;
++	}
++	if (!seen && br_le.naddrs < 48) {
++		br_le.addrs[br_le.naddrs++] = h;
++	}
++	for (uint32_t at = 0; at + 1 < len; ) {
++		uint32_t l = data[at];
++
++		if (l == 0 || at + 1 + l > len) {
++			break;
++		}
++		if (data[at + 1] == 0xff && l >= 3 && data[at + 2] == 0x4c && data[at + 3] == 0x00) {
++			apple = true;
++			if (l >= 8 && data[at + 4] == 0x07) {                   /* proximity pairing: 07 len prefix model(2) ... */
++				br_le.proximity++;
++				if (rssi != 127 && (br_le.model_rssi == 0 || rssi > br_le.model_rssi)) {
++					br_le.model[0] = data[at + 7];
++					br_le.model[1] = data[at + 8];
++					br_le.model_rssi = rssi;
++				}
++			}
++		}
++		at += 1 + l;
++	}
++	if (apple) {
++		br_le.apple++;
++		seen = false;
++		for (uint32_t i = 0; i < br_le.napple; i++) {
++			seen |= br_le.apple_addrs[i] == h;
++		}
++		if (!seen && br_le.napple < 16) {
++			br_le.apple_addrs[br_le.napple++] = h;
++		}
++	}
++}
++
++static void
++br_le_heard(const uint8_t *p, uint32_t n)
++{
++	uint32_t count, at;
++
++	if (n < 5 || p[0] != 0x04 || p[1] != 0x3e) {
++		return;
++	}
++	count = p[4];
++	at = 5;
++	if (p[3] == 0x02) {                                             /* LE Advertising Report */
++		for (uint32_t i = 0; i < count && at + 9 <= n; i++) {
++			uint32_t dl = p[at + 8];
++
++			if (at + 9 + dl + 1 > n) {
++				break;
++			}
++			br_le_one(p + at + 2, p + at + 9, dl, (int8_t)p[at + 9 + dl]);
++			at += 10 + dl;
++		}
++	} else if (p[3] == 0x0d) {                                      /* LE Extended Advertising Report */
++		for (uint32_t i = 0; i < count && at + 24 <= n; i++) {
++			uint32_t dl = p[at + 23];
++
++			if (at + 24 + dl > n) {
++				break;
++			}
++			br_le_one(p + at + 3, p + at + 24, dl, (int8_t)p[at + 13]);
++			at += 24 + dl;
++		}
++	}
++	if (br_le.start_ms == 0) {
++		br_le.start_ms = bt_ms() | 1;
++	}
++}
++
++static void
++br_le_say(void)
++{
++	if (br_le.start_ms == 0 || bt_ms() - br_le.start_ms < 10000) {
++		return;
++	}
++	printf("A34 BT: LE heard in %u s: %u reports from %u devices (best %d dBm); Apple: %u reports from %u devices; "
++	    "proximity pairing (AirPods/Beats): %u%s",
++	    (bt_ms() - br_le.start_ms) / 1000, br_le.reports, br_le.naddrs, br_le.best_rssi, br_le.apple, br_le.napple,
++	    br_le.proximity, br_le.proximity ? "" : "\n");
++	if (br_le.proximity) {
++		printf(", strongest at %d dBm, model bytes %02x %02x\n", br_le.model_rssi, br_le.model[0], br_le.model[1]);
++	}
++	bzero(&br_le, sizeof(br_le));
++	br_le.best_rssi = -128;
++}
++
++/* the kernel control bluetoothd's H4BC transport connects to */
++static errno_t
++br_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **unitinfo)
++{
++	char name[32] = "";
++
++	proc_selfname(name, sizeof(name));
++	lck_mtx_lock(&br_lock);
++	br_txq_count = 0;                                               /* a new user: nothing half-written from the last */
++	lck_mtx_unlock(&br_lock);
++	printf("A34 BT: br: com.apple.uart.sk.bluetooth connected by %s[%d], unit %u\n", name, proc_selfpid(), sac->sc_unit);
++	return 0;
++}
++
++static errno_t
++br_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
++{
++	printf("A34 BT: br: com.apple.uart.sk.bluetooth unit %u disconnected\n", unit);
++	return 0;
++}
++
++static errno_t
++br_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	for (mbuf_t part = m; part != NULL; part = mbuf_next(part)) {
++		a34_bt_host_send(mbuf_data(part), (unsigned)mbuf_len(part));
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++br_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t len)
++{
++	static uint32_t said;
++
++	if (said++ < 16) {
++		const uint32_t *w = data;
++
++		if (len >= 12 && w != NULL) {
++			printf("A34 BT: br: setsockopt %#x, %zu bytes (%#x %#x %#x): taken\n", (unsigned)opt, len, w[0], w[1], w[2]);
++		} else {
++			printf("A34 BT: br: setsockopt %#x, %zu bytes: taken\n", (unsigned)opt, len);
++		}
++	}
++	return 0;
++}
++
++static errno_t
++br_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
++{
++	uuid_t uuid;
++	bool have = (unsigned)opt == 0x40105412u && data != NULL && *len >= sizeof(uuid_t) && a34_btsk_uuid(uuid);
++	static uint32_t said;
++
++	if (said++ < 16) {
++		printf("A34 BT: br: getsockopt %#x, room for %zu bytes: %s\n", (unsigned)opt, *len, have ? "the channel's UUID" : "nothing");
++	}
++	if (have) {
++		memcpy(data, uuid, sizeof(uuid_t));
++		*len = sizeof(uuid_t);
++	} else {
++		*len = 0;
++	}
++	return 0;
++}
++
++static bool
++br_ctl_register(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t error;
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, "com.apple.uart.sk.bluetooth", sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;        /* (any user: bluetoothd is mobile; a datagram socket is refused) */
++	reg.ctl_sendsize = 65536;
++	reg.ctl_recvsize = 65536;
++	reg.ctl_connect = br_ctl_connect;
++	reg.ctl_disconnect = br_ctl_disconnect;
++	reg.ctl_send = br_ctl_send;
++	reg.ctl_setopt = br_ctl_setopt;
++	reg.ctl_getopt = br_ctl_getopt;
++	error = ctl_register(&reg, &br_ctl_ref);
++	printf("A34 BT: br: kernel control com.apple.uart.sk.bluetooth %s (%d)\n", error == 0 ? "registered" : "NOT REGISTERED", error);
++	return error == 0;
++}
++
++/* /dev/btwake, /dev/btreset, /dev/btpoweroff: on an iPhone pins; nothing behind them here */
++static int
++br_node_open(dev_t dev, int flags, __unused int type, __unused struct proc *p)
++{
++	static uint32_t said;
++	char name[32] = "";
++
++	if (said++ < 8) {
++		proc_selfname(name, sizeof(name));
++		printf("A34 BT: br: node %d opened by %s[%d], flags %#x\n", minor(dev), name, proc_selfpid(), flags);
++	}
++	return 0;
++}
++
++static int
++br_node_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++br_node_read(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return 0;
++}
++
++static int
++br_node_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uio_setresid(uio, 0);
++	return 0;
++}
++
++static int
++br_node_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	switch (cmd) {
++	case TIOCGETA: {
++		struct termios *t = (struct termios *)(void *)data;
++
++		bzero(t, sizeof(*t));
++		t->c_cflag = CS8 | CREAD | CLOCAL | HUPCL;
++		t->c_ispeed = t->c_ospeed = 3000000;
++		return 0;
++	}
++	case TIOCMGET:
++		*(int *)(void *)data = TIOCM_CTS | TIOCM_DSR | TIOCM_CAR | TIOCM_RTS | TIOCM_DTR;
++		return 0;
++	case FIONREAD:
++		*(int *)(void *)data = 0;
++		return 0;
++	case TIOCSETA: case TIOCSETAW: case TIOCSETAF: case TIOCEXCL: case TIOCNXCL: case TIOCSDTR: case TIOCCDTR:
++	case TIOCMBIS: case TIOCMBIC: case TIOCMSET: case TIOCFLUSH: case TIOCSBRK: case TIOCCBRK: case TIOCDRAIN:
++	case FIONBIO: case FIOASYNC:
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++br_node_select(__unused dev_t dev, __unused int which, __unused void *wql, __unused struct proc *p)
++{
++	return 1;
++}
++
++static const struct cdevsw br_cdevsw = {
++	.d_open = br_node_open, .d_close = br_node_close, .d_read = br_node_read, .d_write = br_node_write,
++	.d_ioctl = br_node_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = br_node_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++br_nodes(void)
++{
++	static const char *const names[] = { "btwake", "btreset", "btpoweroff" };
++	int major = cdevsw_add(-1, &br_cdevsw);
++	bool made = major >= 0;
++
++	for (unsigned i = 0; made && i < sizeof(names) / sizeof(names[0]); i++) {
++		made = devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", names[i]) != NULL;
++	}
++	printf("A34 BT: br: /dev/btwake, /dev/btreset, /dev/btpoweroff %s (major %d)\n", made ? "made" : "NOT MADE", major);
++}
++
++/* everything bluetoothd looks for; the registry's service last, so that whoever finds it finds the rest there */
++static void
++br_start(void)
++{
++	bool node = false;
++
++	a34_btsk_init();
++	br_nodes();
++	if (!br_ctl_register()) {
++		return;
++	}
++	for (unsigned tries = 0; tries < 40 && !(node = a34_bt_registry(bt_addr)); tries++) {
++		bt_sleep_ms(250);
++	}
++	printf("A34 BT: br: bridge to bluetoothd %s\n", node ? "up: waiting for bluetoothd" : "up, but the registry's service could not be made");
++}
++
++static void
++bt_idle(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_sleep_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /* ---- the thread ---- */
+ 
+ static bool
+@@ -1085,9 +1613,25 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	    bt_ms() - t0);
+ 	printf("A34 BT: UP in %u ms: %u of 6 HCI commands answered%s; com.a34.bt.hci open (userland/a34bt)\n", bt_ms() - t0,
+ 	    good, good == 6 ? " (milestone 1)" : "");
++	if (bt_level >= 2) {
++		br_start();
++		bzero(&br_le, sizeof(br_le));
++		br_le.best_rssi = -128;
++	}
+ 	for (;;) {
+-		if ((n = bt_receive(a, 1000)) != 0) {
+-			bt_dump("in ", a, n, &bt_said_in);
++		bool busy = bt_level >= 2 && br_drain();
++
++		if ((n = bt_receive(a, bt_level >= 2 ? 0 : 1000)) != 0) {
++			busy = true;
++			if (bt_level >= 2) {
++				if (n >= 4 && a[0] == 0x04 && a[1] == 0x3e && (a[3] == 0x02 || a[3] == 0x0d)) {
++					br_le_heard(a, n);              /* (counted every 10 s, not each in the log) */
++				} else {
++					br_dump("br<", a, n);
++				}
++			} else {
++				bt_dump("in ", a, n, &bt_said_in);
++			}
+ 			if (n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
+ 				/* HCI_Reset done: the phone's address again before whoever reset it is told (0970) */
+ 				uint8_t reset[BT_PKT_MAX];
+@@ -1096,8 +1640,18 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 				(void)bt_addr_apply("after an HCI_Reset");
+ 				memcpy(a, reset, n);
+ 			}
++			if (bt_level >= 2) {
++				br_quirks(a, n);
++				a34_btsk_deliver(a, n);
++			}
+ 			bt_deliver(a, n);
+ 		}
++		if (bt_level >= 2) {
++			br_le_say();
++			if (!busy) {
++				bt_idle(bt_ms() - bt_last_rx_ms() < 1000 ? 1 : 4);
++			}
++		}
+ 	}
+ out:
+ 	printf("A34 BT: %s\n", bt_state);
+@@ -1113,6 +1667,8 @@ a34_bt_init(void)
+ 	if (!PE_parse_boot_argn("a34bt", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	bt_level = on;
++	(void)PE_parse_boot_argn("a34btbrlog", &br_log_max, sizeof(br_log_max));
+ 	(void)PE_parse_boot_argn("a34btstep", &bt_step_max, sizeof(bt_step_max));
+ 	(void)PE_parse_boot_argn("a34btwait", &bt_wait_s, sizeof(bt_wait_s));
+ 	(void)PE_parse_boot_argn("a34btsync", &bt_sync, sizeof(bt_sync));
+diff --git a/bsd/dev/a34_btsk.c b/bsd/dev/a34_btsk.c
+new file mode 100644
+index 0000000..05798bf
+--- /dev/null
++++ b/bsd/dev/a34_btsk.c
+@@ -0,0 +1,353 @@
++/*
++ * A34 (0971): the Skywalk channel iOS's bluetoothd reaches its Bluetooth controller by.
++ *
++ * Ported from HackiOS's bsd/dev/redwood_btsk.c (github.com/oosexgang/hakios-xnu-kernel, branch mtk, commit
++ * c36d664; Apple Public Source License 2.0, as the XNU it extends), where it carried iOS 16.5's bluetoothd to an
++ * MT6631; iOS 16.7.16's bluetoothd opens the same way (docs/bluetooth-plan.md, section 3). Its HCI transport
++ * "H4BC" connects a stream socket to the kernel control com.apple.uart.sk.bluetooth (a34_bt.c), sets a channel
++ * specification (option 0x800c5414) and asks for a channel's UUID (option 0x40105412), then os_channel_create()s
++ * the channel, syncs its rings and waits for them on a kqueue. On an iPhone the other end is IOSkywalkFamily, a
++ * kernel pipe (NEXUS_TYPE_KERNEL_PIPE) whose "driver" is the Bluetooth UART's; here it is the MediaTek controller
++ * behind BTIF (a34_bt.c), made by bsd/skywalk/nexus/kpipe/nx_kpipe_loopback.c's pattern:
++ *   user TX ring  -> sync_tx -> the H4 bytes of each slot to a34_bt_host_send (whole packets made there)
++ *   controller    -> a34_btsk_deliver -> a queue -> sync_rx fills the user's RX ring (a byte stream: the user parses H4)
++ * Changes from HackiOS: logging to the console (a34btlog lines), and the controller's bytes are queued only while a
++ * channel is connected -- the queue starts empty at each connection, so a bluetoothd that restarts does not first
++ * read what was meant for the one before it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#include <sys/systm.h>
++#include <sys/random.h>
++#include <skywalk/os_skywalk_private.h>
++
++extern void a34_bt_host_send(const uint8_t *bytes, unsigned length);  /* a34_bt.c: what bluetoothd writes */
++
++void a34_btsk_init(void);
++bool a34_btsk_uuid(uuid_t out);
++void a34_btsk_deliver(const uint8_t *bytes, unsigned length);
++bool a34_btsk_connected(void);
++
++static LCK_GRP_DECLARE(btsk_lck_grp, "a34_btsk");
++static LCK_MTX_DECLARE(btsk_lock, &btsk_lck_grp);
++
++#define BTSK_RXQ        32768u
++static uint8_t btsk_rxq[BTSK_RXQ];
++static unsigned btsk_rxq_head, btsk_rxq_count;
++static uint32_t btsk_rxq_dropped;
++
++static nexus_controller_t btsk_ncd;
++static uuid_t btsk_dom_uuid, btsk_prov_uuid, btsk_nx_uuid;
++static bool btsk_ready, btsk_up;
++static uintptr_t btsk_nx_ctx;
++static kern_channel_ring_t btsk_txring, btsk_rxring;
++static kern_pbufpool_t btsk_tx_pp, btsk_rx_pp;
++static uint32_t btsk_said;
++
++#define SAY(...) do { if (btsk_said < 200) { btsk_said++; printf("A34 BT: channel: " __VA_ARGS__); } } while (0)
++
++static errno_t
++btsk_dom_init(__unused kern_nexus_domain_provider_t domprov)
++{
++	return 0;
++}
++
++static void
++btsk_dom_fini(__unused kern_nexus_domain_provider_t domprov)
++{
++}
++
++static errno_t
++btsk_pre_connect(__unused kern_nexus_provider_t nxprov, proc_t p, kern_nexus_t nexus, nexus_port_t port,
++    kern_channel_t channel, void **ch_ctx)
++{
++	errno_t error = kern_nexus_get_pbufpool(nexus, &btsk_tx_pp, &btsk_rx_pp);
++
++	*ch_ctx = channel;
++	SAY("pre_connect by pid %d, port %u: buffer pools %s (%d)\n", proc_pid(p), port,
++	    btsk_tx_pp != NULL && btsk_rx_pp != NULL ? "there" : "MISSING", error);
++	return 0;
++}
++
++static errno_t
++btsk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	lck_mtx_lock(&btsk_lock);
++	btsk_rxq_head = 0;
++	btsk_rxq_count = 0;
++	btsk_up = true;
++	lck_mtx_unlock(&btsk_lock);
++	SAY("connected: bluetoothd's packets now go to the controller and back\n");
++	return 0;
++}
++
++static void
++btsk_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	lck_mtx_lock(&btsk_lock);
++	btsk_up = false;
++	lck_mtx_unlock(&btsk_lock);
++	SAY("pre_disconnect\n");
++}
++
++static void
++btsk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	SAY("disconnected (%u bytes from the controller were dropped on a full queue)\n", btsk_rxq_dropped);
++}
++
++static errno_t
++btsk_ring_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel,
++    kern_channel_ring_t ring, boolean_t is_tx_ring, void **ring_ctx)
++{
++	lck_mtx_lock(&btsk_lock);
++	if (is_tx_ring) {
++		btsk_txring = ring;
++	} else {
++		btsk_rxring = ring;
++	}
++	lck_mtx_unlock(&btsk_lock);
++	*ring_ctx = ring;
++	SAY("%s ring made\n", is_tx_ring ? "TX" : "RX");
++	return 0;
++}
++
++static void
++btsk_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring)
++{
++	lck_mtx_lock(&btsk_lock);
++	if (ring == btsk_txring) {
++		btsk_txring = NULL;
++	} else if (ring == btsk_rxring) {
++		btsk_rxring = NULL;
++	}
++	lck_mtx_unlock(&btsk_lock);
++}
++
++static errno_t
++btsk_slot_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_ring_t ring,
++    channel_slot_t slot, __unused uint32_t slot_id, struct kern_slot_prop **slot_prop_addr, void **pslot_ctx)
++{
++	*slot_prop_addr = NULL;
++	*pslot_ctx = slot;
++	return 0;
++}
++
++static void
++btsk_slot_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_ring_t ring,
++    __unused channel_slot_t slot, __unused uint32_t slot_id)
++{
++}
++
++/* the user's packets (H4 bytes, a slot at a time) to the controller */
++static errno_t
++btsk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring, __unused uint32_t flags)
++{
++	kern_channel_slot_t slot = kern_channel_get_next_slot(ring, NULL, NULL), last = NULL;
++
++	while (slot != NULL) {
++		kern_packet_t ph = kern_channel_slot_get_packet(ring, slot);
++
++		if (ph != 0) {
++			kern_buflet_t buf = kern_packet_get_next_buflet(ph, NULL);
++
++			if (buf != NULL) {
++				uint8_t *base = kern_buflet_get_data_address(buf);
++				uint16_t length = kern_buflet_get_data_length(buf), offset = kern_buflet_get_data_offset(buf);
++
++				if (base != NULL && length > 0) {
++					a34_bt_host_send(base + offset, length);
++				}
++			}
++			(void)kern_channel_slot_detach_packet(ring, slot, ph);
++			if (btsk_tx_pp != NULL) {
++				kern_pbufpool_free(btsk_tx_pp, ph);
++			}
++		}
++		last = slot;
++		slot = kern_channel_get_next_slot(ring, slot, NULL);
++	}
++	if (last != NULL) {
++		kern_channel_advance_slot(ring, last);
++	}
++	(void)kern_channel_reclaim(ring);
++	return 0;
++}
++
++/* the controller's bytes into the user's ring */
++static errno_t
++btsk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring, __unused uint32_t flags)
++{
++	kern_channel_slot_t slot, last = NULL;
++
++	(void)kern_channel_reclaim(ring);
++	slot = kern_channel_get_next_slot(ring, NULL, NULL);
++	lck_mtx_lock(&btsk_lock);
++	while (slot != NULL && btsk_rxq_count > 0 && btsk_rx_pp != NULL) {
++		kern_packet_t ph = 0;
++		kern_buflet_t buf;
++		uint8_t *base;
++		unsigned room, n = btsk_rxq_count;
++
++		if (kern_pbufpool_alloc_nosleep(btsk_rx_pp, 1, &ph) != 0 || ph == 0) {
++			SAY("no packet for an RX slot\n");
++			break;
++		}
++		buf = kern_packet_get_next_buflet(ph, NULL);
++		base = buf != NULL ? kern_buflet_get_data_address(buf) : NULL;
++		room = buf != NULL ? kern_buflet_get_data_limit(buf) : 0;
++		if (base == NULL || room == 0) {
++			kern_pbufpool_free(btsk_rx_pp, ph);
++			break;
++		}
++		if (n > room) {
++			n = room;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			base[i] = btsk_rxq[(btsk_rxq_head + i) % BTSK_RXQ];
++		}
++		btsk_rxq_head = (btsk_rxq_head + n) % BTSK_RXQ;
++		btsk_rxq_count -= n;
++		(void)kern_buflet_set_data_offset(buf, 0);
++		(void)kern_buflet_set_data_length(buf, (uint16_t)n);
++		(void)kern_packet_finalize(ph);
++		if (kern_channel_slot_attach_packet(ring, slot, ph) != 0) {
++			kern_pbufpool_free(btsk_rx_pp, ph);
++			break;
++		}
++		last = slot;
++		slot = kern_channel_get_next_slot(ring, slot, NULL);
++	}
++	lck_mtx_unlock(&btsk_lock);
++	if (last != NULL) {
++		kern_channel_advance_slot(ring, last);
++	}
++	return 0;
++}
++
++/* what the controller sent (whole H4 packets), while a channel is connected; wakes the user's ring */
++void
++a34_btsk_deliver(const uint8_t *bytes, unsigned length)
++{
++	kern_channel_ring_t ring;
++
++	lck_mtx_lock(&btsk_lock);
++	if (!btsk_ready || !btsk_up) {
++		lck_mtx_unlock(&btsk_lock);
++		return;
++	}
++	if (length > BTSK_RXQ - btsk_rxq_count) {
++		btsk_rxq_dropped += length;     /* (a whole packet or nothing: the user's H4 parser must not lose its place) */
++		lck_mtx_unlock(&btsk_lock);
++		return;
++	}
++	for (unsigned i = 0; i < length; i++) {
++		btsk_rxq[(btsk_rxq_head + btsk_rxq_count) % BTSK_RXQ] = bytes[i];
++		btsk_rxq_count++;
++	}
++	ring = btsk_rxring;
++	lck_mtx_unlock(&btsk_lock);
++	if (ring != NULL) {
++		(void)kern_channel_notify(ring, 0);
++	}
++}
++
++bool
++a34_btsk_connected(void)
++{
++	return btsk_up;
++}
++
++/* the channel's UUID, for bluetoothd's getsockopt; false until the nexus is made */
++bool
++a34_btsk_uuid(uuid_t out)
++{
++	if (!btsk_ready) {
++		return false;
++	}
++	uuid_copy(out, btsk_nx_uuid);
++	return true;
++}
++
++void
++a34_btsk_init(void)
++{
++	nexus_attr_t nxa = NULL;
++	errno_t error;
++	struct kern_nexus_domain_provider_init dom_init = {
++		.nxdpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,
++		.nxdpi_flags = 0,
++		.nxdpi_init = btsk_dom_init,
++		.nxdpi_fini = btsk_dom_fini,
++	};
++	struct kern_nexus_provider_init prov_init = {
++		.nxpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,
++		.nxpi_flags = NXPIF_VIRTUAL_DEVICE,
++		.nxpi_pre_connect = btsk_pre_connect,
++		.nxpi_connected = btsk_connected,
++		.nxpi_pre_disconnect = btsk_pre_disconnect,
++		.nxpi_disconnected = btsk_disconnected,
++		.nxpi_ring_init = btsk_ring_init,
++		.nxpi_ring_fini = btsk_ring_fini,
++		.nxpi_slot_init = btsk_slot_init,
++		.nxpi_slot_fini = btsk_slot_fini,
++		.nxpi_sync_tx = btsk_sync_tx,
++		.nxpi_sync_rx = btsk_sync_rx,
++		.nxpi_tx_doorbell = NULL,
++	};
++	struct kern_nexus_init nx_init = {
++		.nxi_version = KERN_NEXUS_CURRENT_VERSION,
++		.nxi_flags = 0,
++		.nxi_tx_pbufpool = NULL,
++		.nxi_rx_pbufpool = NULL,
++	};
++
++	if (btsk_ready) {
++		return;
++	}
++	read_random(&btsk_nx_ctx, sizeof(btsk_nx_ctx));
++	error = kern_nexus_register_domain_provider(NEXUS_TYPE_KERNEL_PIPE, (const uint8_t *)"a34_bt", &dom_init, sizeof(dom_init),
++	    &btsk_dom_uuid);
++	if (error != 0) {
++		printf("A34 BT: channel: domain provider: %d\n", error);
++		return;
++	}
++	if ((error = kern_nexus_controller_create(&btsk_ncd)) != 0) {
++		printf("A34 BT: channel: controller: %d\n", error);
++		return;
++	}
++	if ((error = kern_nexus_attr_create(&nxa)) != 0) {
++		printf("A34 BT: channel: attr: %d\n", error);
++		return;
++	}
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_ANONYMOUS, 1);
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_RINGS, 1);
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_RINGS, 1);
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_SLOTS, 64);
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_SLOTS, 64);
++	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_SLOT_BUF_SIZE, 2048);
++	error = kern_nexus_controller_register_provider(btsk_ncd, btsk_dom_uuid, (const uint8_t *)"com.apple.nexus.a34_bt", &prov_init,
++	    sizeof(prov_init), nxa, &btsk_prov_uuid);
++	kern_nexus_attr_destroy(nxa);
++	if (error != 0) {
++		printf("A34 BT: channel: provider: %d\n", error);
++		return;
++	}
++	error = kern_nexus_controller_alloc_provider_instance(btsk_ncd, btsk_prov_uuid, (const void *)btsk_nx_ctx, NULL, &btsk_nx_uuid, &nx_init);
++	if (error != 0) {
++		printf("A34 BT: channel: instance: %d\n", error);
++		return;
++	}
++	lck_mtx_lock(&btsk_lock);
++	btsk_ready = true;
++	lck_mtx_unlock(&btsk_lock);
++	{
++		uuid_string_t text;
++
++		uuid_unparse_upper(btsk_nx_uuid, text);
++		printf("A34 BT: channel: the Skywalk kernel pipe %s is up\n", text);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/A34Bluetooth.cpp b/iokit/Kernel/arm/A34Bluetooth.cpp
+new file mode 100644
+index 0000000..274a85b
+--- /dev/null
++++ b/iokit/Kernel/arm/A34Bluetooth.cpp
+@@ -0,0 +1,67 @@
++/*
++ * A34 (0971): the Bluetooth controller as iOS looks for it in the registry.
++ *
++ * bluetoothd finds its controller's address (FindLocalMacAddress: "No bluetooth on this device." without a non-zero
++ * one) and transport in the service named "marconi-bt" or, failing that, "bluetooth"; MobileBluetooth's
++ * BTSessionAttachWithQueue -- how Settings' Bluetooth pane reaches bluetoothd -- answers error 9 without one of them
++ * (docs/bluetooth-plan.md, section 3). An iPhone X's device tree has /arm-io/uart1/bluetooth; this phone's controller
++ * is in CONNSYS and our tree has no such node, so the service is made here once a34_bt.c has the controller up and
++ * its address set. Only local-mac-address is published: without transport-encoding bluetoothd takes 3 (H4BC), which
++ * is what this kernel serves.
++ *
++ * After HackiOS's iokit/Kernel/RedwoodBluetooth.cpp (github.com/oosexgang/hakios-xnu-kernel, branch mtk, c36d664;
++ * Apple Public Source License 2.0).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++
++class A34Bluetooth : public IOService
++{
++	OSDeclareDefaultStructors(A34Bluetooth);
++};
++
++OSDefineMetaClassAndStructors(A34Bluetooth, IOService);
++
++extern "C" bool a34_bt_registry(const uint8_t *address);
++
++static A34Bluetooth * a34_bt_node;
++
++/* The service "bluetooth" with this address (6 bytes, most significant first); true once it is in the registry. */
++bool
++a34_bt_registry(const uint8_t *address)
++{
++	IOService * platform = IOService::getPlatform();
++	A34Bluetooth * made;
++	OSData * data;
++
++	if (a34_bt_node != NULL) {
++		return true;
++	}
++	if (platform == NULL || (made = OSTypeAlloc(A34Bluetooth)) == NULL) {
++		return false;
++	}
++	if (!made->init() || !made->attach(platform)) {
++		made->release();
++		return false;
++	}
++	made->setName("bluetooth");
++	if ((data = OSData::withBytes(address, 6)) != NULL) {
++		made->setProperty("local-mac-address", data);
++		data->release();
++	}
++	if (!made->start(platform)) {
++		made->detach(platform);
++		made->release();
++		return false;
++	}
++	made->registerService();
++	a34_bt_node = made;
++	IOLog("A34 BT: the service \"bluetooth\" is in the registry, local-mac-address %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    address[0], address[1], address[2], address[3], address[4], address[5]);
++	return true;
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index d761456..74cd935 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,6 +21,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/A34Mali.cpp                                     optional iokitcpp
++iokit/Kernel/arm/A34Bluetooth.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
