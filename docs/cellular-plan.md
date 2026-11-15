@@ -231,7 +231,9 @@ server served 1403 requests (386 opens, 232 reads, 45 files in RAM, 0 errors), t
 asserted in `mcu/service/hif/ncccisrv/ccci_shm_bm/src/ccci_shm_bm.c` line 603 (offender MCU,
 type 0x50): its CCB buffer manager. We had sent post_cfg_for_ccb's layout (three CCB users of
 2 MiB at one base, 6 MiB in CCB_SHARE_MEMORY) without Android's later collect_ccb_info (DHL
-0x70000, MD_MONITOR 0x8000, META 0x104000, packed; total 0x17c000). Fixed in
+0x70000, MD_MONITOR 0x8000, META 0x104000, packed; total 0x17c000), and we never zeroed the regions Android clears at
+first boot (BOOT_WAITING_FOR_HS1: all of md1_noncacheable_tbl/md1_cacheable_tbl without
+SMF_NCLR_FIRST, incl. CCB data and CCB_CTRL). Both fixed in
 `xnu-boot-0995-cell3b`.
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)

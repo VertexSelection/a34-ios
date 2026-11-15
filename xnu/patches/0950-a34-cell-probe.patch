@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..4ff7340
+index 0000000..c4aaa87
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1545 @@
+@@ -0,0 +1,1581 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -1261,6 +1261,41 @@ index 0000000..4ff7340
 +
 +/* ---- before the modem is let go ---- */
 +
++/*
++ * ap_md_mem.c ccci_md_clear_smem(first_boot) at BOOT_WAITING_FOR_HS1: every region of
++ * md1_noncacheable_tbl / md1_cacheable_tbl without SMF_NCLR_FIRST is zeroed with its final
++ * size (after the CCB layout above). Kept: SECURITY_SMEM 34, CCISM_MCU 19 / _EXP 20 (our rings),
++ * MD_DRDI 41, PHY_CAP 23, AMMS_POS 29, MD_CONSYS 22, USIP 24. RAM only.
++ */
++static const uint8_t clear_first[] = {
++	10, 27, 31, 12, 13, 37, 18, 14, 15, 33, 0, 16, 4, 7, 8, 9, 40, 11, 30,  /* non-cached */
++	32, 1, 2, 3, 5, 6, 46, 28,                                              /* cached */
++};
++
++static void
++smem_clear_first_boot(void)
++{
++	uint32_t n = 0, kib = 0;
++
++	for (size_t i = 0; i < sizeof(clear_first); i++) {
++		int id = clear_first[i];
++		bool dup = false;
++		if (!rg[id].size || !rg[id].ap)
++			continue;
++		for (size_t j = 0; j < i; j++)
++			if (rg[clear_first[j]].ap == rg[id].ap && rg[clear_first[j]].size == rg[id].size)
++				dup = true;
++		vm_offset_t va = dup ? 0 : rva(id);
++		if (!va)
++			continue;
++		dm_zero(va, 0, rg[id].size & ~3u);
++		n++;
++		kib += rg[id].size >> 10;
++	}
++	printf("A34 CELL: shared memory cleared as Android's first boot: %u regions, %u KiB "
++	    "(rings, DRDI, PHY_CAP, AMMS, CONSYS, USIP kept)\n", n, kib);
++}
++
 +bool
 +a34_ccci_prepare(vm_offset_t ap_ccif, vm_offset_t md)
 +{
@@ -1275,6 +1310,7 @@ index 0000000..4ff7340
 +		printf("A34 CELL: shared memory not mapped\n");
 +		return false;
 +	}
++	smem_clear_first_boot();
 +	ccism_size = rings_build(mcu, rg[R_CCISM_MCU].size, rx_kib, tx_kib, q);
 +	uint32_t exp_total = rings_build(exp, rg[R_CCISM_MCU_EXP].size, exp_kib, exp_kib, NULL);
 +	if (ccism_size != 0xB4280u || exp_total != 0x1E280u) {
