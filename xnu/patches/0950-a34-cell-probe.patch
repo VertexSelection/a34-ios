@@ -3279,10 +3279,10 @@ index 0000000..8c9615f
 +#endif
 diff --git a/bsd/dev/a34_cellfs.c b/bsd/dev/a34_cellfs.c
 new file mode 100644
-index 0000000..6930ac6
+index 0000000..f6c7157
 --- /dev/null
 +++ b/bsd/dev/a34_cellfs.c
-@@ -0,0 +1,1389 @@
+@@ -0,0 +1,1399 @@
 +/*
 + * A34 (0951): the modem's file server, in the kernel and read only.
 + *
@@ -3856,6 +3856,16 @@ index 0000000..6930ac6
 +	return false;
 +}
 +
++/* The trace's error marker ("][E][" after the module), kept even on file-operation lines. */
++static bool
++has_err(const char *s, uint32_t n)
++{
++	for (uint32_t i = 0; i + 5 <= n; i++)
++		if (memcmp(s + i, "][E][", 5) == 0)
++			return true;
++	return false;
++}
++
 +static void
 +mdtrace(const char *key, const uint8_t *d, uint32_t len)
 +{
@@ -3877,7 +3887,7 @@ index 0000000..6930ac6
 +		}
 +		if (n >= 4) {
 +			line[n] = 0;
-+			if (has_fsop(line, n)) {
++			if (has_fsop(line, n) && !has_err(line, n)) {
 +				mdtrace_fsop++;
 +			} else {
 +				mdtrace_mask(line, n);
