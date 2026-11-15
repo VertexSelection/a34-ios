@@ -303,7 +303,7 @@ check() {
 	done
 	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait drmPrimeFDToHandle redwood_drm_mmap redwood_drm_munmap \
 		redwood_drm_surface redwood_drm_stats redwood_drm_queued redwood_drm_last_seq redwood_drm_wait_seq \
-		redwood_drm_surface_seq; do
+		redwood_drm_surface_seq redwood_drm_submit_batch; do
 		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
 	done
 	# panfrost maps BOs through the user client (patch 0002) and sizes IOSurface imports by it (0003)

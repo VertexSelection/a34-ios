@@ -4958,6 +4958,7 @@ drm_selector_name(unsigned selector)
    case 0x7a: return "SET_MODE";
    case 0x7b: return "WAIT_SEQ";
    case 0x7c: return "PENDING";
+   case 0x7d: return "SUBMIT_BATCH";
    case 0x7e: return "SURFACE";
    default: return NULL;
    }
@@ -5010,12 +5011,12 @@ rwa_cb_counters(uint64_t *out, unsigned room)
       static struct rwa_drm_stats st;
       static const struct { unsigned slot, selector; } calls[] = {
          { RWA_CB_K_CREATE, 0x42 }, { RWA_CB_K_SURFACE, 0x7e }, { RWA_CB_K_SUBMIT, 0x40 },
-         { RWA_CB_K_WAIT_BO, 0x41 }, { RWA_CB_K_CLOSE, 0x09 },
+         { RWA_CB_K_SUBMIT, 0x7d }, { RWA_CB_K_WAIT_BO, 0x41 }, { RWA_CB_K_CLOSE, 0x09 },
       };
       redwood_drm_stats(&st);
       for (unsigned i = 0; i < ARRAY_SIZE(calls); i++) {
-         v[calls[i].slot] = st.calls[calls[i].selector];
-         v[calls[i].slot + 1] = ticks_ns(st.ticks[calls[i].selector]);
+         v[calls[i].slot] += st.calls[calls[i].selector];
+         v[calls[i].slot + 1] += ticks_ns(st.ticks[calls[i].selector]);
       }
       v[RWA_CB_K_MAPS] = st.maps;
       v[RWA_CB_K_MAPS + 1] = ticks_ns(st.map_ticks);

@@ -1,0 +1,122 @@
+Darwin: a batch's two job chains in one kernel request, in a Metal process.
+
+A34 (local to this port; nothing here goes upstream). Kernel 0988's SUBMIT_BATCH (request 0x7d)
+queues several SUBMITs at once; redwood-drm's redwood_drm_submit_batch (userland/mesa/redwood-drm)
+sends them and answers their syncobjs. In a process drawing through Metal (redwood_pan_metal),
+jm_submit_batch sends a batch's vertex/tiler chain and its fragment job together instead of one
+request each: ~35 us a request, two a batch, ~15 batches a frame (boot 0980-b). Both jobs name
+the same buffers, gathered once. When the kernel or the mode has no SUBMIT_BATCH (ENOTSUP,
+nothing queued), and with in-syncs, tracing or no-op contexts, the two go one by one as upstream.
+
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -16,6 +16,13 @@
+ #include "pan_job.h"
+ #include "pan_trace.h"
+ #include "kmod/panfrost_kmod.h"
++#include "compiler/air/redwood_pan_prof.h"
++#ifdef __APPLE__
++#include <errno.h>
++#include <redwood_drm.h> /* libdrm's Darwin stand-in (a34-ios userland/mesa/redwood-drm) */
++extern int redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t count)
++   __attribute__((weak_import));
++#endif
+ 
+ #if PAN_ARCH >= 6
+ #include "pan_precomp.h"
+@@ -174,6 +181,78 @@
+    return 0;
+ }
+ 
++#ifdef __APPLE__
++/*
++ * A34 (patch 0016): in a process drawing through Metal, a batch's vertex/tiler chain and its
++ * fragment job in ONE request to the kernel (redwood-drm's redwood_drm_submit_batch over kernel
++ * 0988's SUBMIT_BATCH) instead of one each -- ~35 us a request, two a batch, ~15 batches a frame
++ * (boot 0980-b). Both name the same buffers, gathered once. ENOTSUP when the kernel or the mode
++ * has no SUBMIT_BATCH, nothing then queued: the caller sends the two as before.
++ */
++static int
++redwood_jm_submit_pair(struct panfrost_batch *batch, uint32_t reqs, uint32_t out_sync)
++{
++   struct panfrost_context *ctx = batch->ctx;
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++
++   if (!redwood_drm_submit_batch)
++      return ENOTSUP;
++
++   uint32_t *bo_handles = calloc(panfrost_pool_num_bos(&batch->pool) +
++                                    panfrost_pool_num_bos(&batch->invisible_pool) +
++                                    batch->num_bos + 2,
++                                 sizeof(*bo_handles));
++   if (!bo_handles)
++      return ENOMEM;
++
++   uint32_t count = 0;
++   pan_bo_access *flags = util_dynarray_begin(&batch->bos);
++   unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
++
++   for (unsigned i = 0; i < end_bo; ++i) {
++      if (!flags[i])
++         continue;
++      bo_handles[count++] = i;
++   }
++   panfrost_pool_get_bo_handles(&batch->pool, bo_handles + count);
++   count += panfrost_pool_num_bos(&batch->pool);
++   panfrost_pool_get_bo_handles(&batch->invisible_pool, bo_handles + count);
++   count += panfrost_pool_num_bos(&batch->invisible_pool);
++   if (batch->jm.jobs.vtc_jc.first_tiler)
++      bo_handles[count++] = panfrost_bo_handle(dev->tiler_heap);
++   bo_handles[count++] = panfrost_bo_handle(dev->sample_positions);
++
++   struct drm_panfrost_submit submits[2] = {
++      {
++         .jc = batch->jm.jobs.vtc_jc.first_job,
++         .bo_handles = (uint64_t)(uintptr_t)bo_handles,
++         .bo_handle_count = count,
++         .requirements = reqs,
++         .jm_ctx_handle = ctx->jm.handle,
++      },
++      {
++         .jc = batch->jm.jobs.frag,
++         .out_sync = out_sync,
++         .bo_handles = (uint64_t)(uintptr_t)bo_handles,
++         .bo_handle_count = count,
++         .requirements = reqs | PANFROST_JD_REQ_FS,
++         .jm_ctx_handle = ctx->jm.handle,
++      },
++   };
++
++   int ret = redwood_drm_submit_batch(submits, 2) == 0 ? 0 : errno;
++   free(bo_handles);
++   if (ret == 0) {
++      /* the buffers' accesses reported once, for the pair (jm_submit_jc does it per job) */
++      for (unsigned i = 0; i < end_bo; ++i) {
++         if (flags[i])
++            panfrost_context_report_bo_access(ctx, pan_lookup_bo(dev, i), flags[i]);
++      }
++   }
++   return ret;
++}
++#endif
++
+ /* Submit both vertex/tiler and fragment jobs for a batch, possibly with an
+  * outsync corresponding to the later of the two (since there will be an
+  * implicit dep between them) */
+@@ -201,6 +280,16 @@
+    if (has_tiler)
+       pthread_mutex_lock(&dev->submit_lock);
+ 
++#ifdef __APPLE__
++   if (redwood_pan_metal && has_draws && has_frag && !batch->ctx->is_noop &&
++       batch->ctx->in_sync_fd < 0 && !(dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))) {
++      ret = redwood_jm_submit_pair(batch, reqs, out_sync);
++      if (ret != ENOTSUP)
++         goto done;
++      ret = 0;   /* (no SUBMIT_BATCH here: the two, one by one) */
++   }
++#endif
++
+    if (has_draws) {
+       ret = jm_submit_jc(batch, batch->jm.jobs.vtc_jc.first_job, reqs,
+                          has_frag ? 0 : out_sync);
