@@ -2244,10 +2244,10 @@ index 0000000..b722443
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..8c9615f
+index 0000000..66bf4a7
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1038 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -2504,6 +2504,15 @@ index 0000000..8c9615f
 +			    len, plat, build);
 +		} else {
 +			printf("A34 CELL: LK tag %-24s %u bytes%s%s\n", name, len, h ? ": " : "", hex);
++		}
++		/* LK's EMI MPU setup for the modem's regions (24-byte entries): which domains may read
++		 * them (whether the AP can read drdi_memory before the modem runs). No identity in it. */
++		if (strcmp(name, "md_mpu_inf") == 0 && off <= size && len <= size - off) {
++			for (uint32_t e = 0; e + 24 <= len && e < 24 * 16; e += 24) {
++				const uint8_t *q = t + off + e;
++				printf("A34 CELL: LK md_mpu_inf %2u: %08x %08x %08x %08x %08x %08x\n", e / 24, le32(q),
++				    le32(q + 4), le32(q + 8), le32(q + 12), le32(q + 16), le32(q + 20));
++			}
 +		}
 +		if (next <= cur || next >= size)
 +			break;
