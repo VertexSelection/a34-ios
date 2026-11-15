@@ -1,0 +1,134 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0c2c945..e05f35a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -118,6 +118,21 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+  */
+ static uint32_t      sweet_surface_row_align = SWEET_SURFACE_ROW_ALIGN;
+ static uint32_t      sweet_surface_row_fix;
++/*
++ * A34 (0934): whose surfaces a34surfrowfix=1 rounds: boot-arg
++ * a34surfrowfixnames, program names separated by commas (default
++ * "backboardd", whose CoreAnimation reads the row length it was given;
++ * "*": every program, as 0925). A writer that ignores
++ * IOSurfaceGetBytesPerRow draws a rounded surface sloped (boot 57:
++ * Preferences' 1014x780, asked 4064, got 4096: the Focus picture in
++ * streaks). Said once per program whose rows would be rounded.
++ */
++#define SWEET_SURFACE_ROW_FIX_NAMES 128
++#define SWEET_SURFACE_ROW_FIX_SAID  16
++#define SWEET_SURFACE_NAME          32
++static char          sweet_surface_row_fix_names[SWEET_SURFACE_ROW_FIX_NAMES] = "backboardd";
++static char          sweet_surface_row_fix_said[SWEET_SURFACE_ROW_FIX_SAID][SWEET_SURFACE_NAME];
++static uint32_t      sweet_surface_row_fix_nsaid;
+ /*
+  * A34 (0927): use counts (traps 0/1, boot-arg a34surfuse, default 1).
+  * IOSurface.framework counts IOSurfaceIncrementUseCount per process and
+@@ -462,6 +477,70 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + sweet_surface_row_align - 1) & ~(uint64_t)(sweet_surface_row_align - 1));
+ }
+ 
++/* A34 (0934): `name` is in a34surfrowfixnames ("*": every name). */
++static bool
++sweet_surface_row_fix_for(const char *name)
++{
++	const char *p = sweet_surface_row_fix_names;
++
++	if (p[0] == '*' && p[1] == '\0') {
++		return true;
++	}
++	while (*p != '\0') {
++		size_t i = 0;
++
++		while (p[i] != '\0' && p[i] != ',' && name[i] != '\0' && p[i] == name[i]) {
++			i++;
++		}
++		if ((p[i] == '\0' || p[i] == ',') && name[i] == '\0') {
++			return true;
++		}
++		while (*p != '\0' && *p != ',') {
++			p++;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
++/* A34 (0934): once per program: its rows rounded or kept. */
++static void
++sweet_surface_row_fix_say(const char *name, bool fix, uint32_t asked, uint32_t row)
++{
++	bool said = false;
++
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < sweet_surface_row_fix_nsaid && !said; i++) {
++		size_t k = 0;
++
++		while (k < SWEET_SURFACE_NAME - 1 && name[k] != '\0' && sweet_surface_row_fix_said[i][k] == name[k]) {
++			k++;
++		}
++		said = sweet_surface_row_fix_said[i][k] == name[k] || k == SWEET_SURFACE_NAME - 1;
++	}
++	if (!said) {
++		if (sweet_surface_row_fix_nsaid < SWEET_SURFACE_ROW_FIX_SAID) {
++			size_t k;
++
++			for (k = 0; k < SWEET_SURFACE_NAME - 1 && name[k] != '\0'; k++) {
++				sweet_surface_row_fix_said[sweet_surface_row_fix_nsaid][k] = name[k];
++			}
++			sweet_surface_row_fix_said[sweet_surface_row_fix_nsaid][k] = '\0';
++			sweet_surface_row_fix_nsaid++;
++		} else {
++			said = true;            /* (no room: no more lines) */
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	if (!said) {
++		IOLog("SWEET SURF: %s: rows it gives that are not a multiple of %u bytes are %s (a34surfrowfixnames \"%s\"; "
++		    "first: %u -> %u)\n", name, sweet_surface_row_align, fix ? "rounded up" : "kept as given",
++		    sweet_surface_row_fix_names, asked, row);
++	}
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -492,7 +571,17 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
+ 		    props->getObject("IOSurfacePlaneInfo") == NULL && props->getObject("IOSurfaceAddress") == NULL &&
+ 		    (uint64_t)s->bytesPerRow + sweet_surface_row_align <= UINT32_MAX) {
+-			s->bytesPerRow = (s->bytesPerRow + sweet_surface_row_align - 1) & ~(sweet_surface_row_align - 1);
++			/* A34 (0934): only for the programs of a34surfrowfixnames */
++			char name[SWEET_SURFACE_NAME];
++			uint32_t rounded = (s->bytesPerRow + sweet_surface_row_align - 1) & ~(sweet_surface_row_align - 1);
++			bool fix;
++
++			proc_selfname(name, sizeof(name));
++			fix = sweet_surface_row_fix_for(name);
++			sweet_surface_row_fix_say(name, fix, s->bytesPerRow, fix ? rounded : s->bytesPerRow);
++			if (fix) {
++				s->bytesPerRow = rounded;
++			}
+ 		}
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+@@ -628,12 +717,15 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		sweet_surface_row_align = align;
+ 	}
+ 	(void)PE_parse_boot_argn("a34surfrowfix", &sweet_surface_row_fix, sizeof(sweet_surface_row_fix));
++	(void)PE_parse_boot_arg_str("a34surfrowfixnames", sweet_surface_row_fix_names,
++	    (int)sizeof(sweet_surface_row_fix_names));         /* A34 (0934) */
+ 	(void)PE_parse_boot_argn("a34surfuse", &sweet_surface_use_on, sizeof(sweet_surface_use_on));
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered: rows and offsets aligned to %u bytes (a34surfalign), "
+-	    "rows the creator gives %s (a34surfrowfix), use counts %s (a34surfuse)\n", sweet_surface_row_align,
+-	    sweet_surface_row_fix ? "rounded up to that for 32-bit single-plane surfaces" : "kept",
++	    "rows the creator gives %s%s%s (a34surfrowfix), use counts %s (a34surfuse)\n", sweet_surface_row_align,
++	    sweet_surface_row_fix ? "rounded up to that for 32-bit single-plane surfaces of " : "kept",
++	    sweet_surface_row_fix ? sweet_surface_row_fix_names : "", sweet_surface_row_fix ? " (a34surfrowfixnames)" : "",
+ 	    sweet_surface_use_on ? "kept: IOSurfaceIsInUse works" : "ignored");
+ 	return true;
+ }
