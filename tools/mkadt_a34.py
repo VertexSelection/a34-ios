@@ -19,7 +19,8 @@ arguments as fit -- the ones the kernel looks at first (debug, serial, cpus,
 rd, ufs*, ...) put first -- and written to --commandline-out, for mkpayload.py;
 the rest goes into /chosen/a34-bootargs, where the kernel joins it on
 (xnu/patches/0990-a34-long-bootargs.patch). A line that fits stays as it is,
-and there is no property. In all at most 4095 characters.
+and there is no property. In all at most 1022 characters (userland readers of kern.bootargs
+with fixed buffers; the kernel itself takes 4095).
 """
 import argparse, hashlib, os, struct, sys
 
@@ -62,7 +63,10 @@ cstr = lambda s: s.encode() + b'\0'
 
 
 COMMAND_LINE_MAX = 607         # boot_args.CommandLine: BOOT_LINE_LENGTH 608, with its NUL
-BOOT_ARGS_MAX = 4095            # 0990: the kernel's whole line (KERNEL_BOOT_INFO_MAX 4096, with its NUL)
+# The kernel (0990) takes 4095, but kern.bootargs answers ENOMEM to a buffer that is too small, as
+# it always has, and some readers have fixed ones: libignition in launchd (ignition_level) 1216 bytes,
+# and on ENOMEM it goes on with no boot-args at all; libsystem_trace 1024; a34gl and liba34media 1023.
+BOOT_ARGS_MAX = 1022
 # Kept in CommandLine, which is there even without the device tree's part: what the kernel
 # parses first (arm_init: serial, cpus, debug; the root's rd/ufs*), and what launchd, its
 # cache loader and AMFI read (launchd_unsecure_cache: without it launchd_cache_loader wants
@@ -81,7 +85,8 @@ def split_bootargs(line):
     args = line.split()
     whole = ' '.join(args)
     if len(whole.encode()) > BOOT_ARGS_MAX:
-        raise SystemExit(f'boot-args: {len(whole)} characters, at most {BOOT_ARGS_MAX}')
+        raise SystemExit(f'boot-args: {len(whole)} characters, at most {BOOT_ARGS_MAX} (fixed-size readers of '
+                         'kern.bootargs in launchd/libignition, libsystem_trace, a34gl: see mkadt_a34.py)')
     if len(whole.encode()) <= COMMAND_LINE_MAX:
         return whole, ''
     early = lambda a: arg_name(a) in EARLY_ARGS or arg_name(a).startswith(EARLY_PREFIXES)

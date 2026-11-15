@@ -5,7 +5,7 @@
 #
 #   build-xnu.sh KERNEL [CMDLINE]
 #
-# CMDLINE may be longer than boot_args.CommandLine (607 characters), up to 4095:
+# CMDLINE may be longer than boot_args.CommandLine (607 characters), up to 1022:
 # mkadt_a34.py keeps as many whole arguments as fit in CommandLine (the early ones
 # first) and puts the rest into the ADT as /chosen/a34-bootargs, which the kernel
 # joins on (xnu/patches/0990-a34-long-bootargs.patch; without 0990 the rest is
