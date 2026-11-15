@@ -30,6 +30,11 @@ Status (2026-11-15):
 - **Boot 0989-bt-a**: no crash; identity root refused again: the library only caught service
   `MobileBluetooth`, but bluetoothd's root keys are under `BluetoothGlobal` (LE devices under
   `BluetoothLE`, `BluetoothLESync`). All four services are kept now, each call logged.
+- **Boot 0989-dbe-a**: keychain kept; bluetoothd connected (`com.apple.uart.sk.bluetooth`, the Skywalk
+  channel) and ran HCI init over the bridge, every command answered 0, then refused
+  Write_Default_Erroneous_Data_Reporting itself (status 628): the MT6635's supported-commands mask lacks it
+  (octet 18 bit 3), and bluetoothd checks the mask first (descriptor table `+0x8448e0`). 0973 advertises
+  and answers 0x0C5A, 0x0C5B, 0x0C84 in the kernel.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).

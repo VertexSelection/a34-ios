@@ -195,3 +195,19 @@ account, and each call is logged:
 
 Same kernel and wraps; only `/a34` from the new artifact. (A stale
 `/var/mobile/Library/Bluetooth/com.a34.keychain.plist` from earlier boots is read and rekeyed.)
+
+## 10. HCI initialization (kernel 0973)
+
+0989-dbe-a: with the keychain kept, bluetoothd connected to the bridge and ran its HCI init over it:
+Reset, version, supported commands, address, features, event masks, LE buffer sizes, data length,
+PHY, periodic advertising list size, flow control -- every command answered with status 0 -- and then
+"OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization failed", reason 108.
+That command was never sent: bluetoothd checks each command against the controller's supported-commands
+mask first (its table at `bluetoothd+0x8448e0`), and the MT6635 does not list
+Write_Default_Erroneous_Data_Reporting (octet 18 bit 3). Of the 36 commands bluetoothd knows and the
+mask lacks, 0973 advertises and answers here the three an HCI 5.3 host's init may ask: 0x0C5A, 0x0C5B
+and 0x0C84 (Set_Min_Encryption_Key_Size); `A34 BT: br: command 0c5b ... answered here` and `br=` lines
+show them. Also: once bluetoothd has connected, the raw channel (a34bt) only listens. The com.a34.btprobe
+job can stay (it then just counts what bluetoothd's scans hear).
+
+Kernel: main with 0970-0973, `a34bt=2`. Root unchanged (the 43726586862 artifact).
