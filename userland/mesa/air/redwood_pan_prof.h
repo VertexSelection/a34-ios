@@ -66,6 +66,9 @@ enum redwood_pan_prof_index {
    /* (patch 0014) Mesa's BO cache: fetches answered, refused because its oldest fitting BO was still
     * busy on the GPU, or with no BO of that size; KB of BOs new from the kernel; KB held now */
    RWP_CACHE_HITS, RWP_CACHE_BUSY, RWP_CACHE_NONE, RWP_FRESH_KB, RWP_CACHED_KB,
+   /* (patch 0021) targets written back that were sampled after in the same work, and those that
+    * were not (IOSurfaces left out), with their KB */
+   RWP_WB_READ, RWP_WB_UNREAD, RWP_WB_UNREAD_KB,
    RWP_SLOTS
 };
 
@@ -110,6 +113,7 @@ struct redwood_pan_pass {
    /* a clean-tile write forced (a cleared attachment kept, TSIX-2033): every preload of the batch then
     * runs over the whole drawn area (ALWAYS) instead of only the tiles geometry touches (INTERSECT) */
    bool always;
+   bool read_later;                   /* (patch 0021) what it wrote back was sampled after, in the same work */
 };
 extern bool redwood_pan_trace_on;
 extern unsigned redwood_pan_trace_n;

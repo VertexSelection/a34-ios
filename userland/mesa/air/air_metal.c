@@ -5318,7 +5318,8 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                "back; in all %llu passes (%llu screen-sized); preloads %llu colour + %llu depth/stencil "
                "= %.1f MB; write-backs %llu colour + %llu depth/stencil = %.1f MB; %llu colour clears in the tiles; "
                "re-entries (preloads of a target written back earlier in the same work) %llu = %.1f MB; colour "
-               "traffic of IOSurfaces %.1f MB, of AFBC targets %.1f MB, of linear ones %.1f MB",
+               "traffic of IOSurfaces %.1f MB, of AFBC targets %.1f MB, of linear ones %.1f MB; write-backs "
+               "of targets other than IOSurfaces: %llu sampled after in the same work, %llu not (%.1f MB)",
                (unsigned long long)spans, (double)p[RWP_PASSES] / spans, p[RWP_PRELOAD_KB] / 1024.0 / spans,
                p[RWP_WRITEBACK_KB] / 1024.0 / spans,
                (unsigned long long)p[RWP_PASSES], (unsigned long long)p[RWP_FULL_PASSES],
@@ -5327,7 +5328,8 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                (unsigned long long)p[RWP_ZS_WRITEBACKS], p[RWP_WRITEBACK_KB] / 1024.0,
                (unsigned long long)p[RWP_CLEARS], (unsigned long long)p[RWP_REENTRY_PRELOADS],
                p[RWP_REENTRY_KB] / 1024.0, p[RWP_SHARED_KB] / 1024.0, p[RWP_AFBC_KB] / 1024.0,
-               p[RWP_LINEAR_KB] / 1024.0);
+               p[RWP_LINEAR_KB] / 1024.0, (unsigned long long)p[RWP_WB_READ],
+               (unsigned long long)p[RWP_WB_UNREAD], p[RWP_WB_UNREAD_KB] / 1024.0);
       return 1;
    }
    case 3: {
@@ -5398,7 +5400,10 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                k + 1, ntrace, r->res_w, r->res_h, util_format_short_name((enum pipe_format)r->format),
                kinds[r->kind & 3], r->shared ? " IOSurface" : "", r->level, r->width, r->height, r->extent_w,
                r->extent_h, r->draws, r->nr_cbufs, r->clear ? "cleared" : r->preload ? "preloaded" : "not loaded",
-               r->reentry ? " (re-entry)" : "", "", r->writeback ? "written back" : "not written back",
+               r->reentry ? " (re-entry)" : "", "",
+               r->writeback ? (r->shared ? "written back" : r->read_later ? "written back, sampled after"
+                                                                          : "written back, not sampled after in this work")
+                            : "not written back",
                !r->rt1 ? "none"
                : r->clear1 ? (r->writeback1 ? "cleared, written back" : "cleared, not written back")
                : r->preload1 ? (r->writeback1 ? "preloaded, written back" : "preloaded, not written back")
