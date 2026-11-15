@@ -62,6 +62,16 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
+def cstr_keep8(s):
+    """A C string padded with NULs so that the property (36-byte header plus value
+    rounded up to 4) is a multiple of 8 long: everything after it in the ADT keeps
+    the 8-byte alignment the loader's and XNU's 64-bit reads/writes may assume."""
+    v = cstr(s)
+    while (36 + ((len(v) + 3) & ~3)) % 8:
+        v += b'\0'
+    return v
+
+
 COMMAND_LINE_MAX = 607         # boot_args.CommandLine: BOOT_LINE_LENGTH 608, with its NUL
 # The kernel (0990) takes 4095, but kern.bootargs answers ENOMEM to a buffer that is too small, as
 # it always has, and some readers have fixed ones: libignition in launchd (ignition_level) 1216 bytes,
@@ -148,7 +158,7 @@ def build(d22ap=D22AP_ADT, seed=None, bootargs_more=''):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ] + ([('a34-bootargs', cstr(bootargs_more))] if bootargs_more else []),
+    ] + ([('a34-bootargs', cstr_keep8(bootargs_more))] if bootargs_more else []),
         [node('memory-map', [ph()]),
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
