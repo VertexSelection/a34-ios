@@ -9,7 +9,7 @@ name: a34metal
 
 on:
   push:
-    branches: [metal]
+    branches: [main, metal]
   workflow_dispatch:
 
 concurrency:
