@@ -106,6 +106,9 @@ say_first_drawn(struct rwm_work *const *works, unsigned count, const char *(*lab
 
 } // namespace
 
+__thread bool rwm_on_completion_queue;
+__thread struct rwm_cb_parts rwm_cb_now;
+
 extern "C" bool
 rwm_copyin_late(void)
 {
@@ -176,6 +179,19 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 		rwm_perf.between += began - rwm_perf.last_end;
 	}
 	c->status = RWM_CB_COMMITTED;
+	/* (A34: the buffer's parts, and what the library did over its run: "rwm worst cb") */
+	static unsigned (*counters)(uint64_t *, unsigned);
+	static bool looked;
+	uint64_t lib_before[RWA_CB_SLOTS] = { 0 };
+
+	if (!looked) {
+		looked = true;
+		counters = (unsigned (*)(uint64_t *, unsigned))rwm_profile_call("rwa_cb_counters");
+	}
+	memset(&rwm_cb_now, 0, sizeof(rwm_cb_now));
+	if (counters != nullptr && rwm_camprof() != 0) {
+		counters(lib_before, RWA_CB_SLOTS);
+	}
 	/* its copies in -- here, unless the driver's worker made them at -commit --, the draws, dispatches and copies in
 	 * order, the work sent off, the surfaces copied back */
 	ran = rwm_run_works(device, works, count, !(rwm_worker_on() && !rwm_copyin_late()), finish_wanted(), &c->seq,
@@ -185,6 +201,16 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 
 	const uint64_t now = rwm_ns(), took = now - began;
 
+	if (counters != nullptr && rwm_camprof() != 0) {
+		uint64_t lib_after[RWA_CB_SLOTS] = { 0 };
+
+		counters(lib_after, RWA_CB_SLOTS);
+		for (unsigned i = 0; i < RWA_CB_SLOTS; i++) {
+			rwm_cb_now.lib[i] = lib_after[i] >= lib_before[i] ? lib_after[i] - lib_before[i] : lib_after[i];
+		}
+	}
+	rwm_cb_now.took_ns = took;
+	rwm_cb_parts_note(&rwm_cb_now);
 	rwm_perf.last_end = now;
 	rwm_perf.cbs++;
 	rwm_perf.wait += waited;
@@ -252,8 +278,13 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 		if (air->wait_seq(c->seq, 5000000000ll) != 0) {
 			rwm_print("THE GPU DID NOT FINISH job %llu\n", (unsigned long long)c->seq);
 		}
-		rwm_perf.completed_waits++;
-		rwm_perf.completed_ns += rwm_ns() - from;
+		if (rwm_on_completion_queue) {
+			rwm_perf.completed_q_waits++;
+			rwm_perf.completed_q_ns += rwm_ns() - from;
+		} else {
+			rwm_perf.completed_waits++;
+			rwm_perf.completed_ns += rwm_ns() - from;
+		}
 		c->status = RWM_CB_COMPLETED;
 		return 0;
 	}

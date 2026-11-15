@@ -1,0 +1,80 @@
+Darwin: panfrost's BO cache keeps idle BOs 30 s within 64 MB, in a Metal process.
+
+From y2sios (MIT, Copyright (c) 2026 the y2sios contributors; github.com/stormtroopxyz/y2sios,
+kernel/tools/mesa/panfrost-retain.patch, their PLANS/10-mali2metal.md runs 17-19), ported to Mesa
+26.3; local to this port, nothing here goes upstream.
+
+CoreAnimation makes its offscreen targets in bursts seconds apart and keeps each 1-4 s, so with
+upstream's eviction of BOs idle more than 2 s each burst found the cache empty and paid a CREATE_BO
+and a mapping in the kernel per buffer -- 91 in a 5 s window of boot 0980-b, ~1 ms each and as
+much again for the mapping, inside the command buffers that stuttered. In a process drawing
+through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cache holds at most
+64 MB, the oldest let go first. A process that only uses OpenGL ES keeps upstream's 2 s.
+
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -193,6 +193,20 @@
+  * cache. If it fails, it returns NULL signaling the caller to allocate a new
+  * BO. */
+ 
++/*
++ * A34 (patch 0014; from y2sios's panfrost-retain.patch, MIT, Copyright (c) 2026 the y2sios
++ * contributors, ported to Mesa 26.3): in a process drawing through Metal, an idle BO is kept in
++ * the cache up to REDWOOD_BO_IDLE_S seconds, within REDWOOD_BO_BUDGET bytes in all, oldest let go
++ * first -- not 2 s. CoreAnimation makes its offscreen targets in bursts seconds apart and keeps
++ * each 1-4 s, so with upstream's rule each burst found the cache empty and paid a CREATE_BO and a
++ * mapping in the kernel per buffer: 91 of them in a 5 s window of boot 0980-b, ~1 ms each and as
++ * much again for the mapping, inside the command buffers that stuttered. A process that only uses
++ * OpenGL ES keeps upstream's 2 s and no budget.
++ */
++#define REDWOOD_BO_IDLE_S 30
++#define REDWOOD_BO_BUDGET (64ull << 20)
++static uint64_t redwood_bo_cached_bytes; /* under dev->bo_cache.lock */
++
+ static struct panfrost_bo *
+ panfrost_bo_cache_fetch(struct panfrost_device *dev, size_t size,
+                         uint32_t flags, const char *label, bool dontwait)
+@@ -214,6 +228,7 @@
+       /* This one works, splice it out of the cache */
+       list_del(&entry->bucket_link);
+       list_del(&entry->lru_link);
++      redwood_bo_cached_bytes -= MIN2(redwood_bo_cached_bytes, panfrost_bo_size(entry));
+ 
+       if (!pan_kmod_bo_make_unevictable(entry->kmod_bo)) {
+          panfrost_bo_free(entry);
+@@ -244,11 +259,18 @@
+        * seconds old, but we don't really care, as long as unused BOs
+        * are dropped at some point.
+        */
+-      if (time.tv_sec - entry->last_used <= 2)
++      /* (A34: kept longer and within a budget in a Metal process, above) */
++      if (redwood_pan_metal) {
++         if (time.tv_sec - entry->last_used <= REDWOOD_BO_IDLE_S &&
++             redwood_bo_cached_bytes <= REDWOOD_BO_BUDGET)
++            break;
++      } else if (time.tv_sec - entry->last_used <= 2) {
+          break;
++      }
+ 
+       list_del(&entry->bucket_link);
+       list_del(&entry->lru_link);
++      redwood_bo_cached_bytes -= MIN2(redwood_bo_cached_bytes, panfrost_bo_size(entry));
+       panfrost_bo_free(entry);
+    }
+ }
+@@ -274,6 +296,7 @@
+ 
+    /* Add us to the bucket */
+    list_addtail(&bo->bucket_link, bucket);
++   redwood_bo_cached_bytes += panfrost_bo_size(bo);
+ 
+    /* Add us to the LRU list and update the last_used field. */
+    list_addtail(&bo->lru_link, &dev->bo_cache.lru);
+@@ -312,6 +335,7 @@
+          panfrost_bo_free(entry);
+       }
+    }
++   redwood_bo_cached_bytes = 0;
+    pthread_mutex_unlock(&dev->bo_cache.lock);
+ }
+ 

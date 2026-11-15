@@ -4,6 +4,12 @@
 #   packed into the stock DYG1 recovery layout and signed like TWRP.
 #
 #   build-xnu.sh KERNEL [CMDLINE]
+#
+# CMDLINE may be longer than boot_args.CommandLine (607 characters), up to 1022:
+# mkadt_a34.py keeps as many whole arguments as fit in CommandLine (the early ones
+# first) and puts the rest into the ADT as /chosen/a34-bootargs, which the kernel
+# joins on (xnu/patches/0990-a34-long-bootargs.patch; without 0990 the rest is
+# not seen). A line that fits is passed as it is.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 P="$ROOT/tools/payload"
@@ -27,8 +33,9 @@ if aarch64-linux-gnu-readelf -r "$P/shim-start.o" "$P/a34boot.o" "$P/a34ufs.o" |
 fi
 aarch64-linux-gnu-objcopy -O binary "$P/a34boot.elf" "$P/a34boot.bin"
 
-python3 -I "$ROOT/tools/mkadt_a34.py" "$OUT/a34.adt"
-python3 -I "$SWEET/mkpayload.py" "$KERNEL" "$OUT/a34.adt" "$OUT/xnu-payload.bin" --cmdline "$CMDLINE"
+python3 -I "$ROOT/tools/mkadt_a34.py" "$OUT/a34.adt" --bootargs "$CMDLINE" --commandline-out "$OUT/commandline.txt"
+COMMANDLINE=$(cat "$OUT/commandline.txt")
+python3 -I "$SWEET/mkpayload.py" "$KERNEL" "$OUT/a34.adt" "$OUT/xnu-payload.bin" --cmdline "$COMMANDLINE"
 
 # TWRP rides along as the Volume Up escape: its raw kernel goes behind the
 # XNU payload, and the recovery image takes TWRP's ramdisk, DTB and DTBO.
@@ -64,4 +71,5 @@ python3 -I "$ROOT/ref/avb/avbtool.py" verify_image --image "$V/recovery.img" \
     --key "$ROOT/ref/avb/testkey_rsa4096.pem" | tail -1
 rm -rf "$V"
 echo "cmdline: $CMDLINE"
+[ "$COMMANDLINE" = "$(echo $CMDLINE)" ] || echo "  in CommandLine (${#COMMANDLINE} characters): $COMMANDLINE"
 sha1sum "$OUT/xnu-recovery.img"

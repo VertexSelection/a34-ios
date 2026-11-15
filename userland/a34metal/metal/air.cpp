@@ -6,6 +6,7 @@
 #include "rwm.h"
 
 #include <dlfcn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
@@ -66,6 +67,59 @@ load()
 	 * 0012; shaders compiled from then on -- the disk cache keeps what it has) */
 	if (rwm_boot_arg("rwm_pushubo=0")) {
 		setenv("REDWOOD_PAN_PUSHUBO", "0", 1);
+	}
+	/* boot-arg rwm_actions=0: DontCare load and store actions treated as Load and Store, as before 16 November */
+	if (rwm_boot_arg("rwm_actions=0")) {
+		setenv("RWA_LOAD_STORE", "0", 1);
+	}
+	/* boot-arg rwm_passes=all: every pass switch sends every batch (26 October to 15 November); rwm_passes=none: no
+	 * switch sends anything; rwm_passes=N: a pass left is kept open for N passes more (air_metal.c; 3 unless set) */
+	{
+		const char *args = rwm_boot_args(), *at = strstr(args, "rwm_passes=");
+
+		if (at != nullptr && (at == args || at[-1] == ' ')) {
+			char value[8] = { 0 };
+
+			sscanf(at + 11, "%7[^ ]", value);
+			if (strcmp(value, "all") == 0) {
+				setenv("RWA_FLUSH_ON_SWITCH", "all", 1);
+			} else if (strcmp(value, "none") == 0) {
+				setenv("RWA_FLUSH_ON_SWITCH", "0", 1);
+			} else if (value[0] != 0) {
+				setenv("RWA_OPEN_PASSES", value, 1);
+			}
+		}
+	}
+	/* (metal-fx) boot-arg rwm_overdraw=upstream|fixed: panfrost's "overdraw alpha" flags as upstream sets them
+	 * (any draw that writes all its targets gets both, its blend unread) or asked of the targets a draw writes.
+	 * Without it, Mesa patch 0015 sets neither in this process, as panvk does for a draw with a shader. */
+	if (rwm_boot_arg("rwm_overdraw=upstream")) {
+		setenv("REDWOOD_PAN_OVERDRAW", "upstream", 1);
+	} else if (rwm_boot_arg("rwm_overdraw=fixed")) {
+		setenv("REDWOOD_PAN_OVERDRAW", "fixed", 1);
+	}
+	/* (metal-fx) boot-arg rwm_fetchread=off: a colour target a fragment shader reads by framebuffer fetch is
+	 * preloaded only when a draw of the batch writes it, as upstream; rwm_fetchread=declared: every [[color(n)]] a
+	 * shader declares counts as read, not only the ones left after optimisation (Mesa patch 0017) */
+	if (rwm_boot_arg("rwm_fetchread=off")) {
+		setenv("REDWOOD_PAN_FETCHREAD", "off", 1);
+	} else if (rwm_boot_arg("rwm_fetchread=declared")) {
+		setenv("REDWOOD_PAN_FETCHREAD", "declared", 1);
+	}
+	/* (metal-fx) boot-arg rwm_smallafbc=1: textures of one or two bytes a texel (glyphs, masks) compressed (AFBC)
+	 * as before; without it the library makes them uncompressed */
+	if (rwm_boot_arg("rwm_smallafbc=1")) {
+		setenv("RWA_SMALL_AFBC", "1", 1);
+	}
+	/* (metal-fx) boot-arg rwm_uploads=N: the first N writes of texels into a small texture, what was given and
+	 * what reads back (lines "rwa upload:") */
+	if (const char *at = strstr(rwm_boot_args(), "rwm_uploads=")) {
+		char n[12] = { 0 };
+
+		sscanf(at + 12, "%11[0-9]", n);
+		if (n[0] != 0) {
+			setenv("RWA_UPLOADS", n, 1);
+		}
 	}
 	struct rwm_air &c = calls;
 	const Call table[] = {

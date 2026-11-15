@@ -1,0 +1,215 @@
+Darwin: where the tiles' memory traffic is, and the passes of one command buffer, for the profile.
+
+A34 (local to this port; nothing here goes upstream). Boot 0989-dbe-a moved ~138 MB a frame through
+the tiles (68.5 MB preloaded, 69.6 MB written back, 13.5 passes, 5 of them screen-sized) and the
+Mali took 5.4-9.0 ms a frame. Which passes, of which targets, is what decides between keeping
+passes open, AFBC for the full-screen targets, and transaction elimination; in a process drawing
+through Metal, each batch submitted now also counts:
+
+- re-entries: colour preloads of a target written back earlier in the same span of work (the
+  Metal driver's redwood_pan_span) -- a pass going back into what an earlier one drew;
+- the colour traffic by kind of target: IOSurfaces (shared), AFBC, linear;
+
+and, for one span after each profile report (redwood_pan_trace_on, set by air_metal.c), every batch
+submitted in order: colour attachment 0's resource (size, format, layout, IOSurface or not, level),
+the framebuffer and the drawn area, draws, whether colour 0 was cleared, preloaded (and whether
+that was a re-entry) or not loaded and whether it was written back, the same for depth/stencil, and
+why the batch was sent, and its last GPU job's number (redwood_drm_last_seq) for the kernel's
+per-job timing. The counting of patch 0018 moves into the same function.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -211,6 +211,135 @@
+ static void panfrost_batch_submit(struct panfrost_context *ctx,
+                                   struct panfrost_batch *batch);
+ 
++/*
++ * A34 (patches 0018, 0019): what a batch's tiles cost in memory traffic, for the Metal driver's
++ * profile -- passes, preloads and write-backs over the drawn area, colour clears in the tiles;
++ * re-entries (a preload of a target written back earlier in the same span of work), and the
++ * traffic by kind of target (IOSurface, AFBC, linear) -- and the batch itself in the trace of one
++ * span (redwood_pan_trace).
++ */
++bool redwood_pan_trace_on;
++unsigned redwood_pan_trace_n;
++struct redwood_pan_pass redwood_pan_trace[RWP_TRACE];
++uint64_t redwood_pan_span;
++
++#ifdef __APPLE__
++/* redwood-drm's number of this process's last queued GPU job (libdrm's Darwin stand-in) */
++extern uint64_t redwood_drm_last_seq(void) __attribute__((weak_import));
++#endif
++
++/* the trace slot the batch went into, or -1 */
++static int
++redwood_pan_count_pass(const struct panfrost_batch *batch, const struct pan_fb_info *fb)
++{
++   static const void *written[64];       /* targets written back in this span */
++   static unsigned nwritten;
++   static uint64_t written_span = ~0ull;
++   uint64_t area = fb->draw_extent.maxx >= fb->draw_extent.minx && fb->draw_extent.maxy >= fb->draw_extent.miny
++                      ? (uint64_t)(fb->draw_extent.maxx - fb->draw_extent.minx + 1) *
++                           (fb->draw_extent.maxy - fb->draw_extent.miny + 1)
++                      : (uint64_t)fb->width * fb->height;
++   struct redwood_pan_pass rec = {
++      .width = fb->width, .height = fb->height, .nr_cbufs = fb->rt_count, .draws = batch->draw_count,
++      .why = redwood_pan_why ? redwood_pan_why : "(no reason given)",
++   };
++
++   if (written_span != redwood_pan_span) {
++      nwritten = 0;
++      written_span = redwood_pan_span;
++   }
++   if (fb->draw_extent.maxx >= fb->draw_extent.minx && fb->draw_extent.maxy >= fb->draw_extent.miny) {
++      rec.extent_w = fb->draw_extent.maxx - fb->draw_extent.minx + 1;
++      rec.extent_h = fb->draw_extent.maxy - fb->draw_extent.miny + 1;
++   }
++   redwood_pan_prof[RWP_PASSES]++;
++   if ((uint64_t)fb->width * fb->height >= 2000000)
++      redwood_pan_prof[RWP_FULL_PASSES]++;
++   for (unsigned i = 0; i < fb->rt_count; i++) {
++      if (!fb->rts[i].view || !batch->key.cbufs[i].texture)
++         continue;
++      const struct pipe_resource *res = batch->key.cbufs[i].texture;
++      const struct panfrost_resource *rsrc = pan_resource((struct pipe_resource *)res);
++      uint64_t kb = area * util_format_get_blocksize(fb->rts[i].view->format) *
++                    MAX2(fb->rts[i].view->nr_samples, 1) / 1024;
++      bool shared = (rsrc->bo && (rsrc->bo->flags & PAN_BO_SHARED)) || (res->bind & PIPE_BIND_SHARED);
++      unsigned kind = rsrc->modifier == DRM_FORMAT_MOD_LINEAR ? 0
++                      : rsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED ? 1
++                      : drm_is_afbc(rsrc->modifier) ? 2 : 3;
++      bool reentry = false;
++      uint64_t moved = 0;
++
++      if (fb->rts[i].preload) {
++         redwood_pan_prof[RWP_PRELOADS]++;
++         redwood_pan_prof[RWP_PRELOAD_KB] += kb;
++         moved += kb;
++         for (unsigned k = 0; k < nwritten; k++) {
++            if (written[k] == res) {
++               reentry = true;
++               redwood_pan_prof[RWP_REENTRY_PRELOADS]++;
++               redwood_pan_prof[RWP_REENTRY_KB] += kb;
++               break;
++            }
++         }
++      }
++      if (!fb->rts[i].discard) {
++         redwood_pan_prof[RWP_WRITEBACKS]++;
++         redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
++         moved += kb;
++         bool known = false;
++         for (unsigned k = 0; k < nwritten; k++)
++            known |= written[k] == res;
++         if (!known && nwritten < ARRAY_SIZE(written))
++            written[nwritten++] = res;
++      }
++      if (fb->rts[i].clear)
++         redwood_pan_prof[RWP_CLEARS]++;
++      if (shared)
++         redwood_pan_prof[RWP_SHARED_KB] += moved;
++      if (kind == 2)
++         redwood_pan_prof[RWP_AFBC_KB] += moved;
++      else if (kind == 0)
++         redwood_pan_prof[RWP_LINEAR_KB] += moved;
++      if (i == 0) {
++         rec.res_w = res->width0;
++         rec.res_h = res->height0;
++         rec.format = res->format;
++         rec.level = batch->key.cbufs[0].level;
++         rec.kind = kind;
++         rec.shared = shared;
++         rec.preload = fb->rts[0].preload;
++         rec.writeback = !fb->rts[0].discard;
++         rec.clear = fb->rts[0].clear;
++         rec.reentry = reentry;
++      }
++   }
++   if (fb->zs.view.zs) {
++      uint64_t kb = area * util_format_get_blocksize(fb->zs.view.zs->format) *
++                    MAX2(fb->zs.view.zs->nr_samples, 1) / 1024;
++      rec.zs = true;
++      if (fb->zs.preload.z || fb->zs.preload.s) {
++         redwood_pan_prof[RWP_ZS_PRELOADS]++;
++         redwood_pan_prof[RWP_PRELOAD_KB] += kb;
++         rec.zs_preload = true;
++      }
++      if (!fb->zs.discard.z || !fb->zs.discard.s) {
++         redwood_pan_prof[RWP_ZS_WRITEBACKS]++;
++         redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
++         rec.zs_writeback = true;
++      }
++      if (!rec.res_w && batch->key.zsbuf.texture) {
++         rec.res_w = batch->key.zsbuf.texture->width0;
++         rec.res_h = batch->key.zsbuf.texture->height0;
++         rec.format = batch->key.zsbuf.texture->format;
++      }
++   }
++   if (redwood_pan_trace_on && redwood_pan_trace_n < RWP_TRACE) {
++      redwood_pan_trace[redwood_pan_trace_n] = rec;
++      return (int)redwood_pan_trace_n++;
++   }
++   return -1;
++}
++
+ static struct panfrost_batch *
+ find_best_render_batch(struct panfrost_context *ctx)
+ {
+@@ -838,50 +967,18 @@
+ 
+    panfrost_batch_to_fb_info(batch, &fb, rts, &zs, &s, false);
+ 
+-   if (redwood_pan_metal) {
+-      /* A34 (patch 0018): what the tiles cost in memory traffic, for the Metal driver's profile */
+-      uint64_t area = fb.draw_extent.maxx >= fb.draw_extent.minx && fb.draw_extent.maxy >= fb.draw_extent.miny
+-                         ? (uint64_t)(fb.draw_extent.maxx - fb.draw_extent.minx + 1) *
+-                              (fb.draw_extent.maxy - fb.draw_extent.miny + 1)
+-                         : (uint64_t)fb.width * fb.height;
+-
+-      redwood_pan_prof[RWP_PASSES]++;
+-      if ((uint64_t)fb.width * fb.height >= 2000000)
+-         redwood_pan_prof[RWP_FULL_PASSES]++;
+-      for (unsigned i = 0; i < fb.rt_count; i++) {
+-         if (!fb.rts[i].view)
+-            continue;
+-         uint64_t kb = area * util_format_get_blocksize(fb.rts[i].view->format) *
+-                       MAX2(fb.rts[i].view->nr_samples, 1) / 1024;
+-         if (fb.rts[i].preload) {
+-            redwood_pan_prof[RWP_PRELOADS]++;
+-            redwood_pan_prof[RWP_PRELOAD_KB] += kb;
+-         }
+-         if (!fb.rts[i].discard) {
+-            redwood_pan_prof[RWP_WRITEBACKS]++;
+-            redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
+-         }
+-         if (fb.rts[i].clear)
+-            redwood_pan_prof[RWP_CLEARS]++;
+-      }
+-      if (fb.zs.view.zs) {
+-         uint64_t kb = area * util_format_get_blocksize(fb.zs.view.zs->format) *
+-                       MAX2(fb.zs.view.zs->nr_samples, 1) / 1024;
+-         if (fb.zs.preload.z || fb.zs.preload.s) {
+-            redwood_pan_prof[RWP_ZS_PRELOADS]++;
+-            redwood_pan_prof[RWP_PRELOAD_KB] += kb;
+-         }
+-         if (!fb.zs.discard.z || !fb.zs.discard.s) {
+-            redwood_pan_prof[RWP_ZS_WRITEBACKS]++;
+-            redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
+-         }
+-      }
+-   }
++   int rwp_slot = redwood_pan_metal ? redwood_pan_count_pass(batch, &fb) : -1;
++   (void)rwp_slot;
+    panfrost_emit_tile_map(batch, &fb);
+ 
+    ret = screen->vtbl.submit_batch(batch, &fb);
+    if (ret)
+       mesa_loge("panfrost_batch_submit failed: %d\n", ret);
++#ifdef __APPLE__
++   /* (patch 0019) the traced batch's last GPU job, by number: the kernel's per-job timing names it */
++   if (rwp_slot >= 0 && redwood_drm_last_seq)
++      redwood_pan_trace[rwp_slot].seq = redwood_drm_last_seq();
++#endif
+    if (redwood_pan_metal) {
+       /* A34 (patch 0011): a batch with work, and why it went */
+       redwood_pan_prof[RWP_JOB_SUBMITS]++;

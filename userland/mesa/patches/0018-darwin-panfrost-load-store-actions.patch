@@ -1,0 +1,122 @@
+Darwin: Metal's DontCare load and store actions; the tiles' memory traffic counted.
+
+A34 (local to this port; nothing here goes upstream). Two functions for air_metal.c, declared in
+src/compiler/air/redwood_pan_prof.h (userland/mesa/air):
+
+- redwood_pan_forget(res, level), MTLLoadActionDontCare: the level is no longer valid, so the
+  next batch drawing it does not preload it (panfrost_batch_to_fb_info preloads a drawn target
+  only while it is valid, and marks it valid again when that batch is submitted). Only a 2D
+  resource of one layer: validity is kept per level for all layers.
+- redwood_pan_pass_discard(pctx, cbuf0, zs, colour mask, zs mask), MTLStoreActionDontCare: the
+  open batch of that pass drops those attachments' resolve bits, so they are not written back
+  (as panfrost_invalidate_resource does for the current batch, without beginning one). A later
+  draw into the same batch sets the bits again.
+
+And, in a process drawing through Metal, the tiles of every batch submitted counted for the
+profile (RWP_PASSES .. RWP_CLEARS): passes and screen-sized passes, colour and depth/stencil
+preloads and write-backs with their size over the drawn area, colour clears in the tiles. Every
+screen-sized preload or write-back is ~11 MB of memory traffic for the Mali; the kernel's "GPU
+wait a frame" was ~7.6 ms a frame in boot 0989-all-a.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -837,6 +837,46 @@
+    struct pan_image_view rts[8], zs, s;
+ 
+    panfrost_batch_to_fb_info(batch, &fb, rts, &zs, &s, false);
++
++   if (redwood_pan_metal) {
++      /* A34 (patch 0018): what the tiles cost in memory traffic, for the Metal driver's profile */
++      uint64_t area = fb.draw_extent.maxx >= fb.draw_extent.minx && fb.draw_extent.maxy >= fb.draw_extent.miny
++                         ? (uint64_t)(fb.draw_extent.maxx - fb.draw_extent.minx + 1) *
++                              (fb.draw_extent.maxy - fb.draw_extent.miny + 1)
++                         : (uint64_t)fb.width * fb.height;
++
++      redwood_pan_prof[RWP_PASSES]++;
++      if ((uint64_t)fb.width * fb.height >= 2000000)
++         redwood_pan_prof[RWP_FULL_PASSES]++;
++      for (unsigned i = 0; i < fb.rt_count; i++) {
++         if (!fb.rts[i].view)
++            continue;
++         uint64_t kb = area * util_format_get_blocksize(fb.rts[i].view->format) *
++                       MAX2(fb.rts[i].view->nr_samples, 1) / 1024;
++         if (fb.rts[i].preload) {
++            redwood_pan_prof[RWP_PRELOADS]++;
++            redwood_pan_prof[RWP_PRELOAD_KB] += kb;
++         }
++         if (!fb.rts[i].discard) {
++            redwood_pan_prof[RWP_WRITEBACKS]++;
++            redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
++         }
++         if (fb.rts[i].clear)
++            redwood_pan_prof[RWP_CLEARS]++;
++      }
++      if (fb.zs.view.zs) {
++         uint64_t kb = area * util_format_get_blocksize(fb.zs.view.zs->format) *
++                       MAX2(fb.zs.view.zs->nr_samples, 1) / 1024;
++         if (fb.zs.preload.z || fb.zs.preload.s) {
++            redwood_pan_prof[RWP_ZS_PRELOADS]++;
++            redwood_pan_prof[RWP_PRELOAD_KB] += kb;
++         }
++         if (!fb.zs.discard.z || !fb.zs.discard.s) {
++            redwood_pan_prof[RWP_ZS_WRITEBACKS]++;
++            redwood_pan_prof[RWP_WRITEBACK_KB] += kb;
++         }
++      }
++   }
+    panfrost_emit_tile_map(batch, &fb);
+ 
+    ret = screen->vtbl.submit_batch(batch, &fb);
+@@ -1019,6 +1059,52 @@
+    return sent;
+ }
+ 
++/*
++ * A34 (patch 0018): Metal's load and store actions. MTLLoadActionDontCare: what an attachment
++ * held is not needed, so its level is no longer "valid" and the pass's batch does not preload it
++ * from memory (panfrost_batch_to_fb_info preloads a drawn target only while it is valid; the
++ * level is valid again once this batch is submitted). Only a 2D resource of one layer: validity
++ * is kept per level for all layers. MTLStoreActionDontCare: the open batch drawing that pass does
++ * not write the attachment back (its resolve bit dropped, as panfrost_invalidate_resource does for
++ * the current batch -- without beginning a batch when there is none). A draw after it into the
++ * same batch sets the bit again.
++ */
++void
++redwood_pan_forget(struct pipe_resource *res, unsigned level)
++{
++   struct panfrost_resource *rsrc = pan_resource(res);
++
++   if (!res || res->array_size > 1 || res->depth0 > 1 || res->target == PIPE_TEXTURE_3D ||
++       res->target == PIPE_BUFFER || level >= PIPE_MAX_TEXTURE_LEVELS)
++      return;
++   BITSET_CLEAR(rsrc->valid.data, level);
++   if (rsrc->separate_stencil)
++      BITSET_CLEAR(rsrc->separate_stencil->valid.data, level);
++}
++
++int
++redwood_pan_pass_discard(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
++                         const struct pipe_surface *zs, unsigned color_mask, unsigned zs_mask)
++{
++   struct panfrost_context *ctx = pan_context(pctx);
++   unsigned resolve = zs_mask & PIPE_CLEAR_DEPTHSTENCIL;
++   int found = 0;
++
++   for (unsigned i = 0; i < 8; i++) {
++      if (color_mask & (1u << i))
++         resolve |= PIPE_CLEAR_COLOR0 << i;
++   }
++   for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
++      struct panfrost_batch *batch = &ctx->batches.slots[i];
++
++      if (redwood_pan_batch_is_pass(batch, cbuf0, zs)) {
++         batch->resolve &= ~resolve;
++         found++;
++      }
++   }
++   return found;
++}
++
+ void
+ panfrost_flush_writer(struct panfrost_context *ctx,
+                       struct panfrost_resource *rsrc, const char *reason)

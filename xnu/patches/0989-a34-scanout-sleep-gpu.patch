@@ -1,0 +1,502 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index a5d99a7..35ee667 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -95,9 +95,12 @@ struct a34_mali_job {
+ 	uint64_t fault_va;              /* out: AS0_FAULTADDRESS, meaningful when mmu_raw != 0 */
+ 	uint32_t mmu_raw;               /* out: MMU_INT_RAWSTAT bits of AS0 (a fault) */
+ 	uint32_t job_raw;               /* out: JOB_INT_RAWSTAT bits of the slot (0: no answer) */
++	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
++	uint32_t pad;
+ };
+ bool a34_mali_ready(void);
+ bool a34_mali_param(uint32_t param, uint64_t *value);
++uint32_t a34_mali_flush_id(void);
+ uint64_t a34_mali_va_alloc(uint64_t size, bool exec);
+ void a34_mali_va_free(uint64_t va, uint64_t size);
+ bool a34_mali_map(uint64_t va, uint64_t pa, uint64_t size);
+@@ -211,6 +214,9 @@ void a34_clocks_gpu_restore(void);
+ #define JS_COMMAND_HARD_STOP    3u
+ /* address space 0, caches cleaned and invalidated at both ends, priority 8 */
+ #define JS_CONFIG_AS0           ((3u << 8) | (3u << 12) | (8u << 16))
++#define JS_CONFIG_FLUSH_REDUCTION (1u << 14)    /* A34 (0989): panfrost's JS_CONFIG_ENABLE_FLUSH_REDUCTION */
++#define JS_FLUSH_ID_NEXT        0x70u
++#define GPU_LATEST_FLUSH        0x038u
+ 
+ #define MMU_INT_RAWSTAT         0x2000u
+ #define MMU_INT_CLEAR           0x2004u
+@@ -888,6 +894,7 @@ extern uint32_t a34_mali_napped;
+ uint32_t a34_mali_napped;                               /* jobs that outlasted the spin (A34Mali.cpp's log) */
+ uint32_t a34_mali_spin_us(void);
+ static bool am_spin_given;                              /* A34 (0985): a34malispin was in the boot-args */
++static uint32_t am_flush_red = 1;                       /* A34 (0989): boot-arg a34maliflushred=0: every job flushes at its start */
+ static bool am_nap_only;                                /* A34 (0985): no spin, asleep AM_NAP_US at a time from the start */
+ bool a34_mali_spin_unbound(bool bind_failed);
+ static uint64_t am_as0_tab;                     /* step 6's level-0 table */
+@@ -1167,6 +1174,17 @@ am_wait_job(uint32_t mask, uint32_t *mmu)
+ 	}
+ }
+ 
++/*
++ * A34 (0989): GPU_LATEST_FLUSH, for a job being SUBMITted (A34Mali.cpp); any
++ * thread, no lock (a read of a register of a GPU that stays powered while
++ * the user client runs). 0 before the user client started.
++ */
++uint32_t
++a34_mali_flush_id(void)
++{
++	return am_uc_ready && !am_dead && am_flush_red != 0 ? am_rd(am_gpu, GPU_LATEST_FLUSH) : 0;
++}
++
+ /* A34 (0928): for A34Mali.cpp's log (0985: 0 while jobs are waited for asleep only) */
+ uint32_t
+ a34_mali_spin_us(void)
+@@ -1572,7 +1590,20 @@ a34_mali_submit(struct a34_mali_job *job)
+ 	am_wr(am_gpu, base + JS_HEAD_NEXT_HI, (uint32_t)(job->jc >> 32));
+ 	am_wr(am_gpu, base + JS_AFFINITY_NEXT_LO, am_shaders);
+ 	am_wr(am_gpu, base + JS_AFFINITY_NEXT_HI, 0);
+-	am_wr(am_gpu, base + JS_CONFIG_NEXT, JS_CONFIG_AS0);
++	if (am_flush_red != 0) {
++		/*
++		 * A34 (0989): flush reduction, as panfrost (panfrost_job_hw_submit()):
++		 * the GPU skips the job's start flush (L2 and the cores' caches
++		 * cleaned and invalidated) when one has completed since the job was
++		 * SUBMITted (job->flush_id, GPU_LATEST_FLUSH read then). Here every
++		 * job ends with one, one job runs at a time: what the program wrote
++		 * before its SUBMIT, no GPU cache holds older.
++		 */
++		am_wr(am_gpu, base + JS_FLUSH_ID_NEXT, job->flush_id);
++		am_wr(am_gpu, base + JS_CONFIG_NEXT, JS_CONFIG_AS0 | JS_CONFIG_FLUSH_REDUCTION);
++	} else {
++		am_wr(am_gpu, base + JS_CONFIG_NEXT, JS_CONFIG_AS0);
++	}
+ 	start = mach_absolute_time();
+ 	am_wr(am_gpu, base + JS_COMMAND_NEXT, JS_COMMAND_START);
+ 	raw = am_wait_job(want, &mmu);
+@@ -1707,6 +1738,7 @@ a34_mali_init(void)
+ 		am_pause_s = 60;
+ 	}
+ 	am_spin_given = PE_parse_boot_argn("a34malispin", &am_spin_us, (int)sizeof(am_spin_us));  /* A34 (0928, 0985) */
++	(void)PE_parse_boot_argn("a34maliflushred", &am_flush_red, (int)sizeof(am_flush_red));     /* A34 (0989) */
+ 	if (am_spin_us > AM_SPIN_MAX_US) {
+ 		am_spin_us = AM_SPIN_MAX_US;
+ 	}
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 2c0a800..dfd5ef5 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -170,6 +170,8 @@ struct a34_mali_job {
+ 	uint64_t fault_va;              /* out: AS0_FAULTADDRESS, meaningful when mmu_raw != 0 */
+ 	uint32_t mmu_raw;               /* out: MMU_INT_RAWSTAT bits of AS0 (a fault) */
+ 	uint32_t job_raw;               /* out: JOB_INT_RAWSTAT bits of the slot (0: no answer) */
++	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
++	uint32_t pad;
+ };
+ 
+ extern "C" {
+@@ -184,6 +186,7 @@ bool a34_mali_submit(struct a34_mali_job *job);
+ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ void a34_mali_cpu_clean(uintptr_t va, uint64_t size);     /* A34 (0915): dc cvac */
+ uint32_t a34_mali_spin_us(void);                         /* A34 (0928): a34malispin */
++uint32_t a34_mali_flush_id(void);                        /* A34 (0989): GPU_LATEST_FLUSH */
+ bool a34_mali_spin_unbound(bool bind_failed);            /* A34 (0985): no spin where the worker is not bound */
+ extern uint32_t a34_mali_napped;                         /* A34 (0928): jobs that outlasted the spin */
+ 
+@@ -648,9 +651,20 @@ a34_qjob_free(struct a34_qjob *j)
+  */
+ bool
+ a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
++{
++	return a34_mali_surface_idle_stats(surface, ms, NULL);
++}
++
++/*
++ * A34 (0989): the same, and into st (not NULL): [0] mach time waited for the
++ * driver's mark (0x7c), [1] for the queued jobs, [2] how many jobs (anyone's)
++ * were ahead of the last one that names it -- AppleCLCD's PATH line.
++ */
++bool
++a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st)
+ {
+ 	static uint32_t said, staleSaid;
+-	uint64_t busy, mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE);
++	uint64_t busy, mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE), began = mach_absolute_time();
+ 	bool idle = true;
+ 
+ 	/* A34 (0935): a frame still on a driver's thread (request 0x7c): until it is sent, at most `ms` */
+@@ -661,7 +675,7 @@ a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
+ 		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &deadline);
+ 		deadline += now;
+ 		while (mark != 0 && now - mark < stale && now < deadline) {
+-			IOSleep(1);
++			IODelay(100);   /* A34 (0989): was IOSleep(1): up to a millisecond after the mark went */
+ 			mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE);
+ 			now = mach_absolute_time();
+ 		}
+@@ -679,15 +693,26 @@ a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
+ 		}
+ 	}
+ 	busy = surface->gpuBusySeq;
++	if (st != NULL) {
++		uint64_t now = mach_absolute_time();
+ 
++		st[0] += now - began;
++		began = now;
++	}
+ 	if (gA34MaliQLock == NULL || busy == 0) {
+ 		return true;
+ 	}
+ 	IOLockLock(gA34MaliQLock);
+ 	if (a34_q_done() < busy) {
++		if (st != NULL) {
++			st[2] += busy - a34_q_done();
++		}
+ 		idle = a34_q_wait(busy, (uint64_t)ms * NSEC_PER_MSEC, THREAD_UNINT) == THREAD_AWAKENED;
+ 	}
+ 	IOLockUnlock(gA34MaliQLock);
++	if (st != NULL) {
++		st[1] += mach_absolute_time() - began;
++	}
+ 	if (!idle && said < 8) {
+ 		said++;
+ 		IOLog("A34 MALI UC: surface %u: the jobs that name it were not done in %u ms; the CPU goes on\n", surface->id, ms);
+@@ -1669,6 +1694,7 @@ RedwoodMaliUserClient::queuePrepare(const struct a34_submit *req, IOReturn *ret)
+ 	j->client = this;
+ 	j->job.jc = req->jc;
+ 	j->job.requirements = req->requirements;
++	j->job.flush_id = a34_mali_flush_id();  /* A34 (0989): flush reduction (a34_mali_submit()) */
+ 	retain();                       /* the job's hold on the client, until it is done or dropped */
+ 	return j;
+ }
+@@ -2561,8 +2587,8 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	md = s->memory;
+ 	if (gA34MaliSurfaces == 0) {
+ 		why = 0;
+-	} else if (md == NULL || (OSDynamicCast(IOBufferMemoryDescriptor, md) == NULL && !s->wrapped)) {
+-		why = 1;
++	} else if (md == NULL || (OSDynamicCast(IOBufferMemoryDescriptor, md) == NULL && !s->wrapped && s->scanPA == 0)) {
++		why = 1;                /* (A34 (0989): a scan-out pool surface is physical memory of its own, below 4 GB) */
+ 	} else if (s->wrapped && (s->wrapDelta != 0 || (md->getDirection() & kIODirectionIn) == 0)) {
+ 		why = 2;
+ 	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+@@ -2902,6 +2928,7 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 		bzero(&job, sizeof(job));
+ 		job.jc = r->submit.jc;
+ 		job.requirements = r->submit.requirements;
++		job.flush_id = a34_mali_flush_id();     /* A34 (0989) */
+ 		t0 = mach_absolute_time();
+ 		listed = markListed(r->submit.bo_handles, r->submit.bo_handle_count);
+ 		ret = runChain(&job, !listed, t0, NULL);        /* (0919: what SUBMIT did here, shared with queued jobs) */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 592f191..818e8e1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -374,8 +374,11 @@ static uint64_t sweet_fb_flip_last[12];
+  * the transfer before over) -> start, [12] time polled in teWait() and
+  * xferWait(), [13] where in the TE period swaps came, [14] swaps.
+  */
+-static uint64_t sweet_fb_path_stats[16];
++static uint64_t sweet_fb_path_stats[16];       /* A34 (0989): [15] a34fbsleep sleeps that woke after their TE */
+ static uint64_t sweet_fb_path_last[16];
++/* A34 (0989): the copy's (or scan-out's) wait for the GPU: driver's mark, queued jobs (mach time), jobs ahead */
++static uint64_t sweet_fb_gpu_wait[3];
++static uint64_t sweet_fb_gpu_wait_last[3];
+ /*
+  * A34 (0983), the 10 s SCAN line: [0] frames scanned out, [1] copied with
+  * a34fbscanout on, of those [2] not a pool surface, [3] not one layer
+@@ -453,6 +456,7 @@ extern "C" void a34_dsi_unlock(void);
+ extern "C" void a34_dsi_recover(void);
+ extern "C" uint32_t a34_mutex_rd(uint32_t off);
+ extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pexpert/arm/pe_serial.c */
++extern "C" void a34_sleep_until(uint64_t deadline);             /* A34 (0989): osfmk/kern/sched_prim.c */
+ 
+ /*
+  * A34 (0937): 120 Hz (research/120hz/plan.md; MediaTek's mtk_dsi.c of Samsung's
+@@ -1185,6 +1189,18 @@ sweet_fb_flip_log(void)
+ 	IOLog("A34 FB PATH: 10 s: queued at TE+%llu us (by quarter %llu/%llu/%llu/%llu), to start %llu us; %llu ms polled\n",
+ 	    (unsigned long long)(u[5] / fr), (unsigned long long)p[6], (unsigned long long)p[7], (unsigned long long)p[8],
+ 	    (unsigned long long)p[9], (unsigned long long)(u[11] / st), (unsigned long long)(u[12] / 1000));
++	/* A34 (0989): where the GPU wait goes; a34fbsleep wakes after their TE */
++	uint64_t g[3];
++
++	for (unsigned i = 0; i < 3; i++) {
++		g[i] = sweet_fb_gpu_wait[i] - sweet_fb_gpu_wait_last[i];
++		sweet_fb_gpu_wait_last[i] = sweet_fb_gpu_wait[i];
++	}
++	absolutetime_to_nanoseconds(g[0], &g[0]);
++	absolutetime_to_nanoseconds(g[1], &g[1]);
++	IOLog("A34 FB PATH: 10 s: GPU wait a frame: %llu us for the driver's mark (0x7c), %llu us for its jobs, %llu jobs ahead; "
++	    "%llu kick sleeps woke late\n", (unsigned long long)(g[0] / 1000 / fr), (unsigned long long)(g[1] / 1000 / fr),
++	    (unsigned long long)(g[2] / fr), (unsigned long long)p[15]);
+ 
+ 	/* A34 (0983): a34fbscanout */
+ 	uint64_t c[8];
+@@ -1941,7 +1957,11 @@ AppleCLCD::teWait(uint64_t *waited)
+ 		if (next - t0 > wake + wake) {
+ 			absolutetime_to_nanoseconds(next - t0 - wake, &ns);
+ 			if (fSleepWaits) {
+-				IODelay((unsigned)(ns / NSEC_PER_USEC));
++				/* A34 (0989): not IODelay(): a coalesced timer woke after the TE (a34_sleep_until()) */
++				a34_sleep_until(next - wake);
++				if (mach_absolute_time() > next) {
++					sweet_fb_path_stats[15]++;      /* woke after the TE it slept for */
++				}
+ 			} else {
+ 				IOSleep((unsigned)(ns / NSEC_PER_MSEC));
+ 			}
+@@ -1987,11 +2007,10 @@ AppleCLCD::xferWait(uint64_t started, uint64_t *xfer)
+ 	}
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_SPIN_US * NSEC_PER_USEC, &spin);
+ 	if (fSleepWaits && fXferLast > spin + spin) {
+-		uint64_t now = mach_absolute_time(), ns;
++		uint64_t now = mach_absolute_time();
+ 
+ 		if (now - started < fXferLast - spin) {
+-			absolutetime_to_nanoseconds(fXferLast - spin - (now - started), &ns);
+-			IODelay((unsigned)(ns / NSEC_PER_USEC));
++			a34_sleep_until(started + fXferLast - spin);    /* A34 (0989): see teWait() */
+ 		}
+ 	} else {
+ 		IODelay(50);
+@@ -2377,7 +2396,7 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 	/* the GPU's jobs that draw it done first, as before a copy (no cache to clean: see above) */
+ 	t0 = mach_absolute_time();
+ 	if (s->gpuShared > 0) {
+-		(void)a34_mali_surface_idle(s, 500);
++		(void)a34_mali_surface_idle_stats(s, 500, sweet_fb_gpu_wait);  /* A34 (0989) */
+ 	}
+ 	now = mach_absolute_time();
+ 	sweet_fb_path_stats[2] += now - t0;
+@@ -2724,7 +2743,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				 * frame that the program did not wait for is shown
+ 				 * half drawn.
+ 				 */
+-				(void)a34_mali_surface_idle(s, 500);
++				(void)a34_mali_surface_idle_stats(s, 500, sweet_fb_gpu_wait);   /* A34 (0989) */
+ 				uint64_t gpuDone = mach_absolute_time();
+ 				/* from the first row copied to the last pixel copied: inside the memory (`last` above) */
+ 				a34_mali_cpu_flush(src + s->offset + (uint64_t)sy * s->bytesPerRow,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 8812354..7c90ef4 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -549,19 +549,27 @@ sweet_surface_row_fix_for(const char *name)
+ }
+ 
+ /*
+- * A34 (0983): the scan-out pool (SweetSurface.h). Each buffer an
+- * IOBufferMemoryDescriptor, physically contiguous below 4 GB (MT6877's OVL
+- * takes 32-bit addresses and reads physical memory: its larbs bypass the
+- * M4U), with the write-combine cache mode: IOKit gives every mapping of its
+- * pages that mode, the kernel's and the physical aperture's too (as 0918's
+- * GPU buffers), so no processor's cache ever holds a line of it: neither the
+- * GPU's jobs (A34Mali.cpp upkeep()) nor the display need cache upkeep for
+- * it, whoever maps it. Made at AppleCLCD's start, before memory is cut up.
+- * A buffer is free when only the pool holds it (its retain count as made):
+- * a surface, each mapping of it and the GPU's buffer of it hold it.
++ * A34 (0983, 0989): the scan-out pool (SweetSurface.h). MT6877's OVL takes
++ * 32-bit addresses and reads physical memory (its larbs bypass the M4U), so
++ * a buffer must be physically contiguous below 4 GB -- where XNU on this
++ * phone has no memory at all (it manages RAM from 0x1_40000000,
++ * tools/mkadt_a34.py): 0983 asked the VM for it and got none (boot 0988:
++ * vm_page_find_contiguous found 0 pages). So, as Wi-Fi's DMA memory
++ * (a34_wifi.c, 0x58000000) and CONNSYS's (a34_connsys.c, 0x60000000): RAM
++ * below 4 GB that the boot loader leaves free, by default from
++ * SWEET_SCAN_PA (boot-arg a34fbscanpa), a run no reservation of the phone's
++ * device tree (mblock-*, recon/android-DYG1/live.dts) or of ours touches
++ * (checked: sweet_scan_taken_ranges). Each buffer a physical descriptor
++ * mapped write-combined in the kernel and in every program (as the panel's
++ * own surface): outside the VM, no cacheable alias of it exists, so neither
++ * the GPU's jobs (A34Mali.cpp upkeep()) nor the display need cache upkeep
++ * for it. A buffer is free when only the pool holds it (its retain count as
++ * made): a surface, each mapping of it, hold it.
+  */
+ #define SWEET_SCAN_MAX          6u
+-static IOBufferMemoryDescriptor *sweet_scan_buf[SWEET_SCAN_MAX];
++#define SWEET_SCAN_PA           0x80800000ull
++static IOMemoryDescriptor *sweet_scan_md[SWEET_SCAN_MAX];
++static IOMemoryMap  *sweet_scan_map[SWEET_SCAN_MAX];
+ static uint64_t      sweet_scan_pa[SWEET_SCAN_MAX];
+ static int           sweet_scan_base[SWEET_SCAN_MAX];        /* retain count as made */
+ static uint32_t      sweet_scan_n, sweet_scan_w, sweet_scan_h, sweet_scan_size;
+@@ -570,10 +578,32 @@ static char          sweet_scan_names[SWEET_SURFACE_ROW_FIX_NAMES] = "backboardd
+ static uint32_t      sweet_scan_taken, sweet_scan_full;
+ SInt32               sweet_surface_scan_total;
+ 
++/* RAM below 4 GB that is not free: the phone's reserved-memory regs (live.dts) and ours (start, end) */
++static const uint64_t sweet_scan_taken_ranges[][2] = {
++	{ 0x40000000ull, 0x4a000000ull },       /* LK, DTB, ATF, its own mblocks (0x47c80000-0x49100000) */
++	{ 0x51100000ull, 0x55100000ull },       /* the TWRP ramdisk LK loads (a34_wifi.c) */
++	{ 0x58000000ull, 0x58f20000ull },       /* Wi-Fi's DMA memory (wifi-reserve-memory) */
++	{ 0x60000000ull, 0x60780000ull },       /* CONNSYS's memory (a34btemi default) */
++	{ 0x72000000ull, 0x80000000ull },       /* 0x72000000, the panel's pictures, the TEE, .. 0x7ffff000 */
++	{ 0x8a000000ull, 0x100000000ull },      /* modem, SCP, TEE, ... (0x8a000000 up) */
++};
++
++static bool
++sweet_scan_free_run(uint64_t pa, uint64_t size)
++{
++	for (uint32_t i = 0; i < sizeof(sweet_scan_taken_ranges) / sizeof(sweet_scan_taken_ranges[0]); i++) {
++		if (pa < sweet_scan_taken_ranges[i][1] && pa + size > sweet_scan_taken_ranges[i][0]) {
++			return false;
++		}
++	}
++	return pa >= 0x40000000ull && pa + size <= 0x100000000ull;
++}
++
+ uint32_t
+ sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count)
+ {
+ 	uint32_t row = (width * 4u + 1023u) & ~1023u;   /* (room for any row alignment up to 1 KB) */
++	uint64_t base = SWEET_SCAN_PA;
+ 
+ 	if (sweet_scan_n != 0 || width == 0 || height == 0 || width > 4096 || height > 4096) {
+ 		return sweet_scan_n;
+@@ -583,26 +613,33 @@ sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count)
+ 		return 0;
+ 	}
+ 	(void)PE_parse_boot_arg_str("a34fbscannames", sweet_scan_names, (int)sizeof(sweet_scan_names));
++	(void)PE_parse_boot_argn("a34fbscanpa", &base, sizeof(base));
+ 	sweet_scan_size = (uint32_t)round_page((uint64_t)row * height);
+-	for (uint32_t i = 0; i < count && i < SWEET_SCAN_MAX; i++) {
+-		IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache | kIOMemoryPhysicallyContiguous |
+-		    kIOMemoryMapperNone, sweet_scan_size, 0x00000000ffffc000ULL);
+-		IOByteCount len = 0;
+-		addr64_t pa = b != NULL ? b->getPhysicalSegment(0, &len, kIOMemoryMapperNone) : 0;
+-
+-		if (b == NULL || pa == 0 || len < sweet_scan_size || pa + sweet_scan_size > (1ull << 32) ||
+-		    b->getBytesNoCopy() == NULL) {
+-			IOLog("SWEET SURF: scan-out buffer %u of %u KB: %s (pa 0x%llx, %llu bytes contiguous)\n", i,
+-			    sweet_scan_size >> 10, b == NULL ? "no contiguous memory below 4 GB" : "not usable",
+-			    (unsigned long long)pa, (unsigned long long)len);
+-			OSSafeReleaseNULL(b);
++	if (count > SWEET_SCAN_MAX) {
++		count = SWEET_SCAN_MAX;
++	}
++	if ((base & 0xfffffull) != 0 || !sweet_scan_free_run(base, (uint64_t)sweet_scan_size * count)) {
++		IOLog("SWEET SURF: scan-out pool: %u x %u KB from 0x%llx is not free RAM below 4 GB (a34fbscanpa): none\n", count,
++		    sweet_scan_size >> 10, (unsigned long long)base);
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint64_t pa = base + (uint64_t)i * sweet_scan_size;
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, sweet_scan_size,
++		    kIODirectionInOut);
++		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++
++		if (map == NULL || map->getVirtualAddress() == 0) {
++			IOLog("SWEET SURF: scan-out buffer %u at 0x%llx could not be mapped\n", i, (unsigned long long)pa);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(md);
+ 			break;
+ 		}
+-		bzero(b->getBytesNoCopy(), sweet_scan_size);
+-		sweet_scan_buf[i] = b;
++		bzero((void *)map->getVirtualAddress(), sweet_scan_size);
++		sweet_scan_md[i] = md;
++		sweet_scan_map[i] = map;
+ 		sweet_scan_pa[i] = pa;
+-		sweet_scan_base[i] = b->getRetainCount();
++		sweet_scan_base[i] = md->getRetainCount();
+ 		sweet_scan_n = i + 1;
+ 	}
+ 	sweet_scan_w = width;
+@@ -616,12 +653,13 @@ sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count)
+ /*
+  * A34 (0983): a new surface of the kernel's own memory gets a pool buffer if
+  * it is display-sized, one plane of 4-byte pixels (BGRA), made by a program
+- * of a34fbscannames, and a buffer is free. True: s->memory is it.
++ * of a34fbscannames, and a buffer is free. True: s->memory is it (0989: and
++ * s->kernelMap the pool's write-combined mapping of it).
+  */
+ static bool
+ sweet_surface_scan_take(SweetSurface *s, const char *name)
+ {
+-	IOBufferMemoryDescriptor *b = NULL;
++	IOMemoryDescriptor *md = NULL;
+ 	uint32_t i;
+ 
+ 	if (sweet_scan_n == 0 || s->width != sweet_scan_w || s->height != sweet_scan_h || s->pixelFormat != 0x42475241u ||
+@@ -631,23 +669,24 @@ sweet_surface_scan_take(SweetSurface *s, const char *name)
+ 	}
+ 	IOLockLock(sweet_scan_lock);
+ 	for (i = 0; i < sweet_scan_n; i++) {
+-		if (sweet_scan_buf[i]->getRetainCount() == sweet_scan_base[i]) {
+-			b = sweet_scan_buf[i];
+-			b->retain();            /* the surface's */
++		if (sweet_scan_md[i]->getRetainCount() == sweet_scan_base[i]) {
++			md = sweet_scan_md[i];
++			md->retain();           /* the surface's */
++			sweet_scan_map[i]->retain();
+ 			break;
+ 		}
+ 	}
+ 	IOLockUnlock(sweet_scan_lock);
+-	if (b == NULL) {
++	if (md == NULL) {
+ 		if (sweet_scan_full++ < 8) {
+ 			IOLog("SWEET SURF: %s: a %ux%u surface not from the scan-out pool: all %u buffers in use\n", name, s->width,
+ 			    s->height, sweet_scan_n);
+ 		}
+ 		return false;
+ 	}
+-	bzero(b->getBytesNoCopy(), s->allocSize);
+-	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);  /* (free() takes it off: an IOBMD) */
+-	s->memory = b;
++	bzero((void *)sweet_scan_map[i]->getVirtualAddress(), s->allocSize);
++	s->memory = md;
++	s->kernelMap = sweet_scan_map[i];       /* (kernelAddress(): no second mapping; free() lets go of it) */
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	s->scanPA = sweet_scan_pa[i];
+ 	if (sweet_scan_taken++ < 16) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 6c2a5fd..1591b05 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -127,6 +127,7 @@ void sweet_surface_report(void);
+  * AppleCLCD's copy to the panel). False: they were not done in time.
+  */
+ bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
++bool a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st);    /* A34 (0989): A34Mali.cpp */
+ 
+ /*
+  * A34 (0927): the display-hold detector, read by AppleCLCD's 10 s line: [0]
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 79c0bbd..5d28c51 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -356,6 +356,7 @@ void a34_big_init(void);
+ void a34_big_report(void);
+ static processor_t a34_big_choose(thread_t thread, processor_t processor);
+ bool a34_thread_bind_cpu(int cpu);      /* A34 (0928): iokit/Kernel/arm/A34Mali.cpp */
++void a34_sleep_until(uint64_t deadline); /* A34 (0989): iokit/Kernel/arm/SweetFramebuffer.cpp */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ uint64_t        sched_one_second_interval;
+@@ -9261,4 +9262,25 @@ a34_thread_bind_cpu(int cpu)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	return current_processor() == processor;
+ }
++
++/*
++ * A34 (0989): asleep until `deadline` (mach time) with no timer coalescing.
++ * delay() and IOSleep() sleep with the system's normal urgency, and a kernel
++ * thread's timer may then be put off by up to 1/8 of the interval (1 ms at
++ * most, timer_call_slop()): 0982's a34fbsleep slept to 300 us before the TE
++ * and woke after it for most frames (boot 0988: 89 of 120 TEs missed with a
++ * frame ready). A critical-urgency timer gets no slop.
++ */
++static int a34_sleep_event;
++
++void
++a34_sleep_until(uint64_t deadline)
++{
++	if (deadline <= mach_absolute_time()) {
++		return;
++	}
++	(void)assert_wait_deadline_with_leeway((event_t)&a34_sleep_event, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
++	    deadline, 0);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

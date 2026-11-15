@@ -46,6 +46,9 @@ rwm_run_blit(const struct rwm_blit *blit, char *why, size_t why_size)
 						   blit->from_texture, blit->from_level, blit->from_slice,
 						   blit->from_origin, blit->size, why, why_size) == 0 ? 0 : -1;
 
+		if (done == 0) {
+			rwm_scene_copy(blit->from_texture, blit->from_level, blit->to_texture, blit->to_level, blit->size);
+		}
 		/* (metal-fx) rwm_blurdump: the copies too -- a backdrop may be captured by one -- with the texel at the
 		 * centre of what was copied, in the source and in the destination */
 		if (done == 0 && rwm_blurdump_on() && air->texture_probe != nullptr) {

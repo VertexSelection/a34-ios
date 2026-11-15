@@ -279,9 +279,14 @@ static int adt_patch(u8 *adt, u64 *off, u64 end, int depth)
     }
     if (is_fbcon && reg && stride) {
         u64 size = ((u64)fb_stride * FB_H + PAGE_16K - 1) & ~(PAGE_16K - 1);
-        ((u64 *)reg)[0] = fb_base;
-        ((u64 *)reg)[1] = size;
-        *(u32 *)stride = fb_stride;
+        // ADT values are only 4-byte aligned; with the MMU off an 8-byte store
+        // to a 4-aligned address faults, so write 32 bits at a time.
+        volatile u32 *r = (volatile u32 *)reg;
+        r[0] = (u32)fb_base;
+        r[1] = (u32)(fb_base >> 32);
+        r[2] = (u32)size;
+        r[3] = (u32)(size >> 32);
+        *(volatile u32 *)stride = fb_stride;
         done = 1;
     }
     for (u32 i = 0; i < nchildren; i++)

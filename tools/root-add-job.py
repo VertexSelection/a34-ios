@@ -30,6 +30,12 @@
   root-add-job.py --show ROOT LABEL
       Prints the job.
 
+  root-add-job.py --unlimit ROOT LABEL
+      Removes _LimitLoadToDeviceTree from the job, so that launchd starts it on
+      a device tree without the node it names: wifid (com.apple.wifid) asks for
+      "wlan"/"marconi-wifi", which ours does not have; the Wi-Fi it finds is in
+      the registry instead (iokit/Kernel/arm/A34WLAN.cpp, xnu/patches/0969).
+
 For CoreAnimation on the GPU (userland/a34gl/README.md):
   root-add-job.py --copy  /mnt /a34 a34gl/a34
   root-add-job.py --wrap  /mnt com.apple.backboardd /a34/a34gl-bbd
@@ -133,6 +139,10 @@ def unwrap(job):
     return True
 
 
+def unlimit(job):
+    return job.pop('_LimitLoadToDeviceTree', None) is not None
+
+
 def show(key, job):
     print(key)
     for name, value in sorted(job.items()):
@@ -202,6 +212,8 @@ def main():
         change_job(argv[1], argv[2], lambda job: wrap(job, argv[3]))
     elif mode == '--unwrap' and len(argv) == 3:
         change_job(argv[1], argv[2], unwrap)
+    elif mode == '--unlimit' and len(argv) == 3:
+        change_job(argv[1], argv[2], unlimit)
     elif mode == '--show' and len(argv) == 3:
         _path, plist = load_launchd(argv[1])
         show(*find_job(plist, argv[2]))

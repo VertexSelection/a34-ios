@@ -1,0 +1,191 @@
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffb..d17f74c 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2163,12 +2163,17 @@ STATIC int
+ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+-	int error;
+-	char buf[BOOT_LINE_LENGTH];
+-
+-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+-	return error;
++	/*
++	 * A34 (0990): the whole line PE_boot_args() gives (CommandLine and
++	 * /chosen/a34-bootargs, pexpert/arm/pe_bootargs.c), no longer cut at
++	 * BOOT_LINE_LENGTH. A buffer too small for it gets ENOMEM, as before
++	 * (trunc 0), and that matters: launchd_cache_loader (and libxpc's
++	 * reader) try a 128-byte buffer first and ask for the size only on
++	 * ENOMEM; a truncated "success" hid launchd_unsecure_cache=1 from it
++	 * ("Unable to find AMFI handshake", panic). Not writable (valueSize 0:
++	 * EPERM).
++	 */
++	return sysctl_io_string(req, PE_boot_args(), 0, 0, NULL);
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, bootargs,
+diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
+index c6b87b0..1ee3dc4 100644
+--- a/pexpert/arm/pe_bootargs.c
++++ b/pexpert/arm/pe_bootargs.c
+@@ -3,10 +3,127 @@
+  */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/boot.h>
++#include <pexpert/device_tree.h>
++#include <libkern/section_keywords.h>
++
++/*
++ * A34 (0990): boot-args longer than boot_args.CommandLine, which holds
++ * BOOT_LINE_LENGTH - 1 = 607 characters. What does not fit there is in the
++ * device tree, as the string property /chosen/a34-bootargs (tools/build-xnu.sh
++ * splits the line at an argument and tools/mkadt_a34.py --bootargs puts the
++ * rest there). PE_init_platform() joins the two as soon as the device tree
++ * can be read, before anything parses a boot-arg, and from then on
++ * PE_boot_args() is the whole line: PE_parse_boot_argn() and friends,
++ * kern.bootargs, the panic log, host_get_boot_info(). Without the property
++ * nothing changes. A property that repeats CommandLine at its start (the
++ * whole line) is taken as the whole line. An argument given twice: the last
++ * one counts, as always (the property's come after CommandLine's). At most
++ * A34_BOOT_ARGS_MAX - 1 characters in all (host_get_boot_info() copies
++ * KERNEL_BOOT_INFO_MAX = 4096); arguments past that are left out whole, and
++ * the log says so. Written once, at the same point as debug_enabled, and
++ * read-only after lockdown as that is.
++ */
++#define A34_BOOT_ARGS_MAX       4096
++
++SECURITY_READ_ONLY_LATE(static char) a34_boot_args[A34_BOOT_ARGS_MAX];
++SECURITY_READ_ONLY_LATE(static uint32_t) a34_boot_args_base;            /* characters from CommandLine */
++SECURITY_READ_ONLY_LATE(static uint32_t) a34_boot_args_more;            /* ... from /chosen/a34-bootargs */
++SECURITY_READ_ONLY_LATE(static uint32_t) a34_boot_args_dropped;         /* ... of it left out */
++
++void a34_boot_args_join(void);
++void a34_boot_args_report(void);
++
++static inline boolean_t
++a34_boot_args_sep(char c)
++{
++	return c == ' ' || c == '\t';
++}
+ 
+ char *
+ PE_boot_args(
+ 	void)
+ {
++	if (a34_boot_args[0] != '\0') {
++		return a34_boot_args;
++	}
+ 	return (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
+ }
++
++/* PE_init_platform(FALSE), right after SecureDTInit(). */
++void
++a34_boot_args_join(void)
++{
++	char const *line = ((boot_args *)PE_state.bootArgs)->CommandLine;
++	char const *more = NULL;
++	unsigned int size = 0;
++	size_t base, length, room, at;
++	DTEntry chosen;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "a34-bootargs", (void const **)&more, &size) != kSuccess ||
++	    more == NULL || size == 0) {
++		return;
++	}
++	base = strnlen(line, BOOT_LINE_LENGTH - 1);
++	length = strnlen(more, size);
++
++	/* the whole line: only what follows CommandLine in it */
++	if (base > 0 && length >= base && strncmp(more, line, base) == 0 &&
++	    (length == base || a34_boot_args_sep(more[base]))) {
++		more += base;
++		length -= base;
++	}
++	while (length > 0 && a34_boot_args_sep(*more)) {
++		more++;
++		length--;
++	}
++	while (length > 0 && a34_boot_args_sep(more[length - 1])) {
++		length--;
++	}
++	if (length == 0) {
++		return;
++	}
++
++	at = base > 0 ? base + 1 : 0;                   /* (a space between the two) */
++	room = A34_BOOT_ARGS_MAX - 1 - at;
++	if (length > room) {
++		/* whole arguments only: up to the last separator within the room */
++		size_t cut = room;
++
++		while (cut > 0 && !a34_boot_args_sep(more[cut])) {
++			cut--;
++		}
++		a34_boot_args_dropped = (uint32_t)(length - cut);
++		length = cut;
++		while (length > 0 && a34_boot_args_sep(more[length - 1])) {
++			length--;
++		}
++	}
++
++	memcpy(a34_boot_args, line, base);
++	if (length == 0) {
++		at = base;                      /* (nothing of it fits: the line as it was, and the log says why) */
++	} else if (at > 0) {
++		a34_boot_args[base] = ' ';
++	}
++	memcpy(a34_boot_args + at, more, length);
++	a34_boot_args[at + length] = '\0';
++	a34_boot_args_base = (uint32_t)base;
++	a34_boot_args_more = (uint32_t)length;
++}
++
++/* PE_init_iokit(), once printf() reaches the console. */
++void
++a34_boot_args_report(void)
++{
++	if (a34_boot_args[0] == '\0') {
++		return;
++	}
++	printf("A34 BOOTARGS: %u characters: %u in boot_args, %u from /chosen/a34-bootargs: %s\n",
++	    (unsigned)strlen(a34_boot_args), a34_boot_args_base, a34_boot_args_more,
++	    a34_boot_args + (a34_boot_args_base > 0 ? a34_boot_args_base + 1 : 0));
++	if (a34_boot_args_dropped != 0) {
++		printf("A34 BOOTARGS: %u characters of /chosen/a34-bootargs LEFT OUT (more than %d in all)\n",
++		    a34_boot_args_dropped, A34_BOOT_ARGS_MAX - 1);
++	}
++}
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..ce199e3 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -25,6 +25,9 @@
+ 
+ /* extern references */
+ extern void     pe_identify_machine(boot_args *bootArgs);
++/* A34 (0990): pe_bootargs.c, CommandLine joined with /chosen/a34-bootargs */
++extern void     a34_boot_args_join(void);
++extern void     a34_boot_args_report(void);
+ 
+ /* static references */
+ static void     pe_prepare_images(void);
+@@ -249,6 +252,7 @@ PE_init_iokit(void)
+ 	PE_init_printf(TRUE);
+ 
+ 	printf("iBoot version: %s\n", iBoot_version);
++	a34_boot_args_report();         /* A34 (0990) */
+ #if defined(TARGET_OS_OSX) && defined(__arm64__)
+ 	printf("iBoot Stage 2 version: %s\n", iBoot_Stage_2_version);
+ #endif /* defined(TARGET_OS_OSX) && defined(__arm64__) */
+@@ -423,6 +427,8 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		 * can be used..
+ 		 */
+ 		SecureDTInit(PE_state.deviceTreeHead, PE_state.deviceTreeSize);
++		/* A34 (0990): the whole boot-args line, before anything parses it */
++		a34_boot_args_join();
+ 		pe_identify_machine(boot_args_ptr);
+ 	} else {
+ 		pe_arm_init_interrupts(args);

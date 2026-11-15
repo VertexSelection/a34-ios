@@ -37,6 +37,57 @@ profile_call(const char *name)
 
 } // namespace
 
+extern "C" void *
+rwm_profile_call(const char *name)
+{
+	return profile_call(name);
+}
+
+/* A34: the slowest command buffer of the period, in parts ("rwm worst cb") */
+static struct rwm_cb_parts worst_cb;
+
+extern "C" void
+rwm_cb_parts_note(const struct rwm_cb_parts *parts)
+{
+	if (parts->took_ns > worst_cb.took_ns) {
+		worst_cb = *parts;
+	}
+}
+
+static void
+say_worst_cb(void)
+{
+	const struct rwm_cb_parts &w = worst_cb;
+	const uint64_t *l = w.lib;
+	static const char *const kinds[] = { "?", "draw", "dispatch", "copy" };
+	char line[900];
+
+	if (w.took_ns == 0) {
+		return;
+	}
+	snprintf(line, sizeof(line), "rwm worst cb %.1f ms: %u works; %llu draws %.1f ms, %llu copies %.1f ms, "
+		 "%llu dispatches %.1f ms, %llu copied in %.1f ms, submit %.1f ms; slowest work #%u (a %s) %.1f ms; "
+		 "library: %llu batches %.1f ms (%llu from inside a draw), %llu buffers made %.1f ms (%llu from the kernel "
+		 "%.1f ms), %llu variants %.1f ms, %llu pipelines %.1f ms, %llu textures made %.1f ms (any thread), "
+		 "%llu staging copies; kernel (whole process): CREATE_BO x%llu %.1f ms, maps x%llu %.1f ms, "
+		 "SURFACE x%llu %.1f ms, SUBMIT x%llu %.1f ms, WAIT_BO x%llu %.1f ms, GEM_CLOSE x%llu %.1f ms",
+		 w.took_ns / 1e6, w.works, (unsigned long long)w.draws, w.draw_ns / 1e6, (unsigned long long)w.blits,
+		 w.blit_ns / 1e6, (unsigned long long)w.dispatches, w.dispatch_ns / 1e6, (unsigned long long)w.copyins,
+		 w.copyin_ns / 1e6, w.submit_ns / 1e6, w.slowest_index, kinds[w.slowest_kind < 4 ? w.slowest_kind : 0],
+		 w.slowest_ns / 1e6, (unsigned long long)l[RWA_CB_BATCHES], l[RWA_CB_BATCH_NS] / 1e6,
+		 (unsigned long long)l[RWA_CB_DEP_FLUSHES], (unsigned long long)l[RWA_CB_BO_MADE],
+		 l[RWA_CB_BO_MADE_NS] / 1e6, (unsigned long long)l[RWA_CB_BO_FRESH], l[RWA_CB_BO_FRESH_NS] / 1e6,
+		 (unsigned long long)l[RWA_CB_VARIANTS], l[RWA_CB_VARIANT_NS] / 1e6, (unsigned long long)l[RWA_CB_PIPELINES],
+		 l[RWA_CB_PIPELINE_NS] / 1e6, (unsigned long long)l[RWA_CB_TEXTURES], l[RWA_CB_TEXTURE_NS] / 1e6,
+		 (unsigned long long)l[RWA_CB_STAGING], (unsigned long long)l[RWA_CB_K_CREATE], l[RWA_CB_K_CREATE_NS] / 1e6,
+		 (unsigned long long)l[RWA_CB_K_MAPS], l[RWA_CB_K_MAPS_NS] / 1e6, (unsigned long long)l[RWA_CB_K_SURFACE],
+		 l[RWA_CB_K_SURFACE_NS] / 1e6, (unsigned long long)l[RWA_CB_K_SUBMIT], l[RWA_CB_K_SUBMIT_NS] / 1e6,
+		 (unsigned long long)l[RWA_CB_K_WAIT_BO], l[RWA_CB_K_WAIT_BO_NS] / 1e6, (unsigned long long)l[RWA_CB_K_CLOSE],
+		 l[RWA_CB_K_CLOSE_NS] / 1e6);
+	say(line);
+	memset(&worst_cb, 0, sizeof(worst_cb));
+}
+
 /*
  * The kernel's boot-args, and after them the words of /a34/a34metal.args (A34): XNU keeps at most
  * 607 characters of boot-args (BOOT_LINE_LENGTH), and boot 65's line was cut there, after camtl=1 --
@@ -139,8 +190,9 @@ rwm_perf_report(uint64_t now)
 		 p.copyout_ns / 1e6 / cbs);
 	say(line);
 	snprintf(line, sizeof(line), "rwm waits: queue full x%llu %.0f ms, until processed x%llu %.0f ms, "
-		 "until completed x%llu %.0f ms; the worker %.1f ms a buffer", p.queue_waits, p.queue_ns / 1e6,
-		 p.processed_waits, p.processed_ns / 1e6, p.completed_waits, p.completed_ns / 1e6,
+		 "until completed x%llu %.0f ms (and on the completion queue x%llu %.0f ms); the worker %.1f ms a buffer",
+		 p.queue_waits, p.queue_ns / 1e6, p.processed_waits, p.processed_ns / 1e6, p.completed_waits,
+		 p.completed_ns / 1e6, p.completed_q_waits, p.completed_q_ns / 1e6,
 		 p.worker_cbs ? p.worker_ns / 1e6 / p.worker_cbs : 0.0);
 	{
 		size_t at = strlen(line);
@@ -190,7 +242,8 @@ rwm_perf_report(uint64_t now)
 	if (binds != nullptr && binds(line, sizeof(line)) != 0) {
 		say(line);
 	}
-	for (unsigned which = 0; pan != nullptr && which < 4; which++) {
+	say_worst_cb();
+	for (unsigned which = 0; pan != nullptr && which < 45; which++) {    /* (4: tiles; 5 and on: one span's passes) */
 		char wide[600];
 
 		if (pan(which, wide, sizeof(wide)) != 0) {

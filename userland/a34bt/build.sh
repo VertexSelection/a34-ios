@@ -5,7 +5,8 @@
 #   userland/a34bt/build.sh
 #
 # Makes $A34BT_OUT (default $WORK/a34bt-out):
-#   a34/          what goes into /a34 on the phone: a34bt, a34bt-bluetool (ad-hoc signed, arm64, iOS $IOS_MIN)
+#   a34/          what goes into /a34 on the phone: a34bt, a34bt-bluetool, a34bt-btd, liba34bt-btd.dylib
+#                 (ad-hoc signed, arm64, iOS $IOS_MIN)
 #   INSTALL.md    how to put it and the firmware there, and the first test
 #   install-firmware.sh
 #   BUILD_INFO.txt, dSYM/ (debug symbols, not for the phone)
@@ -36,16 +37,20 @@ log "a34bt (a34bt.c)"
 log "a34bt-bluetool (bluetool.c: BlueTool's stand-in for bluetoothd)"
 "${CC[@]}" -fblocks -o "$A/a34bt-bluetool" "$HERE/bluetool.c"
 
+log "a34bt-btd (btd.c: bluetoothd's wrapper) and liba34bt-btd.dylib (btdlib.c: inserted into bluetoothd)"
+"${CC[@]}" -o "$A/a34bt-btd" "$HERE/btd.c"
+"${CC[@]}" -fblocks -dynamiclib -install_name "$INSTALL_DIR/liba34bt-btd.dylib" -o "$A/liba34bt-btd.dylib" "$HERE/btdlib.c"
+
 log "package"
 mv "$A"/*.dSYM "$OUT/dSYM/" 2>/dev/null || true
 cp "$HERE/INSTALL.md" "$HERE/install-firmware.sh" "$OUT/"
-for f in "$A/a34bt" "$A/a34bt-bluetool"; do
+for f in "$A/a34bt" "$A/a34bt-bluetool" "$A/a34bt-btd" "$A/liba34bt-btd.dylib"; do
 	codesign -f -s - "$f"       # (last: nothing changes a load command after this)
 done
 
 log "check"
 bad=0
-for f in "$A/a34bt" "$A/a34bt-bluetool"; do
+for f in "$A/a34bt" "$A/a34bt-bluetool" "$A/a34bt-btd" "$A/liba34bt-btd.dylib"; do
 	name=$(basename "$f")
 	if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
 		echo "error: $name refers to a library outside $INSTALL_DIR and the system"
@@ -64,6 +69,9 @@ for s in com.a34.bt.hci kern.a34bt; do
 done
 strings "$A/a34bt-bluetool" | grep -x com.apple.BlueTool >/dev/null || { echo "error: a34bt-bluetool does not name com.apple.BlueTool"; bad=1; }
 nm -u "$A/a34bt-bluetool" | grep -q _xpc_connection_create_mach_service || { echo "error: a34bt-bluetool does not import xpc"; bad=1; }
+[ "$(otool -D "$A/liba34bt-btd.dylib" | tail -n 1)" = "$INSTALL_DIR/liba34bt-btd.dylib" ] || { echo "error: liba34bt-btd.dylib is not named $INSTALL_DIR/liba34bt-btd.dylib"; bad=1; }
+otool -l "$A/liba34bt-btd.dylib" | grep -A2 __interpose | grep -q __interpose || { echo "error: liba34bt-btd.dylib has no __interpose section"; bad=1; }
+strings "$A/a34bt-btd" | grep -x "$INSTALL_DIR/liba34bt-btd.dylib" >/dev/null || { echo "error: a34bt-btd does not name the library"; bad=1; }
 [ "$bad" = 0 ] && echo ok
 [ "$bad" = 0 ]
 
