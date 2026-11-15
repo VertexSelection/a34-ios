@@ -277,6 +277,15 @@ then it waits. Next: AMMS requests polled and acknowledged as Android's amms dri
 sides, boot status, the exception record as it stands). An a34celldbg=2 twin shows whether the
 debug level only turned the eLNA assert into a silent stop.
 
+Tenth run (`1011-cell3`, log build/logs/1011-cell3-a): AMMS works (pending 0x1 right after the
+ADC query; DRDI 0xe1c60000 + 0xe60000 acknowledged); still no HS2, and the stall report shows
+the unsignalled exception record: the same eLNA assert. Disassembly of md1rom (MediaTek's
+nanoMIPS GNU tools, read only): line 899 checks that an eLNA table command's entry count (u16
+at +12) is at most 200 (3-byte entries into a 600-byte table): the modem's RF custom data
+gives it garbage. The ADC level table (0x916d48b8, 11 bins up to 1.5 V) puts our 1938-1953 in
+the same bin as Android's, so the DRDI set is the same. Next: the DRDI memory the modem used is
+compared, once given back, with md1drdi from the md1img partition; RF pin modes logged.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
