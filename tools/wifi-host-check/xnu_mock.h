@@ -54,6 +54,8 @@ extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 extern void lck_mtx_lock(lck_mtx_t *);
 extern void lck_mtx_unlock(lck_mtx_t *);
 extern wait_result_t lck_mtx_sleep(lck_mtx_t *, lck_sleep_action_t, event_t, wait_interrupt_t);
+extern wait_result_t lck_mtx_sleep_deadline(lck_mtx_t *, lck_sleep_action_t, event_t, wait_interrupt_t, uint64_t);
+extern void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);   /* kern/clock.h */
 extern void thread_wakeup(event_t);
 extern int PE_parse_boot_argn(const char *, void *, int);
 extern void *kalloc_data(size_t, int);

@@ -38,7 +38,8 @@ int vn_rdwr(enum uio_rw rw, vnode_t v, caddr_t base, int len, long long off, enu
 void *kalloc_data(size_t n, int fl) { (void)fl; return malloc(n); }
 void kfree_data(void *p, size_t n) { (void)n; free(p); }
 void read_random(void *p, unsigned int n) { for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0x5d + 13 * i); }
-void delay(int us) { (void)us; }
+static void firmware_sim(void);
+void delay(int us) { (void)us; firmware_sim(); }
 void delay_for_interval(uint32_t a, uint32_t b) { (void)a; (void)b; }
 static uint64_t now;
 uint64_t mach_absolute_time(void) { return now += 1000; }
@@ -47,6 +48,8 @@ void lck_mtx_lock(lck_mtx_t *m) { (void)m; }
 void lck_mtx_unlock(lck_mtx_t *m) { (void)m; }
 wait_result_t lck_mtx_sleep(lck_mtx_t *m, lck_sleep_action_t a, event_t e, wait_interrupt_t i) { (void)m; (void)a; (void)e; (void)i; return 0; }
 void thread_wakeup(event_t e) { (void)e; }
+wait_result_t lck_mtx_sleep_deadline(lck_mtx_t *m, lck_sleep_action_t a, event_t e, wait_interrupt_t i, uint64_t d) { (void)m; (void)a; (void)e; (void)i; (void)d; return 0; }
+void clock_interval_to_deadline(uint32_t i, uint32_t f, uint64_t *r) { *r = (uint64_t)i * f; }
 int PE_parse_boot_argn(const char *n, void *v, int s) { (void)n; (void)v; (void)s; return 0; }
 int sysctl_io_number(struct sysctl_req *r, long long b, size_t s, void *p, int *c) { (void)r; (void)b; (void)s; (void)p; (void)c; return 0; }
 kern_return_t kernel_thread_start(thread_continue_t f, void *a, thread_t *t) { (void)f; (void)a; (void)t; return 1; }
@@ -70,6 +73,99 @@ vm_offset_t ml_io_map_unmappable(vm_offset_t pa, vm_size_t size, uint32_t flags)
 }
 
 #include "a34_wifi.c"     /* (run.sh puts it beside ruby_hal.h) */
+#include "a34_wpa.c"      /* (0964) */
+
+/*
+ * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
+ * frame it put into the mailbox is taken and kept in `sent` (a copy each), as the firmware would.
+ */
+static int sim_on, sim_ap;
+static uint8_t sent[64][CMD_FRAME_MOST];
+static uint32_t sent_len[64], nsent;
+static uint8_t sim_ap_addr[6];
+/* puts `len` bytes into RX ring `ring`'s next slot (ring 0: the event ring; 2..5: the data rings) as the DMA would */
+static uint32_t rx_w[6];
+static bool rx_w_set[6];
+static void rx_put(uint32_t ring, const uint8_t *data, uint32_t len)
+{
+	uint32_t slot, slots = ring == 0 ? RING_SLOTS : a34w_drx[ring - 2].slots;
+	volatile uint32_t *d;
+	uint8_t *buf;
+	if (!rx_w_set[ring]) {          /* the DMA's next slot: the one after the host's */
+		rx_w[ring] = ((ring == 0 ? a34w_rx_cidx : a34w_drx[ring - 2].cidx) + 1u) % slots;
+		rx_w_set[ring] = true;
+	}
+	slot = rx_w[ring];
+	rx_w[ring] = (slot + 1u) % slots;
+	if (ring == 0) {
+		d = a34w_desc(DMA_RX0_DESC, slot); buf = (uint8_t *)a34w_dma + DMA_RX0_BUFS + slot * SLOT_SIZE;
+	} else {
+		d = a34w_desc(DMA_RXN_DESC(ring), slot); buf = (uint8_t *)a34w_dma + DMA_RXN_BUFS(ring) + slot * SLOT_SIZE;
+	}
+	memcpy(buf, data, len);
+	d[1] = (1u << 31) | (1u << 30) | (len << 16);
+}
+static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+/* an event on RX ring 0: RXD (24), WIFI_EVENT header (12), body */
+static void rx_event(uint8_t eid, uint8_t seq, const uint8_t *body, uint32_t n)
+{
+	uint8_t f[256] = { 0 };
+	put32(f, 0x38000000u | (24u + 12u + n));
+	f[24 + 4] = eid; f[24 + 5] = seq;
+	memcpy(f + 36, body, n);
+	rx_put(0, f, 36u + n);
+}
+/* a forwarded 802.11 management frame on RX ring 0: RXD (24), G3 (8, -50 dBm), the frame */
+static void rx_mgmt(const uint8_t *frame, uint32_t n, uint8_t channel)
+{
+	uint8_t f[512] = { 0 };
+	put32(f, 0x38010000u | (32u + n)); put32(f + 4, 1u << 13); put32(f + 12, (uint32_t)channel << 8);
+	put32(f + 28, 120);
+	memcpy(f + 32, frame, n);
+	rx_put(0, f, 32u + n);
+}
+static uint32_t dw_of(const uint8_t *txd, int i) { return a34w_le32(txd + 4 * i); }
+
+/*
+ * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
+ * frame it put into the mailbox is taken and kept in `sent` (a copy each), as the firmware would;
+ * with sim_ap, the firmware and an AP answer: the channel granted (the request's token), the
+ * Authentication answered (status 0) and acknowledged, the Association answered (AID 5).
+ */
+static void sim_react(const uint8_t *t)
+{
+	uint8_t ev[24], fr[64];
+	bool cmd = ((dw_of(t, 1) >> 16) & 3u) == 1u;
+	if (!sim_ap) return;
+	bzero(ev, sizeof(ev)); bzero(fr, sizeof(fr));
+	if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
+		ev[0] = 0; ev[1] = t[64 + 1]; ev[2] = 0; ev[3] = t[64 + 3];
+		rx_event(EVENT_ID_CH_PRIVILEGE, 0, ev, 24);
+	} else if (!cmd && (t[32] >> 4) == 11) {
+		fr[0] = 0xb0; memcpy(fr + 4, t + 32 + 10, 6); memcpy(fr + 10, sim_ap_addr, 6); memcpy(fr + 16, sim_ap_addr, 6);
+		fr[26] = 2;
+		rx_mgmt(fr, 30, 5);
+		ev[0] = t[20]; ev[1] = 0; ev[5] = 1;    /* its TX status: acknowledged at the first try */
+		rx_event(EVENT_ID_TX_DONE, 0, ev, 16);
+	} else if (!cmd && (t[32] >> 4) == 0) {
+		fr[0] = 0x10; memcpy(fr + 4, t + 32 + 10, 6); memcpy(fr + 10, sim_ap_addr, 6); memcpy(fr + 16, sim_ap_addr, 6);
+		fr[24] = 0x21; fr[26] = 0; fr[28] = 0x05; fr[29] = 0xc0;   /* status 0, AID 5 (bits 14/15 set) */
+		rx_mgmt(fr, 30, 5);
+	}
+}
+static void firmware_sim(void)
+{
+	volatile uint32_t *drv, *fw;
+	if (!sim_on || !a34w_mbox_ready) return;
+	drv = a34w_mbox_word(0); fw = a34w_mbox_word(4);
+	while (*fw != *drv) {
+		const uint8_t *slot = (const uint8_t *)(a34w_emi + a34w_mbox_offset + 8u + *fw * CMD_FRAME_MOST);
+		uint32_t len = a34w_le32(slot) & 0xffffu;
+		if (nsent < 64) { memcpy(sent[nsent], slot, len > CMD_FRAME_MOST ? CMD_FRAME_MOST : len); sent_len[nsent++] = len; }
+		*fw = (*fw + 1u) % SW_WFDMA_SLOTS;
+		sim_react(slot);
+	}
+}
 
 static uint8_t *slurp(const char *path, size_t *n)
 {
@@ -202,6 +298,158 @@ int main(int argc, char **argv)
 		}
 		unlink(path);
 		printf("0963 kept MAC address: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+	/* ---- 0964: the network file ---- */
+	{
+		static const struct { const char *text; const char *why; bool psk; uint32_t ssid; } nets[] = {
+			{ "ssid=Home Net\npsk=correct horse\n", NULL, true, 8 },
+			{ "# mine\r\nssid=x\r\n", NULL, false, 1 },
+			{ "ssid=a\npsk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", NULL, true, 1 },
+			{ "ssid=a\npsk=short\n", "psk= is neither 8 to 63 characters nor 64 hex digits", false, 0 },
+			{ "psk=12345678\n", "no ssid= line", false, 0 },
+			{ "ssid=a\nfoo=b\n", "a line that is not ssid=, psk= or bssid=", false, 0 },
+			{ "ssid=a\nbssid=02:00:00:00:00:01\n", NULL, false, 1 },
+		};
+		int failed = 0;
+		for (size_t i = 0; i < sizeof(nets) / sizeof(nets[0]); i++) {
+			struct a34w_network n;
+			const char *why = a34w_network_parse((const uint8_t *)nets[i].text, (uint32_t)strlen(nets[i].text), &n);
+			if ((why == NULL) != (nets[i].why == NULL) || (why != NULL && strcmp(why, nets[i].why) != 0) ||
+			    (why == NULL && (n.psk_given != nets[i].psk || n.ssid_length != nets[i].ssid))) {
+				printf("network file case %zu: %s\n", i, why ? why : "(good)"); failed = 1;
+			}
+		}
+		printf("0964 network file: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0964: a whole open join against a simulated AP and firmware ---- */
+	{
+		static const uint8_t ap[6] = { 0xc4, 0x9a, 0x31, 0x2a, 0xc8, 0x59 };
+		static const uint8_t own[6] = { 0x06, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5 };
+		uint8_t fr[256];
+		int failed = 0;
+		uint32_t k = 0, auth_at = 0, assoc_at = 0;
+
+		memcpy(a34w_mac, own, 6);
+		bzero(&a34w_net, sizeof(a34w_net));
+		memcpy(a34w_net.ssid, "veryCoolNetwork", 15); a34w_net.ssid_length = 15;
+		bzero(&a34w_target, sizeof(a34w_target)); a34w_target.rssi = -128;
+		a34w_joining = true;
+		/* a beacon: SSID, rates 1 2 5.5 11 (basic) 6 9 12 18, DS channel 5, TIM (DTIM period 3), ext rates */
+		bzero(fr, sizeof(fr));
+		fr[0] = 0x80; memset(fr + 4, 0xff, 6); memcpy(fr + 10, ap, 6); memcpy(fr + 16, ap, 6);
+		fr[32] = 100; fr[34] = 0x21; fr[35] = 0x04;    /* beacon interval 100, ESS + short preamble + short slot */
+		k = 36;
+		fr[k++] = 0; fr[k++] = 15; memcpy(fr + k, "veryCoolNetwork", 15); k += 15;
+		fr[k++] = 1; fr[k++] = 8; memcpy(fr + k, "\x82\x84\x8b\x96\x0c\x12\x18\x24", 8); k += 8;
+		fr[k++] = 3; fr[k++] = 1; fr[k++] = 5;
+		fr[k++] = 5; fr[k++] = 4; fr[k++] = 0; fr[k++] = 3; fr[k++] = 0; fr[k++] = 0;
+		fr[k++] = 50; fr[k++] = 4; memcpy(fr + k, "\x30\x48\x60\x6c", 4); k += 4;
+		a34w_mgmt_in(fr, k, -70, 5);
+		a34w_joining = false;
+		failed |= !a34w_target.found || a34w_target.channel != 5 || a34w_target.rssi != -70;
+
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);        /* (what earlier checks left in the mailbox: taken) */
+		nsent = 0; sim_on = 1; sim_ap = 1; memcpy(sim_ap_addr, ap, 6);
+		bool joined = a34w_connect();
+		firmware_sim();                                 /* (the last command, which nothing waited after) */
+		sim_on = 0; sim_ap = 0;
+		printf("0964 open join: %s, AID %u, %u frames through the mailbox:\n", joined ? "joined" : "NOT JOINED", a34w_aid, nsent);
+		for (uint32_t i = 0; i < nsent; i++) {
+			const uint8_t *t = sent[i];
+			bool cmd = ((dw_of(t, 0) >> 23) & 3u) == 2u && ((dw_of(t, 1) >> 16) & 3u) == 1u;
+			printf("  %2u: %4u bytes DW0 0x%08x DW1 0x%08x %s 0x%02x\n", i, sent_len[i], dw_of(t, 0), dw_of(t, 1),
+			    cmd ? "command" : "frame, subtype", cmd ? t[36] : t[32] >> 4);
+			if (!cmd && (t[32] >> 4) == 11) auth_at = i;
+			if (!cmd && (t[32] >> 4) == 0) assoc_at = i;
+		}
+		/* the order: CH_PRIVILEGE, STA_REC (state 1), Authentication, Association Request, BSS_INFO, STA_REC
+		 * (state 3), PM_BSS_CONNECTED, POWER_SAVE_MODE, RX filter, CH_PRIVILEGE abort */
+		static const int want[] = { 0x1c, 0x13, -11, -0, 0x12, 0x13, 0x16, 0x05, 0x0a, 0x1c };
+		failed |= !joined || a34w_aid != 5 || nsent != sizeof(want) / sizeof(want[0]);
+		for (uint32_t i = 0; i < nsent && i < sizeof(want) / sizeof(want[0]); i++) {
+			const uint8_t *t = sent[i];
+			bool cmd = ((dw_of(t, 1) >> 16) & 3u) == 1u;
+			if (want[i] > 0 ? (!cmd || t[36] != want[i]) : (cmd || (t[32] >> 4) != -want[i])) { failed = 1; printf("  frame %u is not the one expected\n", i); }
+		}
+		/* the Authentication frame's TXD, against the one nic_txd_v2_compose makes (WTBL 5, SN 1, PID 1) */
+		{
+			const uint8_t *t = sent[auth_at];
+			uint32_t w[8]; for (int i = 0; i < 8; i++) w[i] = dw_of(t, i);
+			printf("  Authentication TXD: %08x %08x %08x %08x %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+			failed |= w[0] != 0x0310003eu || w[1] != 0x80026405u || w[2] != 0x801e000bu || (w[3] & 0x8000ffffu) != 0x8000f000u ||
+			    (w[5] & 0x2ffu) != 0x201u || w[6] != 0 || w[7] != 0x000bc000u || memcmp(t + 32 + 4, ap, 6) != 0 ||
+			    memcmp(t + 32 + 10, own, 6) != 0 || t[32 + 26] != 1;
+		}
+		/* the Association Request: capability ESS + short preamble + short slot, listen 10, SSID, the AP's rates, no RSN */
+		{
+			const uint8_t *f = sent[assoc_at] + 32;
+			uint32_t n = sent_len[assoc_at] - 32;
+			failed |= f[24] != 0x21 || f[25] != 0x04 || f[26] != 10 || f[28] != 0 || f[29] != 15 || memcmp(f + 30, "veryCoolNetwork", 15) != 0 ||
+			    f[45] != 1 || f[46] != 8 || f[55] != 50 || n != 24 + 4 + 17 + 10 + 6;
+		}
+		/* STA_REC state 3: 168 bytes, AID 5, WTBL 5, broadcast 0xff, rates 0x0fcf? (1 2 5.5 11 6 9 12 18 24 36 48 54) basic 0x000f */
+		{
+			const uint8_t *c = sent[5] + 64;
+			uint32_t operational = (uint32_t)(c[14] | c[15] << 8), basic = (uint32_t)(c[16] | c[17] << 8);
+			printf("  STA_REC: %u bytes, state %u, AID %u, WTBL %u, phy 0x%02x, rates 0x%04x basic 0x%04x\n", sent_len[5] - 64,
+			    c[20], c[8] | c[9] << 8, c[54], c[13], operational, basic);
+			failed |= sent_len[5] != 64 + 168 || c[20] != 2 || (c[8] | c[9] << 8) != 5 || c[54] != 5 || c[55] != 0xff ||
+			    c[13] != 0x03 || operational != 0x3fcfu || basic != 0x000fu || c[23] != 0;
+		}
+		/* BSS_INFO: 116 bytes, connected, BSSID, auth open, enc none, BMC 4, RLM channel 5 */
+		{
+			const uint8_t *c = sent[4] + 64;
+			failed |= sent_len[4] != 64 + 116 || c[1] != 0 || memcmp(c + 36, ap, 6) != 0 || c[53] != 0 || c[54] != 1 ||
+			    c[58] != 4 || c[68 + 2] != 5 || c[68 + 1] != 1 || c[48] != 0;
+		}
+		printf("0964 open join against a simulated AP: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0964: EAPOL in on RX ring 2 (header translated), message 2 out on TX ring 0, the token back on ring 4 ---- */
+	{
+		uint8_t f[512], *m;
+		int failed = 0;
+		uint32_t n = 0;
+		const uint8_t *tok = (const uint8_t *)a34w_dma + DMA_TOKENS;
+
+		a34w_net.psk_given = true;
+		a34w_associated = true;
+		bzero(&a34w_wpa, sizeof(a34w_wpa));
+		memset(a34w_wpa.pmk, 0x11, 32); memcpy(a34w_wpa.own, a34w_mac, 6); memcpy(a34w_wpa.peer, a34w_target.bssid, 6);
+		memset(a34w_wpa.own_nonce, 0x22, 32); a34w_wpa.rsn = a34w_own_rsn; a34w_wpa.rsn_length = sizeof(a34w_own_rsn);
+		bzero(f, sizeof(f));
+		put32(f, (2u << 27) | (24u + 14u + 99u));      /* RXD: packet type 2 (data), byte count */
+		put32(f + 4, AP_WLAN_INDEX);                    /* no groups */
+		put32(f + 8, 1u << 13);                         /* header translated */
+		m = f + 24;
+		memcpy(m, a34w_mac, 6); memcpy(m + 6, a34w_target.bssid, 6); m[12] = 0x88; m[13] = 0x8e;
+		m += 14;                                        /* EAPOL-Key, message 1 of 4 (RSN, version 2, pairwise, ack) */
+		m[0] = 2; m[1] = 3; m[2] = 0; m[3] = 95; m[4] = 2; m[5] = 0x00; m[6] = 0x8a; m[8] = 16; m[16] = 1;
+		memset(m + 17, 0x33, 32);
+		n = 24u + 14u + 99u;
+		rx_put(2, f, n);
+		(void)a34w_data_poll();
+		{
+			uint32_t w0 = a34w_le32(tok), w1 = a34w_le32(tok + 4);
+			const uint8_t *e = tok + 64;
+			printf("0964 EAPOL: message 1 in -> %u out; TX0 cidx %u; token 0: DW0 0x%08x DW1 0x%08x TXP %02x%02x ptr 0x%08x len 0x%04x; "
+			    "to %02x:..:%02x type %02x%02x key info %02x%02x\n", a34w_eapol_tx, a34w_rd(a34w_conn, WFDMA_TX_RING(0) + 8),
+			    w0, w1, tok[33], tok[32], a34w_le32(tok + 40), tok[44] | tok[45] << 8, e[0], e[5], e[12], e[13], e[14 + 5], e[14 + 6]);
+			failed |= a34w_eapol_tx != 1 || a34w_rd(a34w_conn, WFDMA_TX_RING(0) + 8) != 1 || (w0 & 0xffff0000u) != 0x020a0000u ||
+			    w1 != 0x80008405u || tok[33] != 0x80 || a34w_le32(tok + 40) != 0x58050040u || e[12] != 0x88 || e[13] != 0x8e ||
+			    memcmp(e, a34w_target.bssid, 6) != 0 || e[14 + 5] != 0x01 || e[14 + 6] != 0x0a || (a34w_tokens_busy & 1u) == 0;
+		}
+		/* the token's report on RX ring 4 (version 3: one word, token 0 in bits 30:16) */
+		bzero(f, sizeof(f));
+		put32(f, (6u << 27) | (1u << 16) | 12u); put32(f + 4, 3u << 16); put32(f + 8, (0u << 16) | 1u);
+		rx_put(4, f, 12);
+		(void)a34w_data_poll();
+		failed |= (a34w_tokens_busy & 1u) != 0 || a34w_tokens_back != 1;
+		printf("0964 data path (EAPOL out on TX ring 0, the token back on ring 4): %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 	printf("log:\n%s", a34w_log);

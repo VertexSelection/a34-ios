@@ -1,0 +1,2357 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 70c2540..5133589 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/a34_clocks.c			standard
+ bsd/dev/a34_connsys.c			standard
+ bsd/dev/a34_bt.c			standard
+ bsd/dev/a34_wifi.c			standard
++bsd/dev/a34_wpa.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 076e5c5..0fba26b 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -17,6 +17,10 @@
+  *   4  and 5: see the Wi-Fi part below
+  *   6  and 7 (0961, milestone 2): the running firmware's command channel and one passive scan,
+  *      every network heard said in the log -- see milestone 2's part below
++ *   8  (0964, milestone 3): join the network the phone's owner names in /a34/wifi/network (open,
++ *      or WPA2-PSK with CCMP; the four-way handshake on the host, a34_wpa.c), then the rings
++ *      serviced every 2 ms -- see step 8's part below. Step 5 now sets up the data rings too
++ *      (TX 0, RX 2-5) and the DMA scheduler (DMASHDL), as Android does before the firmware runs.
+  *
+  * A34 (0963): the station's address is this phone's own, kept on the iOS root in /a34/wifi/mac
+  * (random, locally administered; userland/a34wifi writes it once); never from nvram/nvdata/efs.
+@@ -69,6 +73,7 @@
+ #include <libkern/libkern.h>
+ 
+ #include "ruby_hal.h"
++#include "a34_wpa.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -154,7 +159,7 @@ void a34_wifi_init(void);               /* bsd/dev/sweet_ufs.c, at boot */
+ 
+ /* ---- state, the log ---- */
+ 
+-#define A34W_STEPS              7u
++#define A34W_STEPS              8u
+ #define A34W_LOG_SIZE           12288u
+ 
+ static LCK_GRP_DECLARE(a34w_grp, "a34_wifi");
+@@ -580,6 +585,30 @@ a34w_step3(void)
+ #define HW_TX_CMD_RING                  17u
+ #define HW_RX_EVENT_RING                0u
+ 
++/*
++ * (0964) The data rings, as Android has them (soc5_0.c:713-765, hal_pdma.c), smaller: TX ring 0
++ * (best effort; every frame a token buffer: TXD, TXP, the Ethernet frame), RX rings 2 and 3
++ * (data of band 0 and 1, 2352-byte buffers), RX rings 4 and 5 (the "TX free done" reports
++ * that give the tokens back). Above the command rings' memory; 1.1 MB of the 4 MB in all.
++ */
++#define DATA_TX_RING                    0u
++#define DATA_TX_SLOTS                   64u
++#define DATA_TOKEN_SIZE                 0x800u          /* TXD 32 + TXP 32 + up to 1532 bytes of frame */
++#define DATA_RX_SLOTS                   64u
++#define DATA_RX_BUF_SIZE                2352u
++#define FREE_RX_SLOTS                   16u
++#define FREE_RX_BUF_SIZE                3840u
++#define DMA_TX0_DESC                    0x02000u
++#define DMA_RX2_DESC                    0x03000u        /* ring n's descriptors at 0x03000 + 0x1000 * (n - 2), n = 2..5 */
++#define DMA_TOKENS                      0x50000u        /* DATA_TX_SLOTS token buffers */
++#define DMA_RX2_BUFS                    0x70000u        /* ring n's buffers at 0x70000 + 0x40000 * (n - 2), 4 KB apart */
++#define DMA_RXN_DESC(n)                 (DMA_RX2_DESC + 0x1000u * ((n) - 2u))
++#define DMA_RXN_BUFS(n)                 (DMA_RX2_BUFS + 0x40000u * ((n) - 2u))
++#define DMA_USED_END                    (DMA_RXN_BUFS(5u) + FREE_RX_SLOTS * SLOT_SIZE)
++#define DMASHDL                         0x26000u        /* WF_HIF_DMASHDL_TOP (0x7c026000 = AP 0x18026000) */
++_Static_assert(DMA_USED_END <= A34W_DMA_SIZE, "the rings fit in the DMA memory");
++_Static_assert(DMA_TOKENS + DATA_TX_SLOTS * DATA_TOKEN_SIZE <= DMA_RX2_BUFS, "the token buffers fit");
++
+ static vm_offset_t a34w_wf, a34w_emi, a34w_dma;
+ static uint64_t a34w_emi_pa;
+ static uint32_t a34w_emi_size;
+@@ -837,6 +866,82 @@ a34w_desc(uint32_t ring_off, uint32_t slot)
+ 	return (volatile uint32_t *)(a34w_dma + ring_off + slot * 16u);
+ }
+ 
++/* (0964) RX rings 2..5 as the host sees them */
++struct a34w_rx_ring {
++	uint32_t slots, buf_size, cidx;
++};
++static struct a34w_rx_ring a34w_drx[4];
++static uint32_t a34w_dtx_cidx;
++static uint64_t a34w_tokens_busy;               /* bit n: token n is the DMA's until its report comes */
++static bool a34w_data_rings;
++
++/* soc5_0DmashdlInit (hal_dmashdl_soc5_0.c:290-332, values hal_dmashdl_soc5_0.h): read-modify-write */
++static void
++a34w_dmashdl_init(void)
++{
++	static const uint8_t queue_group[32] = { 0, 0, 0, 2, 1, 1, 1, 2, 0, 0, 0, 2, 1, 1, 1, 2,
++		                                 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1 };
++
++	a34w_mask(a34w_conn, DMASHDL + 0x1cu, 0x0fff0fffu, 0x00000001u);   /* PLE packet max 1 page, PSE 0 */
++	for (uint32_t g = 0; g < 16u; g++) {
++		bool on = g < 3u;
++
++		a34w_mask(a34w_conn, DMASHDL + 0x10u, 1u << (16u + g), on ? 0u : 1u << (16u + g));  /* refill */
++		a34w_mask(a34w_conn, DMASHDL + 0x20u + 4u * g, 0x0fff0fffu, on ? 0x02000010u : 0u); /* max 0x200, min 0x10 */
++	}
++	for (uint32_t q = 0; q < 32u; q++) {
++		a34w_mask(a34w_conn, DMASHDL + 0x60u + 4u * (q >> 3), 0xfu << (4u * (q & 7u)),
++		    (uint32_t)queue_group[q] << (4u * (q & 7u)));
++	}
++	for (uint32_t pr = 0; pr < 16u; pr++) {
++		a34w_mask(a34w_conn, DMASHDL + 0x70u + 4u * (pr >> 3), 0xfu << (4u * (pr & 7u)), pr << (4u * (pr & 7u)));
++	}
++	a34w_clr(a34w_conn, DMASHDL + 0x0cu, 1u << 16);                   /* slot arbiter off */
++	a34w_mask(a34w_conn, DMASHDL + 0x08u, 0x00ffffffu, 0x00030007u);   /* ack threshold 3, groups 0-2 */
++}
++
++/* (from a34w_wfdma_init, DMA off) TX ring 0 empty, RX rings 2..5 the DMA's, DMASHDL as Android's */
++static void
++a34w_data_rings_init(void)
++{
++	for (uint32_t s = 0; s < DATA_TX_SLOTS; s++) {
++		volatile uint32_t *t = a34w_desc(DMA_TX0_DESC, s);
++
++		t[0] = 0;
++		t[1] = DESC_DMADONE;
++		t[2] = 0;
++		t[3] = 0;
++	}
++	for (uint32_t n = 2; n <= 5u; n++) {
++		struct a34w_rx_ring *r = &a34w_drx[n - 2u];
++
++		r->slots = n <= 3u ? DATA_RX_SLOTS : FREE_RX_SLOTS;
++		r->buf_size = n <= 3u ? DATA_RX_BUF_SIZE : FREE_RX_BUF_SIZE;
++		r->cidx = r->slots - 1u;
++		for (uint32_t s = 0; s < r->slots; s++) {
++			volatile uint32_t *d = a34w_desc(DMA_RXN_DESC(n), s);
++
++			d[0] = (uint32_t)A34W_DMA_PA + DMA_RXN_BUFS(n) + s * SLOT_SIZE;
++			d[1] = DESC_SDLEN0(r->buf_size);
++			d[2] = 0;
++			d[3] = 0;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_dtx_cidx = 0;
++	a34w_tokens_busy = 0;
++	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_TX0_DESC);
++	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x8u, 0);
++	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x4u, DATA_TX_SLOTS);
++	for (uint32_t n = 2; n <= 5u; n++) {
++		a34w_wr(a34w_conn, WFDMA_RX_RING(n) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_RXN_DESC(n));
++		a34w_wr(a34w_conn, WFDMA_RX_RING(n) + 0x8u, a34w_drx[n - 2u].cidx);
++		a34w_wr(a34w_conn, WFDMA_RX_RING(n) + 0x4u, a34w_drx[n - 2u].slots);
++	}
++	a34w_dmashdl_init();
++	a34w_data_rings = true;
++}
++
+ static void
+ a34w_wfdma_init(void)
+ {
+@@ -873,6 +978,7 @@ a34w_wfdma_init(void)
+ 	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_RX0_DESC);
+ 	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u, a34w_rx_cidx);
+ 	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x4u, RING_SLOTS);
++	a34w_data_rings_init();                         /* (0964) TX 0, RX 2-5, DMASHDL */
+ 
+ 	/* soc5_0asicConnac2xWfdmaManualPrefetch(): chain off, each ring's prefetch slot, as Android orders them */
+ 	a34w_clr(a34w_conn, WFDMA_GLO_CFG, GLO_CHAIN_EN);
+@@ -902,14 +1008,20 @@ a34w_wfdma_init(void)
+ 	a34w_set(a34w_conn, WFDMA_INT_RX_PRI_SEL, (1u << 1) | (0xfu << 6));
+ 	a34w_wr(a34w_conn, WFDMA_RST_DTX_PTR, 0xffffffffu);
+ 	a34w_wr(a34w_conn, WFDMA_RST_DRX_PTR, 0xffffffffu);
+-	/* the reset cleared the CPU indices: the RX ring's again */
++	/* the reset cleared the CPU indices: the RX rings' again */
+ 	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u, a34w_rx_cidx);
++	for (uint32_t n = 2; n <= 5u; n++) {
++		a34w_wr(a34w_conn, WFDMA_RX_RING(n) + 0x8u, a34w_drx[n - 2u].cidx);
++	}
+ 
+ 	/* on (asicConnac2xWfdmaControl(enable), soc5_0asicConnac2xWpdmaConfig); interrupts stay masked: polled */
+ 	a34w_set(a34w_conn, WFDMA_GLO_CFG, GLO_ENABLE_BITS);
+ 	v = a34w_rd(a34w_conn, WFDMA_PAUSE_RX_Q_TH10);
+ 	a34w_wr(a34w_conn, WFDMA_PAUSE_RX_Q_TH10, (v & 0x0fff0000u) + 4u);
+ 	a34w_set(a34w_wf, WF_WFDMA_DUMMY_CR, 1u << 1);
++	a34w_say("step 5: data rings (0964): TX0 %u slots, RX2/3 %u, RX4/5 %u; DMASHDL group 0 0x%08x, queues 0x%08x, "
++	    "control 0x%08x", DATA_TX_SLOTS, DATA_RX_SLOTS, FREE_RX_SLOTS, a34w_rd(a34w_conn, DMASHDL + 0x20u),
++	    a34w_rd(a34w_conn, DMASHDL + 0x60u), a34w_rd(a34w_conn, DMASHDL + 0x08u));
+ 	a34w_say("step 5: WFDMA: GLO_CFG 0x%08x, TX17 at 0x%x (%u slots) cidx/didx %u/%u, RX0 at 0x%x cidx/didx %u/%u",
+ 	    a34w_rd(a34w_conn, WFDMA_GLO_CFG), (uint32_t)A34W_DMA_PA + DMA_TX17_DESC, RING_SLOTS,
+ 	    a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x8u), a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0xcu),
+@@ -1339,6 +1451,8 @@ a34w_heard_report(const char *what)
+ #define CMD_ID_BSS_ACTIVATE_CTRL        0x11u
+ #define CMD_ID_GET_NIC_CAPABILITY_V2    0x8au
+ #define EVENT_ID_SCAN_DONE              0x0du
++#define EVENT_ANY                       0x00u           /* (0964) a34w_wait_event: any event of that sequence */
++#define EVENT_NONE                      0xffu           /* (0964) a34w_wait_event: none (RX serviced for so long) */
+ #define EVENT_ID_NIC_CAPABILITY_V2      0xecu
+ #define WIFI_EVENT_HEADER_SIZE          12u
+ #define RXD_SIZE                        24u
+@@ -1372,8 +1486,14 @@ static bool a34w_mbox_ready;
+ static uint8_t a34w_cmd_seq;
+ static uint8_t a34w_mac[6];             /* (0963) step 6 chooses it: a34w_mac_choose() */
+ static uint8_t a34w_scan_seq;
+-static uint32_t a34w_rx_events, a34w_rx_frames, a34w_rx_other;
++static uint32_t a34w_rx_events, a34w_rx_frames, a34w_rx_other, a34w_events_said;
+ static uint8_t a34w_rxbuf[SLOT_SIZE];
++/* (0964) milestone 3's part, below: what RX ring 0 hands to it */
++static void a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel);
++static void a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated);
++static bool a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length);
++static bool a34w_data_poll(void);
++static bool a34w_joined;                /* associated, and for WPA2 the keys in */
+ 
+ /* step 5, before the RAM code: where the mailbox is, and zeroed (halSwWfdmaInit, halSwWfdmaReset) */
+ static bool
+@@ -1401,18 +1521,20 @@ a34w_mbox_word(uint32_t off)
+ 	return (volatile uint32_t *)(a34w_emi + a34w_mbox_offset + off);
+ }
+ 
+-/* a command to the running firmware, through the mailbox; its sequence number (0: not sent) */
+-static uint8_t
+-a34w_cmd(uint8_t cid, bool set, const void *payload, uint32_t payload_length)
++/*
++ * One frame (a TXD and what follows it) into the mailbox's next slot, and the doorbell
++ * (halSwWfdmaSetCidx): commands, and (0964) management frames as nicTxCmd sends them. `what`
++ * names it if the mailbox stays full.
++ */
++static bool
++a34w_mbox_put(const uint8_t *frame, uint32_t length, const char *what, uint32_t id)
+ {
+-	static uint8_t frame[CMD_FRAME_MOST];
+-	const uint32_t length = INIT_CMD_HEADER_SIZE + payload_length;
+ 	volatile uint32_t *drv = a34w_mbox_word(0), *fw = a34w_mbox_word(4);
+-	uint32_t d, f = 0, dw;
++	uint32_t d, f = 0;
+ 	uint64_t until = a34w_ms() + 1000u;
+ 
+ 	if (!a34w_mbox_ready || length > CMD_FRAME_MOST) {
+-		return 0;
++		return false;
+ 	}
+ 	/* the mailbox has room when the slot after ours is not the firmware's next */
+ 	for (;;) {
+@@ -1422,11 +1544,30 @@ a34w_cmd(uint8_t cid, bool set, const void *payload, uint32_t payload_length)
+ 			break;
+ 		}
+ 		if (a34w_ms() >= until) {
+-			a34w_say("command 0x%02x: the mailbox stays full (drv %u fw %u)", cid, d, f);
+-			return 0;
++			a34w_say("%s 0x%02x: the mailbox stays full (drv %u fw %u)", what, id, d, f);
++			return false;
+ 		}
+ 		delay(100);
+ 	}
++	memcpy((void *)(a34w_emi + a34w_mbox_offset + 8u + d * CMD_FRAME_MOST), frame, length);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*drv = (d + 1u) % SW_WFDMA_SLOTS;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_wr(a34w_conn, CCIF_TCHNUM, CCIF_SW_WFDMA_CHANNEL);
++	return true;
++}
++
++/* a command to the running firmware, through the mailbox; its sequence number (0: not sent) */
++static uint8_t
++a34w_cmd(uint8_t cid, bool set, const void *payload, uint32_t payload_length)
++{
++	static uint8_t frame[CMD_FRAME_MOST];
++	const uint32_t length = INIT_CMD_HEADER_SIZE + payload_length;
++	uint32_t dw;
++
++	if (!a34w_mbox_ready || length > CMD_FRAME_MOST) {
++		return 0;
++	}
+ 	bzero(frame, INIT_CMD_HEADER_SIZE);
+ 	dw = (length & 0xffffu) | (2u << 23);           /* TXD DW0: byte count, packet format 2 (command) */
+ 	memcpy(frame + 0, &dw, 4);
+@@ -1444,12 +1585,7 @@ a34w_cmd(uint8_t cid, bool set, const void *payload, uint32_t payload_length)
+ 	if (payload_length != 0) {
+ 		memcpy(frame + INIT_CMD_HEADER_SIZE, payload, payload_length);
+ 	}
+-	memcpy((void *)(a34w_emi + a34w_mbox_offset + 8u + d * CMD_FRAME_MOST), frame, length);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	*drv = (d + 1u) % SW_WFDMA_SLOTS;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	a34w_wr(a34w_conn, CCIF_TCHNUM, CCIF_SW_WFDMA_CHANNEL);
+-	return a34w_cmd_seq;
++	return a34w_mbox_put(frame, length, "command", cid) ? a34w_cmd_seq : 0;
+ }
+ 
+ /* a forwarded 802.11 frame: its RXD and groups skipped (nic_rxd_v2.c), then the scan table's */
+@@ -1483,11 +1619,15 @@ a34w_rx_80211(const uint8_t *f, uint32_t got)
+ 	}
+ 	at += (vld & 16u) ? 72u : 0u;                   /* G5 */
+ 	at += ((dw2 >> 14) & 3u) * 2u;                  /* padding before the header */
++	if ((dw2 & (1u << 13)) != 0) {                  /* (0964) header translated: data (nic_rx.c:4004-4040) */
++		a34w_data_in(f, count, at, true);
++		return;
++	}
+ 	if (at + 24u > count) {
+ 		a34w_rx_other++;
+ 		return;
+ 	}
+-	a34w_heard_frame(f + at, count - at, rssi, (uint8_t)((dw3 >> 8) & 0xffu));
++	a34w_mgmt_in(f + at, count - at, rssi, (uint8_t)((dw3 >> 8) & 0xffu));
+ }
+ 
+ /*
+@@ -1521,9 +1661,18 @@ a34w_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, uint8_t *got_e
+ 	}
+ 	a34w_rx_events++;
+ 	*got_eid = a34w_rxbuf[RXD_SIZE + 4];
+-	if (a34w_rxbuf[RXD_SIZE + 4] != eid || (seq != 0 && a34w_rxbuf[RXD_SIZE + 5] != seq)) {
+-		a34w_say("event 0x%02x (sequence %u, %d bytes) while waiting for 0x%02x", a34w_rxbuf[RXD_SIZE + 4],
+-		    a34w_rxbuf[RXD_SIZE + 5], got, eid);
++	if (a34w_rxbuf[RXD_SIZE + 4] != eid && a34w_event_note(a34w_rxbuf[RXD_SIZE + 4], a34w_rxbuf + RXD_SIZE +
++	    WIFI_EVENT_HEADER_SIZE, (uint32_t)got - RXD_SIZE - WIFI_EVENT_HEADER_SIZE)) {
++		return -2;                              /* (0964) TX_DONE, CH_PRIVILEGE, ...: noted */
++	}
++	if ((eid != EVENT_ANY && a34w_rxbuf[RXD_SIZE + 4] != eid) || (seq != 0 && a34w_rxbuf[RXD_SIZE + 5] != seq)) {
++		if (eid != EVENT_NONE) {
++			a34w_say("event 0x%02x (sequence %u, %d bytes) while waiting for 0x%02x", a34w_rxbuf[RXD_SIZE + 4],
++			    a34w_rxbuf[RXD_SIZE + 5], got, eid);
++		} else if (a34w_events_said < 64u) {
++			a34w_events_said++;
++			a34w_say("event 0x%02x (sequence %u, %d bytes)", a34w_rxbuf[RXD_SIZE + 4], a34w_rxbuf[RXD_SIZE + 5], got);
++		}
+ 		return -2;
+ 	}
+ 	got -= (int)(RXD_SIZE + WIFI_EVENT_HEADER_SIZE);
+@@ -1547,7 +1696,7 @@ a34w_wait_event(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, uint32_t
+ 		if (got >= 0) {
+ 			return got;
+ 		}
+-		if (got == -1) {
++		if (got == -1 && !a34w_data_poll()) {   /* (0964) the data rings meanwhile */
+ 			delay(200);
+ 		}
+ 	} while (a34w_ms() < until);
+@@ -1572,9 +1721,9 @@ a34w_hex(uint8_t c)
+ 	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+ }
+ 
+-/* "xx:xx:xx:xx:xx:xx" (':' or '-'), then nothing but white space; locally administered, unicast, not all zero */
++/* "xx:xx:xx:xx:xx:xx" (':' or '-'), white space around it and nothing else */
+ static bool
+-a34w_mac_parse(const uint8_t *text, uint32_t length, uint8_t mac[6])
++a34w_mac_text(const uint8_t *text, uint32_t length, uint8_t mac[6])
+ {
+ 	uint32_t at = 0;
+ 
+@@ -1601,7 +1750,14 @@ a34w_mac_parse(const uint8_t *text, uint32_t length, uint8_t mac[6])
+ 			return false;
+ 		}
+ 	}
+-	return (mac[0] & 3u) == 2u;     /* locally administered (bit 1), unicast (bit 0 clear): so never all zero */
++	return true;
++}
++
++/* ... and locally administered, unicast (so never all zero) */
++static bool
++a34w_mac_parse(const uint8_t *text, uint32_t length, uint8_t mac[6])
++{
++	return a34w_mac_text(text, length, mac) && (mac[0] & 3u) == 2u;
+ }
+ 
+ /* `efuse`: the chip's own address, or NULL; leaves the one to use in a34w_mac and says where it came from */
+@@ -1717,8 +1873,13 @@ a34w_bss_activate(bool on)
+ 	return a34w_cmd(CMD_ID_BSS_ACTIVATE_CTRL, CMD_SET, c, sizeof(c)) != 0;
+ }
+ 
++/*
++ * One passive scan of 2.4 GHz 1-13 and 5 GHz 36-48, 149-165, every network heard said in the log
++ * (`who` starts each line). (0964) `stay`: the BSS is left active afterwards (step 8 joins with
++ * it: HakiOS run 457, a scan that deactivated the BSS of a connection killed its traffic).
++ */
+ static bool
+-a34w_step7(void)
++a34w_scan(const char *who, bool stay)
+ {
+ 	static uint8_t scan[SCAN_REQ_V2_SIZE], done[476];
+ 	static const uint8_t channels_2g4[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+@@ -1729,7 +1890,7 @@ a34w_step7(void)
+ 	int got = -1;
+ 
+ 	if (!a34w_mbox_ready || !a34w_conn_reachable() || (a34w_rd(a34w_conn, HOST_SW_SYNC0) & 3u) != 3u) {
+-		a34w_say("step 7: the firmware is not running (step 6 first)");
++		a34w_say("%s: the firmware is not running (step 6 first)", who);
+ 		return false;
+ 	}
+ 	a34w_set(a34w_conn, HOST_WAKEPU_WF, 1u);
+@@ -1737,8 +1898,8 @@ a34w_step7(void)
+ 	a34w_heard_dropped = 0;
+ 	events0 = a34w_rx_events;
+ 	frames0 = a34w_rx_frames;
+-	if (!a34w_bss_activate(true)) {
+-		a34w_say("step 7: BSS_ACTIVATE_CTRL not sent");
++	if (!a34w_joined && !a34w_bss_activate(true)) { /* (0964: joined, the BSS is active and stays so) */
++		a34w_say("%s: BSS_ACTIVATE_CTRL not sent", who);
+ 		return false;
+ 	}
+ 	bzero(scan, sizeof(scan));
+@@ -1766,26 +1927,1256 @@ a34w_step7(void)
+ 	t0 = a34w_ms();
+ 	seq = a34w_cmd(CMD_ID_SCAN_REQ_V2, CMD_SET, scan, sizeof(scan));
+ 	if (seq == 0) {
+-		a34w_say("step 7: SCAN_REQ_V2 not sent");
++		a34w_say("%s: SCAN_REQ_V2 not sent", who);
+ 		return false;
+ 	}
+-	a34w_say("step 7: passive scan %u of %u channels asked (command sequence %u)", a34w_scan_seq, n, seq);
++	a34w_say("%s: passive scan %u of %u channels asked (command sequence %u)", who, a34w_scan_seq, n, seq);
+ 	sweet_log_flush();
+ 	got = a34w_wait_event(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 20000);
+-	(void)a34w_bss_activate(false);
++	if (!stay) {
++		(void)a34w_bss_activate(false);
++	}
+ 	if (got < 8) {
+-		a34w_say("step 7: no SCAN_DONE in 20 s (%u events, %u frames, %u other; mailbox drv %u fw %u)",
++		a34w_say("%s: no SCAN_DONE in 20 s (%u events, %u frames, %u other; mailbox drv %u fw %u)", who,
+ 		    a34w_rx_events - events0, a34w_rx_frames - frames0, a34w_rx_other, *a34w_mbox_word(0), *a34w_mbox_word(4));
+-		a34w_heard_report("step 7: nonetheless");
++		a34w_heard_report(who);
+ 		return false;
+ 	}
+-	a34w_say("step 7: SCAN_DONE in %llu ms: scan %u (asked %u), %u channels done, state %u, version %u, %u beacons "
+-	    "counted by the firmware; %u frames forwarded", (unsigned long long)(a34w_ms() - t0), done[0], a34w_scan_seq,
++	a34w_say("%s: SCAN_DONE in %llu ms: scan %u (asked %u), %u channels done, state %u, version %u, %u beacons "
++	    "counted by the firmware; %u frames forwarded", who, (unsigned long long)(a34w_ms() - t0), done[0], a34w_scan_seq,
+ 	    done[4], done[5], done[6], a34w_le32(done + 8), a34w_rx_frames - frames0);
+-	a34w_heard_report("step 7");
++	a34w_heard_report(who);
+ 	return true;
+ }
+ 
++static bool
++a34w_step7(void)
++{
++	return a34w_scan("step 7", false);
++}
++
++/* ---- step 8 (0964, milestone 3): joining a network ---- */
++
++/*
++ * Step 8 joins the network named in /a34/wifi/network (written by the phone's owner, never in
++ * the repository; the passphrase is never said in the log), open or WPA2-PSK with CCMP, as
++ * gen4m_s1's AIS/SAA state machines do it (ais_fsm.c, saa_fsm.c, cnm.c, nic.c), host side
++ * where Android is host side:
++ *
++ *   - a passive scan (step 7's, the BSS left active); the loudest BSS of that name is the target
++ *   - CH_PRIVILEGE (0x1c, JOIN, 4 s) and its grant, EVENT_ID_CH_PRIVILEGE (0x10), token matched
++ *   - UPDATE_STA_RECORD (0x13, 168 bytes, version 0: the A34's module has no 802.11ax) for
++ *     the AP, state 1, WTBL entry 5 (0-3 are BIP's, 4 the broadcast one), no HT/VHT
++ *   - Authentication (open) and Association Request: 802.11 frames built here, sent as
++ *     nicTxCmd sends COMMAND_TYPE_MANAGEMENT_FRAME on soc5_0 -- a CONNAC2X TXD and the frame
++ *     in the SW-WFDMA mailbox (not a ring: soc5_0.c:419); their answers come forwarded on RX
++ *     ring 0, and EVENT_ID_TX_DONE (0x0f) says whether the AP acknowledged each
++ *   - SET_BSS_INFO (0x12) connected, UPDATE_STA_RECORD state 3 with the AID (answered),
++ *     INDICATE_PM_BSS_CONNECTED (0x16), POWER_SAVE_MODE CAM (0x05: HakiOS run 459, else the AP
++ *     thinks the station asleep), the RX filter (0x0a: directed, multicast, broadcast)
++ *   - WPA2: the four-way handshake on the host (a34_wpa.c, HakiOS's lx_wpa.c, MIT); EAPOL
++ *     goes as data on TX ring 0 (gl_kal.c:4161: no more by command) at the BSS's lowest basic
++ *     rate, comes on RX ring 2; then ADD_REMOVE_KEY (0x07) for the pairwise key (WTBL 5) and
++ *     the group key (WTBL 4)
++ *   - CH_PRIVILEGE abort: "JOINED" in the log
++ *
++ * After that the thread services the rings every 2 ms (group rekeys, the AP's deauth, data:
++ * counted here, handed to the network interface from 0965 on). Legacy rates only (no HT
++ * elements are sent): enough for a first connection. A failed join can be asked again.
++ */
++#define CMD_ID_POWER_SAVE_MODE          0x05u
++#define CMD_ID_ADD_REMOVE_KEY           0x07u
++#define CMD_ID_SET_RX_FILTER            0x0au
++#define CMD_ID_SET_BSS_INFO             0x12u
++#define CMD_ID_UPDATE_STA_RECORD        0x13u
++#define CMD_ID_REMOVE_STA_RECORD        0x14u
++#define CMD_ID_INDICATE_PM_BSS_CONNECTED 0x16u
++#define CMD_ID_INDICATE_PM_BSS_ABORT    0x17u
++#define CMD_ID_CH_PRIVILEGE             0x1cu
++#define EVENT_ID_TX_DONE                0x0fu
++#define EVENT_ID_CH_PRIVILEGE           0x10u
++#define STA_REC_SIZE                    168u
++#define BSS_INFO_SIZE                   116u
++#define KEY_CMD_SIZE                    64u
++#define AP_WLAN_INDEX                   5u
++#define AP_STA_INDEX                    0u
++#define STA_TYPE_LEGACY_AP              0x41u
++#define DBDC_BAND_AUTO                  4u
++#define RATE_CODE_CCK_1M                0x0000u
++#define RATE_CODE_OFDM_6M               0x004bu
++#define CIPHER_CCMP                     4u
++#define RX_PKT_TYPE_DATA                2u
++#define RX_PKT_TYPE_MSDU_REPORT         6u
++#define A34W_NETWORK_FILE               "network"
++#define A34W_IES_MOST                   768u
++#define ETHERTYPE_EAPOL                 0x888eu
++#define FRAME_MOST                      1532u           /* an Ethernet frame (hal_pdma.c:2683) */
++
++struct a34w_network {
++	uint8_t ssid[32];
++	uint32_t ssid_length;
++	bool psk_given;                 /* a "psk=" line: WPA2-PSK, else open */
++	bool psk_is_key;                /* 64 hex digits: the PMK itself */
++	uint8_t passphrase[64];         /* 8..63 printable characters (never said in the log) */
++	uint32_t passphrase_length;
++	uint8_t pmk[32];
++	bool bssid_given;
++	uint8_t bssid[6];
++};
++
++struct a34w_target {
++	bool found;
++	uint8_t bssid[6];
++	uint8_t channel;
++	int8_t rssi;
++	uint16_t capability;
++	uint16_t beacon_interval;
++	uint8_t ies[A34W_IES_MOST];     /* its beacon's or probe response's elements (as heard loudest) */
++	uint32_t ies_length;
++};
++
++static struct a34w_network a34w_net;
++static struct a34w_target a34w_target;
++static struct a34_wpa a34w_wpa;
++static bool a34w_joining;               /* while step 8's scan looks for a34w_net's SSID */
++static bool a34w_associated;
++static bool a34w_keys_in;
++static uint16_t a34w_aid;
++static uint8_t a34w_ch_token, a34w_pid, a34w_tx_done_pid, a34w_tx_done_status = 0xff, a34w_tx_done_count;
++static uint16_t a34w_mgmt_sn;
++static int a34w_auth_status = -1, a34w_assoc_status = -1;
++static int a34w_ch_status = -1;
++static uint32_t a34w_eapol_rx, a34w_eapol_tx;
++static uint32_t a34w_reports, a34w_tokens_back, a34w_report_version = 0xffffffffu;
++static uint64_t a34w_data_frames_in, a34w_data_bytes_in, a34w_data_frames_out, a34w_data_bytes_out;
++static uint64_t a34w_data_dropped_in, a34w_data_dropped_out;
++static LCK_MTX_DECLARE(a34w_tx_mtx, &a34w_grp);
++static void (*a34w_eth_input)(const uint8_t *frame, uint32_t length);   /* (0965: the network interface) */
++static void (*a34w_link_change)(bool up);
++
++/* ---- the network the owner wants joined: /a34/wifi/network ---- */
++
++/*
++ * "key=value" lines; '#' starts a comment line; the value is everything after the first '=' up
++ * to the end of the line (a '\r' before it dropped, nothing else trimmed: names and passphrases
++ * may have spaces). ssid= (1..32 bytes), psk= (8..63 printable characters, or 64 hex digits),
++ * bssid= (optional). NULL when good, else what is wrong (never the passphrase).
++ */
++static const char *
++a34w_network_parse(const uint8_t *text, uint32_t length, struct a34w_network *n)
++{
++	uint32_t at = 0;
++
++	bzero(n, sizeof(*n));
++	while (at < length) {
++		uint32_t end = at, eq, vlen;
++		const uint8_t *v;
++
++		while (end < length && text[end] != '\n') {
++			end++;
++		}
++		vlen = end;
++		if (vlen > at && text[vlen - 1u] == '\r') {
++			vlen--;
++		}
++		if (vlen == at || text[at] == '#') {
++			at = end + 1u;
++			continue;
++		}
++		for (eq = at; eq < vlen && text[eq] != '='; eq++) {
++		}
++		if (eq == vlen) {
++			return "a line without '='";
++		}
++		v = text + eq + 1u;
++		vlen -= eq + 1u;
++		if (eq - at == 4u && memcmp(text + at, "ssid", 4) == 0) {
++			if (vlen < 1u || vlen > 32u) {
++				return "ssid= is not 1 to 32 bytes";
++			}
++			memcpy(n->ssid, v, vlen);
++			n->ssid_length = vlen;
++		} else if (eq - at == 3u && memcmp(text + at, "psk", 3) == 0) {
++			bool hex = vlen == 64u;
++
++			for (uint32_t i = 0; i < vlen && hex; i++) {
++				hex = a34w_hex(v[i]) >= 0;
++			}
++			if (hex) {
++				for (uint32_t i = 0; i < 32u; i++) {
++					n->pmk[i] = (uint8_t)(a34w_hex(v[2u * i]) << 4 | a34w_hex(v[2u * i + 1u]));
++				}
++				n->psk_is_key = true;
++			} else {
++				if (vlen < 8u || vlen > 63u) {
++					return "psk= is neither 8 to 63 characters nor 64 hex digits";
++				}
++				for (uint32_t i = 0; i < vlen; i++) {
++					if (v[i] < 0x20u || v[i] > 0x7eu) {
++						return "psk= has a character that is not printable ASCII";
++					}
++				}
++				memcpy(n->passphrase, v, vlen);
++				n->passphrase_length = vlen;
++			}
++			n->psk_given = true;
++		} else if (eq - at == 5u && memcmp(text + at, "bssid", 5) == 0) {
++			if (!a34w_mac_text(v, vlen, n->bssid)) {
++				return "bssid= is not xx:xx:xx:xx:xx:xx";
++			}
++			n->bssid_given = true;
++		} else {
++			return "a line that is not ssid=, psk= or bssid=";
++		}
++		at = end + 1u;
++	}
++	return n->ssid_length == 0 ? "no ssid= line" : NULL;
++}
++
++/* the SSID for the log: printable ASCII, the rest as '?' */
++static void
++a34w_net_ssid(char out[33])
++{
++	for (uint32_t i = 0; i < a34w_net.ssid_length; i++) {
++		out[i] = (a34w_net.ssid[i] >= 0x20u && a34w_net.ssid[i] < 0x7fu) ? (char)a34w_net.ssid[i] : '?';
++	}
++	out[a34w_net.ssid_length] = '\0';
++}
++
++static bool
++a34w_network_load(void)
++{
++	uint32_t size = 0;
++	uint8_t *text = a34w_file(A34W_NETWORK_FILE, 6u, "the phone's owner writes it (\"ssid=...\", \"psk=...\")", &size);
++	const char *why;
++	char ssid[33];
++	uint64_t t0;
++
++	if (text == NULL) {
++		return false;
++	}
++	why = size <= 1024u ? a34w_network_parse(text, size, &a34w_net) : "longer than 1024 bytes";
++	bzero(text, size);
++	kfree_data(text, (vm_size_t)size);
++	if (why != NULL) {
++		a34w_say("step 8: " A34W_FW_DIR A34W_NETWORK_FILE ": %s", why);
++		bzero(&a34w_net, sizeof(a34w_net));
++		return false;
++	}
++	a34w_net_ssid(ssid);
++	if (a34w_net.psk_given && !a34w_net.psk_is_key) {
++		t0 = a34w_ms();
++		a34_wpa_pmk(a34w_net.passphrase, a34w_net.passphrase_length, a34w_net.ssid, a34w_net.ssid_length, a34w_net.pmk);
++		bzero(a34w_net.passphrase, sizeof(a34w_net.passphrase));
++		a34w_say("step 8: network \"%s\": WPA2-PSK, a passphrase of %u characters (its key made in %llu ms)%s", ssid,
++		    a34w_net.passphrase_length, (unsigned long long)(a34w_ms() - t0), a34w_net.bssid_given ? ", one BSSID only" : "");
++	} else {
++		a34w_say("step 8: network \"%s\": %s%s", ssid, a34w_net.psk_given ? "WPA2-PSK, a 64-digit key" : "open",
++		    a34w_net.bssid_given ? ", one BSSID only" : "");
++	}
++	return true;
++}
++
++/* ---- the target: the network chosen from a scan ---- */
++
++/* the element `id` among the target's, or NULL */
++static const uint8_t *
++a34w_target_ie(uint8_t id)
++{
++	const uint8_t *ie = a34w_target.ies, *end = a34w_target.ies + a34w_target.ies_length;
++
++	for (; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] == id) {
++			return ie;
++		}
++	}
++	return NULL;
++}
++
++/* (from a34w_mgmt_in, while joining) a beacon or probe response: kept if of the SSID wanted and the loudest so far */
++static void
++a34w_target_heard(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel)
++{
++	const uint8_t *ie, *end = frame + length, *ssid = NULL;
++	uint8_t ds = 0;
++
++	if (!a34w_joining || length < 36u) {
++		return;
++	}
++	for (ie = frame + 36; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] == 0 && ssid == NULL) {
++			ssid = ie;
++		} else if (ie[0] == 3 && ie[1] == 1) {
++			ds = ie[2];
++		}
++	}
++	channel = ds != 0 ? ds : channel;
++	if (ssid == NULL || ssid[1] != a34w_net.ssid_length || memcmp(ssid + 2, a34w_net.ssid, ssid[1]) != 0 ||
++	    (a34w_net.bssid_given && memcmp(frame + 16, a34w_net.bssid, 6) != 0) || channel == 0 ||
++	    (a34w_target.found && rssi <= a34w_target.rssi && memcmp(frame + 16, a34w_target.bssid, 6) != 0)) {
++		return;
++	}
++	if (!a34w_target.found || memcmp(frame + 16, a34w_target.bssid, 6) != 0 || rssi > a34w_target.rssi) {
++		a34w_target.rssi = (int8_t)rssi;
++	}
++	a34w_target.found = true;
++	memcpy(a34w_target.bssid, frame + 16, 6);
++	a34w_target.channel = channel;
++	a34w_target.beacon_interval = (uint16_t)(frame[32] | frame[33] << 8);
++	a34w_target.capability = (uint16_t)(frame[34] | frame[35] << 8);
++	a34w_target.ies_length = length - 36u > A34W_IES_MOST ? A34W_IES_MOST : length - 36u;
++	memcpy(a34w_target.ies, frame + 36, a34w_target.ies_length);
++}
++
++/* 00-0f-ac-<n> */
++static bool
++a34w_suite_is(const uint8_t *s, uint8_t n)
++{
++	return s[0] == 0x00u && s[1] == 0x0fu && s[2] == 0xacu && s[3] == n;
++}
++
++/* NULL if WPA2-PSK with CCMP for both keys is possible without management frame protection, else why not */
++static const char *
++a34w_rsn_check(void)
++{
++	const uint8_t *e = a34w_target_ie(48), *p, *end;
++	uint32_t count;
++	bool ccmp = false, psk = false;
++
++	if (e == NULL) {
++		return (a34w_target.capability & 0x10u) ? "it wants WEP or WPA (no RSN element)" : "it is open";
++	}
++	p = e + 2;
++	end = e + 2 + e[1];
++	if (p + 6 > end || (p[0] | p[1] << 8) != 1) {
++		return "its RSN element is not version 1";
++	}
++	if (!a34w_suite_is(p + 2, 4)) {
++		return "its group cipher is not CCMP (TKIP: WPA/WPA2 mixed mode)";
++	}
++	p += 6;
++	if (p + 2 > end) {
++		return "its RSN element lists no pairwise cipher";
++	}
++	count = (uint32_t)(p[0] | p[1] << 8);
++	p += 2;
++	for (uint32_t i = 0; i < count && p + 4 <= end; i++, p += 4) {
++		ccmp |= a34w_suite_is(p, 4);
++	}
++	if (p + 2 > end) {
++		return "its RSN element lists no key management";
++	}
++	count = (uint32_t)(p[0] | p[1] << 8);
++	p += 2;
++	for (uint32_t i = 0; i < count && p + 4 <= end; i++, p += 4) {
++		psk |= a34w_suite_is(p, 2);
++	}
++	if (!ccmp) {
++		return "its pairwise ciphers do not include CCMP";
++	}
++	if (!psk) {
++		return "it does not offer PSK (WPA3-only SAE, or 802.1X)";
++	}
++	if (p + 2 <= end && (p[0] & 0x40u) != 0) {
++		return "it requires management frame protection (WPA3 / PMF required)";
++	}
++	return NULL;
++}
++
++/* the station's RSN element: WPA2-PSK, CCMP for both keys, no capabilities (message 2 carries it too) */
++static const uint8_t a34w_own_rsn[] = {
++	48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
++};
++
++/* 2, 4, 11, 22, ... (500 kb/s units) -> the firmware's rate bits (wlan_def.h: bit 0 1M ... bit 13 54M) */
++static uint16_t
++a34w_rate_bit(uint8_t rate)
++{
++	static const uint8_t rates[14] = { 2, 4, 11, 22, 44, 66, 12, 18, 24, 36, 48, 72, 96, 108 };
++
++	for (uint32_t i = 0; i < 14u; i++) {
++		if (rates[i] == (rate & 0x7fu)) {
++			return (uint16_t)(1u << i);
++		}
++	}
++	return 0;
++}
++
++/* the target's operational and basic rate sets, from Supported Rates and Extended Supported Rates */
++static void
++a34w_target_rates(uint16_t *operational, uint16_t *basic)
++{
++	static const uint8_t ids[2] = { 1, 50 };
++
++	*operational = 0;
++	*basic = 0;
++	for (uint32_t k = 0; k < 2u; k++) {
++		const uint8_t *e = a34w_target_ie(ids[k]);
++
++		for (uint32_t i = 0; e != NULL && i < e[1]; i++) {
++			uint16_t bit = a34w_rate_bit(e[2 + i]);
++
++			*operational |= bit;
++			if (e[2 + i] & 0x80u) {
++				*basic |= bit;
++			}
++		}
++	}
++	if (*operational == 0) {                /* (none understood: the band's own) */
++		*operational = a34w_target.channel > 14u ? 0x3fc0u : 0x000fu;
++	}
++	if (*basic == 0) {
++		*basic = a34w_target.channel > 14u ? 0x0540u : 0x0003u;
++	}
++}
++
++/* the lowest basic rate as a TXD rate code (CCK 1/2/5.5/11 M: 0..3; OFDM 6..54 M: 0x4b, 0x4f, 0x4a, ...) */
++static uint16_t
++a34w_lowest_basic_rate(void)
++{
++	static const uint16_t codes[14] = { 0x0000, 0x0001, 0x0002, 0x0003, 0, 0, 0x004b, 0x004f, 0x004a, 0x004e, 0x0049,
++		                            0x004d, 0x0048, 0x004c };
++	uint16_t operational, basic;
++
++	a34w_target_rates(&operational, &basic);
++	for (uint32_t i = 0; i < 14u; i++) {
++		if ((basic & (1u << i)) != 0 && (i < 4u || i >= 6u)) {
++			return codes[i];
++		}
++	}
++	return a34w_target.channel > 14u ? RATE_CODE_OFDM_6M : RATE_CODE_CCK_1M;
++}
++
++/* 2.4 GHz: HR/DSSS, and ERP if any OFDM rate; 5 GHz: OFDM (PHY_TYPE_BIT_*) */
++static uint8_t
++a34w_target_phy(uint16_t operational)
++{
++	if (a34w_target.channel > 14u) {
++		return 0x08u;
++	}
++	return (operational & 0x3fc0u) != 0 ? 0x03u : 0x01u;
++}
++
++/* ---- the frames: TXDs (nic_txd_v2_compose), the mailbox for management frames, TX ring 0 for data ---- */
++
++static uint8_t
++a34w_next_pid(void)
++{
++	a34w_pid = (uint8_t)(a34w_pid % 127u + 1u);     /* 1..127, as nic_tx.c's per-WLAN pool */
++	return a34w_pid;
++}
++
++static void
++a34w_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++/*
++ * The CONNAC2X TXD (32 bytes) for a frame to the AP (WTBL 5): a management frame (802.11 header,
++ * packet format "command", MCU queue 1, lifetime 2 s, 30 tries, the lowest basic rate, a
++ * sequence number) or an Ethernet frame (header translated by the hardware, AC_BE queue; EAPOL
++ * at the lowest basic rate with its TX status asked for). `pid` 0: no TX status.
++ */
++static void
++a34w_txd(uint8_t txd[32], uint32_t length, int mgmt_subtype, bool fixed_rate, bool protect, uint8_t pid)
++{
++	uint32_t dw[8] = { 0 };
++	uint32_t rate = a34w_lowest_basic_rate();
++
++	if (mgmt_subtype >= 0) {
++		uint32_t sub = (uint32_t)mgmt_subtype & 0xfu;
++
++		a34w_mgmt_sn = (uint16_t)(a34w_mgmt_sn % 4095u + 1u);
++		dw[0] = (32u + length) | (16u << 16) | (2u << 23) | (1u << 25);
++		dw[1] = AP_WLAN_INDEX | (1u << 10) | (12u << 11) | (2u << 16) | (1u << 31);
++		dw[2] = sub | (30u << 16) | (1u << 31);
++		dw[3] = (30u << 11) | ((uint32_t)a34w_mgmt_sn << 16) | (1u << 31);
++		dw[6] = rate << 16;
++		dw[7] = (24u << 11) | (sub << 16);
++	} else {
++		dw[0] = (32u + length) | (10u << 16) | (1u << 25);
++		dw[1] = AP_WLAN_INDEX | (1u << 10) | (1u << 15) | (1u << 31);
++		dw[3] = (30u << 11) | (protect ? 2u : 0u);
++		if (fixed_rate) {
++			dw[2] = 1u << 31;
++			dw[6] = rate << 16;
++			dw[7] = 24u << 11;
++		}
++	}
++	if (pid != 0) {
++		dw[5] = pid | (1u << 9);
++	}
++	for (uint32_t i = 0; i < 8u; i++) {
++		a34w_put32(txd + 4u * i, dw[i]);
++	}
++}
++
++/* a management frame (from its Frame Control on, no FCS) to the AP, through the mailbox */
++static bool
++a34w_mgmt_tx(const uint8_t *frame, uint32_t length, const char *what)
++{
++	static uint8_t buf[CMD_FRAME_MOST];
++	uint8_t pid = a34w_next_pid();
++
++	if (32u + length > sizeof(buf)) {
++		return false;
++	}
++	a34w_txd(buf, length, frame[0] >> 4, true, false, pid);
++	memcpy(buf + 32, frame, length);
++	if (!a34w_mbox_put(buf, 32u + length, what, frame[0])) {
++		a34w_say("step 8: %s NOT SENT", what);
++		return false;
++	}
++	a34w_say("step 8: %s sent (%u bytes, TX status %u asked for)", what, length, pid);
++	return true;
++}
++
++/* the RX rings 4/5 reports (HW_MAC_MSDU_REPORT, hal_pdma.c:1342-1393): their tokens free again */
++static void
++a34w_report_in(const uint8_t *r, uint32_t count)
++{
++	uint32_t dw0, dw1, version, tokens, done = 0;
++
++	if (count < 8u) {
++		return;
++	}
++	memcpy(&dw0, r, 4);
++	memcpy(&dw1, r + 4, 4);
++	version = (dw1 >> 16) & 7u;
++	tokens = version == 3u ? (dw0 >> 16) & 0x3ffu : (dw0 >> 16) & 0x7fu;
++	if (a34w_report_version != version) {
++		a34w_report_version = version;
++		a34w_say("TX ring 0: the first token report: version %u, %u tokens, words 0x%08x 0x%08x 0x%08x", version,
++		    tokens, dw0, dw1, count >= 12u ? a34w_le32(r + 8) : 0u);
++	}
++	a34w_reports++;
++	lck_mtx_lock(&a34w_tx_mtx);
++	for (uint32_t i = 0; done < tokens && 8u + 4u * i + 4u <= count; i++) {
++		uint32_t w = a34w_le32(r + 8u + 4u * i), token;
++
++		if (version == 0u) {
++			token = (a34w_le32(r + 8u + 4u * (i >> 1)) >> (16u * (i & 1u))) & 0xffffu;
++		} else if (version == 1u) {
++			token = w & 0xffffu;
++		} else if (version == 2u) {
++			token = w & 0x7fffu;
++		} else if ((w & (1u << 31)) != 0) {
++			continue;                       /* (a rate word, not a token) */
++		} else {
++			token = (w >> 16) & 0x7fffu;
++		}
++		done++;
++		if (token < DATA_TX_SLOTS) {
++			a34w_tokens_busy &= ~(1ull << token);
++			a34w_tokens_back++;
++		}
++	}
++	lck_mtx_unlock(&a34w_tx_mtx);
++}
++
++/*
++ * An Ethernet frame to the AP on TX ring 0: a free token's buffer holds the TXD, the TXP
++ * (fillTxDescAppendByHostV2: the token, where the frame is and how long) and the frame; the
++ * DMA reads the first 64 bytes, the MAC the frame. The token is the DMA's until its report.
++ */
++static bool
++a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect)
++{
++	uint32_t token, slot, next, didx;
++	uint8_t *buf;
++	uint64_t pa;
++	volatile uint32_t *d;
++	uint8_t pid = eapol ? a34w_next_pid() : 0;
++
++	if (!a34w_data_rings || length < 14u || length > FRAME_MOST) {
++		return false;
++	}
++	lck_mtx_lock(&a34w_tx_mtx);
++	for (token = 0; token < DATA_TX_SLOTS && (a34w_tokens_busy & (1ull << token)) != 0; token++) {
++	}
++	slot = a34w_dtx_cidx;
++	next = (slot + 1u) % DATA_TX_SLOTS;
++	didx = a34w_rd(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0xcu) & 0xfffu;
++	if (token == DATA_TX_SLOTS || next == didx) {
++		lck_mtx_unlock(&a34w_tx_mtx);
++		a34w_data_dropped_out++;
++		return false;
++	}
++	buf = (uint8_t *)(a34w_dma + DMA_TOKENS + token * DATA_TOKEN_SIZE);
++	pa = A34W_DMA_PA + DMA_TOKENS + token * DATA_TOKEN_SIZE;
++	a34w_txd(buf, length, -1, eapol, protect, pid);
++	bzero(buf + 32, 32);
++	buf[32] = (uint8_t)token;                       /* MSDU ID 0: the token, valid */
++	buf[33] = (uint8_t)((token >> 8) | 0x80u);
++	a34w_put32(buf + 40, (uint32_t)(pa + 64u));     /* pointer 0 */
++	buf[44] = (uint8_t)length;                      /* length 0, address bits 34:32, last */
++	buf[45] = (uint8_t)(((length >> 8) & 0xfu) | (((pa + 64u) >> 32 & 7u) << 4) | 0x80u);
++	memcpy(buf + 64, frame, length);
++	d = a34w_desc(DMA_TX0_DESC, slot);
++	d[0] = (uint32_t)pa;
++	d[2] = 0;
++	d[3] = 0;
++	d[1] = DESC_SDLEN0(64u) | DESC_LS0;             /* DMADONE clear: the DMA's */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_tokens_busy |= 1ull << token;
++	a34w_dtx_cidx = next;
++	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x8u, next);
++	a34w_data_frames_out++;
++	a34w_data_bytes_out += length;
++	lck_mtx_unlock(&a34w_tx_mtx);
++	if (eapol) {
++		a34w_say("step 8: EAPOL out on TX ring 0 (%u bytes, token %u, TX status %u asked for)", length, token, pid);
++	}
++	return true;
++}
++
++/* ---- what comes from the AP ---- */
++
++/* (from RX ring 0) a management frame the firmware forwarded, from its Frame Control on */
++static void
++a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel)
++{
++	uint8_t subtype;
++
++	if (length < 24u || (frame[0] & 0x0cu) != 0) {
++		a34w_rx_other++;
++		return;
++	}
++	subtype = (uint8_t)(frame[0] >> 4);
++	if (subtype == 8u || subtype == 5u) {           /* beacon, probe response */
++		a34w_heard_frame(frame, length, rssi, channel);
++		a34w_target_heard(frame, length, rssi, channel);
++		return;
++	}
++	if (!a34w_target.found || memcmp(frame + 10, a34w_target.bssid, 6) != 0 || memcmp(frame + 4, a34w_mac, 6) != 0) {
++		return;                                 /* not from the target, or not to us */
++	}
++	switch (subtype) {
++	case 11u:                                       /* Authentication: algorithm, transaction 2, status */
++		if (length >= 30u && (frame[26] | frame[27] << 8) == 2u) {
++			a34w_auth_status = frame[28] | frame[29] << 8;
++		}
++		break;
++	case 1u:                                        /* Association Response: capability, status, AID */
++	case 3u:
++		if (length >= 30u) {
++			a34w_assoc_status = frame[26] | frame[27] << 8;
++			a34w_aid = (uint16_t)((frame[28] | frame[29] << 8) & 0x3fffu);
++		}
++		break;
++	case 10u:                                       /* Disassociation, Deauthentication: reason */
++	case 12u:
++		a34w_say("the AP %s us (reason %u)%s", subtype == 12u ? "deauthenticated" : "disassociated",
++		    length >= 26u ? (unsigned)(frame[24] | frame[25] << 8) : 0u, a34w_joined ? ": LEFT the network" : "");
++		if (a34w_joined && a34w_link_change != NULL) {
++			a34w_link_change(false);
++		}
++		a34w_joined = false;
++		a34w_associated = false;
++		a34w_keys_in = false;
++		break;
++	default:
++		break;
++	}
++}
++
++/* (from RX ring 0, while waiting for something else) events step 8 cares about; true: noted */
++static bool
++a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length)
++{
++	if (eid == EVENT_ID_TX_DONE && length >= 6u) {
++		a34w_tx_done_pid = body[0];
++		a34w_tx_done_status = body[1];
++		a34w_tx_done_count = body[5];
++		a34w_say("TX status %u: %s (status %u) after %u tries", body[0], body[1] == 0 ? "acknowledged" :
++		    "NOT acknowledged", body[1], body[5]);
++		return true;
++	}
++	if (eid == EVENT_ID_CH_PRIVILEGE && length >= 3u) {
++		if (body[1] == a34w_ch_token) {
++			a34w_ch_status = body[2];
++		}
++		return true;
++	}
++	return false;
++}
++
++static void a34w_eapol_in(const uint8_t *frame, uint32_t length);
++
++/*
++ * A data frame (RXD packet type 2, or forwarded with its header translated): an Ethernet frame
++ * out of it -- as the hardware made it, or out of the 802.11 header and LLC/SNAP -- for EAPOL
++ * (the handshake) or the network interface. `at`: where the frame starts after RXD and groups.
++ */
++static void
++a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated)
++{
++	static uint8_t eth[FRAME_MOST + 32u];
++	uint32_t dw1, dw2, length;
++	const uint8_t *f = rxd + at;
++
++	memcpy(&dw1, rxd + 4, 4);
++	memcpy(&dw2, rxd + 8, 4);
++	if (at >= count || (dw1 & 0x0b000000u) != 0) { /* FCS, ICV, cipher length errors */
++		a34w_data_dropped_in++;
++		return;
++	}
++	length = count - at;
++	if (translated) {
++		if (length < 14u || length > FRAME_MOST) {
++			a34w_data_dropped_in++;
++			return;
++		}
++		memcpy(eth, f, length);
++	} else {
++		uint32_t header = ((dw2 >> 8) & 0x1fu) * 2u, fc_flags;
++
++		if (header < 24u || length < header + 8u || f[header] != 0xaau || f[header + 1u] != 0xaau || f[header + 2u] != 3u ||
++		    length - header - 8u + 14u > FRAME_MOST || (f[0] & 0x0cu) != 0x08u) {
++			a34w_data_dropped_in++;
++			return;
++		}
++		fc_flags = f[1] & 3u;                   /* ToDS, FromDS: from the AP it is FromDS, A1 DA, A3 SA */
++		memcpy(eth, f + 4, 6);
++		memcpy(eth + 6, fc_flags == 2u ? f + 16 : f + 10, 6);
++		memcpy(eth + 12, f + header + 6u, length - header - 6u);
++		length = length - header - 8u + 14u;
++	}
++	if ((dw1 & (1u << 23)) != 0 && (eth[12] << 8 | eth[13]) != ETHERTYPE_EAPOL) {
++		a34w_data_dropped_in++;                 /* plaintext where a cipher was wanted: only EAPOL may */
++		return;
++	}
++	a34w_data_frames_in++;
++	a34w_data_bytes_in += length;
++	if ((eth[12] << 8 | eth[13]) == ETHERTYPE_EAPOL) {
++		a34w_eapol_in(eth, length);
++	} else if (a34w_eth_input != NULL && a34w_joined) {
++		a34w_eth_input(eth, length);
++	}
++}
++
++/* one RX ring of 2..5 drained; how many buffers it gave */
++static uint32_t
++a34w_drx_poll(uint32_t n)
++{
++	struct a34w_rx_ring *r = &a34w_drx[n - 2u];
++	uint32_t got = 0;
++
++	for (;;) {
++		uint32_t slot = (r->cidx + 1u) % r->slots, count, dw0, dw1, dw2, vld, at;
++		volatile uint32_t *d = a34w_desc(DMA_RXN_DESC(n), slot);
++		const uint8_t *buf = (const uint8_t *)(a34w_dma + DMA_RXN_BUFS(n) + slot * SLOT_SIZE);
++
++		if ((d[1] & DESC_DMADONE) == 0) {
++			break;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		count = (d[1] >> 16) & 0x3fffu;
++		memcpy(&dw0, buf, 4);
++		if (count > r->buf_size) {
++			count = r->buf_size;
++		}
++		if ((d[1] & DESC_LS0) == 0) {
++			a34w_data_dropped_in++;         /* (a frame in pieces: none expected without A-MSDU) */
++		} else if (RXD_PKT_TYPE(dw0) == RX_PKT_TYPE_MSDU_REPORT) {
++			a34w_report_in(buf, count);
++		} else if (RXD_PKT_TYPE(dw0) == RX_PKT_TYPE_DATA && count >= RXD_SIZE) {
++			memcpy(&dw1, buf + 4, 4);
++			memcpy(&dw2, buf + 8, 4);
++			if ((dw0 & 0xffffu) < count) {
++				count = dw0 & 0xffffu;
++			}
++			vld = (dw1 >> 11) & 0x1fu;
++			at = RXD_SIZE + ((vld & 8u) ? 16u : 0u) + ((vld & 1u) ? 16u : 0u) + ((vld & 2u) ? 8u : 0u) +
++			    ((vld & 4u) ? 8u : 0u) + ((vld & 16u) ? 72u : 0u) + ((dw2 >> 14) & 3u) * 2u;
++			if ((dw2 & (1u << 29)) != 0 && (dw2 & (1u << 13)) == 0 && at + 24u <= count) {
++				a34w_mgmt_in(buf + at, count - at, -128, (uint8_t)0);   /* a management frame here */
++			} else {
++				a34w_data_in(buf, count, at, (dw2 & (1u << 13)) != 0);
++			}
++		} else {
++			a34w_rx_other++;
++		}
++		d[0] = (uint32_t)A34W_DMA_PA + DMA_RXN_BUFS(n) + slot * SLOT_SIZE;
++		d[1] = DESC_SDLEN0(r->buf_size);
++		r->cidx = slot;
++		got++;
++	}
++	if (got != 0) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		a34w_wr(a34w_conn, WFDMA_RX_RING(n) + 0x8u, r->cidx);
++	}
++	return got;
++}
++
++/* RX rings 2..5 once; true if anything came */
++static bool
++a34w_data_poll(void)
++{
++	uint32_t got = 0;
++
++	if (!a34w_data_rings) {
++		return false;
++	}
++	for (uint32_t n = 2; n <= 5u; n++) {
++		got += a34w_drx_poll(n);
++	}
++	return got != 0;
++}
++
++/* ---- the four-way handshake (a34_wpa.c) and the keys ---- */
++
++/* ADD_REMOVE_KEY (CMD_802_11_KEY, 64 bytes; wlanoidSetAddKey): CCMP, from the AP, to WTBL `wlan` */
++static bool
++a34w_key_install(bool pairwise, uint8_t key_id, const uint8_t *key, uint8_t wlan)
++{
++	uint8_t c[KEY_CMD_SIZE];
++	bool sent;
++
++	bzero(c, sizeof(c));
++	c[0] = 1;                                       /* ucAddRemove: add */
++	c[1] = pairwise ? 1u : 0u;                      /* ucTxKey */
++	c[2] = pairwise ? 1u : 0u;                      /* ucKeyType: pairwise / group */
++	memcpy(c + 4, a34w_target.bssid, 6);            /* aucPeerAddr */
++	c[10] = BSS_AIS;                                /* ucBssIdx */
++	c[11] = CIPHER_CCMP;                            /* ucAlgorithmId */
++	c[12] = key_id;                                 /* ucKeyId */
++	c[13] = 16;                                     /* ucKeyLen */
++	c[14] = wlan;                                   /* ucWlanIndex */
++	memcpy(c + 16, key, 16);                        /* aucKeyMaterial */
++	sent = a34w_cmd(CMD_ID_ADD_REMOVE_KEY, CMD_SET, c, sizeof(c)) != 0;
++	bzero(c, sizeof(c));
++	return sent;
++}
++
++/* an EAPOL frame (Ethernet, type 0x888e) from the AP: answered, and the keys put in when it says so */
++static void
++a34w_eapol_in(const uint8_t *frame, uint32_t length)
++{
++	static uint8_t reply[14u + A34_WPA_REPLY_MOST];
++	unsigned reply_length = 0;
++	const char *why = NULL;
++	int what;
++
++	a34w_eapol_rx++;
++	if (!a34w_associated || !a34w_net.psk_given) {
++		a34w_say("EAPOL from the AP (%u bytes) while not associated with WPA2: ignored", length);
++		return;
++	}
++	what = a34_wpa_message(&a34w_wpa, frame + 14, length - 14u, reply + 14, &reply_length, &why);
++	if (what == A34_WPA_BAD) {
++		a34w_say("EAPOL from the AP (%u bytes): refused: %s", length, why);
++		return;
++	}
++	if (what == A34_WPA_NOTHING || reply_length == 0) {
++		return;
++	}
++	memcpy(reply, a34w_target.bssid, 6);            /* to the AP, from us, EAPOL */
++	memcpy(reply + 6, a34w_mac, 6);
++	reply[12] = 0x88;
++	reply[13] = 0x8e;
++	a34w_say("EAPOL: message %s from the AP; answered", what == A34_WPA_ANSWER ? "1 of 4" : what == A34_WPA_KEYS ?
++	    "3 of 4" : "1 of 2 (a new group key)");
++	(void)a34w_data_tx(reply, 14u + reply_length, true, what == A34_WPA_GROUP && a34w_keys_in);
++	a34w_eapol_tx++;
++	if (what == A34_WPA_KEYS) {
++		bool p = a34w_key_install(true, 0, a34w_wpa.pairwise, AP_WLAN_INDEX);
++		bool g = a34w_key_install(false, (uint8_t)a34w_wpa.group_index, a34w_wpa.group, BMC_WLAN_INDEX);
++
++		a34w_keys_in = p && g;
++		a34w_say("EAPOL: the four-way handshake is done: pairwise key (WTBL %u) %s, group key %u (WTBL %u) %s",
++		    AP_WLAN_INDEX, p ? "in" : "NOT SENT", a34w_wpa.group_index, BMC_WLAN_INDEX, g ? "in" : "NOT SENT");
++	} else if (what == A34_WPA_GROUP) {
++		bool g = a34w_key_install(false, (uint8_t)a34w_wpa.group_index, a34w_wpa.group, BMC_WLAN_INDEX);
++
++		a34w_say("EAPOL: new group key %u %s", a34w_wpa.group_index, g ? "in" : "NOT SENT");
++	}
++}
++
++/* ---- the commands of joining ---- */
++
++/* CMD_UPDATE_STA_RECORD (168 bytes, version 0) for the AP: state 0 (STA_STATE_1) or 2 (STA_STATE_3) */
++static uint8_t
++a34w_sta_record(uint8_t state, bool need_response)
++{
++	uint8_t c[STA_REC_SIZE];
++	uint16_t operational, basic, fixed = a34w_lowest_basic_rate();
++	int rcpi = (a34w_target.rssi + 110) * 2;
++
++	a34w_target_rates(&operational, &basic);
++	bzero(c, sizeof(c));
++	c[0] = AP_STA_INDEX;                            /* ucStaIndex */
++	c[1] = STA_TYPE_LEGACY_AP;                      /* ucStaType */
++	memcpy(c + 2, a34w_target.bssid, 6);            /* aucMacAddr */
++	c[8] = (uint8_t)a34w_aid;                       /* u2AssocId */
++	c[9] = (uint8_t)(a34w_aid >> 8);
++	c[12] = BSS_AIS;                                /* ucBssIndex */
++	c[13] = a34w_target_phy(operational);           /* ucDesiredPhyTypeSet */
++	c[14] = (uint8_t)operational;                   /* u2DesiredNonHTRateSet */
++	c[15] = (uint8_t)(operational >> 8);
++	c[16] = (uint8_t)basic;                         /* u2BSSBasicRateSet */
++	c[17] = (uint8_t)(basic >> 8);
++	c[20] = state;                                  /* ucStaState */
++	c[50] = (uint8_t)(rcpi < 0 ? 0 : rcpi > 220 ? 220 : rcpi);     /* ucRCPI */
++	c[51] = need_response ? 1u : 0u;                /* ucNeedResp */
++	c[54] = AP_WLAN_INDEX;                          /* ucWlanIndex */
++	c[55] = 0xffu;                                  /* ucBMCWlanIndex, as cnmStaSendUpdateCmd */
++	c[74] = (uint8_t)fixed;                         /* u2HwDefaultFixedRateCode */
++	c[75] = (uint8_t)(fixed >> 8);
++	return a34w_cmd(CMD_ID_UPDATE_STA_RECORD, CMD_SET, c, sizeof(c));
++}
++
++/* CMD_SET_BSS_INFO (116 bytes): BSS 0 connected to the target (or no more), its RLM part at +68 */
++static uint8_t
++a34w_bss_info(bool connected)
++{
++	uint8_t c[BSS_INFO_SIZE], *rlm = c + 68;
++	uint16_t operational, basic, fixed = a34w_lowest_basic_rate();
++	bool five = a34w_target.channel > 14u;
++
++	a34w_target_rates(&operational, &basic);
++	bzero(c, sizeof(c));
++	c[0] = BSS_AIS;                                 /* ucBssIndex */
++	c[1] = (uint8_t)(connected ? 0u : 1u);                   /* ucConnectionState: MEDIA_STATE_CONNECTED 0, DISCONNECTED 1 */
++	c[2] = 0;                                       /* ucCurrentOPMode: infrastructure */
++	c[3] = (uint8_t)a34w_net.ssid_length;           /* ucSSIDLen, aucSSID */
++	memcpy(c + 4, a34w_net.ssid, a34w_net.ssid_length);
++	memcpy(c + 36, a34w_target.bssid, 6);           /* aucBSSID */
++	c[44] = (uint8_t)operational;                   /* u2OperationalRateSet */
++	c[45] = (uint8_t)(operational >> 8);
++	c[46] = (uint8_t)basic;                         /* u2BSSBasicRateSet */
++	c[47] = (uint8_t)(basic >> 8);
++	c[48] = connected ? AP_STA_INDEX : 0xfeu;       /* ucStaRecIdxOfAP */
++	c[50] = (uint8_t)fixed;                         /* u2HwDefaultFixedRateCode */
++	c[51] = (uint8_t)(fixed >> 8);
++	c[52] = five ? 3u : 1u;                         /* ucNonHTBasicPhyType: OFDM / ERP */
++	c[53] = a34w_net.psk_given ? 7u : 0u;           /* ucAuthMode: WPA2-PSK / open */
++	c[54] = a34w_net.psk_given ? 6u : 1u;           /* ucEncStatus: CCMP / none */
++	c[55] = a34w_target_phy(operational);           /* ucPhyTypeSet */
++	c[58] = BMC_WLAN_INDEX;                         /* ucBMCWlanIndex */
++	rlm[0] = BSS_AIS;                               /* rBssRlmParam (rlmFillSyncCmdParam): ucBssIndex */
++	rlm[1] = five ? CMD_BAND_5G : CMD_BAND_2G4;     /* ucRfBand */
++	rlm[2] = a34w_target.channel;                   /* ucPrimaryChannel; SCO 0: 20 MHz, no HT/VHT */
++	rlm[13] = (a34w_target.capability & 0x0020u) ? 1u : 0u;        /* ucUseShortPreamble */
++	rlm[14] = five || (a34w_target.capability & 0x0400u) ? 1u : 0u;/* ucUseShortSlotTime */
++	rlm[20] = 1;                                    /* ucTxNss */
++	rlm[21] = 1;                                    /* ucRxNss */
++	c[90] = DBDC_BAND_AUTO;                         /* ucDBDCBand */
++	c[93] = 1;                                      /* ucNss */
++	return a34w_cmd(CMD_ID_SET_BSS_INFO, CMD_SET, c, sizeof(c));
++}
++
++/* CMD_CH_PRIVILEGE (24 bytes): ask for the target's channel to join on (action 0), or give it back (1) */
++static uint8_t
++a34w_ch_privilege(bool request)
++{
++	uint8_t c[24];
++
++	bzero(c, sizeof(c));
++	if (request) {
++		a34w_ch_token++;
++		a34w_ch_status = -1;
++	}
++	c[0] = BSS_AIS;                                 /* ucBssIndex */
++	c[1] = a34w_ch_token;                           /* ucTokenID (a new one for each request: HakiOS run 449) */
++	c[2] = (uint8_t)(request ? 0u : 1u);                   /* ucAction: REQ / ABORT */
++	if (request) {
++		c[3] = a34w_target.channel;             /* ucPrimaryChannel; SCO 0, 20/40 MHz width 0 */
++		c[5] = a34w_target.channel > 14u ? CMD_BAND_5G : CMD_BAND_2G4;  /* ucRfBand */
++		c[9] = 0;                               /* ucReqType: JOIN */
++		a34w_put32(c + 12, 4000);               /* u4MaxInterval, ms (AIS_JOIN_CH_REQUEST_INTERVAL) */
++	}
++	c[10] = DBDC_BAND_AUTO;                         /* ucDBDCBand */
++	return a34w_cmd(CMD_ID_CH_PRIVILEGE, CMD_SET, c, sizeof(c));
++}
++
++/* the 24 bytes every management frame to the target starts with */
++static uint32_t
++a34w_mgmt_header(uint8_t *f, uint8_t subtype)
++{
++	bzero(f, 24);
++	f[0] = (uint8_t)(subtype << 4);
++	memcpy(f + 4, a34w_target.bssid, 6);
++	memcpy(f + 10, a34w_mac, 6);
++	memcpy(f + 16, a34w_target.bssid, 6);
++	return 24;
++}
++
++/* Association Request: the AP's own rate elements (every legacy rate is ours too), the RSN element for WPA2 */
++static uint32_t
++a34w_frame_assoc(uint8_t *f, uint32_t room)
++{
++	uint32_t n = a34w_mgmt_header(f, 0);
++	uint16_t capability = (uint16_t)(0x0001u | (a34w_target.capability & 0x0430u));  /* ESS; privacy, short preamble/slot as the AP's */
++	const uint8_t *rates = a34w_target_ie(1), *more = a34w_target_ie(50);
++
++	f[n++] = (uint8_t)capability;
++	f[n++] = (uint8_t)(capability >> 8);
++	f[n++] = 10;                                    /* listen interval, beacons (assoc.c) */
++	f[n++] = 0;
++	f[n++] = 0;                                     /* SSID */
++	f[n++] = (uint8_t)a34w_net.ssid_length;
++	memcpy(f + n, a34w_net.ssid, a34w_net.ssid_length);
++	n += a34w_net.ssid_length;
++	if (rates != NULL && n + 2u + rates[1] <= room) {
++		memcpy(f + n, rates, 2u + rates[1]);
++		n += 2u + rates[1];
++	}
++	if (more != NULL && n + 2u + more[1] <= room) {
++		memcpy(f + n, more, 2u + more[1]);
++		n += 2u + more[1];
++	}
++	if (a34w_net.psk_given && n + sizeof(a34w_own_rsn) <= room) {
++		memcpy(f + n, a34w_own_rsn, sizeof(a34w_own_rsn));
++		n += (uint32_t)sizeof(a34w_own_rsn);
++	}
++	return n;
++}
++
++/* until `*status` is set (>= 0) or `ms` pass, with every ring serviced meanwhile */
++static bool
++a34w_wait_status(volatile int *status, uint32_t ms)
++{
++	uint64_t until = a34w_ms() + ms;
++	uint8_t body[64];
++
++	while (*status < 0 && a34w_ms() < until) {
++		(void)a34w_wait_event(EVENT_NONE, 0, body, sizeof(body), 20);   /* (nothing it waits for comes) */
++	}
++	return *status >= 0;
++}
++
++/* everything joining set up, undone (after a failure on the way): the AP told, the firmware too */
++static void
++a34w_unjoin(bool deauth)
++{
++	uint8_t f[26], c[4];
++
++	if (deauth) {
++		(void)a34w_mgmt_header(f, 12);          /* Deauthentication, reason 3: leaving */
++		f[24] = 3;
++		f[25] = 0;
++		(void)a34w_mgmt_tx(f, sizeof(f), "Deauthentication");
++	}
++	bzero(c, sizeof(c));
++	c[0] = BSS_AIS;
++	(void)a34w_cmd(CMD_ID_INDICATE_PM_BSS_ABORT, CMD_SET, c, sizeof(c));
++	(void)a34w_bss_info(false);
++	c[0] = 0;                                       /* CMD_REMOVE_STA_RECORD: action 0, the AP's record, BSS 0 */
++	c[1] = AP_STA_INDEX;
++	c[2] = BSS_AIS;
++	(void)a34w_cmd(CMD_ID_REMOVE_STA_RECORD, CMD_SET, c, sizeof(c));
++	(void)a34w_ch_privilege(false);
++	if (a34w_joined && a34w_link_change != NULL) {
++		a34w_link_change(false);
++	}
++	a34w_joined = false;
++	a34w_associated = false;
++	a34w_keys_in = false;
++}
++
++/* authentication, association, (WPA2) the handshake: with the channel held; true when JOINED */
++static bool
++a34w_connect(void)
++{
++	static uint8_t f[512];
++	uint8_t c[68], answer[16], seq;
++	const uint8_t *tim = a34w_target_ie(5);
++	uint32_t n;
++	int got;
++	uint64_t t0 = a34w_ms();
++
++	a34w_associated = false;
++	a34w_keys_in = false;
++	a34w_aid = 0;
++	if (a34w_ch_privilege(true) == 0 || !a34w_wait_status(&a34w_ch_status, 2000)) {
++		a34w_say("step 8: channel %u NOT GRANTED (CH_PRIVILEGE, token %u)", a34w_target.channel, a34w_ch_token);
++		(void)a34w_ch_privilege(false);
++		return false;
++	}
++	if (a34w_ch_status != 0) {
++		a34w_say("step 8: channel %u refused (status %d)", a34w_target.channel, a34w_ch_status);
++		(void)a34w_ch_privilege(false);
++		return false;
++	}
++	a34w_say("step 8: channel %u granted in %llu ms", a34w_target.channel, (unsigned long long)(a34w_ms() - t0));
++	(void)a34w_sta_record(0, false);                /* the AP's record, state 1, WTBL 5 */
++
++	for (uint32_t tries = 1; tries <= 3u; tries++) {        /* Authentication: open system, transaction 1 */
++		a34w_auth_status = -1;
++		n = a34w_mgmt_header(f, 11);
++		bzero(f + n, 6);
++		f[n + 2] = 1;
++		if (!a34w_mgmt_tx(f, n + 6u, "Authentication") || a34w_wait_status(&a34w_auth_status, 400)) {
++			break;
++		}
++		a34w_say("step 8: no answer to Authentication (try %u)", tries);
++	}
++	if (a34w_auth_status != 0) {
++		a34w_say("step 8: Authentication %s (status %d)", a34w_auth_status < 0 ? "NOT ANSWERED" : "REFUSED",
++		    a34w_auth_status);
++		a34w_unjoin(false);
++		return false;
++	}
++	a34w_say("step 8: authenticated (open system)");
++
++	for (uint32_t tries = 1; tries <= 3u; tries++) {        /* Association */
++		a34w_assoc_status = -1;
++		n = a34w_frame_assoc(f, sizeof(f));
++		if (!a34w_mgmt_tx(f, n, "Association Request") || a34w_wait_status(&a34w_assoc_status, 600)) {
++			break;
++		}
++		a34w_say("step 8: no answer to Association Request (try %u)", tries);
++	}
++	if (a34w_assoc_status != 0) {
++		a34w_say("step 8: Association %s (status %d)", a34w_assoc_status < 0 ? "NOT ANSWERED" : "REFUSED",
++		    a34w_assoc_status);
++		a34w_unjoin(true);
++		return false;
++	}
++	a34w_associated = true;
++	a34w_say("step 8: ASSOCIATED, AID %u (%llu ms in)", a34w_aid, (unsigned long long)(a34w_ms() - t0));
++
++	/* the firmware told: the BSS connected, the AP's record in state 3, power management, CAM, the RX filter */
++	(void)a34w_bss_info(true);
++	seq = a34w_sta_record(2, true);
++	got = seq != 0 ? a34w_wait_event(EVENT_ANY, seq, answer, sizeof(answer), 1000) : -1;
++	a34w_say("step 8: BSS_INFO connected; the AP's record in state 3: %s", got < 0 ? "no answer (going on)" :
++	    "answered");
++	bzero(c, sizeof(c));
++	c[0] = BSS_AIS;                                 /* CMD_INDICATE_PM_BSS_CONNECTED */
++	c[1] = tim != NULL && tim[1] >= 2u ? tim[3] : 1u;   /* ucDtimPeriod (TIM element: count, period) */
++	c[2] = (uint8_t)a34w_aid;
++	c[3] = (uint8_t)(a34w_aid >> 8);
++	c[4] = (uint8_t)a34w_target.beacon_interval;
++	c[5] = (uint8_t)(a34w_target.beacon_interval >> 8);
++	(void)a34w_cmd(CMD_ID_INDICATE_PM_BSS_CONNECTED, CMD_SET, c, 12);
++	bzero(c, sizeof(c));
++	c[0] = BSS_AIS;                                 /* CMD_PS_PROFILE: CAM */
++	(void)a34w_cmd(CMD_ID_POWER_SAVE_MODE, CMD_SET, c, 4);
++	bzero(c, sizeof(c));
++	a34w_put32(c, 0x0fu);                           /* CMD_RX_PACKET_FILTER: directed, multicast, all multicast, broadcast */
++	(void)a34w_cmd(CMD_ID_SET_RX_FILTER, CMD_SET, c, sizeof(c));
++
++	if (a34w_net.psk_given) {                       /* the AP begins the handshake: message 1 within a second or so */
++		uint64_t until = a34w_ms() + 6000u;
++
++		while (!a34w_keys_in && a34w_associated && a34w_ms() < until) {
++			uint8_t body[16];
++
++			(void)a34w_wait_event(EVENT_NONE, 0, body, sizeof(body), 20);
++		}
++		if (!a34w_keys_in) {
++			a34w_say("step 8: the WPA2 handshake did NOT finish (%u EAPOL frames from the AP, %u to it; %llu data "
++			    "frames in; token reports %u)%s", a34w_eapol_rx, a34w_eapol_tx,
++			    (unsigned long long)a34w_data_frames_in, a34w_reports, a34w_associated ? "" : ": the AP let go");
++			a34w_unjoin(a34w_associated);
++			return false;
++		}
++	}
++	(void)a34w_ch_privilege(false);                 /* (Android: when the port is authorized) */
++	a34w_joined = true;
++	if (a34w_link_change != NULL) {
++		a34w_link_change(true);
++	}
++	return true;
++}
++
++/*
++ * Step 8: the network file read, a scan for the network, the loudest BSS of that name joined.
++ * The step can be asked for again after a failure (a34w_thread): each try reads the file anew.
++ */
++static bool
++a34w_step8(void)
++{
++	char ssid[33];
++	const char *why;
++	uint64_t t0 = a34w_ms();
++
++	if (a34w_joined) {
++		a34w_say("step 8: joined already");
++		return true;
++	}
++	if (!a34w_network_load()) {
++		return false;
++	}
++	bzero(&a34w_target, sizeof(a34w_target));
++	a34w_target.rssi = -128;
++	a34w_joining = true;
++	for (uint32_t scan = 1; scan <= 2u && !a34w_target.found; scan++) {
++		(void)a34w_scan("step 8", true);
++	}
++	a34w_joining = false;
++	a34w_net_ssid(ssid);
++	if (!a34w_target.found) {
++		a34w_say("step 8: \"%s\" NOT HEARD in two scans (a hidden network is not looked for)", ssid);
++		(void)a34w_bss_activate(false);
++		return false;
++	}
++	a34w_say("step 8: \"%s\": %02x:%02x:%02x:%02x:%02x:%02x on channel %u, %d dBm, capability 0x%04x, beacon every "
++	    "%u TU", ssid, a34w_target.bssid[0], a34w_target.bssid[1], a34w_target.bssid[2], a34w_target.bssid[3],
++	    a34w_target.bssid[4], a34w_target.bssid[5], a34w_target.channel, a34w_target.rssi, a34w_target.capability,
++	    a34w_target.beacon_interval);
++	why = a34w_rsn_check();
++	if (a34w_net.psk_given && why != NULL) {
++		a34w_say("step 8: cannot join it with WPA2-PSK: %s", why);
++		return false;
++	}
++	if (!a34w_net.psk_given && (a34w_target.capability & 0x10u) != 0) {
++		a34w_say("step 8: it is not open (it wants a passphrase: a psk= line)");
++		return false;
++	}
++	bzero(&a34w_wpa, sizeof(a34w_wpa));
++	if (a34w_net.psk_given) {
++		memcpy(a34w_wpa.pmk, a34w_net.pmk, 32);
++		memcpy(a34w_wpa.own, a34w_mac, 6);
++		memcpy(a34w_wpa.peer, a34w_target.bssid, 6);
++		read_random(a34w_wpa.own_nonce, 32);
++		a34w_wpa.rsn = a34w_own_rsn;
++		a34w_wpa.rsn_length = (unsigned)sizeof(a34w_own_rsn);
++	}
++	sweet_log_flush();
++	if (!a34w_connect()) {
++		bzero(&a34w_wpa, sizeof(a34w_wpa));
++		return false;
++	}
++	a34w_say("step 8: JOINED \"%s\" (%s) in %llu ms: %02x:%02x:%02x:%02x:%02x:%02x, channel %u, AID %u", ssid,
++	    a34w_net.psk_given ? "WPA2-PSK, CCMP" : "open", (unsigned long long)(a34w_ms() - t0), a34w_target.bssid[0],
++	    a34w_target.bssid[1], a34w_target.bssid[2], a34w_target.bssid[3], a34w_target.bssid[4], a34w_target.bssid[5],
++	    a34w_target.channel, a34w_aid);
++	return true;
++}
++
++/*
++ * (the thread, every 2 ms while joined) RX ring 0 (events, management frames: the AP's deauth)
++ * and the data rings (EAPOL rekeys, data, token reports); a line about the traffic now and then.
++ */
++static void
++a34w_service(void)
++{
++	static uint64_t said_at, said_total;
++	uint8_t body[16], seen = 0;
++	uint64_t total;
++
++	for (uint32_t i = 0; i < 16u && a34w_pump(EVENT_NONE, 0, body, sizeof(body), &seen) != -1; i++) {
++	}
++	for (uint32_t i = 0; i < 8u && a34w_data_poll(); i++) {
++	}
++	total = a34w_data_frames_in + a34w_data_frames_out + a34w_data_dropped_in + a34w_data_dropped_out;
++	if (a34w_ms() - said_at >= 30000u && total != said_total) {
++		said_at = a34w_ms();
++		said_total = total;
++		a34w_say("carried: %llu frames out (%llu bytes), %llu in (%llu bytes); dropped %llu out, %llu in; tokens back %u",
++		    (unsigned long long)a34w_data_frames_out, (unsigned long long)a34w_data_bytes_out,
++		    (unsigned long long)a34w_data_frames_in, (unsigned long long)a34w_data_bytes_in,
++		    (unsigned long long)a34w_data_dropped_out, (unsigned long long)a34w_data_dropped_in, a34w_tokens_back);
++	}
++}
++
+ /* ---- the thread: steps up to what is asked, one at a time ---- */
+ 
+ static bool
+@@ -1806,6 +3197,8 @@ a34w_run_step(int step)
+ 		return a34w_step6();
+ 	case 7:
+ 		return a34w_step7();
++	case 8:
++		return a34w_step8();
+ 	default:
+ 		return false;
+ 	}
+@@ -1822,15 +3215,26 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		lck_mtx_lock(&a34w_run_mtx);
+ 		while ((a34w_want <= a34w_done || a34w_failed != 0) && !a34w_rescan) {
+ 			a34w_busy = 0;
+-			lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
++			if (a34w_joined) {              /* (0964) the rings serviced every 2 ms while joined */
++				uint64_t deadline;
++
++				clock_interval_to_deadline(2, NSEC_PER_MSEC, &deadline);
++				(void)lck_mtx_sleep_deadline(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT,
++				    deadline);
++				lck_mtx_unlock(&a34w_run_mtx);
++				a34w_service();
++				lck_mtx_lock(&a34w_run_mtx);
++			} else {
++				lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
++			}
+ 		}
+ 		a34w_busy = 1;
+ 		again = a34w_rescan != 0 && (a34w_want <= a34w_done || a34w_failed != 0);
+ 		a34w_rescan = 0;
+-		step = again ? (int)A34W_STEPS : a34w_done + 1;
++		step = again ? 7 : a34w_done + 1;
+ 		lck_mtx_unlock(&a34w_run_mtx);
+ 		if (again) {
+-			(void)a34w_step7();             /* a scan more: done and failed stay as they are */
++			(void)a34w_scan("scan", a34w_joined);  /* a scan more: done and failed stay as they are */
+ 			continue;
+ 		}
+ 
+@@ -1843,11 +3247,15 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		uint64_t t0 = a34w_ms();
+ 		bool ok = a34w_run_step(step);
+ 
+-		a34w_say("step %d %s (%llu ms)%s", step, ok ? "done" : "FAILED: nothing more will be tried this boot",
+-		    (unsigned long long)(a34w_ms() - t0), ok && step == (int)A34W_STEPS ? ": milestone 1 reached" : "");
++		a34w_say("step %d %s (%llu ms)%s", step, ok ? "done" : step >= 8 ? "FAILED: it can be asked for again" :
++		    "FAILED: nothing more will be tried this boot", (unsigned long long)(a34w_ms() - t0),
++		    ok && step == 7 ? ": milestone 2 reached" : ok && step == 8 ? ": milestone 3 reached" : "");
++		sweet_log_flush();
+ 		lck_mtx_lock(&a34w_run_mtx);
+ 		if (ok) {
+ 			a34w_done = step;
++		} else if (step >= 8) {
++			a34w_want = step - 1;           /* (0964) joining may be asked for again (a34wifi join) */
+ 		} else {
+ 			a34w_failed = step;
+ 		}
+@@ -1910,7 +3318,7 @@ a34w_sysctl_want SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, want, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+-    a34w_sysctl_want, "I", "steps asked for (write N: 1..7)");
++    a34w_sysctl_want, "I", "steps asked for (write N: 1..8)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, done, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_done, 0, "steps done");
+ 
+ /* (0961) write 1: the scan (step 7) once more, once step 7 is done */
+@@ -1928,7 +3336,7 @@ a34w_sysctl_rescan SYSCTL_HANDLER_ARGS
+ 		return error;
+ 	}
+ 	lck_mtx_lock(&a34w_run_mtx);
+-	if (a34w_done < (int)A34W_STEPS || a34w_busy) {
++	if (a34w_done < 7 || a34w_busy) {
+ 		lck_mtx_unlock(&a34w_run_mtx);
+ 		return EBUSY;
+ 	}
+@@ -1944,6 +3352,21 @@ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, rescan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
+ 
++/* (0964) 1 while joined to the network of /a34/wifi/network */
++static int
++a34w_sysctl_joined SYSCTL_HANDLER_ARGS
++{
++	int value = a34w_joined ? 1 : 0;
++
++	(void)arg1;
++	(void)arg2;
++	(void)oidp;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++
++SYSCTL_PROC(_kern_a34wifi, OID_AUTO, joined, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    a34w_sysctl_joined, "I", "joined to the network of /a34/wifi/network");
++
+ static int
+ a34w_sysctl_log SYSCTL_HANDLER_ARGS
+ {
+diff --git a/bsd/dev/a34_wpa.c b/bsd/dev/a34_wpa.c
+new file mode 100644
+index 0000000..3bf269c
+--- /dev/null
++++ b/bsd/dev/a34_wpa.c
+@@ -0,0 +1,531 @@
++/*
++ * A34 (0964): the WPA2-PSK handshake's arithmetic for a34_wifi.c's join (the MT6877's Wi-Fi
++ * firmware, like the MT6768's, leaves the four-way handshake to the host). This is HakiOS's
++ * wifi/lx/src/lx_wpa.c (github.com/oosexgang/hakios-xnu-kernel, branch mtk, commit a962798;
++ * MIT licence, per that repository's README: everything outside its XNU patch), with its names
++ * changed from lx_wpa to a34_wpa and nothing else; its tests are in tools/wifi-host-check/wpa.
++ */
++/*
++ * The arithmetic of WPA2 with a passphrase (a34_wpa.h): SHA-1 and HMAC over it (FIPS 180, RFC
++ * 2104), the key of a name and a passphrase (PBKDF2, RFC 8018), the function that makes the
++ * handshake's keys out of that key, two addresses and two nonces (IEEE 802.11-2020, 12.7.1.2),
++ * AES decryption and the unwrapping of a key with it (FIPS 197, RFC 3394), and the messages of
++ * the four-way and the group-key handshake (12.7.6, 12.7.7; figure 12-35 is the layout).
++ *
++ * Nothing here is taken from another implementation; the tests in tools/wpa-test (here tools/wifi-host-check/wpa) check it
++ * against the standards' own examples and against Python's hashlib and "cryptography".
++ * Nothing here is written for speed, and nothing here says a key in a message.
++ */
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#endif
++
++#include "a34_wpa.h"
++
++/* ---- SHA-1 ------------------------------------------------------------------------------------ */
++
++struct sha1 {
++	uint32_t h[5];
++	uint64_t length;			/* bytes so far */
++	uint8_t block[64];
++};
++
++static uint32_t
++rol(uint32_t x, unsigned n)
++{
++	return (x << n | x >> (32 - n));
++}
++
++static void
++sha1_block(uint32_t h[5], const uint8_t *p)
++{
++	uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
++
++	for (unsigned t = 0; t < 16; t++) {
++		w[t] = (uint32_t)p[4 * t] << 24 | (uint32_t)p[4 * t + 1] << 16 | (uint32_t)p[4 * t + 2] << 8 | p[4 * t + 3];
++	}
++	for (unsigned t = 16; t < 80; t++) {
++		w[t] = rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
++	}
++	for (unsigned t = 0; t < 80; t++) {
++		uint32_t f = t < 20 ? ((b & c) | (~b & d)) + 0x5a827999 : t < 40 ? (b ^ c ^ d) + 0x6ed9eba1 : t < 60 ?
++		    ((b & c) | (b & d) | (c & d)) + 0x8f1bbcdc : (b ^ c ^ d) + 0xca62c1d6;
++		uint32_t next = rol(a, 5) + f + e + w[t];
++
++		e = d;
++		d = c;
++		c = rol(b, 30);
++		b = a;
++		a = next;
++	}
++	h[0] += a;
++	h[1] += b;
++	h[2] += c;
++	h[3] += d;
++	h[4] += e;
++}
++
++static void
++sha1_begin(struct sha1 *s)
++{
++	s->h[0] = 0x67452301;
++	s->h[1] = 0xefcdab89;
++	s->h[2] = 0x98badcfe;
++	s->h[3] = 0x10325476;
++	s->h[4] = 0xc3d2e1f0;
++	s->length = 0;
++}
++
++static void
++sha1_more(struct sha1 *s, const uint8_t *data, unsigned length)
++{
++	for (unsigned i = 0; i < length; i++) {
++		s->block[s->length++ % 64] = data[i];
++		if (s->length % 64 == 0) {
++			sha1_block(s->h, s->block);
++		}
++	}
++}
++
++static void
++sha1_end(struct sha1 *s, uint8_t digest[20])
++{
++	uint64_t bits = s->length * 8;
++	uint8_t tail[8];
++
++	sha1_more(s, (const uint8_t *)"\x80", 1);
++	while (s->length % 64 != 56) {
++		sha1_more(s, (const uint8_t *)"", 1);
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		tail[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	sha1_more(s, tail, 8);
++	for (unsigned i = 0; i < 20; i++) {
++		digest[i] = (uint8_t)(s->h[i / 4] >> (24 - 8 * (i % 4)));
++	}
++}
++
++/* HMAC-SHA1 of several pieces in a row. */
++static void
++hmac_sha1(const uint8_t *key, unsigned key_length, const uint8_t *const pieces[], const unsigned lengths[], unsigned count,
++    uint8_t digest[20])
++{
++	uint8_t pad[64], hashed[20], inner[20];
++	struct sha1 s;
++
++	if (key_length > 64) {
++		sha1_begin(&s);
++		sha1_more(&s, key, key_length);
++		sha1_end(&s, hashed);
++		key = hashed;
++		key_length = 20;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] = (i < key_length ? key[i] : 0) ^ 0x36;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	for (unsigned i = 0; i < count; i++) {
++		sha1_more(&s, pieces[i], lengths[i]);
++	}
++	sha1_end(&s, inner);
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] ^= 0x36 ^ 0x5c;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	sha1_more(&s, inner, 20);
++	sha1_end(&s, digest);
++	memset(pad, 0, sizeof(pad));
++	memset(inner, 0, sizeof(inner));
++}
++
++/* ---- the key of a name and a passphrase -------------------------------------------------------- */
++
++/* PBKDF2 with HMAC-SHA1, 4096 rounds, 32 bytes: two blocks of 20, of the second the first 12. */
++void
++a34_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32])
++{
++	for (unsigned block = 1; block <= 2; block++) {
++		const uint8_t number[4] = { 0, 0, 0, (uint8_t)block };
++		const uint8_t *first[2] = { name, number };
++		const unsigned first_lengths[2] = { name_length, 4 };
++		uint8_t u[20], sum[20];
++
++		hmac_sha1(passphrase, passphrase_length, first, first_lengths, 2, u);
++		memcpy(sum, u, 20);
++		for (unsigned round = 1; round < 4096; round++) {
++			const uint8_t *again[1] = { u };
++			const unsigned again_lengths[1] = { 20 };
++
++			hmac_sha1(passphrase, passphrase_length, again, again_lengths, 1, u);
++			for (unsigned i = 0; i < 20; i++) {
++				sum[i] ^= u[i];
++			}
++		}
++		memcpy(pmk + 20 * (block - 1), sum, block == 1 ? 20 : 12);
++		memset(u, 0, sizeof(u));
++		memset(sum, 0, sizeof(sum));
++	}
++}
++
++/* The standard's PRF: HMAC-SHA1 of (label, a zero byte, data, a counter byte), block after block. */
++static void
++prf(const uint8_t *key, unsigned key_length, const char *label, const uint8_t *data, unsigned data_length, uint8_t *out,
++    unsigned out_length)
++{
++	uint8_t zero = 0, counter = 0, digest[20];
++	const uint8_t *pieces[4] = { (const uint8_t *)label, &zero, data, &counter };
++	const unsigned lengths[4] = { (unsigned)strlen(label), 1, data_length, 1 };
++
++	for (unsigned done = 0; done < out_length; done += 20, counter++) {
++		hmac_sha1(key, key_length, pieces, lengths, 4, digest);
++		memcpy(out + done, digest, out_length - done < 20 ? out_length - done : 20);
++	}
++	memset(digest, 0, sizeof(digest));
++}
++
++/* ---- AES-128, decryption only, and the unwrapping of a key --------------------------------------- */
++
++static uint8_t sbox[256], inverse_sbox[256];
++
++static uint8_t
++times(uint8_t a, uint8_t b)			/* in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 */
++{
++	uint8_t product = 0;
++
++	for (; b != 0; b >>= 1) {
++		if (b & 1) {
++			product ^= a;
++		}
++		a = (uint8_t)(a << 1 ^ (a & 0x80 ? 0x1b : 0));
++	}
++	return (product);
++}
++
++/* FIPS 197, 5.1.1: a byte's inverse in the field, then the affine map. */
++static void
++aes_tables(void)
++{
++	if (sbox[0] != 0) {
++		return;
++	}
++	for (unsigned x = 0; x < 256; x++) {
++		uint8_t inverse = 0, s;
++
++		for (unsigned y = 1; y < 256 && x != 0; y++) {
++			if (times((uint8_t)x, (uint8_t)y) == 1) {
++				inverse = (uint8_t)y;
++				break;
++			}
++		}
++		s = inverse;
++		for (unsigned i = 1; i < 5; i++) {
++			s ^= (uint8_t)(inverse << i | inverse >> (8 - i));
++		}
++		s ^= 0x63;
++		sbox[x] = s;
++		inverse_sbox[s] = (uint8_t)x;
++	}
++}
++
++static void
++aes_keys(const uint8_t key[16], uint8_t round_keys[176])
++{
++	uint8_t constant = 1;
++
++	aes_tables();
++	memcpy(round_keys, key, 16);
++	for (unsigned i = 16; i < 176; i += 4) {
++		uint8_t word[4];
++
++		memcpy(word, round_keys + i - 4, 4);
++		if (i % 16 == 0) {
++			uint8_t first = word[0];
++
++			word[0] = sbox[word[1]] ^ constant;
++			word[1] = sbox[word[2]];
++			word[2] = sbox[word[3]];
++			word[3] = sbox[first];
++			constant = times(constant, 2);
++		}
++		for (unsigned j = 0; j < 4; j++) {
++			round_keys[i + j] = round_keys[i - 16 + j] ^ word[j];
++		}
++	}
++}
++
++/* FIPS 197, 5.3: the inverse cipher on one block (bytes in column order: byte r of column c is s[4c + r]). */
++static void
++aes_decrypt(const uint8_t round_keys[176], uint8_t s[16])
++{
++	for (unsigned i = 0; i < 16; i++) {
++		s[i] ^= round_keys[160 + i];
++	}
++	for (int round = 9; round >= 0; round--) {
++		uint8_t t[16];
++
++		for (unsigned c = 0; c < 4; c++) {		/* the rows shifted back, and the bytes substituted back */
++			for (unsigned r = 0; r < 4; r++) {
++				t[4 * ((c + r) % 4) + r] = inverse_sbox[s[4 * c + r]];
++			}
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			t[i] ^= round_keys[16 * round + i];
++		}
++		if (round == 0) {
++			memcpy(s, t, 16);
++			break;
++		}
++		for (unsigned c = 0; c < 4; c++) {		/* the columns mixed back */
++			const uint8_t *a = t + 4 * c;
++
++			s[4 * c + 0] = times(a[0], 14) ^ times(a[1], 11) ^ times(a[2], 13) ^ times(a[3], 9);
++			s[4 * c + 1] = times(a[0], 9) ^ times(a[1], 14) ^ times(a[2], 11) ^ times(a[3], 13);
++			s[4 * c + 2] = times(a[0], 13) ^ times(a[1], 9) ^ times(a[2], 14) ^ times(a[3], 11);
++			s[4 * c + 3] = times(a[0], 11) ^ times(a[1], 13) ^ times(a[2], 9) ^ times(a[3], 14);
++		}
++	}
++}
++
++/*
++ * RFC 3394, 2.2.2: `wrapped` is 8 bytes longer than what comes out, which goes to `plain`. 0, or -1
++ * if the length is not one a wrapped key has or the check value does not come out.
++ */
++static int
++aes_unwrap(const uint8_t kek[16], const uint8_t *wrapped, unsigned length, uint8_t *plain)
++{
++	unsigned n = length / 8 - 1;
++	uint8_t round_keys[176], a[8], block[16];
++	int good = 0;
++
++	if (length % 8 != 0 || length < 24) {
++		return (-1);
++	}
++	aes_keys(kek, round_keys);
++	memcpy(a, wrapped, 8);
++	memcpy(plain, wrapped + 8, 8 * n);
++	for (int j = 5; j >= 0; j--) {
++		for (unsigned i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (unsigned)j + i;
++
++			memcpy(block, a, 8);
++			for (unsigned k = 0; k < 8; k++) {
++				block[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(block + 8, plain + 8 * (i - 1), 8);
++			aes_decrypt(round_keys, block);
++			memcpy(a, block, 8);
++			memcpy(plain + 8 * (i - 1), block + 8, 8);
++		}
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		good |= a[i] ^ 0xa6;
++	}
++	memset(round_keys, 0, sizeof(round_keys));
++	memset(block, 0, sizeof(block));
++	return (good == 0 ? 0 : -1);
++}
++
++/* ---- the handshake -------------------------------------------------------------------------------- */
++
++/*
++ * A key message, after the four bytes every EAPOL frame begins with (version, type 3, length):
++ *   4 the kind of descriptor (2: RSN)     5 what the message is (bits below)     7 key length
++ *   9 replay counter (8)     17 nonce (32)     49 IV (16)     65 RSC (8)     73 reserved (8)
++ *   81 MIC (16)     97 length of the key data     99 key data
++ */
++#define AT_KIND		4
++#define AT_INFO		5
++#define AT_REPLAY	9
++#define AT_NONCE	17
++#define AT_RSC		65
++#define AT_MIC		81
++#define AT_DATA_LENGTH	97
++#define AT_DATA		99
++#define MESSAGE_MOST	640
++
++#define INFO_VERSION	0x0007			/* 2: HMAC-SHA1 for the MIC, the AES key wrap for the key data */
++#define INFO_PAIRWISE	0x0008
++#define INFO_INSTALL	0x0040
++#define INFO_ACK	0x0080
++#define INFO_MIC	0x0100
++#define INFO_SECURE	0x0200
++#define INFO_ENCRYPTED	0x1000
++
++static void
++mic_of(const struct a34_wpa *wpa, const uint8_t *message, unsigned length, uint8_t mic[16])
++{
++	const uint8_t zeros[16] = { 0 };
++	const uint8_t *pieces[3] = { message, zeros, message + AT_MIC + 16 };
++	const unsigned lengths[3] = { AT_MIC, 16, length - AT_MIC - 16 };
++	uint8_t digest[20];
++
++	hmac_sha1(wpa->kck, 16, pieces, lengths, 3, digest);
++	memcpy(mic, digest, 16);
++}
++
++/* The keys of the handshake and the pairwise key, from the PMK, both addresses and both nonces. */
++static void
++derive(struct a34_wpa *wpa)
++{
++	uint8_t data[76], keys[48];
++	int own_first = memcmp(wpa->own, wpa->peer, 6) < 0, own_nonce_first = memcmp(wpa->own_nonce, wpa->peer_nonce, 32) < 0;
++
++	memcpy(data, own_first ? wpa->own : wpa->peer, 6);
++	memcpy(data + 6, own_first ? wpa->peer : wpa->own, 6);
++	memcpy(data + 12, own_nonce_first ? wpa->own_nonce : wpa->peer_nonce, 32);
++	memcpy(data + 44, own_nonce_first ? wpa->peer_nonce : wpa->own_nonce, 32);
++	prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, sizeof(keys));
++	memcpy(wpa->kck, keys, 16);
++	memcpy(wpa->kek, keys + 16, 16);
++	memcpy(wpa->pairwise, keys + 32, 16);
++	memset(keys, 0, sizeof(keys));
++	wpa->have_keys = 1;
++}
++
++/* Our message in answer to `message`: the same counter, our bits, our nonce and key data if any, signed. */
++static void
++answer(const struct a34_wpa *wpa, const uint8_t *message, unsigned info, const uint8_t *nonce, const uint8_t *data,
++    unsigned data_length, uint8_t *reply, unsigned *reply_length)
++{
++	unsigned length = AT_DATA + data_length;
++
++	memset(reply, 0, length);
++	reply[0] = message[0];
++	reply[1] = 3;
++	reply[2] = (uint8_t)((length - 4) >> 8);
++	reply[3] = (uint8_t)(length - 4);
++	reply[AT_KIND] = 2;
++	reply[AT_INFO] = (uint8_t)(info >> 8);
++	reply[AT_INFO + 1] = (uint8_t)info;
++	memcpy(reply + AT_REPLAY, message + AT_REPLAY, 8);
++	if (nonce != NULL) {
++		memcpy(reply + AT_NONCE, nonce, 32);
++	}
++	reply[AT_DATA_LENGTH] = (uint8_t)(data_length >> 8);
++	reply[AT_DATA_LENGTH + 1] = (uint8_t)data_length;
++	if (data_length != 0) {
++		memcpy(reply + AT_DATA, data, data_length);
++	}
++	mic_of(wpa, reply, length, reply + AT_MIC);
++	*reply_length = length;
++}
++
++/* The group key among what message 3 (or a group message) carries: an element 0xdd of the suite 00-0f-ac, kind 1. */
++static int
++group_key(struct a34_wpa *wpa, const uint8_t *data, unsigned length, const uint8_t *counter)
++{
++	for (unsigned at = 0; at + 2 <= length && at + 2 + data[at + 1] <= length; at += 2 + data[at + 1]) {
++		const uint8_t *e = data + at;
++
++		if (e[0] == 0xdd && e[1] == 0) {
++			break;				/* (padding from here on) */
++		}
++		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
++		    e[1] - 6u <= sizeof(wpa->group)) {
++			wpa->group_index = e[6] & 3;
++			wpa->group_length = e[1] - 6u;
++			memcpy(wpa->group, e + 8, wpa->group_length);
++			memcpy(wpa->group_counter, counter, 8);
++			return (0);
++		}
++	}
++	return (-1);
++}
++
++int
++a34_wpa_message(struct a34_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply, unsigned *reply_length,
++    const char **why)
++{
++	uint8_t mic[16], data[MESSAGE_MOST];
++	unsigned info, body, data_length, difference = 0;
++	const char *nothing;
++
++	why = why != NULL ? why : &nothing;
++	*why = "";
++	*reply_length = 0;
++	if (length < 4 || message[1] != 3) {
++		return (A34_WPA_NOTHING);
++	}
++	body = (unsigned)message[2] << 8 | message[3];
++	if (length < AT_DATA || 4 + body > length || 4 + body < AT_DATA || 4 + body > MESSAGE_MOST) {
++		*why = "its length is not a key message's";
++		return (A34_WPA_BAD);
++	}
++	length = 4 + body;
++	info = (unsigned)message[AT_INFO] << 8 | message[AT_INFO + 1];
++	data_length = (unsigned)message[AT_DATA_LENGTH] << 8 | message[AT_DATA_LENGTH + 1];
++	if (message[AT_KIND] != 2) {
++		*why = "it is not an RSN key message (WPA of the first kind?)";
++		return (A34_WPA_BAD);
++	}
++	if ((info & INFO_VERSION) != 2) {
++		*why = "its key descriptor is not version 2 (the network wants another kind of key management)";
++		return (A34_WPA_BAD);
++	}
++	if (AT_DATA + data_length > length) {
++		*why = "its key data is longer than the message";
++		return (A34_WPA_BAD);
++	}
++
++	/* message 1: the access point's nonce, unsigned */
++	if ((info & (INFO_PAIRWISE | INFO_ACK | INFO_MIC)) == (INFO_PAIRWISE | INFO_ACK)) {
++		memcpy(wpa->peer_nonce, message + AT_NONCE, 32);
++		derive(wpa);
++		answer(wpa, message, 2 | INFO_PAIRWISE | INFO_MIC, wpa->own_nonce, wpa->rsn, wpa->rsn_length, reply, reply_length);
++		return (A34_WPA_ANSWER);
++	}
++
++	/* everything else is signed, by an access point that has shown it has the key */
++	if (!(info & INFO_MIC) || !(info & INFO_ACK)) {
++		return (A34_WPA_NOTHING);
++	}
++	if (!wpa->have_keys) {
++		*why = "it is signed, and there has been no message 1 to make the keys from";
++		return (A34_WPA_BAD);
++	}
++	mic_of(wpa, message, length, mic);
++	for (unsigned i = 0; i < 16; i++) {
++		difference |= mic[i] ^ message[AT_MIC + i];
++	}
++	if (difference != 0) {
++		*why = "its signature is not right (a wrong passphrase gives this)";
++		return (A34_WPA_BAD);
++	}
++	if (wpa->replay_known && memcmp(message + AT_REPLAY, wpa->replay, 8) <= 0) {
++		*why = "its counter is not beyond the last one's (a message played again)";
++		return (A34_WPA_BAD);
++	}
++	if ((info & INFO_PAIRWISE) && memcmp(message + AT_NONCE, wpa->peer_nonce, 32) != 0) {
++		*why = "its nonce is not message 1's";
++		return (A34_WPA_BAD);
++	}
++	if (!(info & INFO_ENCRYPTED) || aes_unwrap(wpa->kek, message + AT_DATA, data_length, data) != 0) {
++		*why = "its key data does not unwrap";
++		return (A34_WPA_BAD);
++	}
++	if (group_key(wpa, data, data_length - 8, message + AT_RSC) != 0) {
++		memset(data, 0, sizeof(data));
++		*why = "there is no group key in it";
++		return (A34_WPA_BAD);
++	}
++	memset(data, 0, sizeof(data));
++	memcpy(wpa->replay, message + AT_REPLAY, 8);
++	wpa->replay_known = 1;
++
++	/* message 3 of the four, or message 1 of a new group key */
++	if (info & INFO_PAIRWISE) {
++		answer(wpa, message, 2 | INFO_PAIRWISE | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++		return (A34_WPA_KEYS);
++	}
++	answer(wpa, message, 2 | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++	return (A34_WPA_GROUP);
++}
+diff --git a/bsd/dev/a34_wpa.h b/bsd/dev/a34_wpa.h
+new file mode 100644
+index 0000000..ba33399
+--- /dev/null
++++ b/bsd/dev/a34_wpa.h
+@@ -0,0 +1,53 @@
++/*
++ * A34 (0964): HakiOS's wifi/lx/src/lx_wpa.h (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * commit a962798; MIT licence), names changed from lx_wpa to a34_wpa. See a34_wpa.c.
++ */
++/*
++ * WPA2 with a passphrase, as a station sees it: the key a name and a passphrase make, and the
++ * four-way handshake in which an access point and a station prove that key to each other and
++ * arrive at the keys their frames are ciphered with (IEEE 802.11-2020, 12.7; RSN, AKM "PSK",
++ * key descriptor version 2: HMAC-SHA1 and the AES key wrap). a34_wpa.c is the arithmetic and
++ * nothing else -- no radio, no kernel --, so that it runs on the machine the kernel is built on
++ * (tools/wpa-test; here tools/wifi-host-check/wpa) as it runs in the kernel.
++ */
++#ifndef _A34_WPA_H_
++#define _A34_WPA_H_
++
++/* The key ("PMK") of a network's name and passphrase: 32 bytes. Slow on purpose: 8192 rounds of HMAC-SHA1. */
++void a34_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32]);
++
++struct a34_wpa {
++	unsigned char pmk[32];
++	unsigned char own[6], peer[6];		/* the station's address and the access point's */
++	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
++	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
++	unsigned rsn_length;			/* ... which goes into message 2 */
++	/* from here on: a34_wpa.c's */
++	unsigned char peer_nonce[32];
++	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
++	unsigned char replay[8];		/* the counter of the last message accepted */
++	int have_keys, replay_known;
++	/* what comes out of it */
++	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
++	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
++	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
++	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */
++};
++
++/*
++ * What a message of the handshake (an EAPOL frame: what follows the Ethernet header of a frame
++ * of type 0x888e) calls for. `reply` has room for A34_WPA_REPLY_MOST bytes.
++ */
++#define A34_WPA_REPLY_MOST	256
++enum {
++	A34_WPA_BAD = -1,		/* not a message that can be answered: *why says what was wrong with it */
++	A34_WPA_NOTHING = 0,		/* not for us to answer (not a key message) */
++	A34_WPA_ANSWER = 1,		/* message 1: send the reply (message 2) */
++	A34_WPA_KEYS = 2,		/* message 3: send the reply (message 4), then both keys are to be used */
++	A34_WPA_GROUP = 3,		/* a new group key later on: send the reply, then use the new group key */
++};
++int a34_wpa_message(struct a34_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
++    unsigned *reply_length, const char **why);
++
++#endif

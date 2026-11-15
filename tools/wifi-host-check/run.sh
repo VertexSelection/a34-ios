@@ -17,18 +17,20 @@ FW=$(cd "$FW" && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# bsd/dev/a34_wifi.c and a34_connsys.c as the patches leave them: every patch that touches one, in order
+# bsd/dev/a34_wifi.c, a34_connsys.c and (0964) a34_wpa.c/.h as the patches leave them: every patch that touches
+# one, in order
 mkdir -p "$TMP/tree"
 git -C "$TMP/tree" init -q
 for p in "$ROOT"/xnu/patches/*.patch; do
-	for f in a34_wifi a34_connsys; do
-		if grep -q "^+++ b/bsd/dev/$f.c" "$p"; then
-			git -C "$TMP/tree" apply --include="bsd/dev/$f.c" "$p"
-			echo "$f.c: applied $(basename "$p")"
+	for f in a34_wifi.c a34_connsys.c a34_wpa.c a34_wpa.h; do
+		if grep -q "^+++ b/bsd/dev/$f" "$p"; then
+			git -C "$TMP/tree" apply --include="bsd/dev/$f" "$p"
+			echo "$f: applied $(basename "$p")"
 		fi
 	done
 done
 cp "$TMP/tree/bsd/dev/a34_wifi.c" "$TMP/tree/bsd/dev/a34_connsys.c" "$TMP/"
+cp "$TMP/tree/bsd/dev/a34_wpa.c" "$TMP/tree/bsd/dev/a34_wpa.h" "$TMP/" 2>/dev/null || true
 echo "a34_wifi.c: $(wc -l <"$TMP/a34_wifi.c") lines, a34_connsys.c: $(wc -l <"$TMP/a34_connsys.c") lines"
 cp "$HERE/ruby_hal.h" "$TMP/"
 # the XNU headers it includes, each standing for xnu_mock.h (ahead of the host's own on the -I path)
@@ -40,7 +42,8 @@ for h in sys/param.h sys/systm.h sys/errno.h sys/sysctl.h sys/vnode.h sys/vnode_
 done
 
 echo "== syntax and types (-Werror)"
-for f in a34_wifi a34_connsys; do
+for f in a34_wifi a34_connsys a34_wpa; do
+	[ -f "$TMP/$f.c" ] || continue
 	gcc -fsyntax-only -std=gnu11 -Wall -Wextra -Wshadow -Wmissing-prototypes -Wstrict-prototypes -Wpointer-arith \
 		-Wcast-qual -Wformat=2 -Wconversion -Wno-sign-conversion -Werror -DARM64_BOARD_CONFIG_SWEET \
 		-I"$TMP/inc" -I"$HERE" -I"$TMP" -include "$HERE/xnu_mock.h" "$TMP/$f.c"
@@ -52,3 +55,9 @@ sed -i 's/__asm__ volatile ("dsb sy" ::: "memory");/__asm__ volatile ("" ::: "me
 gcc -std=gnu11 -O1 -g -w -DARM64_BOARD_CONFIG_SWEET -I"$TMP/inc" -I"$HERE" -I"$TMP" -include "$HERE/xnu_mock.h" \
 	-fsanitize=address,undefined -fno-sanitize-recover=all -o "$TMP/harness" "$HERE/harness.c"
 ASAN_OPTIONS=detect_leaks=0 "$TMP/harness" "$FW"
+
+echo "== the WPA2 handshake's arithmetic (0964, a34_wpa.c; needs Python 3 with \"cryptography\")"
+"$HERE/wpa/reference.py" 1 >"$TMP/cases.inc"
+gcc -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -I"$TMP" \
+	-o "$TMP/wpa-test" "$HERE/wpa/test_wpa.c"
+"$TMP/wpa-test"

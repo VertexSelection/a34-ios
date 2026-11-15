@@ -28,13 +28,14 @@ echo "clang: $("$CLANG" --version | head -n 1)"
 echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $IOS_SDK"
 
 log "a34wifi (a34wifi.c)"
-"${CC[@]}" -o "$A/a34wifi" "$HERE/a34wifi.c"
+"${CC[@]}" -o "$A/a34wifi" "$HERE/a34wifi.c" -framework CoreFoundation
 mv "$A"/*.dSYM "$OUT/dSYM/" 2>/dev/null || true
 
 log "host check of the same source (macOS: it builds and says what it is without the kernel side)"
-xcrun --sdk macosx clang -std=gnu11 -O2 -Wall -Wextra -Werror -o "$WORK/a34wifi-host" "$HERE/a34wifi.c"
+xcrun --sdk macosx clang -std=gnu11 -O2 -Wall -Wextra -Werror -o "$WORK/a34wifi-host" "$HERE/a34wifi.c" \
+	-framework CoreFoundation
 # (no kern.a34wifi and no /a34/wifi on a Mac: each must say so and fail, not crash)
-for args in "" "files" "log" "up 3 1" "scan 1" "bogus"; do
+for args in "" "files" "log" "up 3 1" "scan 1" "mac" "join 1" "dhcp 1" "bogus"; do
 	rc=0
 	# shellcheck disable=SC2086
 	"$WORK/a34wifi-host" $args || rc=$?

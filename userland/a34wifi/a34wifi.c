@@ -21,6 +21,22 @@
  *   7  (M2) one scan: the station's BSS activated, a scan request, beacons and probe responses
  *      collected until SCAN_DONE: one line per network heard (BSSID, channel, RSSI, SSID)
  *
+ *   8  (0964) join the network named in /a34/wifi/network (below): a scan for it, the
+ *      loudest access point of that name chosen, authentication, association, for WPA2
+ *      the four-way handshake and its keys installed: "JOINED" in the log
+ *
+ *   9  (0965) the data path: the network interface (kern.a34wifi.ifname, "enN") attached and
+ *      its frames carried over the radio's data rings; then "a34wifi dhcp" for an address
+ *
+ * The network to join (0964): /a34/wifi/network, written by the phone's owner and by no one
+ * else -- it is never in the repository, and nothing here prints the passphrase:
+ *
+ *   ssid=Name Of The Network
+ *   psk=the passphrase          (8 to 63 characters, or 64 hex digits; no psk line: open)
+ *   bssid=xx:xx:xx:xx:xx:xx     (optional: only this access point)
+ *
+ * Everything after the '=' up to the end of the line counts (spaces too). Mode 0600 is best.
+ *
  * The phone's Wi-Fi address (0963): /a34/wifi/mac, one line "xx:xx:xx:xx:xx:xx". The chip's
  * efuse has none and Samsung's is in /efs, which nothing here reads; so this tool makes one
  * the first time it is needed -- random, locally administered, unicast -- and keeps it, so
@@ -35,12 +51,19 @@
  *   a34wifi log             the kernel's Wi-Fi log only
  *   a34wifi files           the firmware files in /a34/wifi: present, sizes, what they say
  *   a34wifi mac             the phone's Wi-Fi address, made and kept first if there is none
+ *   a34wifi join [SECONDS]  check /a34/wifi/network, then ask for step 8 (as "up 8")
+ *   a34wifi dhcp [SECONDS]  (0965) once step 9 is done: have configd's IPConfiguration run DHCP
+ *                           on the interface, and wait (default 60 s) for its IPv4 address
  *                           ("up" does that too, before it asks the kernel for anything)
  *
  * Output goes to stdout; as a launchd job (tools/root-add-job.py) that is /dev/console, so it
  * lands in the kernel's persistent log too (tools/pull-log.sh).
  */
 #include <errno.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,6 +76,7 @@
 
 #define A34WIFI_DIR     "/a34/wifi"
 #define MAC_FILE        A34WIFI_DIR "/mac"
+#define NETWORK_FILE    A34WIFI_DIR "/network"
 #define LOG_MAX         (16 * 1024)
 
 static int
@@ -192,6 +216,85 @@ keep_mac(void)
 	return 0;
 }
 
+/* ---- the network to join (0964) ---- */
+
+/* what /a34/wifi/network asks for, said without the passphrase; 0 if the kernel will take it */
+static int
+check_network(void)
+{
+	char text[1024], *line, *next;
+	int fd = open(NETWORK_FILE, O_RDONLY), ssid = 0, bad = 0;
+	struct stat st;
+	ssize_t got;
+	const char *psk = "none: an open network";
+
+	if (fd < 0) {
+		printf("a34wifi: %s: %s. Write it on the phone's root (it is never in the repository):\n"
+		    "    ssid=Name Of The Network\n    psk=the passphrase   (no psk line: an open network)\n", NETWORK_FILE,
+		    strerror(errno));
+		return 1;
+	}
+	if (fstat(fd, &st) == 0 && (st.st_mode & 077) != 0) {
+		printf("a34wifi: %s can be read by others (mode %03o): chmod 600 is better\n", NETWORK_FILE,
+		    (unsigned)(st.st_mode & 0777));
+	}
+	got = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	if (got <= 0 || got >= (ssize_t)sizeof(text) - 1) {
+		printf("a34wifi: %s: empty, unreadable or longer than %zu bytes\n", NETWORK_FILE, sizeof(text) - 2);
+		return 1;
+	}
+	text[got] = '\0';
+	for (line = text; line != NULL && *line != '\0'; line = next) {
+		size_t n;
+
+		next = strchr(line, '\n');
+		if (next != NULL) {
+			*next++ = '\0';
+		}
+		n = strlen(line);
+		if (n > 0 && line[n - 1] == '\r') {
+			line[--n] = '\0';
+		}
+		if (n == 0 || line[0] == '#') {
+			continue;
+		}
+		if (strncmp(line, "ssid=", 5) == 0) {
+			ssid = 1;
+			if (n - 5 < 1 || n - 5 > 32) {
+				printf("a34wifi: ssid= is not 1 to 32 bytes\n");
+				bad = 1;
+			} else {
+				printf("a34wifi: network \"%s\"\n", line + 5);
+			}
+		} else if (strncmp(line, "psk=", 4) == 0) {
+			size_t k = n - 4, hex = 0;
+
+			for (size_t i = 4; i < n; i++) {
+				hex += (line[i] >= '0' && line[i] <= '9') || (line[i] >= 'a' && line[i] <= 'f') ||
+				    (line[i] >= 'A' && line[i] <= 'F');
+			}
+			psk = k == 64 && hex == 64 ? "WPA2-PSK, a 64-digit key" : k >= 8 && k <= 63 ? "WPA2-PSK, a passphrase" : NULL;
+			if (psk == NULL) {
+				printf("a34wifi: psk= is neither 8 to 63 characters nor 64 hex digits (%zu characters)\n", k);
+				psk = "unusable";
+				bad = 1;
+			}
+		} else if (strncmp(line, "bssid=", 6) == 0) {
+			printf("a34wifi: only the access point %s\n", line + 6);
+		} else {
+			printf("a34wifi: a line that is not ssid=, psk= or bssid= (line %zu bytes)\n", n);
+			bad = 1;
+		}
+	}
+	if (!ssid) {
+		printf("a34wifi: %s has no ssid= line\n", NETWORK_FILE);
+		bad = 1;
+	}
+	printf("a34wifi: security: %s\n", psk);
+	return bad;
+}
+
 static int
 up(int step, int seconds)
 {
@@ -201,6 +304,10 @@ up(int step, int seconds)
 	}
 	if (step >= 6) {
 		(void)keep_mac();       /* step 6 reads it; without it the kernel uses a random one for this boot */
+	}
+	if (step >= 8 && check_network() != 0) {
+		printf("a34wifi: step 8 needs %s: asking for step 7 only\n", NETWORK_FILE);
+		step = 7;
 	}
 	return ask("kern.a34wifi.want", step, step, seconds);
 }
@@ -334,6 +441,161 @@ files(void)
 	return bad;
 }
 
+/* ---- an address by DHCP (0965) ---- */
+
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
+
+/* in the libraries, not in the iOS SDK's headers */
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, mach_port_t *service);
+
+/*
+ * configd's IPConfiguration plugin, asked by hand as macOS's "ipconfig setservice IF DHCP" asks
+ * it (bootp's ipconfig.defs, subsystem 20000, routine ipconfig_set_service, message 20011): it
+ * makes a service for the interface, runs DHCP and publishes the address, the router and the
+ * name servers, so the rest of iOS uses them. The message's layout is HakiOS's
+ * userland/src/net_test.m (github.com/oosexgang/hakios-xnu-kernel, MIT). Root only.
+ */
+#pragma pack(push, 4)
+struct set_request {
+	mach_msg_header_t head;
+	mach_msg_body_t body;
+	mach_msg_ool_descriptor_t method;
+	NDR_record_t ndr;
+	char name[16];
+	mach_msg_type_number_t method_length;
+};
+struct set_reply {
+	mach_msg_header_t head;
+	NDR_record_t ndr;
+	kern_return_t result;
+	char service[128];
+	int status;
+	mach_msg_max_trailer_t trailer;
+};
+#pragma pack(pop)
+
+static int
+ask_dhcp(const char *interface)
+{
+	static const char *const statuses[] = { "done", "permission denied", "no such interface", "invalid parameter",
+		                                "invalid operation", "allocation failed", "internal error", "not supported" };
+	const void *keys[1] = { CFSTR("ConfigMethod") }, *values[1] = { CFSTR("DHCP") };
+	CFDictionaryRef plist = CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	CFDataRef method = plist != NULL ? CFPropertyListCreateData(NULL, plist, kCFPropertyListBinaryFormat_v1_0, 0, NULL) : NULL;
+	mach_port_t server = MACH_PORT_NULL, reply_port = mig_get_reply_port();
+	union {
+		struct set_request request;
+		struct set_reply reply;
+	} message;
+	kern_return_t result;
+	int status = -1;
+
+	if (method == NULL) {
+		printf("a34wifi: dhcp: no property list\n");
+		return 1;
+	}
+	result = bootstrap_look_up(bootstrap_port, "com.apple.network.IPConfiguration", &server);
+	if (result != KERN_SUCCESS) {
+		printf("a34wifi: dhcp: configd's IPConfiguration is not there (0x%x)\n", result);
+		CFRelease(method);
+		CFRelease(plist);
+		return 1;
+	}
+	memset(&message, 0, sizeof(message));
+	message.request.head.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+	message.request.head.msgh_size = sizeof(message.request);
+	message.request.head.msgh_remote_port = server;
+	message.request.head.msgh_local_port = reply_port;
+	message.request.head.msgh_id = 20011;
+	message.request.body.msgh_descriptor_count = 1;
+	message.request.method.address = (void *)CFDataGetBytePtr(method);
+	message.request.method.size = (mach_msg_size_t)CFDataGetLength(method);
+	message.request.method.deallocate = FALSE;
+	message.request.method.copy = MACH_MSG_VIRTUAL_COPY;
+	message.request.method.type = MACH_MSG_OOL_DESCRIPTOR;
+	message.request.ndr = NDR_record;
+	strlcpy(message.request.name, interface, sizeof(message.request.name));
+	message.request.method_length = (mach_msg_type_number_t)CFDataGetLength(method);
+	result = mach_msg(&message.request.head, MACH_SEND_MSG | MACH_RCV_MSG, sizeof(message.request), sizeof(message),
+	    reply_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+	if (result != KERN_SUCCESS) {
+		printf("a34wifi: dhcp: the message did not go through (0x%x)\n", result);
+	} else if (message.reply.result != KERN_SUCCESS) {
+		printf("a34wifi: dhcp: IPConfiguration does not take the message (%d)\n", message.reply.result);
+	} else {
+		status = message.reply.status;
+		message.reply.service[sizeof(message.reply.service) - 1] = '\0';
+		printf("a34wifi: dhcp: IPConfiguration, \"setservice %s DHCP\": %d (%s), service %s\n", interface, status,
+		    status >= 0 && status < 8 ? statuses[status] : "?", message.reply.service);
+	}
+	mach_port_deallocate(mach_task_self(), server);
+	CFRelease(method);
+	CFRelease(plist);
+	return status == 0 ? 0 : 1;
+}
+#else
+static int
+ask_dhcp(const char *interface)
+{
+	printf("a34wifi: dhcp %s: only on iOS (configd's IPConfiguration)\n", interface);
+	return 1;
+}
+#endif
+
+/* the interface's IPv4 address, if it has one */
+static int
+ipv4_of(const char *interface, char *text, size_t size)
+{
+	struct ifaddrs *list = NULL, *a;
+	int found = 0;
+
+	if (getifaddrs(&list) != 0) {
+		return 0;
+	}
+	for (a = list; a != NULL && !found; a = a->ifa_next) {
+		if (a->ifa_addr != NULL && a->ifa_addr->sa_family == AF_INET && strcmp(a->ifa_name, interface) == 0) {
+			found = inet_ntop(AF_INET, &((struct sockaddr_in *)(void *)a->ifa_addr)->sin_addr, text,
+			    (socklen_t)size) != NULL;
+		}
+	}
+	freeifaddrs(list);
+	return found;
+}
+
+static int
+dhcp(int seconds)
+{
+	char interface[16] = "", address[INET_ADDRSTRLEN];
+	size_t len = sizeof(interface) - 1;
+	time_t until = time(NULL) + seconds;
+
+	if (sysctlbyname("kern.a34wifi.ifname", interface, &len, NULL, 0) != 0 || interface[0] == '\0') {
+		printf("a34wifi: dhcp: no Wi-Fi interface yet (kern.a34wifi.ifname: %s): 'a34wifi up 9' first\n",
+		    interface[0] == '\0' && errno == 0 ? "empty" : strerror(errno));
+		return 1;
+	}
+	interface[sizeof(interface) - 1] = '\0';
+	if (ipv4_of(interface, address, sizeof(address))) {
+		printf("a34wifi: %s has %s already\n", interface, address);
+		return 0;
+	}
+	if (ask_dhcp(interface) != 0) {
+		return 1;
+	}
+	while (time(NULL) < until) {
+		sleep(1);
+		if (ipv4_of(interface, address, sizeof(address))) {
+			printf("a34wifi: %s: IPv4 address %s (DHCP)\n", interface, address);
+			return 0;
+		}
+	}
+	printf("a34wifi: %s: no IPv4 address after %d s\n", interface, seconds);
+	return 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -358,6 +620,13 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "mac") == 0) {
 		return keep_mac();
 	}
-	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files | mac]\n");
+	if (strcmp(argv[1], "join") == 0) {
+		return up(8, argc >= 3 ? atoi(argv[2]) : 180);
+	}
+	if (strcmp(argv[1], "dhcp") == 0) {
+		return dhcp(argc >= 3 ? atoi(argv[2]) : 60);
+	}
+	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files | mac | join [SECONDS] | "
+	    "dhcp [SECONDS]]\n");
 	return 2;
 }
