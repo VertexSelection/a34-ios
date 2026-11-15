@@ -313,7 +313,7 @@ check() {
 	# the Metal driver's library in libgallium (0006, userland/a34metal looks these up) and its
 	# counters in panfrost (0007)
 	for sym in rwa_device_open rwa_render_create rwa_render_draw rwa_texture_from_surface rwa_finish \
-		rwa_wait_seq; do
+		rwa_wait_seq rwa_bind_profile rwa_pan_profile; do
 		nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libgallium lacks $sym (0006)"; bad=1; }
 	done
 	nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep -E ' _redwood_pan_submits$' >/dev/null ||

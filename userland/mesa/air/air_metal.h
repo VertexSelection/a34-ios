@@ -642,6 +642,9 @@ int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 void rwa_draw_profile(uint64_t out[7]);
 /* the state the draws set and skipped since the last call, as one line; 0 if no draws */
 int rwa_bind_profile(char *line, size_t size);
+/* panfrost's profile (patch 0011) and the kernel calls since the last call, line `which` (0 first,
+ * which takes the snapshot the others report) as one line; 0 when there is no such line */
+int rwa_pan_profile(unsigned which, char *line, size_t size);
 
 /* The work so far sent off without waiting, and the number of its last job; a wait for it. */
 uint64_t rwa_flush_seq(struct rwa_device *device);

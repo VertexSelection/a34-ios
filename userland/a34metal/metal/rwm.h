@@ -398,6 +398,7 @@ void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device)
 /* (metal-fx) rwm_blurdump=N: whether it is on, and the label of the pipeline just set (kept when it is a blur's or a
  * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
 bool rwm_blurdump_on(void);
+void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */
 void rwm_render_set_label(struct rwm_render_state *state, const char *label);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,
 		      bool clears, const double color[4], unsigned long store_action, bool resolve_texture,

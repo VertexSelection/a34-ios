@@ -72,8 +72,11 @@
 #include "util/u_gen_mipmap.h"
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#include <mach/mach_time.h>
 #endif
+#include <time.h>
 #include "util/u_sampler.h"
+#include "redwood_pan_prof.h"
 #include "drm-uapi/drm_fourcc.h"
 
 /*
@@ -600,6 +603,18 @@ static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, 
  * of work (since the last finish or rwa_flush_seq): each such pass is a second batch with a
  * preload of its own where one would have done, unless something in between read it */
 static uint64_t rwa_bind_returns, rwa_bind_span;
+/* draw_vbo on the processor (the thread's own time) against the clock: what of a draw's time
+ * is work and what is the thread waiting to run */
+static uint64_t rwa_bind_vbo_wall_ns, rwa_bind_vbo_cpu_ns;
+
+static uint64_t
+thread_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static bool
 rebind_all(void)
@@ -1788,17 +1803,20 @@ rwa_bind_profile(char *line, size_t size)
       return 0;
    snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch "
             "(%llu back into one left before); "
-            "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu); "
-            "states set %llu, skipped %llu%s",
+            "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
+            "%llu%% of it on the processor; states set %llu, skipped %llu%s",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
             (unsigned long long)rwa_bind_returns,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
             (unsigned long long)rwa_bind_fresh_draws,
             (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
-            (unsigned long long)rwa_bind_steady_draws, (unsigned long long)rwa_bind_sets,
+            (unsigned long long)rwa_bind_steady_draws,
+            (unsigned long long)(rwa_bind_vbo_wall_ns ? rwa_bind_vbo_cpu_ns * 100 / rwa_bind_vbo_wall_ns : 0),
+            (unsigned long long)rwa_bind_sets,
             (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "");
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
+   rwa_bind_vbo_wall_ns = rwa_bind_vbo_cpu_ns = 0;
    return 1;
 }
 
@@ -4858,6 +4876,170 @@ rwa_submit_profile(uint64_t out[5])
       redwood_pan_submit_ns = 0;
       redwood_pan_blend_compiles = 0;
    }
+}
+
+/* redwood-drm's own count of its requests to the kernel (redwood_drm.h, struct
+ * redwood_drm_stats; laid out the same here): calls and mach_absolute_time ticks by selector */
+struct rwa_drm_stats {
+   uint64_t calls[256];
+   uint64_t ticks[256];
+   uint64_t maps, map_ticks;
+   uint64_t unmaps, unmap_ticks;
+   uint64_t local_waits, local_madvises;
+   uint64_t queued_jobs, failed_jobs;
+};
+extern void redwood_drm_stats(struct rwa_drm_stats *stats) __attribute__((weak_import));
+
+static const char *
+drm_selector_name(unsigned selector)
+{
+   switch (selector) {
+   case 0x40: return "SUBMIT";
+   case 0x41: return "WAIT_BO";
+   case 0x42: return "CREATE_BO";
+   case 0x43: return "MMAP_BO";
+   case 0x44: return "GET_PARAM";
+   case 0x45: return "GET_BO_OFFSET";
+   case 0x48: return "MADVISE";
+   case 0x09: return "GEM_CLOSE";
+   case 0x7a: return "SET_MODE";
+   case 0x7b: return "WAIT_SEQ";
+   case 0x7c: return "PENDING";
+   case 0x7e: return "SURFACE";
+   default: return NULL;
+   }
+}
+
+static uint64_t
+ticks_ns(uint64_t ticks)
+{
+#ifdef __APPLE__
+   static mach_timebase_info_data_t tb;
+   if (tb.denom == 0)
+      mach_timebase_info(&tb);
+   return tb.denom ? ticks * tb.numer / tb.denom : ticks;
+#else
+   return ticks;
+#endif
+}
+
+/*
+ * panfrost's own profile since the last call (patch 0011, redwood_pan_prof.h) and redwood-drm's
+ * requests to the kernel, as lines for the plug-in's camprof: line `which` (0, 1, ...) into
+ * `line`; 0 when there is no such line. Line 0 clears what the others report, so they are read
+ * in order, 0 first, under one lock each but between the same two draws.
+ */
+int
+rwa_pan_profile(unsigned which, char *line, size_t size)
+{
+   RWA_GUARD();
+   static uint64_t p[RWP_SLOTS];
+   static const char *reason[RWP_REASONS];
+   static uint64_t reason_count[RWP_REASONS];
+   static struct rwa_drm_stats now, before;
+   static bool have_before;
+
+   if (!line || !size)
+      return 0;
+   if (which == 0) {
+      memcpy(p, redwood_pan_prof, sizeof(p));
+      memset(redwood_pan_prof, 0, sizeof(redwood_pan_prof));
+      memcpy(reason, redwood_pan_reason, sizeof(reason));
+      memcpy(reason_count, redwood_pan_reason_count, sizeof(reason_count));
+      memset(redwood_pan_reason, 0, sizeof(redwood_pan_reason));
+      memset(redwood_pan_reason_count, 0, sizeof(redwood_pan_reason_count));
+      if (redwood_drm_stats) {
+         before = now;
+         redwood_drm_stats(&now);
+      }
+   }
+   uint64_t draws = p[RWP_DRAWS] ? p[RWP_DRAWS] : 1;
+#define RWP_US(i) ((unsigned long long)(p[i] / 1000 / draws))
+#define RWP_EACH(n, ns) ((unsigned long long)(p[n] ? p[ns] / 1000 / p[n] : 0))
+   switch (which) {
+   case 0:
+      if (!p[RWP_DRAWS])
+         return 0;
+      snprintf(line, size, "rwm pan draw us: prepare %llu, count %llu, state3d %llu (zs %llu, blend %llu, "
+               "vertex %llu), stages %llu (textures %llu, samplers %llu, shaders %llu, ubos %llu, images %llu), "
+               "launch %llu; %llu draws, %llu with all state dirty",
+               RWP_US(RWP_PREPARE), RWP_US(RWP_VCOUNT), RWP_US(RWP_STATE3D), RWP_US(RWP_ZS),
+               RWP_US(RWP_BLEND), RWP_US(RWP_VERTEX), RWP_US(RWP_STAGES), RWP_US(RWP_TEX),
+               RWP_US(RWP_SAMP), RWP_US(RWP_SHADER), RWP_US(RWP_UBO), RWP_US(RWP_IMG),
+               RWP_US(RWP_LAUNCH), (unsigned long long)p[RWP_DRAWS], (unsigned long long)p[RWP_REBINDS]);
+      return 1;
+   case 1:
+      snprintf(line, size, "rwm pan memory: %llu batches begun (%llu us each), %llu pool buffers (%llu us each), "
+               "%llu buffers made (%llu us each), %llu of them new from the kernel (%llu us each); %llu batches "
+               "sent from inside a draw (%llu us each); %llu sent with work (%llu us each), %llu empty; "
+               "4 KB of a batch pool's memory: stored a word at a time %.1f us, memcpy %.1f us, loaded %.1f us "
+               "(malloc's: %.1f, %.1f, %.1f)",
+               (unsigned long long)p[RWP_BATCH_INITS], RWP_EACH(RWP_BATCH_INITS, RWP_BATCH_INIT_NS),
+               (unsigned long long)p[RWP_POOL_ALLOCS], RWP_EACH(RWP_POOL_ALLOCS, RWP_POOL_ALLOC_NS),
+               (unsigned long long)p[RWP_BO_CREATES], RWP_EACH(RWP_BO_CREATES, RWP_BO_CREATE_NS),
+               (unsigned long long)p[RWP_BO_FRESH], RWP_EACH(RWP_BO_FRESH, RWP_BO_FRESH_NS),
+               (unsigned long long)p[RWP_DEP_FLUSHES], RWP_EACH(RWP_DEP_FLUSHES, RWP_DEP_FLUSH_NS),
+               (unsigned long long)p[RWP_JOB_SUBMITS], RWP_EACH(RWP_JOB_SUBMITS, RWP_JOB_SUBMIT_NS),
+               (unsigned long long)p[RWP_EMPTY_SUBMITS],
+               redwood_pan_memtest[RWP_MEM_POOL_STORE] / 1e3, redwood_pan_memtest[RWP_MEM_POOL_COPY] / 1e3,
+               redwood_pan_memtest[RWP_MEM_POOL_LOAD] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_STORE] / 1e3,
+               redwood_pan_memtest[RWP_MEM_RAM_COPY] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_LOAD] / 1e3);
+      return 1;
+   case 2: {
+      size_t at = (size_t)snprintf(line, size, "rwm pan batches sent for:");
+      bool any = false;
+      for (unsigned i = 0; i < RWP_REASONS && reason[i] && at < size; i++) {
+         at += (size_t)snprintf(line + at, size - at, "%s %s x%llu", any ? "," : "", reason[i],
+                                (unsigned long long)reason_count[i]);
+         any = true;
+      }
+      return any;
+   }
+   case 3: {
+      if (!redwood_drm_stats)
+         return 0;
+      if (!have_before) {
+         have_before = true;     /* the first call has nothing to subtract */
+         return 0;
+      }
+      size_t at = (size_t)snprintf(line, size, "rwm kernel calls:");
+      bool taken[256] = { false };
+      /* the five that took longest, by name */
+      for (unsigned k = 0; k < 5 && at < size; k++) {
+         unsigned best = 256;
+         uint64_t best_ticks = 0;
+         for (unsigned s = 0; s < 256; s++) {
+            uint64_t t = now.ticks[s] - before.ticks[s];
+            if (!taken[s] && now.calls[s] != before.calls[s] && t >= best_ticks) {
+               best = s;
+               best_ticks = t;
+            }
+         }
+         if (best == 256)
+            break;
+         taken[best] = true;
+         const char *name = drm_selector_name(best);
+         char hex[8];
+         snprintf(hex, sizeof(hex), "%#04x", best);
+         at += (size_t)snprintf(line + at, size - at, "%s %s x%llu %.1f ms", k ? "," : "", name ? name : hex,
+                                (unsigned long long)(now.calls[best] - before.calls[best]),
+                                ticks_ns(best_ticks) / 1e6);
+      }
+      if (at < size)
+         snprintf(line + at, size - at, "; maps x%llu %.1f ms, unmaps x%llu %.1f ms; answered here: %llu waits, "
+                  "%llu madvises",
+                  (unsigned long long)(now.maps - before.maps), ticks_ns(now.map_ticks - before.map_ticks) / 1e6,
+                  (unsigned long long)(now.unmaps - before.unmaps),
+                  ticks_ns(now.unmap_ticks - before.unmap_ticks) / 1e6,
+                  (unsigned long long)(now.local_waits - before.local_waits),
+                  (unsigned long long)(now.local_madvises - before.local_madvises));
+      return 1;
+   }
+   default:
+      return 0;
+   }
+#undef RWP_US
+#undef RWP_EACH
 }
 
 uint64_t
@@ -8289,9 +8471,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .count = draw->vertex_count,
          .index_bias = index_size ? draw->base_vertex : 0,
       };
+      uint64_t c4 = thread_ns();
       t4 = os_time_get_nano();
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
       t5 = os_time_get_nano();
+      rwa_bind_vbo_cpu_ns += thread_ns() - c4;
+      rwa_bind_vbo_wall_ns += t5 - t4;
       rwa_draw_ns[3] += t4 - t3;
       rwa_draw_ns[4] += t5 - t4;
       /* a draw after a framebuffer set, which panfrost answers by emitting all its state */

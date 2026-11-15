@@ -184,6 +184,13 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   `_Tcma`, `_Tvcm`, `_Tc3`, `_Tmua`, `_Tm1a`, `_Tasg`, `_Tlub` or a `Bpl` blend), the texel at
   the centre of attachment 0 after the draw, with the pipeline's name (lines `blurdump:`; waits
   for the GPU). Boot 70's blurs (ds4/ds8, n15/n23) draw at level 0 and were not dumped before.
+- `rwm_blurdump` also gives, for each probed draw, the centre texel of every attachment (`a1` is
+  the clip mask) and of level 0 of every texture it reads (`reads t3 ...`), and probes the
+  texture-to-texture copies ("a copy of WxH from ... the source's centre ..., the
+  destination's ...").
+- **`rwm_pandebug=FLAGS`**: Mesa's `PAN_MESA_DEBUG` for the driver's screen (`sync`: every GPU
+  job waited for; `nocrc`, `noafbc`, `linear`). The first test: `rwm_pandebug=sync` shows whether
+  the blur's black is a read of a texture before the GPU wrote it.
 - **`rwm_caps=1`**: every capability question CoreAnimation or Metal asks of the device
   (`supports*`, `max*`, `min*`, `readWrite*`, `are*`, `is*`, `has*`, ... with integer or pointer
   arguments) with our answer, once each, and every `new*` of the device that answers nil, with
