@@ -225,6 +225,15 @@ x8, GET_EINT_ATTR x18, DTSI_QUERY, GET_GPIO_ADC. Those four are now answered as 
 port_rpc.c does (device tree and read-only hardware), and the modem's exception overview is
 logged when it asserts (`xnu-boot-0995-cell3`).
 
+Fifth run (`0995-cell3`, log build/logs/0995-cell3-a): every RPC answered (GPIO_SIM1_HOT_PLUG
+176, SIM1/2 EINT attributes, md_product_name_model_id 0xf0f0f0f, ADC channel 6 raw 1938), the file
+server served 1403 requests (386 opens, 232 reads, 45 files in RAM, 0 errors), then the modem
+asserted in `mcu/service/hif/ncccisrv/ccci_shm_bm/src/ccci_shm_bm.c` line 603 (offender MCU,
+type 0x50): its CCB buffer manager. We had sent post_cfg_for_ccb's layout (three CCB users of
+2 MiB at one base, 6 MiB in CCB_SHARE_MEMORY) without Android's later collect_ccb_info (DHL
+0x70000, MD_MONITOR 0x8000, META 0x104000, packed; total 0x17c000). Fixed in
+`xnu-boot-0995-cell3b`.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
