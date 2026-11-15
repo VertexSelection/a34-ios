@@ -43,7 +43,9 @@ The kernel keeps a persistent log at the end of `userdata`;
   (you supply the IPSW; it applies the first-boot fix in `tools/icl-nop.py`).
 - Write the root from TWRP: `tools/write-root.sh build/ios16-root.img`.
 - Boot image: `tools/build-xnu.sh KERNEL "BOOT-ARGS"`, then
-  `tools/run-test.sh build/xnu-recovery.img`.
+  `tools/run-test.sh build/xnu-recovery.img`. BOOT-ARGS may be up to 4095 characters:
+  what does not fit in boot_args' 607 goes into the ADT as `/chosen/a34-bootargs`, and the
+  kernel (patch 0990) joins it on before anything parses a boot-arg.
 
 Boot args in use: `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
 ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1 sweethw=0 sweetgt=0
