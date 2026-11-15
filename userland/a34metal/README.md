@@ -207,6 +207,18 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   blend. panvk sets neither on a draw with a fragment shader; in a Metal process neither is set now.
   Boot-arg `rwm_overdraw=upstream`: as upstream; `rwm_overdraw=fixed`: the test asked of the targets
   a draw writes.
+- **A target read by framebuffer fetch is preloaded (Mesa patch 0017).** Boot 0988-nosleep-b
+  (`rwm_scene`): a composite reading attachment 1 (`Tc4p..._IsrcM1`) wrote nothing although
+  attachment 1 held the glyph, and a copy of attachment 0 into 1 (`TimgA2S1Xhf_IsrcM0`) wrote
+  zeros. panfrost preloads a colour target into the tile buffer only when a draw of the batch
+  writes it; a batch that only READS it (by `[[color(n)]]`) read an uninitialised tile buffer.
+  CoreAnimation's clips (`Ccl`), groups drawn into attachment 1 and composited (`M1`), and copies
+  of attachment 0 into 1 (`M0`) read so whenever panfrost's batch is cut inside a pass -- about a
+  thousand times in five seconds of Control Center ("back into one left before", "an access to
+  what another batch writes"). Now the targets the bound fragment shader reads are read by the
+  batch and preloaded; for a Metal shader only the reads left after optimisation count (the uber
+  shader declares three). Boot-arg `rwm_fetchread=off`: as upstream; `rwm_fetchread=declared`:
+  every declared `[[color(n)]]` counts.
 - **`rwm_scene=N`**: N windows of 5 s (lines `scene`): every pipeline drawn with and how often; for
   the first two draws a window of each pipeline that clips (`Ccl`), draws into the second attachment
   (`A2S1`), reads an attachment (`M0`, `M1`), blends other than source-over (`Badd`, `Bpld`, `Bcbn`,

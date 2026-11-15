@@ -94,6 +94,14 @@ load()
 	} else if (rwm_boot_arg("rwm_overdraw=fixed")) {
 		setenv("REDWOOD_PAN_OVERDRAW", "fixed", 1);
 	}
+	/* (metal-fx) boot-arg rwm_fetchread=off: a colour target a fragment shader reads by framebuffer fetch is
+	 * preloaded only when a draw of the batch writes it, as upstream; rwm_fetchread=declared: every [[color(n)]] a
+	 * shader declares counts as read, not only the ones left after optimisation (Mesa patch 0017) */
+	if (rwm_boot_arg("rwm_fetchread=off")) {
+		setenv("REDWOOD_PAN_FETCHREAD", "off", 1);
+	} else if (rwm_boot_arg("rwm_fetchread=declared")) {
+		setenv("REDWOOD_PAN_FETCHREAD", "declared", 1);
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),

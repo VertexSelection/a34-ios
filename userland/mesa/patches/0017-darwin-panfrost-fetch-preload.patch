@@ -1,0 +1,138 @@
+Darwin: a colour target a fragment shader reads by framebuffer fetch is preloaded.
+
+A34 (local to this port). panfrost preloads a colour target into the tile buffer only when a
+draw of the batch writes it (batch->draws) or batch->read has it, and batch->read is set for
+depth and stencil only. A batch that READS a colour target through framebuffer fetch and never
+writes it therefore reads an uninitialised tile buffer. CoreAnimation does exactly that on Metal:
+it draws a group, a clip or a glyph into its second attachment and composites it into the first
+(M1, Ccl), and copies the first into the second (M0); when panfrost's batch is cut between the
+two (a flush for an upload, a pass left and come back to), the second batch read zeros. Boot
+0988-nosleep-b (rwm_scene): a composite reading an attachment 1 with content wrote nothing, and a
+copy of attachment 0 into 1 wrote zeros.
+
+- pan_cmdstream.c, panfrost_update_state_3d: the targets the bound fragment shader reads
+  (info.fs.outputs_read) are added to batch->read, every draw, in every process.
+  REDWOOD_PAN_FETCHREAD=off (the plug-in's rwm_fetchread=off): as upstream.
+- pan_compiler.c, pan_shader_update_info: for a Metal shader (label "air") outputs_read is
+  narrowed to the targets its tile reads still read after optimisation; CoreAnimation's uber
+  shader declares three [[color(n)]] and a pipeline reads one or none, and every declared one
+  preloaded would read a whole screen's second attachment for every batch.
+  REDWOOD_PAN_FETCHREAD=declared (the plug-in's rwm_fetchread=declared) keeps the declared set.
+
+--- a/src/panfrost/compiler/pan_compiler.c
++++ b/src/panfrost/compiler/pan_compiler.c
+@@ -255,6 +255,40 @@
+    return -1;
+ }
+ 
++#ifdef __APPLE__
++#include <stdlib.h>
++#include <string.h>
++
++/* A34 (patch 0017): the colour targets a fragment shader still reads from the tile buffer
++ * after optimisation -- its load_tile_pan, load_tile_res_pan, load_raw_output_pan (and a
++ * load_output that is a framebuffer fetch, before that lowering) -- as FRAG_RESULT bits. */
++static uint64_t
++pan_live_tile_reads(nir_shader *s)
++{
++   uint64_t mask = 0;
++
++   nir_foreach_function_impl(impl, s) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic == nir_intrinsic_load_tile_pan ||
++                intr->intrinsic == nir_intrinsic_load_tile_res_pan ||
++                intr->intrinsic == nir_intrinsic_load_raw_output_pan ||
++                (intr->intrinsic == nir_intrinsic_load_output &&
++                 nir_intrinsic_io_semantics(intr).fb_fetch_output)) {
++               unsigned loc = nir_intrinsic_io_semantics(intr).location;
++               if (loc < 64)
++                  mask |= BITFIELD64_BIT(loc);
++            }
++         }
++      }
++   }
++   return mask;
++}
++#endif
++
+ void
+ pan_shader_update_info(struct pan_shader_info *info, nir_shader *s,
+                        unsigned arch)
+@@ -294,6 +328,19 @@
+          info->fs.writes_coverage = true;
+ 
+       info->fs.outputs_read = s->info.outputs_read;
++#ifdef __APPLE__
++      /* A34 (patch 0017): a Metal shader's (label "air") framebuffer fetches are the ones
++       * still there after optimisation, not every [[color(n)]] it declares: CoreAnimation's
++       * uber shader declares three and a pipeline of it reads one or none. What is read is
++       * what panfrost preloads for it (pan_cmdstream.c) and what keeps forward pixel kill
++       * off. REDWOOD_PAN_FETCHREAD=declared keeps the declared set. */
++      if (arch >= 6 && s->info.label != NULL && strcmp(s->info.label, "air") == 0) {
++         const char *keep = getenv("REDWOOD_PAN_FETCHREAD");
++
++         if (keep == NULL || strcmp(keep, "declared") != 0)
++            info->fs.outputs_read &= (uint32_t)pan_live_tile_reads(s);
++      }
++#endif
+ 
+       info->fs.sample_shading = s->info.fs.uses_sample_shading;
+       info->fs.untyped_color_outputs = s->info.fs.untyped_color_outputs;
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -3301,6 +3301,40 @@
+ #endif
+ }
+ 
++#ifdef __APPLE__
++#include <stdlib.h>
++#include <string.h>
++
++/* A34 (patch 0017): a colour target the fragment shader reads (framebuffer fetch) is read by
++ * the batch, and preloaded even when no draw of the batch writes it. Upstream preloads a colour
++ * target only when a draw of the batch writes it (batch->draws) or batch->read has it, and sets
++ * batch->read for depth and stencil only -- so a batch that only reads a target read an
++ * uninitialised tile buffer: CoreAnimation compositing its second attachment (a group drawn
++ * there, a clip) after its pass was cut, or copying its first into the second. Every draw:
++ * batch->read only grows within a batch. REDWOOD_PAN_FETCHREAD=off: as upstream. */
++static inline void
++pan_fetch_read(struct panfrost_batch *batch)
++{
++   static int off = -1;
++   struct panfrost_compiled_shader *fs = batch->ctx->prog[MESA_SHADER_FRAGMENT];
++
++   if (off < 0) {
++      const char *e = getenv("REDWOOD_PAN_FETCHREAD");
++
++      off = e != NULL && strcmp(e, "off") == 0;
++   }
++   if (off || fs == NULL || fs->info.fs.outputs_read == 0)
++      return;
++
++   const uint32_t rts = fs->info.fs.outputs_read >> FRAG_RESULT_DATA0;
++
++   for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
++      if ((rts & BITFIELD_BIT(i)) && batch->key.cbufs[i].texture)
++         batch->read |= PIPE_CLEAR_COLOR0 << i;
++   }
++}
++#endif
++
+ static inline void
+ panfrost_update_state_3d(struct panfrost_batch *batch)
+ {
+@@ -3316,6 +3350,10 @@
+    if (dirty & PAN_DIRTY_ZS)
+       panfrost_set_batch_masks_zs(batch);
+ 
++#ifdef __APPLE__
++   pan_fetch_read(batch);
++#endif
++
+ #if PAN_ARCH >= 9
+    uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
+    if ((dirty & (PAN_DIRTY_ZS | PAN_DIRTY_RASTERIZER)) ||
