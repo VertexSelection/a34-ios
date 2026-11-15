@@ -112,6 +112,15 @@ Status (2026-11-15):
   scan did not ask for duplicate filtering (uncounted); 0981 counts them. bluetoothd's own WiProx scan
   session stopped with "0 advertisements delivered" each time: the proximity card's path is next (the
   verbose log's cap was 3000 lines a run, now 30000).
+- **Boot 0981-120-a**: bluetoothd's grant came ("bluetoothd privilege 12000 granted"); no crash. bluetoothd
+  started with an empty keychain file and no 'paired devices' cache (the root's /var did not keep the last
+  boot's pairing), so the AirPods paired again by SSP (result 0, link key stored) and encrypted (AES-CCM);
+  after that every L2CAP connection timed out (CONNECT_RSP/CONFIG_RSP, STATUS 559: AVDTP, RFCOMM, AACP, GATT,
+  and the AirPods' own SDP) and bluetoothd dropped the link (0x16). The bridge's trace had stopped (600
+  lines) before. 0983: packets that arrive while the kernel waits on a command of its own are passed on to
+  bluetoothd instead of dropped (ACL data, Number Of Completed Packets); every 10 s with ACL traffic the
+  bridge counts packets each way, completions and outstanding buffers, and says a stall; L2CAP signalling
+  is always traced; the last 24 packets are said at each Disconnection Complete.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
