@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..196d650
+index 0000000..c4cea7d
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1996 @@
+@@ -0,0 +1,2113 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -76,6 +76,7 @@ index 0000000..196d650
 +#define CC_WIN          (1u << 20)
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
 +extern bool a34_cell_lk_tag(const char *name, const uint8_t **data, uint32_t *len);
 +bool a34_ccci_prepare(vm_offset_t ap_ccif, vm_offset_t md_ccif);
 +void a34_ccci_hs1(vm_offset_t ap_ccif, vm_offset_t md_ccif, const uint32_t feature_query[56]);
@@ -1422,6 +1423,101 @@ index 0000000..196d650
 +#define AMMS_POS_DEALLOC                (1ull << 1)
 +#define AMMS_POS_ALLOC                  (1ull << 2)
 +
++/*
++ * After the modem gives the DRDI range back (AMMS), it is the AP's again (Android frees it into
++ * its kernel), so it can be read: is it what LK should have loaded, md1drdi from the md1img
++ * partition? md1drdi is 0x8880 bytes larger than LK's drdi_memory, so the region is compared
++ * with the section from offset 0 and from offset (section - region). Firmware only (no identity
++ * in it); FNV-1a 64 hashes and match results are logged. Its own thread: the file server keeps
++ * running.
++ */
++extern bool a34_cell_md1img_drdi(uint64_t *off, uint32_t *size);
++extern int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes);
++static uint64_t drdi_pa;
++static uint32_t drdi_len;
++
++static uint64_t
++fnv64(uint64_t h, const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		h ^= p[i];
++		h *= 0x100000001b3ull;
++	}
++	return h;
++}
++
++static void
++drdi_compare(uint8_t *ram, uint8_t *img, uint32_t CH, uint64_t secoff, uint32_t secsize)
++{
++	uint64_t h_ram = 0xcbf29ce484222325ull, h0 = h_ram, h1 = h_ram;
++	uint32_t shift = secsize > drdi_len ? secsize - drdi_len : 0;
++	uint32_t zeros = 0, ffs = 0, first_diff0 = ~0u, first_diff1 = ~0u;
++
++	for (uint32_t o = 0; o < drdi_len; o += CH) {
++		uint32_t n = drdi_len - o < CH ? drdi_len - o : CH;
++		vm_size_t ml = ((vm_size_t)n + PAGE_MASK) & ~(vm_size_t)PAGE_MASK;
++		vm_offset_t m = ml_io_map_unmappable((vm_offset_t)(drdi_pa + o), ml, CC_WIMG_IO);
++		if (!m) {
++			printf("A34 CELL: DRDI check: no mapping at +0x%x\n", o);
++			return;
++		}
++		dm_get(ram, m, 0, n & ~3u);
++		ml_io_unmap(m, ml);
++		h_ram = fnv64(h_ram, ram, n);
++		for (uint32_t i = 0; i < n; i++) {
++			zeros += ram[i] == 0;
++			ffs += ram[i] == 0xff;
++		}
++		for (int k = 0; k < 2; k++) {
++			uint64_t so = (k ? shift : 0) + (uint64_t)o;
++			uint32_t sn = so >= secsize ? 0 : (secsize - so < n ? (uint32_t)(secsize - so) : n);
++			memset(img, 0, n);
++			if (sn && sweet_ufs_read_part("md1img", secoff + so, img, sn, NULL) != 0) {
++				printf("A34 CELL: DRDI check: md1img read failed at +0x%llx\n", so);
++				return;
++			}
++			if (k == 0)
++				h0 = fnv64(h0, img, n);
++			else
++				h1 = fnv64(h1, img, n);
++			uint32_t *fd = k ? &first_diff1 : &first_diff0;
++			if (*fd == ~0u && memcmp(ram, img, n) != 0)
++				for (uint32_t i = 0; i < n; i++)
++					if (ram[i] != img[i]) {
++						*fd = o + i;
++						break;
++					}
++		}
++	}
++	printf("A34 CELL: DRDI check: RAM 0x%llx + 0x%x hash %016llx (%u zero, %u 0xff bytes); md1drdi (%u bytes) "
++	    "from +0 hash %016llx, from +0x%x hash %016llx\n", drdi_pa, drdi_len, h_ram, zeros, ffs, secsize, h0,
++	    shift, h1);
++	printf("A34 CELL: DRDI check: RAM %s md1drdi from +0 (first difference at 0x%x), %s it from +0x%x (first "
++	    "difference at 0x%x)\n", first_diff0 == ~0u ? "MATCHES" : "differs from", first_diff0,
++	    first_diff1 == ~0u ? "MATCHES" : "differs from", shift, first_diff1);
++}
++
++static void
++drdi_check_thread(void *arg, wait_result_t wr)
++{
++	const uint32_t CH = 64u << 10;
++	uint8_t *ram = kalloc_data(CH, Z_WAITOK), *img = kalloc_data(CH, Z_WAITOK);
++	uint64_t secoff = 0;
++	uint32_t secsize = 0;
++
++	(void)arg;
++	(void)wr;
++	if (ram && img && a34_cell_md1img_drdi(&secoff, &secsize) && drdi_len)
++		drdi_compare(ram, img, CH, secoff, secsize);
++	else
++		printf("A34 CELL: DRDI check: nothing to compare with\n");
++	if (ram)
++		kfree_data(ram, CH);
++	if (img)
++		kfree_data(img, CH);
++	(void)thread_terminate(current_thread());
++}
++
 +static void
 +amms_poll(bool verbose)
 +{
@@ -1446,6 +1542,13 @@ index 0000000..196d650
 +		printf("A34 CELL: AMMS: the modem gives back 0x%llx + 0x%llx (DRDI); kept reserved here; "
 +		    "acknowledged (0x%llx)\n", a[0], l[0], k[0]);
 +		last = ~0ull;
++		if (!drdi_len && a[0] && l[0] && l[0] <= (64u << 20) && (a[0] & PAGE_MASK) == 0) {
++			thread_t t;
++			drdi_pa = a[0];
++			drdi_len = (uint32_t)l[0];
++			if (kernel_thread_start(drdi_check_thread, NULL, &t) == KERN_SUCCESS)
++				thread_deallocate(t);
++		}
 +	}
 +	if (pending & (AMMS_POS_DEALLOC | AMMS_POS_ALLOC))
 +		printf("A34 CELL: AMMS: POS request 0x%llx not served (no POS area in this layout)\n",
@@ -1667,6 +1770,20 @@ index 0000000..196d650
 +		if (pm_read(ldo[i].con0, &c) && pm_read(ldo[i].mon, &m))
 +			printf("A34 CELL: PMIC %s: %s CON0 0x%04x MON 0x%04x (on: %u)\n", when, ldo[i].nm, c, m,
 +			    m & 1u);
++	}
++	/* Pin modes of the modem's RF control pins (MT6877: GPIO 66-69 MIPI_M/MIPI2, 70 MD_UCNT,
++	 * 71-81 BPI_BUS0-10, 82-85 MIPI1/MIPI0, 87-97 BPI_BUS11-21: their function is mode 1), one
++	 * hex digit per pin, as the boot loaders left them (nothing on the AP side changes them). */
++	if (!gpio_base)
++		gpio_base = ml_io_map(0x10005000, PAGE_SIZE);
++	if (gpio_base) {
++		char modes[40];
++		for (uint32_t pin = 66; pin <= 97; pin++) {
++			uint32_t m = (rd32(gpio_base, 0x300 + (pin / 8) * 0x10) >> ((pin % 8) * 4)) & 7u;
++			modes[pin - 66] = (char)('0' + m);
++		}
++		modes[32] = 0;
++		printf("A34 CELL: %s: RF pin modes GPIO66..97 %s\n", when, modes);
 +	}
 +	/* The RF power-enable pin the device tree gives the modem (gpio_usage_mapping): its state only. */
 +	uint32_t rfpin;
@@ -2068,10 +2185,10 @@ index 0000000..0e1aaf3
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..01e34ab
+index 0000000..8c9615f
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1029 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -2936,6 +3053,19 @@ index 0000000..01e34ab
 +#define MD_MAGIC        0x58881688u
 +#define MD_EXT_MAGIC    0x58891689u
 +
++/* Where md1drdi's data sits in the md1img partition (for bsd/dev/a34_ccci.c's DRDI check). */
++static uint64_t ac_drdi_off;
++static uint32_t ac_drdi_size;
++
++bool a34_cell_md1img_drdi(uint64_t *off, uint32_t *size);
++bool
++a34_cell_md1img_drdi(uint64_t *off, uint32_t *size)
++{
++	*off = ac_drdi_off;
++	*size = ac_drdi_size;
++	return ac_drdi_size != 0;
++}
++
 +static void
 +ac_md1img(void)
 +{
@@ -2974,6 +3104,10 @@ index 0000000..01e34ab
 +		}
 +		nsec++;
 +		printf("A34 CELL: md1img 0x%08llx %-24s %u bytes\n", off, name, dsize);
++		if (strcmp(name, "md1drdi") == 0 && !ac_drdi_size) {
++			ac_drdi_off = off + hsz;
++			ac_drdi_size = dsize;
++		}
 +		if (strcmp(name, "md1rom") == 0 && dsize >= tsz) {
 +			/* CHECK_HEADER sits at the end of md1rom's data (v6: platform at +24,
 +			 * build time at +40, build version at +104). */
