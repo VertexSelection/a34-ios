@@ -89,6 +89,66 @@ rwm_blurdump_used(void)
 	}
 }
 
+/*
+ * (metal-fx) Boot-arg rwm_framedump=N: once a blur has been drawn (a downsample, a narrow blur, a variable blur), the
+ * next N draws into a target of the screen's size (whatever their pipeline), a line each ("framedump:"): the pipeline,
+ * the target (#id), whether the draw cleared it, and a 4 x 4 grid over its whole first level after the draw. Boot
+ * 0938-metal120-d: the target the blur samples and composites into held black and the materials' tint only, while
+ * the screen showed the wallpaper -- this shows into which target the wallpaper and the icons are drawn, and whether
+ * anything clears that target in between.
+ */
+static long frame_dumps_left = -1;
+static bool blur_seen;
+
+extern "C" bool
+rwm_framedump_on(void)
+{
+	if (frame_dumps_left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_framedump=");
+
+		frame_dumps_left = at != nullptr ? atol(at + 14) : 0;
+	}
+	return frame_dumps_left > 0;
+}
+
+static size_t probe_into(char *line, size_t used, size_t size, struct rwa_texture *texture, unsigned level,
+			 unsigned slice, const unsigned box_in[4]);
+
+static void
+frame_dump(const struct rwm_draw *d)
+{
+	if (!rwm_framedump_on() || d->color_count == 0 || d->color[0] == nullptr || rwm_air()->texture_probe == nullptr) {
+		return;
+	}
+	if (!blur_seen) {
+		blur_seen = strstr(d->label, "_Tds") != nullptr || strstr(d->label, "_Tn1") != nullptr ||
+			    strstr(d->label, "_Tn2") != nullptr || strstr(d->label, "_Tvr") != nullptr;
+		if (!blur_seen) {
+			return;
+		}
+	}
+
+	uint8_t texel[16];
+	unsigned w = 0, h = 0;
+	char why[64], line[400];
+
+	if (rwm_air()->texture_probe(d->color[0], 0, 0, texel, &w, &h, why, sizeof(why)) <= 0 || w < 1000) {
+		return;
+	}
+	frame_dumps_left--;
+
+	size_t used = (size_t)snprintf(line, sizeof(line), "framedump: %s%s%s:", d->label[0] ? d->label : "?",
+				       (d->clear_color_mask & 1) != 0 ? " (clears a0)" : "",
+				       d->clear_color != nullptr ? " (clears)" : "");
+
+	used = probe_into(line, used, sizeof(line), d->color[0], d->color_levels ? d->color_level[0] : 0, 0, nullptr);
+	if (d->scissor != nullptr && used < sizeof(line) - 40) {
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " scissor %u,%u %ux%u", d->scissor[0], d->scissor[1],
+					 d->scissor[2], d->scissor[3]);
+	}
+	rwm_print("%s\n", line);
+}
+
 static void
 blur_dump(const struct rwm_draw *d)
 {
@@ -274,5 +334,6 @@ rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
 		return -2;
 	}
 	blur_dump(d);
+	frame_dump(d);
 	return 0;
 }
