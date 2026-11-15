@@ -669,6 +669,9 @@ enum rwa_cb_counter {
    RWA_CB_SLOTS
 };
 unsigned rwa_cb_counters(uint64_t *out, unsigned room);
+/* A34: the kernel's per-job GPU trace asked for jobs first .. first + count - 1 (at most 128; kernel 0992,
+ * boot-arg a34malijobtrace=1): 0, else an errno (ENOTSUP without it) */
+int rwa_trace_jobs(uint64_t first, uint32_t count);
 
 /* The work so far sent off without waiting, and the number of its last job; a wait for it. */
 uint64_t rwa_flush_seq(struct rwa_device *device);

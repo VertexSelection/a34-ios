@@ -101,6 +101,17 @@ Status (2026-11-15):
   the controller's filter off and filters here: Apple adverts (0x004C) always pass, others once per scan.
   Settings' list of other devices comes from classic inquiry, which works (Inquiry Complete, status 0);
   AirPods answer it only in pairing mode (the case button held until the light flashes white).
+- **Boot 1004-120-a (0979)**: the AirPods Pro 2 paired and connected (pairing mode; no proximity card;
+  kernel model bytes 24 20 = 0x2024, AirPods Pro 2). bluetoothd then crashed seven times (SIGSEGV at 0)
+  publishing the A2DP audio device: with "Device supports Skywalk Path" it registers a user-pipe nexus
+  "com.apple.bluetooth.AudioPipe" (`+0x3efaf4`, `+0x3f0448`) and `os_channel_get_fd()` of the channel
+  (`+0x3effb4`) got NULL: "SWEET Sandbox: bluetoothd privilege 12000 denied" -- PRIV_SKYWALK_REGISTER_USER_PIPE
+  needs a MAC grant, and SWEET's policy granted only PRIV_WORK_INTERVAL. 0981 grants Skywalk's privileges
+  to processes entitled for them (bluetoothd has com.apple.private.skywalk.register-user-pipe), in
+  `bsd/kern/sweet_amfi.c`. The "0 passed to bluetoothd" stretches were reports passed while bluetoothd's
+  scan did not ask for duplicate filtering (uncounted); 0981 counts them. bluetoothd's own WiProx scan
+  session stopped with "0 advertisements delivered" each time: the proximity card's path is next (the
+  verbose log's cap was 3000 lines a run, now 30000).
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).

@@ -666,6 +666,14 @@ extern int redwood_drm_trace_jobs(uint64_t first_seq, uint32_t count) __attribut
 static uint64_t rwa_trace_first_job, rwa_trace_last_job;
 static int rwa_trace_answer = -1;
 
+int
+rwa_trace_jobs(uint64_t first, uint32_t count)
+{
+   if (!redwood_drm_trace_jobs)
+      return ENOTSUP;
+   return redwood_drm_trace_jobs(first, MIN2(count, 128u)) == 0 ? 0 : errno;
+}
+
 /* a span of work sent: panfrost told (re-entries are counted within one), and the pass trace of
  * the span that recorded something ended (rwa_pan_profile) -- its GPU jobs then asked of the
  * kernel's per-job trace, so that each pass's line meets its jobs' GPU times one for one */

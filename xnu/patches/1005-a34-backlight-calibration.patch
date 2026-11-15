@@ -1,0 +1,162 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7a456a4..bdb7cfd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -236,7 +236,6 @@ public:
+ 	void blLevel(uint32_t level, const char *who);
+ 	/* A34 (1004): the level to the panel (S6E3FC5 DBV, DCS 0x51), sent from the kick work loop */
+ 	bool          fBLPanel;                 /* a34blpanel (default 1) */
+-	uint32_t      fBLPanelNits;             /* nits at DBV 0x3FF, the panel's normal maximum (a34blpanelnits) */
+ 	volatile uint32_t fBLWant;              /* the DBV wanted (0: none yet) */
+ 	uint32_t      fBLSent;                  /* the DBV last sent (0: none) */
+ 	uint64_t      fBLSentAt;                /* ... mach time */
+@@ -2143,10 +2142,46 @@ AppleCLCD::publishRefresh(uint32_t hz)
+ #define SWEET_FB_BL_SAY         24u     /* requests logged one by one, then a line every 2 s at most */
+ #define SWEET_FB_BL_DBV_MIN     0x002u  /* A34 (1004): Samsung's UI level 0 */
+ #define SWEET_FB_BL_DBV_MAX     0x3ffu  /* ... 255, the normal maximum (no HBM) */
+-#define SWEET_FB_BL_PANEL_NITS  480u    /* nits at DBV 0x3FF (a34blpanelnits) */
+ #define SWEET_FB_BL_GAP_MS      33u     /* one level to the panel every 33 ms at most */
+ #define SWEET_FB_BL_IDLE_MS     20u     /* the link waited for that long (a transfer is 4-8 ms) */
+ 
++/*
++ * A34 (1005): the panel's level along Samsung's own curve. 1004 made DBV
++ * linear in nits and the user found the slider changed "a very small
++ * amount": Samsung's DBV is not linear in luminance -- its platform levels
++ * 0..255 (a perceptual scale) map to DBV through S6E3FC5_SDC_BRIGHTNESS
++ * (a34x_s6e3fc5_sdc_param_brightness.h, Samsung's GPL panel driver), which
++ * puts level 128 at DBV 0x1A5. Samsung's driver has no nits table for this
++ * panel. CoreBrightness's level (0..1 of 65536) is taken as Samsung's
++ * platform level 0..255, so the slider spans the panel's whole normal range,
++ * 0x002 (about 2 nits) to 0x3FF; DBV comes from these 17 points of
++ * Samsung's table (every 16th level and 255; within 4 DBV of the table).
++ * CoreAnimation is told other nits (blNits16, a34blmin..a34blmax), kept
++ * above its luma boost and overdrive-fix limits.
++ */
++static const uint16_t sweet_fb_bl_ui_dbv[17] = {
++	0x002, 0x01e, 0x047, 0x077, 0x0ac, 0x0e5, 0x122, 0x162, 0x1a5, 0x1e9, 0x230, 0x27a, 0x2c5, 0x312, 0x361, 0x3b2, 0x3ff
++};
++
++static uint32_t
++sweet_fb_bl_dbv(uint32_t level)
++{
++	/* the platform level in 1/256 steps: level * 255 / 65536, times 256 */
++	uint32_t ui256 = (uint32_t)(((uint64_t)(level > SWEET_FB_BL_MAX ? SWEET_FB_BL_MAX : level) * 255 * 256) /
++	    SWEET_FB_BL_MAX);
++	uint32_t i = ui256 / (16 * 256), lo, hi, x0, x1, dbv;
++
++	if (i >= 15) {
++		i = 15;         /* the last segment is 240..255 */
++	}
++	x0 = i * 16 * 256;
++	x1 = (i == 15 ? 255 : (i + 1) * 16) * 256;
++	lo = sweet_fb_bl_ui_dbv[i];
++	hi = sweet_fb_bl_ui_dbv[i + 1];
++	dbv = lo + (uint32_t)(((uint64_t)(hi - lo) * (ui256 - x0) + (x1 - x0) / 2) / (x1 - x0));
++	return dbv < SWEET_FB_BL_DBV_MIN ? SWEET_FB_BL_DBV_MIN : (dbv > SWEET_FB_BL_DBV_MAX ? SWEET_FB_BL_DBV_MAX : dbv);
++}
++
+ uint32_t
+ AppleCLCD::blNits16(uint32_t level)
+ {
+@@ -2169,10 +2204,7 @@ AppleCLCD::blLevel(uint32_t level, const char *who)
+ 	}
+ 	fBLValue = level;
+ 	n16 = blNits16(level);
+-	/* A34 (1004): DBV linear in nits up to 0x3FF, the normal maximum (Samsung's UI 255); 0x400.. would be HBM */
+-	dbv = fBLPanelNits != 0 ? (uint32_t)(((uint64_t)n16 * SWEET_FB_BL_DBV_MAX + ((uint64_t)fBLPanelNits << 15)) /
+-	    ((uint64_t)fBLPanelNits << 16)) : 0;
+-	dbv = dbv < SWEET_FB_BL_DBV_MIN ? SWEET_FB_BL_DBV_MIN : (dbv > SWEET_FB_BL_DBV_MAX ? SWEET_FB_BL_DBV_MAX : dbv);
++	dbv = sweet_fb_bl_dbv(level);      /* A34 (1005): the panel along Samsung's own curve, not the nits CA is told */
+ 	if (fBLPanel) {
+ 		fBLWant = dbv;
+ 		blArm(1);
+@@ -2180,9 +2212,10 @@ AppleCLCD::blLevel(uint32_t level, const char *who)
+ 	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &every);
+ 	if (fBLSaidAt == 0 || now - fBLSaidAt >= every) {
+ 		fBLSaidAt = now;
+-		IOLog("A34 BL: level %u of %u from %s: %u.%02u nits on the curve (%u..%u), panel DBV 0x%03x%s (%u sent, %u "
+-		    "failed)\n", level, SWEET_FB_BL_MAX, who, n16 >> 16, (uint32_t)(((uint64_t)(n16 & 0xffffu) * 100) >> 16),
+-		    fBLMin, fBLMax, dbv, fBLPanel ? "" : " not sent (a34blpanel=0)", fBLSends, fBLFails);
++		IOLog("A34 BL: level %u of %u from %s: CA told %u.%02u nits (%u..%u), panel UI %u of 255, DBV 0x%03x%s (%u sent, "
++		    "%u failed)\n", level, SWEET_FB_BL_MAX, who, n16 >> 16, (uint32_t)(((uint64_t)(n16 & 0xffffu) * 100) >> 16),
++		    fBLMin, fBLMax, (uint32_t)(((uint64_t)level * 255 + SWEET_FB_BL_MAX / 2) / SWEET_FB_BL_MAX), dbv,
++		    fBLPanel ? "" : " not sent (a34blpanel=0)", fBLSends, fBLFails);
+ 	}
+ }
+ 
+@@ -2441,12 +2474,7 @@ sweet_fb_backlight_publish(AppleCLCD *fb)
+ 		table[i] = fb->blNits16(i * SWEET_FB_BL_MAX / (SWEET_FB_BL_STEPS - 1));
+ 	}
+ 	uint32_t panel = 1;     /* A34 (1004) */
+-	fb->fBLPanelNits = SWEET_FB_BL_PANEL_NITS;
+ 	(void)PE_parse_boot_argn("a34blpanel", &panel, sizeof(panel));
+-	(void)PE_parse_boot_argn("a34blpanelnits", &fb->fBLPanelNits, sizeof(fb->fBLPanelNits));
+-	if (fb->fBLPanelNits < 100 || fb->fBLPanelNits > 1000) {
+-		fb->fBLPanelNits = SWEET_FB_BL_PANEL_NITS;
+-	}
+ 	if (panel != 0 && a34_kick_wl != NULL) {
+ 		fb->fBLTimer = IOTimerEventSource::timerEventSource(fb, &sweet_fb_bl_fired);
+ 		if (fb->fBLTimer != NULL && a34_kick_wl->addEventSource(fb->fBLTimer) != kIOReturnSuccess) {
+@@ -2454,23 +2482,57 @@ sweet_fb_backlight_publish(AppleCLCD *fb)
+ 		}
+ 	}
+ 	fb->fBLPanel = fb->fBLTimer != NULL;
+-	IOLog("A34 BL: the panel's level %s (a34blpanel=%u): DBV 0x%03x..0x%03x for 0..%u nits, smooth dimming, no HBM\n",
+-	    fb->fBLPanel ? "follows the backlight" : "is not changed", panel, SWEET_FB_BL_DBV_MIN, SWEET_FB_BL_DBV_MAX,
+-	    fb->fBLPanelNits);
++	IOLog("A34 BL: the panel's level %s (a34blpanel=%u): DBV 0x%03x..0x%03x along Samsung's levels 0..255, smooth "
++	    "dimming, no HBM\n", fb->fBLPanel ? "follows the backlight" : "is not changed", panel, SWEET_FB_BL_DBV_MIN,
++	    SWEET_FB_BL_DBV_MAX);
+ 	marketing = OSData::withBytes(table, sizeof(table));
++	/*
++	 * A34 (1005): why CoreAnimation still ran its luma boost at 420-476 nits
++	 * (1004's boot): CoreBrightness's DisplayBrightness said Nits 0,
++	 * NitsPhysical 0 at every level. Its backlight setup (CBDisplayModuleiOS)
++	 * reads "backlight-calibration-parameters" off this service, a dictionary
++	 * of 16.16 numbers: current-for-max-backlight, current-for-mid-backlight,
++	 * hardware-max-current-limit, lMaxProduct, lMidProduct, lMinProduct (the
++	 * nits the levels are sold as), lMaxPanel, lMidPanel, lMinPanel (what the
++	 * panel gives there; NitsPhysical = the marketing table's nits mapped
++	 * through these 3 points). Without it the "hardware" range was the
++	 * fallback's 0..1 nit (its "Digital dimming params" line), so the nits it
++	 * pushed to CoreAnimation were under 1. (On an iPhone X the values come
++	 * from the device tree's /backlight: LmaxProduct 674, LmidProduct 155,
++	 * LminProduct 2 nits.) Every key must be there: CoreBrightness reads them
++	 * without checking. Here the curve's own points, product = panel, and
++	 * currents that never limit (20 mA at max, 5 at mid, limit 40).
++	 */
++	OSDictionary *calibration = OSDictionary::withCapacity(9);
++	if (calibration != NULL) {
++		sweet_fb_set_number(calibration, "current-for-max-backlight", 20u << 16);
++		sweet_fb_set_number(calibration, "current-for-mid-backlight", 5u << 16);
++		sweet_fb_set_number(calibration, "hardware-max-current-limit", 40u << 16);
++		sweet_fb_set_number(calibration, "lMaxProduct", fb->blNits16(SWEET_FB_BL_MAX));
++		sweet_fb_set_number(calibration, "lMidProduct", fb->blNits16(SWEET_FB_BL_MAX / 2));
++		sweet_fb_set_number(calibration, "lMinProduct", fb->blNits16(0));
++		sweet_fb_set_number(calibration, "lMaxPanel", fb->blNits16(SWEET_FB_BL_MAX));
++		sweet_fb_set_number(calibration, "lMidPanel", fb->blNits16(SWEET_FB_BL_MAX / 2));
++		sweet_fb_set_number(calibration, "lMinPanel", fb->blNits16(0));
++	}
+ 	if (backlight != NULL && marketing != NULL && backlight->init()) {
+ 		backlight->fFB = fb;
+ 		backlight->fValue = SWEET_FB_BL_MAX / 2;
+ 		backlight->setName("backlight");
+ 		backlight->setProperty("backlight-control", kOSBooleanTrue);
+ 		backlight->setProperty("backlight-marketing-table", marketing);
++		if (calibration != NULL && calibration->getCount() == 9) {
++			backlight->setProperty("backlight-calibration-parameters", calibration);
++		}
+ 		backlight->publishParameters();
+ 		if (backlight->attach(fb)) {
+ 			backlight->registerService();
+-			IOLog("A34 BL: AppleARMBacklight published (IODisplayParameters 0..%u, marketing table %u..%u nits: "
+-			    "a34blmin, a34blmax); CA's luma boost runs under 20 nits\n", SWEET_FB_BL_MAX, fb->fBLMin, fb->fBLMax);
++			IOLog("A34 BL: AppleARMBacklight published (IODisplayParameters 0..%u, marketing table and calibration "
++			    "%u..%u nits: a34blmin, a34blmax%s); CA's luma boost runs under 20 nits\n", SWEET_FB_BL_MAX, fb->fBLMin,
++			    fb->fBLMax, calibration != NULL && calibration->getCount() == 9 ? "" : ", NO calibration");
+ 		}
+ 	}
++	OSSafeReleaseNULL(calibration);
+ 	OSSafeReleaseNULL(marketing);
+ 	OSSafeReleaseNULL(backlight);
+ }

@@ -111,6 +111,9 @@ __thread bool rwm_on_completion_queue;
 /* A34: the last buffer committed (its last GPU job) and when the completion queue saw a buffer's GPU work end */
 static uint64_t last_committed_seq, last_done_ns;
 __thread struct rwm_cb_parts rwm_cb_now;
+struct rwm_burst_cb rwm_burst[RWM_BURST];
+unsigned rwm_burst_n;
+bool rwm_burst_on, rwm_burst_ready;
 bool rwm_pass_draws_on;
 unsigned rwm_pass_draws_n;
 struct rwm_pass_draws rwm_pass_draws[RWM_PASS_DRAWS];
@@ -139,6 +142,7 @@ rwm_command_begin(struct rwm_command *c)
 	memset(c, 0, sizeof(*c));
 	c->born = rwm_ns();
 	c->born_cpu = rwm_thread_cpu_ns();
+	c->burst_slot = -1;
 	c->status = RWM_CB_ENQUEUED;    /* nothing is pending yet */
 	/*
 	 * A34: frames in flight. Begun while the GPU still draws the buffer committed before: the program overlaps its
@@ -174,9 +178,10 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 	static __thread bool bound;
 
 	if (!rwm_worker_on()) {
+		c->made_cpu = rwm_thread_cpu_ns() - c->born_cpu;
 		rwm_perf.made_cbs++;
 		rwm_perf.made_ns += rwm_ns() - c->born;
-		rwm_perf.made_cpu += rwm_thread_cpu_ns() - c->born_cpu;
+		rwm_perf.made_cpu += c->made_cpu;
 	}
 	if (!bound) {
 		bound = true;
@@ -233,6 +238,18 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 	if (counters != nullptr && rwm_camprof() != 0) {
 		counters(lib_before, RWA_CB_SLOTS);
 	}
+	/* (A34: an animation burst begins after 150 ms without a buffer, and ends at one more such gap) */
+	static uint64_t burst_last_end, burst_prev_seq;
+	const bool idle_before = burst_last_end != 0 && began > burst_last_end + 150000000ull;
+
+	if (rwm_burst_on && idle_before) {
+		rwm_burst_on = false;
+		rwm_burst_ready = true;
+	}
+	if (!rwm_burst_on && !rwm_burst_ready && idle_before && rwm_camprof() != 0) {
+		rwm_burst_on = true;
+		rwm_burst_n = 0;
+	}
 	/* its copies in -- here, unless the driver's worker made them at -commit --, the draws, dispatches and copies in
 	 * order, the work sent off, the surfaces copied back */
 	ran = rwm_run_works(device, works, count, !(rwm_worker_on() && !rwm_copyin_late()), finish_wanted(), &c->seq,
@@ -252,6 +269,32 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 	}
 	rwm_cb_now.took_ns = took;
 	rwm_cb_parts_note(&rwm_cb_now);
+	if (rwm_burst_on && rwm_burst_n < RWM_BURST) {
+		struct rwm_burst_cb *b = &rwm_burst[rwm_burst_n];
+
+		memset(b, 0, sizeof(*b));
+		b->born = c->born;
+		b->run_start = began;
+		b->run_end = now;
+		b->made_cpu = c->made_cpu;
+		b->draws = (unsigned)rwm_cb_now.draws;
+		b->passes = rwm_cb_now.passes;
+		b->first_job = burst_prev_seq + 1;
+		b->last_job = c->seq;
+		b->trace_answer = -1;
+		if (c->seq > burst_prev_seq && burst_prev_seq != 0 && rwm_air()->trace_jobs != nullptr) {
+			b->trace_answer = rwm_air()->trace_jobs(b->first_job, (uint32_t)(c->seq - burst_prev_seq));
+		}
+		c->burst_slot = (int)rwm_burst_n++;
+		if (rwm_burst_n == RWM_BURST) {
+			rwm_burst_on = false;
+			rwm_burst_ready = true;
+		}
+	}
+	if (c->seq != 0) {
+		burst_prev_seq = c->seq;
+	}
+	burst_last_end = now;
 	if (rwm_pass_draws_on && rwm_pass_draws_n != 0) {
 		rwm_pass_draws_on = false;      /* (one command buffer's, said with the next report) */
 	}
@@ -329,6 +372,9 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 			rwm_perf.completed_q_waits++;
 			rwm_perf.completed_q_ns += rwm_ns() - from;
 			__atomic_store_n(&last_done_ns, rwm_ns(), __ATOMIC_RELAXED);
+			if (c->burst_slot >= 0 && c->burst_slot < RWM_BURST) {
+				rwm_burst[c->burst_slot].gpu_done = rwm_ns();
+			}
 		} else {
 			rwm_perf.completed_waits++;
 			rwm_perf.completed_ns += rwm_ns() - from;

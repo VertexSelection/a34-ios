@@ -77,11 +77,29 @@ extern __thread bool rwm_on_completion_queue;
 struct rwm_cb_parts {
 	uint64_t took_ns;
 	uint64_t draws, draw_ns, blits, blit_ns, dispatches, dispatch_ns, copyins, copyin_ns, submit_ns;
+	unsigned passes;                /* draws into other attachments than the draw before's */
 	uint64_t slowest_ns;
 	unsigned slowest_index, slowest_kind, works;
 	uint64_t lib[RWA_CB_SLOTS];
 };
 extern __thread struct rwm_cb_parts rwm_cb_now;
+/*
+ * A34: an animation burst, frame by frame -- the command buffers that follow 150 ms or more without one (Control
+ * Center opening, an app's zoom), up to RWM_BURST of them: when each was made and committed, how long the program
+ * took making it (and its thread's processor time), how long the driver took running it, its draws and passes,
+ * when the completion queue saw its GPU work end, and its GPU jobs, which the kernel's per-job trace is asked for
+ * (kernel 0992, a34malijobtrace=1) so the frames over 8.33 ms can be told CPU from GPU. Said with the next report.
+ */
+#define RWM_BURST 48
+struct rwm_burst_cb {
+	uint64_t born, run_start, run_end, gpu_done, made_cpu;
+	unsigned draws, passes;
+	uint64_t first_job, last_job;
+	int trace_answer;
+};
+extern struct rwm_burst_cb rwm_burst[RWM_BURST];
+extern unsigned rwm_burst_n;
+extern bool rwm_burst_on, rwm_burst_ready;
 void rwm_cb_parts_note(const struct rwm_cb_parts *parts);
 /*
  * A34: the draws of one command buffer's passes, by pipeline -- the one the library traces after each profile
@@ -140,6 +158,7 @@ struct rwm_air {
 	__typeof__(&rwa_texture_create) texture_create;
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;   /* A34 (y2sios): may be NULL */
 	__typeof__(&rwa_render_stats) render_stats;                 /* A34: may be NULL */
+	__typeof__(&rwa_trace_jobs) trace_jobs;                     /* A34: may be NULL */
 	__typeof__(&rwa_texture_write) texture_write;
 	__typeof__(&rwa_texture_read) texture_read;
 	__typeof__(&rwa_texture_copy) texture_copy;
@@ -635,6 +654,8 @@ enum {
 struct rwm_command {
 	unsigned status;
 	uint64_t born, born_cpu;        /* when it was made, and the making thread's processor time then */
+	uint64_t made_cpu;              /* A34: the making thread's processor time from made to -commit */
+	int burst_slot;                 /* A34: its place in the burst being recorded (rwm_burst), -1: none */
 	uint64_t seq;                   /* its last GPU job, when it was sent off without a wait */
 	volatile bool queued, processed;   /* handed to the driver's worker at -commit, and done there */
 	struct rwm_drawn drawn;         /* the surfaces it draws into in place, pending meanwhile */

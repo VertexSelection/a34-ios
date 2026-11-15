@@ -255,6 +255,42 @@ rwm_perf_report(uint64_t now)
 		}
 	}
 	say_worst_cb();
+	/* A34: the animation burst recorded (rwm_burst), a report after it ended (its last GPU work done by then) */
+	{
+		static bool armed;
+
+		if (rwm_burst_ready && !armed) {
+			armed = true;
+		} else if (rwm_burst_ready && armed) {
+			const uint64_t t0 = rwm_burst_n ? rwm_burst[0].run_start : 0;
+			unsigned over = 0, gpu_over = 0;
+
+			for (unsigned k = 0; k < rwm_burst_n; k++) {
+				const struct rwm_burst_cb *b = &rwm_burst[k];
+				const double interval = k ? (b->run_start - rwm_burst[k - 1].run_start) / 1e6 : 0.0;
+				const double gpu = b->gpu_done > b->run_end ? (b->gpu_done - b->run_end) / 1e6 : -1.0;
+				char wide[400];
+
+				over += interval > 8.4;
+				gpu_over += gpu > 8.33;
+				snprintf(wide, sizeof(wide), "rwm burst %u of %u: +%.1f ms (%.1f after the one before), made in %.1f ms "
+					 "(its thread running %.1f), the driver %.1f ms, %u draws, %u passes; GPU done %.1f ms after "
+					 "commit; jobs %llu-%llu (job trace %s)", k + 1, rwm_burst_n, (b->run_start - t0) / 1e6, interval,
+					 (b->run_start - b->born) / 1e6, b->made_cpu / 1e6, (b->run_end - b->run_start) / 1e6, b->draws,
+					 b->passes, gpu, (unsigned long long)b->first_job, (unsigned long long)b->last_job,
+					 b->trace_answer == 0 ? "asked" : b->trace_answer < 0 ? "not asked" : "refused");
+				say(wide);
+			}
+			snprintf(line, sizeof(line), "rwm burst: %u buffers in %.1f ms from %llu us (mach_absolute_time, the "
+				 "kernel's clock); %u commits more than 8.4 ms after the one before; %u whose GPU work ended more "
+				 "than 8.33 ms after their commit", rwm_burst_n,
+				 rwm_burst_n ? (rwm_burst[rwm_burst_n - 1].run_end - t0) / 1e6 : 0.0, (unsigned long long)(t0 / 1000),
+				 over, gpu_over);
+			say(line);
+			rwm_burst_ready = false;
+			armed = false;
+		}
+	}
 	/* A34: the traced command buffer's passes by pipeline (rwm_pass_draws), and the next one traced */
 	for (unsigned k = 0; !rwm_pass_draws_on && k < rwm_pass_draws_n; k++) {
 		const struct rwm_pass_draws *d = &rwm_pass_draws[k];
