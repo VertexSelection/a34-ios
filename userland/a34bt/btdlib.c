@@ -29,7 +29,13 @@
  *    through as before (the kernel's CRASH line still comes).
  * 5. Its os_log on the console (OS_ACTIVITY_DT_MODE did not show it): _os_log_impl, _os_log_error_impl and
  *    _os_log_fault_impl formatted here (format string and arguments, privacy ignored: this is the phone's own log),
- *    the first 3000 lines of each run, debug ones left out; "bt: " ahead of each.
+ *    debug ones left out; "bt: " ahead of each. Quiet by default (boot 0999-120-a: 33077 lines in one boot, most of
+ *    them "PowerManager power state is 2" and XPC traffic, flooded the kernel's log): only errors and faults (the
+ *    first 400 of a run) and the lines that say where bluetoothd stands (restarts, HCI init, power state changes,
+ *    "Could not", timeouts) are written; the last 30 lines of every kind are kept, and written as "bt~ " when
+ *    bluetoothd exits or crashes; every 10 s that hid anything, one line counts them. With /a34/bluetoothd.verbose
+ *    (or A34BT_LOG=verbose) every line is written, the first 3000 of a run, and the keychain calls and BlueTool's
+ *    messages in full, as before.
  *
  * Lines go to the console (the kernel's log) as "a34bt-btd: bluetoothd[PID]: ...".
  */
@@ -51,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <xpc/xpc.h>
@@ -91,6 +98,7 @@ say(const char *fmt, ...)
 
 static xpc_connection_t bluetool[8];
 static bool bluetool_local = true;
+static bool log_verbose;                        /* (0975) /a34/bluetoothd.verbose: everything said, as before */
 
 static bool
 is_bluetool(xpc_connection_t c)
@@ -106,11 +114,21 @@ is_bluetool(xpc_connection_t c)
 static xpc_object_t
 bluetool_answer(xpc_object_t message)
 {
-	char *text = xpc_copy_description(message);
 	xpc_object_t reply = xpc_dictionary_create(NULL, NULL, 0);
 
-	say("com.apple.BlueTool asked %s: answered here (result 0: the kernel has the controller up)", text != NULL ? text : "(?)");
-	free(text);
+	if (log_verbose) {
+		char *text = xpc_copy_description(message);
+
+		say("com.apple.BlueTool asked %s: answered here (result 0: the kernel has the controller up)",
+		    text != NULL ? text : "(?)");
+		free(text);
+	} else {
+		xpc_object_t args = xpc_dictionary_get_value(message, "kMsgArgs");
+		const char *script = args != NULL && xpc_get_type(args) == XPC_TYPE_DICTIONARY ?
+		    xpc_dictionary_get_string(args, "script") : NULL;
+
+		say("com.apple.BlueTool script \"%s\": answered here (result 0)", script != NULL ? script : "?");
+	}
 	xpc_dictionary_set_int64(reply, "result", 0);
 	xpc_dictionary_set_int64(reply, "manufacturer", 15);
 	xpc_dictionary_set_string(reply, "firmware", "MT6635 (A34, kernel 0971)");
@@ -124,7 +142,7 @@ my_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flag
 	static unsigned said;
 	xpc_connection_t c = a34_xpc_create_mach_service(name, targetq, flags);
 
-	if (said++ < 40) {
+	if (log_verbose && said++ < 40) {
 		say("connects to %s (flags %#llx)", name != NULL ? name : "(null)", (unsigned long long)flags);
 	}
 	if (bluetool_local && name != NULL && strcmp(name, "com.apple.BlueTool") == 0) {
@@ -389,8 +407,9 @@ kc_say(const char *op, CFDictionaryRef query, CFDictionaryRef more, OSStatus sta
 	size_t used = 0;
 	CFIndex n;
 
-	if (kc_said++ >= 200) {
-		return;
+	if ((!log_verbose && status == errSecSuccess) || (!log_verbose && status == errSecItemNotFound) ||
+	    kc_said++ >= 200) {
+		return;                 /* (0975) quiet: only a call that went wrong */
 	}
 	kc_cstr(CFDictionaryGetValue(query, kSecAttrService), service, sizeof(service));
 	kc_cstr(CFDictionaryGetValue(query, kSecAttrAccount), account, sizeof(account));
@@ -763,22 +782,83 @@ log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint3
 #undef PUT
 }
 
+/* (0975) quiet mode: the last lines kept for an exit, the hidden ones counted */
+#define LOG_RING        30u
+static char log_ring[LOG_RING][320];
+static unsigned log_ring_at, log_shown, log_hidden, log_hidden_errors;
+static time_t log_summary_at;
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static int log_console = -1;
+
+static void
+log_write(const char *line, size_t n)
+{
+	if (log_console < 0) {
+		log_console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+	}
+	if (log_console >= 0) {
+		(void)write(log_console, line, n);
+	}
+}
+
+/* a default-level line that says where bluetoothd stands */
+static bool
+log_important(const char *line)
+{
+	static const char *const words[] = {
+		"restarting", "Bluetooth error", "initialization", "timedout", "Could not", "stopped improperly",
+		"Power state change -", "STATUS ", "Fatal", "assert",
+	};
+
+	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (strstr(line, words[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* the kept lines, as "bt~ ", oldest first (at an exit or a crash; quiet mode only) */
+static void
+log_ring_say(const char *why)
+{
+	char head[96];
+	bool locked = pthread_mutex_trylock(&log_lock) == 0;   /* (a crash may come with it held) */
+	int n;
+
+	if (!log_verbose) {
+		n = snprintf(head, sizeof(head), "bt~ the last lines before %s (newest last):\n", why);
+		log_write(head, (size_t)n);
+		for (unsigned k = 0; k < LOG_RING; k++) {
+			char *l = log_ring[(log_ring_at + k) % LOG_RING];
+			size_t len = strlen(l);
+
+			if (len != 0) {
+				l[2] = '~';
+				log_write(l, len);
+				l[0] = 0;
+			}
+		}
+	}
+	if (locked) {
+		pthread_mutex_unlock(&log_lock);
+	}
+}
+
 static void
 log_say(os_log_type_t type, const char *format, uint8_t *buf, uint32_t size)
 {
-	static int console = -1;
 	char line[1100];
 	size_t n;
+	bool error = type == OS_LOG_TYPE_ERROR || type == OS_LOG_TYPE_FAULT;
+	time_t now;
 
 	static __thread int inside;
 
-	if (type == OS_LOG_TYPE_DEBUG || format == NULL || inside || log_said++ >= 3000) {
+	if (type == OS_LOG_TYPE_DEBUG || format == NULL || inside || (log_verbose && log_said++ >= 3000)) {
 		return;
 	}
 	inside = 1;                     /* (a description that logs is not formatted again) */
-	if (console < 0) {
-		console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
-	}
 	memcpy(line, "bt: ", 4);
 	log_format(line + 4, sizeof(line) - 6, format, buf, size);
 	n = strlen(line);
@@ -786,9 +866,42 @@ log_say(os_log_type_t type, const char *format, uint8_t *buf, uint32_t size)
 		n--;
 	}
 	line[n++] = '\n';
-	if (console >= 0) {
-		(void)write(console, line, n);
+	line[n] = 0;
+	if (log_verbose) {
+		log_write(line, n);
+		inside = 0;
+		return;
 	}
+	pthread_mutex_lock(&log_lock);
+	{
+		char *slot = log_ring[log_ring_at++ % LOG_RING];
+
+		strlcpy(slot, line, sizeof(log_ring[0]));
+		if (n >= sizeof(log_ring[0])) {
+			slot[sizeof(log_ring[0]) - 2] = '\n';
+		}
+	}
+	if ((error || log_important(line)) && log_shown < 400) {
+		log_shown++;
+		log_write(line, n);
+	} else {
+		log_hidden++;
+		log_hidden_errors += error ? 1u : 0u;
+	}
+	now = time(NULL);
+	if (log_summary_at == 0) {
+		log_summary_at = now;
+	} else if (now - log_summary_at >= 10 && log_hidden != 0) {
+		char sum[160];
+		int k = snprintf(sum, sizeof(sum), "bt: (%ld s: %u lines not shown%s; /a34/bluetoothd.verbose shows all)\n",
+		    (long)(now - log_summary_at), log_hidden, log_hidden_errors != 0 ? ", errors among them" : "");
+
+		log_write(sum, (size_t)k);
+		log_hidden = 0;
+		log_hidden_errors = 0;
+		log_summary_at = now;
+	}
+	pthread_mutex_unlock(&log_lock);
 	inside = 0;
 }
 
@@ -856,6 +969,7 @@ crash_handler(int sig, siginfo_t *si, void *context)
 		}
 		fp = next;
 	}
+	log_ring_say("the crash");
 	say("crash: signal %d at %#lx: pc %s lr %s frames%s", sig, si != NULL ? (unsigned long)(uintptr_t)si->si_addr : 0UL,
 	    pc, lr, frames);
 	signal(sig, SIG_DFL);                   /* returning re-runs the faulting instruction: the system's crash, as before */
@@ -910,6 +1024,7 @@ static void my__exit(int status) __attribute__((noreturn));
 static void
 my_exit(int status)
 {
+	log_ring_say("exit()");
 	say_frames("exit", status);
 	exit(status);
 }
@@ -917,6 +1032,7 @@ my_exit(int status)
 static void
 my__exit(int status)
 {
+	log_ring_say("_exit()");
 	say_frames("_exit", status);
 	_exit(status);
 }
@@ -946,11 +1062,14 @@ btd_init(void)
 	const char *mode = getenv("A34BT_BLUETOOL");
 
 	const char *kc = getenv("A34BT_KEYCHAIN");
+	const char *lg = getenv("A34BT_LOG");
 
 	bluetool_local = !(mode != NULL && strcmp(mode, "launchd") == 0);
 	kc_local = !(kc != NULL && strcmp(kc, "securityd") == 0);
+	log_verbose = access("/a34/bluetoothd.verbose", F_OK) == 0 || (lg != NULL && strcmp(lg, "verbose") == 0);
 	unsetenv("DYLD_INSERT_LIBRARIES");     /* (not into what bluetoothd starts) */
 	crash_handlers();
-	say("liba34bt-btd loaded: BlueTool %s, keychain (bluetoothd's services) %s, os_log on the console, exits and crashes said",
-	    bluetool_local ? "answered here" : "left to launchd", kc_local ? "kept in " KC_FILE : "left to securityd");
+	say("liba34bt-btd loaded: BlueTool %s, keychain (bluetoothd's services) %s, os_log on the console %s, exits and "
+	    "crashes said", bluetool_local ? "answered here" : "left to launchd", kc_local ? "kept in " KC_FILE :
+	    "left to securityd", log_verbose ? "(verbose: every line)" : "(errors, restarts and the last 30 lines at an exit)");
 }

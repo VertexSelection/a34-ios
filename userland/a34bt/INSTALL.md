@@ -211,3 +211,20 @@ show them. Also: once bluetoothd has connected, the raw channel (a34bt) only lis
 job can stay (it then just counts what bluetoothd's scans hear).
 
 Kernel: main with 0970-0973, `a34bt=2`. Root unchanged (the 43726586862 artifact).
+
+## 11. Long frames and LE scanning (kernels 0974, 0975); a quiet bluetoothd log
+
+0994-all-a: the controller went silent after bluetoothd's first frame over 16 bytes (PIO bursts lose
+bytes); 0974 sends BTIF's TX through the AP DMA and tests a 252-byte frame at bring-up (`A34 BT: step 9:
+long frames (AP DMA): ... whole`). 0999-120-a: power-on worked (the switch on), then every bluetoothd
+restarted with reason 712 = OI_HCIERR_COMMAND_DISALLOWED: the controller refused LE_Set_Scan_Parameters
+while scanning (Apple's controllers allow it). 0975 turns scanning off around such a command and on
+again (`A34 BT: br: command 200b sent with scanning off around it`), says every non-zero status the
+controller gives, and the last 24 bridge packets when bluetoothd leaves.
+
+The library's log is quiet now: only errors, restarts, HCI init, power-state changes and timeouts (`bt:`),
+a count every 10 s of what was hidden, and the last 30 lines as `bt~` when bluetoothd exits or crashes.
+`touch /a34/bluetoothd.verbose` on the root brings back every line (and OS_ACTIVITY_DT_MODE).
+
+Kernel: main with 0970-0975, `a34bt=2`. Root: `a34bt-btd` and `liba34bt-btd.dylib` from this round's
+`a34bt` artifact copied to `/a34` (section 6's command).
