@@ -1,0 +1,365 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index 5113697..91148c8 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -116,6 +116,9 @@ void a34_battery_report(void);          /* A34 (0929): bsd/dev/a34_diag.c's hear
+ uint32_t a34_disp_clock_khz(uint32_t *sel, uint32_t *mmpll_khz);     /* A34 (0940): SweetFramebuffer.cpp */
+ uint32_t a34_vcore_uv(void);
+ bool a34_disp_clock_set(uint32_t sel);
++uint32_t a34_clocks_gpu_khz(void);      /* A34 (0991): A34Mali.cpp's 10 s line */
++int a34_ddr_state(uint32_t r[4]);       /* A34 (0991): DVFSRC, see below */
++bool a34_ddr_top(bool on);
+ 
+ /* ---- where things are ---- */
+ 
+@@ -197,6 +200,7 @@ static LCK_MTX_DECLARE(a34_pmic_mtx, &a34_pmic_grp);
+ static vm_offset_t ck_top, ck_spm, ck_apmixed, ck_pwrap, ck_mcucfg, ck_gpupll;
+ static bool ck_started;
+ static uint32_t ck_gpu_want_mhz;        /* a34gpumhz */
++static uint32_t ck_gpu_seg;             /* A34 (0991): a34gpuseg, the phone's GPU segment efuse byte (0: not given) */
+ 
+ /* The wrapper's channel is one command at a time: ruby_keys.c's poll, a34_touch.c and this take turns. */
+ void
+@@ -1252,6 +1256,7 @@ a34_clocks_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("a34gpumhz", &ck_gpu_want_mhz, (int)sizeof(ck_gpu_want_mhz));
++	(void)PE_parse_boot_argn("a34gpuseg", &ck_gpu_seg, (int)sizeof(ck_gpu_seg));       /* A34 (0991) */
+ 	if (ck_gpu_want_mhz > 10000u) {
+ 		ck_gpu_want_mhz = 10000u;       /* (only "the most there is"; no overflow in kHz) */
+ 	}
+@@ -1276,25 +1281,39 @@ a34_clocks_init(void)
+ 		ck_cpu_requests();
+ 	}
+ 	if (ck_gpu_want_mhz != 0) {
+-		printf("A34 CLOCKS: a34gpumhz=%u: the GPU's clock is raised before programs get the GPU (a34_mali.c)\n",
+-		    ck_gpu_want_mhz);
++		printf("A34 CLOCKS: a34gpumhz=%u: the GPU's clock is raised before programs get the GPU (a34_mali.c); "
++		    "segment %u (a34gpuseg: 2..4 MT6877T, up to 950 MHz; else up to 902)\n", ck_gpu_want_mhz, ck_gpu_seg);
+ 	}
+ }
+ 
+ /* ---- the GPU ---- */
+ 
+ /*
+- * gpufreq_mt6877.h's OPPs of the MT6877 segment (signed OPPs 4..37; the
+- * MT6877T's 950..914 need the segment efuse): kHz, VGPU and VSRAM_GPU in
+- * 10 uV (gpufreq's mV x 100). The voltage is the highest of the three PTPOD
++ * gpufreq_mt6877.h's signed OPPs 0..37: kHz, VGPU and VSRAM_GPU in 10 uV
++ * (gpufreq's mV x 100). The voltage is the highest of the three PTPOD
+  * variants (g_opp_table_segment_1..3, by efuse ptpod28 [15:14]); they are
+  * the same from 670 MHz up.
++ *
++ * A34 (0991): OPPs 0..3 (950..914 MHz) are the MT6877T segment's only
++ * (__gpufreq_init_opp_table(): segment_upbound 0 for MT6877T_SEGMENT, 4
++ * for MT6877_SEGMENT), the segment being the low byte of the devinfo efuse
++ * word at 0x78 (__gpufreq_init_segment_id(): 1 MT6877, 2/3/4 MT6877T,
++ * anything else MT6877). This kernel does not read the efuse (Android gets
++ * it from the boot loader's atag,devinfo, not from the efuse block); the
++ * boot-arg a34gpuseg=N says it, read from the phone's own Android device
++ * tree: recon/android-DYG1/live.dts /chosen atag,devinfo, word 1 + 0x78/4,
++ * is 0x00000003 on this phone (Dimensity 1080, MT6877T: Android runs its
++ * GPU up to 950 MHz). Without a34gpuseg=2..4 the top stays 902 MHz.
+  */
+ struct ck_gpu_opp {
+ 	uint32_t khz, vgpu, vsram;
+ };
+ 
+ static const struct ck_gpu_opp ck_gpu_opps[] = {
++	{ 950000, 78125, 78125 },       /*  0 sign-off, MT6877T only */
++	{ 938000, 77500, 77500 },       /*  1 MT6877T only */
++	{ 926000, 76875, 76875 },       /*  2 MT6877T only */
++	{ 914000, 76250, 76250 },       /*  3 MT6877T only */
+ 	{ 902000, 75625, 75625 },       /*  4 */
+ 	{ 890000, 75000, 75000 },       /*  5 sign-off */
+ 	{ 876000, 74375, 75000 },
+@@ -1332,6 +1351,7 @@ static const struct ck_gpu_opp ck_gpu_opps[] = {
+ };
+ 
+ #define CK_GPU_OPPS             ((unsigned)(sizeof(ck_gpu_opps) / sizeof(ck_gpu_opps[0])))
++#define CK_GPU_T_OPPS           4u      /* A34 (0991): the first four, the MT6877T segment's (a34gpuseg) */
+ #define CK_BUCK_DIFF_MAX        20000u  /* VSRAM - VGPU <= 200 mV (MAX_BUCK_DIFF) */
+ #define CK_VGPU_LOW             55000u  /* the table's lowest VGPU (segment 1, 385 MHz) */
+ #define CK_VGPU_TOP             78125u  /* the table's highest (950 MHz) */
+@@ -1553,16 +1573,20 @@ a34_clocks_gpu_raise(void)
+ 	if (!a34_clocks_gpu_wanted() || ck_gpu_raised) {
+ 		return false;
+ 	}
+-	for (t = 0; t < CK_GPU_OPPS && ck_gpu_opps[t].khz > ck_gpu_want_mhz * 1000u; t++) {
++	/* A34 (0991): the MT6877T's OPPs 0..3 only for that segment (a34gpuseg, see the table) */
++	unsigned top = ck_gpu_seg >= 2 && ck_gpu_seg <= 4 ? 0 : CK_GPU_T_OPPS;
++
++	for (t = top; t < CK_GPU_OPPS && ck_gpu_opps[t].khz > ck_gpu_want_mhz * 1000u; t++) {
+ 	}
+ 	if (t == CK_GPU_OPPS) {
+ 		printf("A34 CLOCKS: GPU: a34gpumhz=%u is below the table's lowest OPP (385 MHz): left as it is\n", ck_gpu_want_mhz);
+ 		return false;
+ 	}
+ 	o = &ck_gpu_opps[t];
+-	if (ck_gpu_want_mhz * 1000u > ck_gpu_opps[0].khz) {
+-		printf("A34 CLOCKS: GPU: a34gpumhz=%u: 902 MHz at most (the MT6877T segment's 950 MHz needs its efuse)\n",
+-		    ck_gpu_want_mhz);
++	if (ck_gpu_want_mhz * 1000u > ck_gpu_opps[top].khz) {
++		printf("A34 CLOCKS: GPU: a34gpumhz=%u: %u MHz at most (segment %u, a34gpuseg: %s)\n", ck_gpu_want_mhz,
++		    ck_gpu_opps[top].khz / 1000u, ck_gpu_seg, top == 0 ? "MT6877T, Android's 950 MHz" :
++		    "MT6877 or not given; 2..4 is the MT6877T's 950 MHz");
+ 	}
+ 
+ 	/* 1. exactly as the boot loader leaves it, or nothing is touched */
+@@ -1662,4 +1686,90 @@ a34_clocks_gpu_restore(void)
+ 	ck_gpu_raised = false;
+ 	ck_gpu_report(" (put back after a failed job)");
+ }
++/* A34 (0991): the GPU's clock as MFGPLL1's CON1 makes it, kHz (0: MFG0 off or not mapped). */
++uint32_t
++a34_clocks_gpu_khz(void)
++{
++	if (ck_gpupll == 0 || ck_top == 0 || !ck_mfg0_on()) {
++		return 0;
++	}
++	return ck_mfgpll_khz(ruby_rd32(ck_gpupll, MFGPLL1_CON1));
++}
++
++/*
++ * ---- DRAM through DVFSRC (A34 0991) ----
++ *
++ * DRAM's rate is DVFSRC's (dvfsrc@10012000, with the SPM firmware doing the
++ * switches): it runs at the level that meets every request, a level being
++ * one of 30 VCORE/DDR pairs (helio-dvfsrc-opp-v6877.c dvfsrc_opp_level_init():
++ * levels 0 -> DDR OPP 0, 1-2 -> 1, 3-5 -> 2, 6-9 -> 3, 10-14 -> 4, 15-19 ->
++ * 5, 20-24 -> 6, 25-29 -> 7; DDR OPP 0 the fastest of 8). The level it is
++ * at: DVFSRC_CURRENT_LEVEL (0xd44), one bit set (get_cur_vcore_dvfs_opp()).
++ * The AP's DDR request (helio-dvfsrc-ip-v2.c commit_data(), DVFSRC_QOS_DDR_OPP):
++ * DVFSRC_SW_REQ3 [14:12] = 7 - DDR OPP (DDR_SW_AP); DVFSRC_BASIC_CONTROL [0]
++ * DVFSRC_EN and [8] OUT_EN: without both nobody acts on a request, and it is
++ * left alone. Android's own levels only: nothing but its request field is
++ * written, and only to its top value (what Android's PM QoS asks for a busy
++ * GPU or a camera). a34_ddr_top(false) puts the field back as found.
++ */
++#define CK_DVFSRC_PA            0x10012000u
++#define DVFSRC_BASIC_CONTROL    0x000u
++#define DVFSRC_EN_BITS          ((1u << 0) | (1u << 8))
++#define DVFSRC_SW_REQ3          0x00cu
++#define DVFSRC_DDR_SHIFT        12u
++#define DVFSRC_DDR_MASK         0x7u
++#define DVFSRC_CURRENT_LEVEL    0xd44u
++#define DVFSRC_TARGET_LEVEL     0xd48u
++static vm_offset_t ck_dvfsrc;
++static uint32_t ck_ddr_saved = 0xffffffffu;     /* SW_REQ3's DDR field before a34_ddr_top(true) */
++static const uint8_t ck_ddr_of_level[30] = {
++	0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7
++};
++
++/* r: BASIC_CONTROL, CURRENT_LEVEL, SW_REQ3, TARGET_LEVEL. The DDR OPP (0 fastest .. 7), -1: not known. */
++int
++a34_ddr_state(uint32_t r[4])
++{
++	uint32_t level;
++
++	if (ck_dvfsrc == 0) {
++		ck_dvfsrc = ml_io_map(CK_DVFSRC_PA, CK_PAGE);
++	}
++	if (ck_dvfsrc == 0) {
++		r[0] = r[1] = r[2] = r[3] = 0xdeadbeefu;
++		return -1;
++	}
++	r[0] = ruby_rd32(ck_dvfsrc, DVFSRC_BASIC_CONTROL);
++	r[1] = ruby_rd32(ck_dvfsrc, DVFSRC_CURRENT_LEVEL);
++	r[2] = ruby_rd32(ck_dvfsrc, DVFSRC_SW_REQ3);
++	r[3] = ruby_rd32(ck_dvfsrc, DVFSRC_TARGET_LEVEL);
++	level = r[1] != 0 ? (uint32_t)__builtin_ctz(r[1]) : 32u;
++	return level < 30u ? (int)ck_ddr_of_level[level] : -1;
++}
++
++/* DDR OPP 0 asked of DVFSRC (on), or the request put back (off). False: DVFSRC is not on, nothing written. */
++bool
++a34_ddr_top(bool on)
++{
++	uint32_t r[4], req;
++
++	(void)a34_ddr_state(r);
++	if (ck_dvfsrc == 0 || (r[0] & DVFSRC_EN_BITS) != DVFSRC_EN_BITS) {
++		return false;
++	}
++	req = r[2];
++	if (on) {
++		if (ck_ddr_saved == 0xffffffffu) {
++			ck_ddr_saved = (req >> DVFSRC_DDR_SHIFT) & DVFSRC_DDR_MASK;
++		}
++		req = (req & ~(DVFSRC_DDR_MASK << DVFSRC_DDR_SHIFT)) | (DVFSRC_DDR_MASK << DVFSRC_DDR_SHIFT);
++	} else if (ck_ddr_saved != 0xffffffffu) {
++		req = (req & ~(DVFSRC_DDR_MASK << DVFSRC_DDR_SHIFT)) | (ck_ddr_saved << DVFSRC_DDR_SHIFT);
++		ck_ddr_saved = 0xffffffffu;
++	} else {
++		return true;
++	}
++	ruby_wr32(ck_dvfsrc, DVFSRC_SW_REQ3, req);
++	return true;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index dfd5ef5..80929a8 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -187,6 +187,9 @@ void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ void a34_mali_cpu_clean(uintptr_t va, uint64_t size);     /* A34 (0915): dc cvac */
+ uint32_t a34_mali_spin_us(void);                         /* A34 (0928): a34malispin */
+ uint32_t a34_mali_flush_id(void);                        /* A34 (0989): GPU_LATEST_FLUSH */
++uint32_t a34_clocks_gpu_khz(void);                       /* A34 (0991): bsd/dev/a34_clocks.c */
++int a34_ddr_state(uint32_t r[4]);
++bool a34_ddr_top(bool on);
+ bool a34_mali_spin_unbound(bool bind_failed);            /* A34 (0985): no spin where the worker is not bound */
+ extern uint32_t a34_mali_napped;                         /* A34 (0928): jobs that outlasted the spin */
+ 
+@@ -486,6 +489,20 @@ static uint32_t gA34MaliPair = 1;               /* A34 (0985): boot-arg a34malip
+ static uint32_t gA34MaliScanWaits, gA34MaliScanLate;    /* A34 (0983): the worker's, scanWait() */
+ static uint32_t gA34MaliKeep = 16;              /* A34 (0986): a34malikeep: surface buffers kept after GEM_CLOSE, a client */
+ static uint64_t gA34MaliScanTicks;
++/*
++ * A34 (0991), with gA34MaliLock (runChain()): every client's jobs in 10 s for
++ * the GPU line -- jobs, GPU ns and the longest by slot (0 fragment, 1
++ * vertex/tiler/compute), the GPU idle while a queued job was ready, the last
++ * job's end. a34ddrboost: 1 DDR's top OPP asked of DVFSRC while the GPU
++ * works (let go after A34_DDR_IDLE_MS without a job), 2 from the first job
++ * on, 0 never.
++ */
++static uint64_t gA34MaliWinStart, gA34MaliWinNs[2], gA34MaliWinMost[2], gA34MaliWinIdle, gA34MaliLastEnd;
++static uint32_t gA34MaliWinN[2];
++static uint32_t gA34MaliDdrBoost;
++static bool gA34MaliDdrOn;
++#define A34_GPU_WINDOW_NS       (10ull * NSEC_PER_SEC)
++#define A34_DDR_IDLE_MS         500u
+ 
+ /*
+  * A34 (0919): queued jobs.
+@@ -772,6 +789,7 @@ RedwoodMaliStart(void)
+ 	(void)PE_parse_boot_argn("a34maliskip", &gA34MaliSkip, sizeof(gA34MaliSkip));    /* A34 (0985) */
+ 	(void)PE_parse_boot_argn("a34malipair", &gA34MaliPair, sizeof(gA34MaliPair));    /* A34 (0985) */
+ 	(void)PE_parse_boot_argn("a34malikeep", &gA34MaliKeep, sizeof(gA34MaliKeep));    /* A34 (0986) */
++	(void)PE_parse_boot_argn("a34ddrboost", &gA34MaliDdrBoost, sizeof(gA34MaliDdrBoost));    /* A34 (0991) */
+ 	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
+ 		/* A34 (0919): the queue and the thread that runs it */
+ 		IOLock *qlock = IOLockAlloc();
+@@ -816,6 +834,15 @@ RedwoodMaliStart(void)
+ 	    "write-combined");
+ 	IOLog("A34 MALI UC: queued jobs (SET_MODE 0x7a, WAIT_SEQ 0x7b) %s\n", gA34MaliAsync ? "on request" :
+ 	    "refused (a34maliasync=0 or no thread)");
++	{
++		/* A34 (0991): DVFSRC as found (and its registers mapped now, not from the job thread) */
++		uint32_t r[4];
++		int ddr = a34_ddr_state(r);
++
++		IOLog("A34 MALI UC: DVFSRC BASIC_CONTROL 0x%08x CURRENT_LEVEL 0x%08x (DDR OPP %d of 0..7) SW_REQ3 0x%08x "
++		    "TARGET_LEVEL 0x%08x; GPU %u kHz; a34ddrboost=%u\n", r[0], r[1], ddr, r[2], r[3], a34_clocks_gpu_khz(),
++		    gA34MaliDdrBoost);
++	}
+ 	IOLog("A34 MALI UC: cache upkeep visits %s (a34maliscan); a job is watched spinning for %u us, then in 100 us "
+ 	    "naps (a34malispin)\n", gA34MaliScan ? "every handle" : "only the handles that can need it",
+ 	    a34_mali_spin_us());
+@@ -1346,6 +1373,49 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 	}
+ }
+ 
++/*
++ * A34 (0991), with the lock held: a job's GPU time into the 10 s window, and
++ * the GPU line once it is full: busy time by slot (fragment chains: the
++ * bandwidth side; vertex/tiler/compute), the longest, the idle time with a
++ * job ready, the clock and the DDR OPP.
++ */
++static void
++gpuWindow(const struct a34_mali_job *job, uint64_t now)
++{
++	uint64_t win;
++	int slot = (job->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
++
++	gA34MaliLastEnd = now;
++	if (gA34MaliWinStart == 0) {
++		gA34MaliWinStart = now;
++	}
++	gA34MaliWinN[slot]++;
++	gA34MaliWinNs[slot] += job->ns;
++	if (job->ns > gA34MaliWinMost[slot]) {
++		gA34MaliWinMost[slot] = job->ns;
++	}
++	absolutetime_to_nanoseconds(now - gA34MaliWinStart, &win);
++	if (win < A34_GPU_WINDOW_NS) {
++		return;
++	}
++	uint32_t r[4];
++	uint64_t idle;
++	int ddr = a34_ddr_state(r);
++
++	absolutetime_to_nanoseconds(gA34MaliWinIdle, &idle);
++	IOLog("A34 MALI: %llu s: GPU busy %llu ms at %u MHz: vertex/tiler %u x %llu us (most %llu), fragment %u x %llu us "
++	    "(most %llu); idle with a job ready %llu ms; DDR OPP %d\n", (unsigned long long)(win / NSEC_PER_SEC),
++	    (unsigned long long)((gA34MaliWinNs[0] + gA34MaliWinNs[1]) / NSEC_PER_MSEC), a34_clocks_gpu_khz() / 1000u,
++	    gA34MaliWinN[1], (unsigned long long)(gA34MaliWinN[1] != 0 ? gA34MaliWinNs[1] / 1000u / gA34MaliWinN[1] : 0),
++	    (unsigned long long)(gA34MaliWinMost[1] / 1000u), gA34MaliWinN[0],
++	    (unsigned long long)(gA34MaliWinN[0] != 0 ? gA34MaliWinNs[0] / 1000u / gA34MaliWinN[0] : 0),
++	    (unsigned long long)(gA34MaliWinMost[0] / 1000u), (unsigned long long)(idle / NSEC_PER_MSEC), ddr);
++	gA34MaliWinStart = now;
++	gA34MaliWinN[0] = gA34MaliWinN[1] = 0;
++	gA34MaliWinNs[0] = gA34MaliWinNs[1] = gA34MaliWinMost[0] = gA34MaliWinMost[1] = 0;
++	gA34MaliWinIdle = 0;
++}
++
+ /*
+  * With the lock held: one job chain run to its end, with the cache upkeep
+  * before and after it, the accounts and what the log gets; what SUBMIT
+@@ -1365,8 +1435,34 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ 	/* A34 (0915): only what the CPU and this job can both touch (upkeep()) */
+ 	cleaned = upkeep(true, all, q);         /* the program's writes to memory for the GPU */
+ 	ticks = mach_absolute_time() - t0;
++	if (gA34MaliDdrBoost != 0 && !gA34MaliDdrOn) {
++		/* A34 (0991): DDR's top OPP while the GPU works (a34_ddr_top(): DVFSRC's own request field) */
++		static uint32_t ddrSaid;
++
++		gA34MaliDdrOn = a34_ddr_top(true);
++		if (ddrSaid++ < 4) {
++			uint32_t r[4];
++			int ddr = a34_ddr_state(r);
++
++			IOLog("A34 MALI UC: a34ddrboost: DDR OPP 0 %s of DVFSRC; now DDR OPP %d (CURRENT_LEVEL 0x%08x SW_REQ3 0x%08x)\n",
++			    gA34MaliDdrOn ? "asked" : "NOT asked (DVFSRC is not on)", ddr, r[1], r[2]);
++		}
++		if (!gA34MaliDdrOn) {
++			gA34MaliDdrBoost = 0;   /* (not again) */
++		}
++	}
++	uint64_t subAt = mach_absolute_time();  /* A34 (0991) */
++
++	if (q != NULL && gA34MaliLastEnd != 0) {
++		uint64_t ready = q->queued > gA34MaliLastEnd ? q->queued : gA34MaliLastEnd;
++
++		if (subAt > ready) {
++			gA34MaliWinIdle += subAt - ready;       /* the GPU idle with this job ready */
++		}
++	}
+ 	done = a34_mali_submit(job);
+ 	t0 = mach_absolute_time();
++	gpuWindow(job, t0);                     /* A34 (0991) */
+ 	flushed = upkeep(false, all, q);        /* and no stale lines over what the GPU wrote */
+ 	ticks += mach_absolute_time() - t0;
+ 	if (q != NULL) {
+@@ -1474,7 +1570,20 @@ RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
+ 
+ 		IOLockLock(gA34MaliQLock);
+ 		while (gA34MaliQHead == NULL) {
+-			(void)IOLockSleep(gA34MaliQLock, &gA34MaliQWork, THREAD_UNINT);
++			if (gA34MaliDdrOn && gA34MaliDdrBoost == 1) {
++				/* A34 (0991): a34ddrboost=1: DDR's request let go of after A34_DDR_IDLE_MS without a job */
++				uint64_t deadline;
++
++				nanoseconds_to_absolutetime((uint64_t)A34_DDR_IDLE_MS * NSEC_PER_MSEC, &deadline);
++				deadline += mach_absolute_time();
++				if (IOLockSleepDeadline(gA34MaliQLock, &gA34MaliQWork, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
++				    gA34MaliQHead == NULL) {
++					(void)a34_ddr_top(false);
++					gA34MaliDdrOn = false;
++				}
++			} else {
++				(void)IOLockSleep(gA34MaliQLock, &gA34MaliQWork, THREAD_UNINT);
++			}
+ 		}
+ 		j = gA34MaliQHead;
+ 		gA34MaliQHead = j->next;
