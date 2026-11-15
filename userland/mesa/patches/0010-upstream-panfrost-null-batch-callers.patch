@@ -1,0 +1,164 @@
+From d74d766d213d73a59b3b95c035e1106754157b4d Mon Sep 17 00:00:00 2001
+From: "osman.yagci" <osmnyagc@gmail.com>
+Date: Tue, 13 Oct 2026 11:35:06 +0300
+Subject: [PATCH] panfrost: handle a NULL batch in the remaining callers
+
+panfrost_get_compute_batch() and find_best_render_batch() return NULL
+when panfrost_batch_init() fails, which happens when a batch pool cannot
+allocate its first BO. prepare_draw(), panfrost_invalidate_resource(),
+the blitter's batch clear and panfrost_flush_all_batches() check for
+that, but several callers dereference the result unconditionally:
+
+- panfrost_get_fresh_render_batch() itself, through batch->draw_count;
+- panfrost_launch_grid(), panfrost_compute_copy_buffer() and
+  panfrost_mtk_detile_compute();
+- the AFBC-P payload-size and pack steps;
+- panfrost_emit_write_timestamp().
+
+Check the result in each and bail out, logging as the existing checks
+do. The AFBC-P steps return false, which stops packing and releases the
+BOs already allocated; the MTK detile path puts the resource formats
+back before returning.
+
+Found on a bare-metal port, where a failed GPU VA bind made every BO
+allocation fail and the driver then crashed on a NULL batch instead of
+dropping the call. On Linux the same paths are reached when BO
+allocation runs out of memory. Not run: reaching the new branches needs
+panfrost_batch_init() to fail.
+
+Fixes: 56abe1e472f ("panfrost: handle pool-allocation errors")
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Acked-by: Erik Faye-Lund <erik.faye-lund@arm.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45158>
+---
+ src/gallium/drivers/panfrost/pan_cmdstream.c | 15 +++++++++++++++
+ src/gallium/drivers/panfrost/pan_context.c   |  4 ++++
+ src/gallium/drivers/panfrost/pan_job.c       |  5 +++++
+ src/gallium/drivers/panfrost/pan_resource.c  | 15 +++++++++++++--
+ 4 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index 4ae31812f615..cc3b6209c70a 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -3837,6 +3837,11 @@ panfrost_launch_grid(struct pipe_context *pipe,
+    panfrost_flush_all_batches(ctx, "Launch grid pre-barrier");
+ 
+    struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   if (!batch) {
++      mesa_loge("panfrost_launch_grid failed");
++      return;
++   }
++
+    panfrost_launch_grid_on_batch(pipe, batch, info);
+ 
+    panfrost_flush_all_batches(ctx, "Launch grid post-barrier");
+@@ -3978,6 +3983,10 @@ panfrost_compute_copy_buffer(struct pipe_context *pctx,
+    panfrost_flush_all_batches(ctx, "Compute buffer copy pre-barrier");
+ 
+    struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   if (!batch) {
++      mesa_loge("panfrost_compute_copy_buffer failed");
++      return;
++   }
+ 
+    panfrost_batch_read_rsrc(batch, src);
+    panfrost_batch_write_rsrc(batch, dst);
+@@ -4098,6 +4107,11 @@ panfrost_mtk_detile_compute(struct panfrost_context *ctx, struct pipe_blit_info
+    panfrost_flush_all_batches(ctx, "mtk_detile pre-barrier");
+ 
+    struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   if (!batch) {
++      mesa_loge("panfrost_mtk_detile_compute failed");
++      goto out_restore_res;
++   }
++
+    pipe->set_shader_images(pipe, MESA_SHADER_COMPUTE, 0, 4, 0, image);
+ 
+    /* launch the compute shader */
+@@ -4134,6 +4148,7 @@ panfrost_mtk_detile_compute(struct panfrost_context *ctx, struct pipe_blit_info
+    pipe->bind_compute_state(pipe, saved_cso);
+    pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, 0, &saved_const);
+ 
++out_restore_res:
+    panfrost_resource_restore_format(pan_resource(y_src), &y_src_save);
+    panfrost_resource_restore_format(pan_resource(uv_src), &uv_src_save);
+    panfrost_resource_restore_format(pan_resource(y_dst), &y_dst_save);
+diff --git a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
+index 6179d72f6d69..b2eb81a17def 100644
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -708,6 +708,10 @@ panfrost_emit_write_timestamp(struct panfrost_context *ctx,
+    struct panfrost_screen *screen = pan_screen(ctx->base.screen);
+    struct panfrost_batch *batch =
+       panfrost_get_fresh_render_batch(ctx, reason);
++   if (!batch) {
++      mesa_loge("panfrost_emit_write_timestamp failed");
++      return;
++   }
+ 
+    screen->vtbl.emit_write_timestamp(batch, rsrc, offset);
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
+index d61f7edd7cc7..41b753441b06 100644
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -224,6 +224,9 @@ panfrost_get_fresh_render_batch(struct panfrost_context *ctx,
+    struct panfrost_batch *batch;
+ 
+    batch = find_best_render_batch(ctx);
++   if (!batch)
++      return NULL;
++
+    panfrost_dirty_state_all(ctx);
+ 
+    /* We only need to submit and get a fresh batch if there is no
+@@ -233,6 +236,8 @@ panfrost_get_fresh_render_batch(struct panfrost_context *ctx,
+       perf_debug(ctx, "Flushing the current FBO due to: %s", reason);
+       panfrost_batch_submit(ctx, batch);
+       batch = find_best_render_batch(ctx);
++      if (!batch)
++         return NULL;
+    }
+ 
+    ctx->batch[PANFROST_BATCH_RENDER] = batch;
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index 48937053bf3e..bc3f2518d9d8 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -2033,9 +2033,15 @@ pan_resource_afbcp_get_payload_sizes(struct panfrost_context *ctx,
+    if (!pan_screen(ctx->base.screen)->afbcp_gpu_payload_sizes)
+       return true;
+ 
++   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   if (!batch) {
++      mesa_loge("pan_resource_afbcp_get_payload_sizes: failed to get a "
++                "compute batch");
++      return false;
++   }
++
+    prsrc->afbcp->skip_access_updates = true;
+ 
+-   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
+    for (unsigned level = 0; level <= last_level; ++level)
+       screen->vtbl.afbc_size(batch, prsrc, prsrc->afbcp->layout_bo,
+                              prsrc->afbcp->layout_offsets[level], level);
+@@ -2183,9 +2189,14 @@ pan_resource_afbcp_pack(struct panfrost_context *ctx,
+       return false;
+    }
+ 
++   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   if (!batch) {
++      mesa_loge("pan_resource_afbcp_pack: failed to get a compute batch");
++      return false;
++   }
++
+    prsrc->afbcp->skip_access_updates = true;
+ 
+-   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
+    for (unsigned level = 0; level <= last_level; ++level)
+       screen->vtbl.afbc_pack(batch, prsrc, prsrc->afbcp->packed_bo,
+                              &prsrc->afbcp->plane.layout.slices[level],
+-- 
+GitLab
+
