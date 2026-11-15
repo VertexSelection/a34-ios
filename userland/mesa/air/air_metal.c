@@ -606,6 +606,9 @@ static uint64_t rwa_bind_returns, rwa_bind_span;
 /* draw_vbo on the processor (the thread's own time) against the clock: what of a draw's time
  * is work and what is the thread waiting to run */
 static uint64_t rwa_bind_vbo_wall_ns, rwa_bind_vbo_cpu_ns;
+/* constant buffers bound from a mapping, and of them those bound as the mapping alone (an
+ * offset the GPU cannot fetch from), which panfrost copies out of write-combined memory */
+static uint64_t rwa_bind_ubos, rwa_bind_ubo_copies;
 
 static uint64_t
 thread_ns(void)
@@ -1804,7 +1807,8 @@ rwa_bind_profile(char *line, size_t size)
    snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch "
             "(%llu back into one left before); "
             "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
-            "%llu%% of it on the processor; states set %llu, skipped %llu%s",
+            "%llu%% of it on the processor; states set %llu, skipped %llu%s; "
+            "constant buffers %llu, %llu of them copied",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
             (unsigned long long)rwa_bind_returns,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
@@ -1813,10 +1817,12 @@ rwa_bind_profile(char *line, size_t size)
             (unsigned long long)rwa_bind_steady_draws,
             (unsigned long long)(rwa_bind_vbo_wall_ns ? rwa_bind_vbo_cpu_ns * 100 / rwa_bind_vbo_wall_ns : 0),
             (unsigned long long)rwa_bind_sets,
-            (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "");
+            (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "",
+            (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies);
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
    rwa_bind_vbo_wall_ns = rwa_bind_vbo_cpu_ns = 0;
+   rwa_bind_ubos = rwa_bind_ubo_copies = 0;
    return 1;
 }
 
@@ -2248,6 +2254,14 @@ int
 rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, uint8_t texel[16],
                   unsigned *width, unsigned *height, char *why, size_t why_size)
 {
+   return rwa_texture_probe_at(texture, level, layer, ~0u, ~0u, texel, width, height, why, why_size);
+}
+
+int
+rwa_texture_probe_at(struct rwa_texture *texture, unsigned level, unsigned layer, unsigned x,
+                     unsigned y, uint8_t texel[16], unsigned *width, unsigned *height, char *why,
+                     size_t why_size)
+{
    RWA_GUARD();
    struct pipe_resource *res = texture ? texture->res : NULL;
    struct pipe_transfer *transfer = NULL;
@@ -2264,7 +2278,8 @@ rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, u
       return -1;
    }
    unsigned w = u_minify(res->width0, level), h = u_minify(res->height0 ? res->height0 : 1, level);
-   u_box_3d(w / 2, h / 2, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
+   unsigned px = x == ~0u ? w / 2 : MIN2(x, w - 1), py = y == ~0u ? h / 2 : MIN2(y, h - 1);
+   u_box_3d(px, py, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
    const uint8_t *map = texture->device->pipe->texture_map(texture->device->pipe, res, level, PIPE_MAP_READ,
                                                          &box, &transfer);
    if (!map) {
@@ -4539,6 +4554,15 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
           * and its passes did up to 17 such loads a pixel, 12 to 17 ms of the Mali a pass
           * (pan_shader.c pushable_ubos). A buffer without a mapping still goes as itself.
           */
+         /*
+          * ...and since 15 November, at an offset the GPU can fetch from, the buffer AS WELL
+          * as its mapping (Mesa patch 0012): the GPU reads what is not pushed from the buffer
+          * itself, and panfrost reads only the pushed words from the mapping, in one copy.
+          * The mapping alone made panfrost copy the whole of what the shader may read out of
+          * write-combined memory for every draw -- 0.1 us a word, ~360 us of a draw's ~400
+          * (boot 0962, "ubos"). An offset it cannot fetch from still goes as the mapping
+          * alone, copied ("constant buffers copied" in the profile).
+          */
          if (b->map == NULL) {
             cb.buffer = b->res;
          } else {
@@ -4547,9 +4571,17 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             if (r->reads && r->reads < want)
                want = r->reads;
 
-            cb.user_buffer = (const char *)b->map + boffset;
-            cb.buffer_offset = 0;
+            if (boffset % device->ubo_offset_align == 0) {
+               cb.buffer = b->res;
+               cb.buffer_offset = (unsigned)boffset;
+               cb.user_buffer = b->map;
+            } else {
+               cb.user_buffer = (const char *)b->map + boffset;
+               cb.buffer_offset = 0;
+               rwa_bind_ubo_copies++;
+            }
             cb.buffer_size = (unsigned)want;
+            rwa_bind_ubos++;
          }
          pipe->set_constant_buffer(pipe, stage, r->index, &cb);
          break;

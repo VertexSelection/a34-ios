@@ -112,6 +112,12 @@ rwm_render_set_label(struct rwm_render_state *s, const char *label)
 					      "Bpl", "_Tasg", "_Tlub" };
 
 	s->probe[0] = '\0';
+	s->label[0] = '\0';
+	if (label != nullptr && rwm_framedump_on()) {
+		const char *at = strstr(label, "coreanimation.");
+
+		snprintf(s->label, sizeof(s->label), "%s", at != nullptr ? at + 14 : label);
+	}
 	if (label == nullptr || !rwm_blurdump_on()) {
 		return;
 	}
@@ -392,6 +398,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 	}
 	d->color_levels = levels_on();
 	memcpy(d->probe, s->probe, sizeof(d->probe));
+	memcpy(d->label, s->label, sizeof(d->label));
 	d->clear_color_mask = s->clear_mask;
 	memcpy(d->clear_colors, s->clear_colors, sizeof(d->clear_colors));
 	memcpy(w->clear_color, s->clear_color, sizeof(w->clear_color));

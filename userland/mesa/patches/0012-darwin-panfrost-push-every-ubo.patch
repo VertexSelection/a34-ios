@@ -1,0 +1,123 @@
+Darwin: every UBO of a Metal shader may be pushed; pushed words read in one copy.
+
+A34 (local to this port; nothing here goes upstream). From HackiOS's Mali Metal driver ("pushubo",
+MIT, Copyright 2026 Darwin on redwood contributors; github.com/oosexgang/hakios-xnu-kernel,
+branch mtk, tools/mesa/panfrost-redwood-perf.patch), ported to Mesa 26.3 and extended:
+
+- pan_shader.c: a shader of the Metal driver (nir->info.label "air") may have any UBO pushed,
+  not only UBO 0. CoreAnimation's uniforms are in Metal buffers 1 and up, which upstream leaves
+  as loads from memory for every pixel. REDWOOD_PAN_PUSHUBO=0 (the plug-in's rwm_pushubo=0)
+  keeps upstream's rule for shaders compiled from then on.
+- pan_cmdstream.c, panfrost_emit_const_buf, in a process drawing through Metal only: a pushed
+  word may come from any UBO -- from the user buffer, which the Metal driver sets to its
+  buffer's mapping alongside the buffer itself (air_metal.c), or from the resource's own
+  mapping after its GPU writes are flushed and waited for. The words of a UBO are read in one
+  copy of the span they cover (up to 4 KB) into ordinary memory: the mapping is write-combined,
+  ~0.1 us a load (boot 0962: 4 KB read a word at a time in 109 us, 3 in malloc's memory).
+
+With the buffer bound as itself as well (air_metal.c), the GPU reads what is not pushed from the
+buffer, and panfrost no longer copies a user buffer's whole range into the batch for every draw
+-- the "ubos" step, ~360 us of a ~400 us draw in boot 0962.
+
+--- a/src/gallium/drivers/panfrost/pan_shader.c
++++ b/src/gallium/drivers/panfrost/pan_shader.c
+@@ -10,6 +10,10 @@
+ #include "pan_shader.h"
+ #include "nir/tgsi_to_nir.h"
+ #include "util/u_memory.h"
++#ifdef __APPLE__
++#include <stdlib.h>
++#include <string.h>
++#endif
+ #include "util/u_prim.h"
+ #include "nir_builder.h"
+ #include "nir_serialize.h"
+@@ -198,6 +202,21 @@
+     * we can relax this. */
+    assert(s->info.first_ubo_is_default_ubo);
+    inputs.fau.pushable_ubos = BITFIELD_BIT(0);
++#ifdef __APPLE__
++   /* A34 (patch 0012; HackiOS's "pushubo", MIT, Darwin on redwood contributors): every UBO of
++    * a Metal driver's shader (label "air") may be pushed. Its uniforms are in buffers 1 and up,
++    * which upstream leaves as loads from memory for every pixel; the driver binds each as its
++    * buffer AND that buffer's processor mapping (air_metal.c, bind_stage), and
++    * panfrost_emit_const_buf reads the pushed words from the mapping. REDWOOD_PAN_PUSHUBO=0
++    * (the plug-in's rwm_pushubo=0) pushes only UBO 0, as upstream -- for shaders compiled from
++    * then on: the disk cache keeps what it has. */
++   if (s->info.label != NULL && strcmp(s->info.label, "air") == 0) {
++      const char *push = getenv("REDWOOD_PAN_PUSHUBO");
++
++      if (push == NULL || strcmp(push, "0") != 0)
++         inputs.fau.pushable_ubos = ~0u;
++   }
++#endif
+ 
+    if (out->sysvals.sysval_count != 0) {
+       inputs.fau.pushable_ubos |= BITFIELD_BIT(PAN_UBO_SYSVALS);
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -1599,6 +1599,14 @@
+    uint32_t *push_cpu = (uint32_t *)push_transfer.cpu;
+    *push_constants = push_transfer.gpu;
+ 
++   /* A34 (patch 0012): in a process drawing through Metal, the pushed words of a UBO are read
++    * in one copy of the span they cover into ordinary memory, and taken from there. The Metal
++    * driver's user buffers are its buffers' own mappings, write-combined, where a load costs
++    * ~0.1 us a word (4 KB read a word at a time: 109 us, against 3 in malloc's memory; boot
++    * 0962) and a copy a load per 16 or 32 bytes. A span over 4 KB is read a word at a time. */
++   uint8_t rwp_span[4096];
++   unsigned rwp_span_ubo = ~0u, rwp_lo = 0, rwp_hi = 0;
++
+    pan_fau_foreach_reloc(fau, i) {
+       struct pan_ubo_relocation src = fau->words[i].relocation;
+ 
+@@ -1633,6 +1641,49 @@
+       const void *mapped_ubo;
+       if (src.ubo == sysval_ubo) {
+          mapped_ubo = sysvals;
++      } else if (redwood_pan_metal) {
++         /* A34 (patch 0012): any UBO of a Metal shader may be pushed (pan_shader.c). The
++          * driver gives a buffer with its mapping as the user buffer (air_metal.c); one
++          * without is read through the resource's own mapping, after the GPU's writes. */
++         unsigned ubo_adj = src.ubo - (src.ubo > sysval_ubo ? 1 : 0);
++         struct pipe_constant_buffer *cb = &buf->cb[ubo_adj];
++
++         if (cb->user_buffer) {
++            mapped_ubo = (const uint8_t *)cb->user_buffer + cb->buffer_offset;
++         } else if (cb->buffer) {
++            struct panfrost_resource *rsrc = pan_resource(cb->buffer);
++
++            panfrost_flush_writer(ctx, rsrc, "Pushed uniforms of a GPU-written buffer");
++            if (!rsrc->bo || !panfrost_bo_wait(rsrc->bo, INT64_MAX, false) ||
++                panfrost_bo_mmap(rsrc->bo))
++               return 0;
++            mapped_ubo = (const uint8_t *)rsrc->bo->ptr.cpu + cb->buffer_offset;
++         } else {
++            mapped_ubo = NULL;
++         }
++
++         if (mapped_ubo && src.ubo != rwp_span_ubo) {
++            /* the span of this UBO's pushed words, copied once */
++            unsigned lo = src.offset, hi = src.offset + 4;
++            pan_fau_foreach_reloc(fau, j) {
++               struct pan_ubo_relocation o = fau->words[j].relocation;
++               if (o.ubo == src.ubo) {
++                  lo = MIN2(lo, o.offset);
++                  hi = MAX2(hi, o.offset + 4);
++               }
++            }
++            if (hi - lo <= sizeof(rwp_span)) {
++               memcpy(rwp_span, (const uint8_t *)mapped_ubo + lo, hi - lo);
++               rwp_span_ubo = src.ubo;
++               rwp_lo = lo;
++               rwp_hi = hi;
++            }
++         }
++         if (mapped_ubo && src.ubo == rwp_span_ubo && src.offset >= rwp_lo &&
++             src.offset + 4 <= rwp_hi) {
++            memcpy(push_cpu + i, rwp_span + (src.offset - rwp_lo), 4);
++            continue;
++         }
+       } else {
+          unsigned ubo_adj = src.ubo - (src.ubo > sysval_ubo ? 1 : 0);
+ 

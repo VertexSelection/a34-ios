@@ -95,6 +95,7 @@ struct rwm_air {
 	__typeof__(&rwa_render_clear_attachments) render_clear_attachments;   /* optional (metal-fx) */
 	__typeof__(&rwa_texture_view) texture_view;                           /* optional (metal-fx) */
 	__typeof__(&rwa_texture_probe) texture_probe;                         /* optional (metal-fx) */
+	__typeof__(&rwa_texture_probe_at) texture_probe_at;                   /* optional (metal-fx) */
 	__typeof__(&rwa_depth_read) depth_read;
 	__typeof__(&rwa_texture_destroy) texture_destroy;
 	__typeof__(&rwa_sampler_create) sampler_create;
@@ -244,6 +245,7 @@ struct rwm_draw {
 	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action */
 	float clear_colors[8][4];
 	char probe[64];                            /* (metal-fx) rwm_blurdump: the pipeline, when one to probe */
+	char label[64];                            /* (metal-fx) rwm_framedump: every pipeline's */
 	const float *clear_color;       /* NULL: kept, not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -371,6 +373,7 @@ struct rwm_render_state {
 	unsigned clear_stencil;
 	bool clears, clears_depth, clears_stencil;
 	char probe[64];                 /* (metal-fx, rwm_blurdump) the pipeline's label when it is a blur's or a material's */
+	char label[64];                 /* (metal-fx, rwm_framedump) the pipeline's label, whatever it is */
 	void *pipeline;
 	struct rwa_render *render;
 	unsigned stream_mask, stream_count;
@@ -398,6 +401,7 @@ void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device)
 /* (metal-fx) rwm_blurdump=N: whether it is on, and the label of the pipeline just set (kept when it is a blur's or a
  * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
 bool rwm_blurdump_on(void);
+bool rwm_framedump_on(void);           /* (metal-fx) rwm_framedump=N */
 void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */
 void rwm_render_set_label(struct rwm_render_state *state, const char *label);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,
