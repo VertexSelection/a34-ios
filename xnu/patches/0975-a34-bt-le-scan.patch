@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index d869e70..bdf2fc7 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -70,6 +70,19 @@
+  * bluetoothd's is unanswered for 2 s, the BTIF, DMA, BGF MCU (pc twice) and SW IRQ state and the firmware's
+  * coredump text (EMI +0x43C00, Android's "BTSYS" area, cleared at step 4 as Android clears it) are said.
+  *
++ * A34 (0975): LE scanning. Boot 0999-120-a: HCI init and power-on went through (the switch on), then every
++ * bluetoothd restarted with reason 712 after "Could not start LE scan (leScanParamsLPCoreCb): STATUS 712". 712 is
++ * OI_HCIERR_COMMAND_DISALLOWED (700 + HCI error 0x0C; bluetoothd's status names at +0x1c5e84), and that callback
++ * (+0x19a05c) is the completion of its LE_Set_Scan_Parameters (0x200B) or LE_Set_Extended_Scan_Parameters (0x2041)
++ * (+0x199fa4, +0x199fd4: command ids 0xab and 0xd7 of the table at +0x8448e0): bluetoothd changes the scan
++ * parameters while the controller scans -- Apple's controllers take that, the Core specification (Vol 4 Part E
++ * 7.8.10, also 7.8.4 for LE_Set_Random_Address) has the controller refuse it, and the MT6635 does. So the scan
++ * state is followed here (each enable that was answered with success): LE_Set_Random_Address and either scan
++ * parameter command, sent while scanning, are wrapped -- scanning off, the command, scanning on again with the same
++ * parameters before its answer is passed on -- and an enable or disable refused with 0x0C because scanning already
++ * is in that state is answered as done. Also: every status other than 0 the controller gives is said (the first 64),
++ * and when bluetoothd leaves, the last 24 packets of the bridge are said (the full trace stops at a34btbrlog).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1439,10 +1452,54 @@ a34_bt_host_send(const uint8_t *bytes, unsigned length)
+ 	thread_wakeup(&bt_sleep_chan);
+ }
+ 
++/* (0975) the last packets of the bridge, said when bluetoothd leaves */
++#define BR_RING                 24u
++static struct {
++	char dir[4];
++	uint16_t n;
++	uint8_t b[14];
++	uint32_t ms;
++} br_ring[BR_RING];
++static uint32_t br_ring_at;
++static volatile bool br_ring_pending;
++
++static void
++br_ring_say(void)
++{
++	uint32_t now = bt_ms(), shown = 0;
++
++	for (uint32_t k = 0; k < BR_RING; k++) {
++		uint32_t i = (br_ring_at + k) % BR_RING, m;
++		char text[3 * 14 + 1];
++
++		if (br_ring[i].n == 0) {
++			continue;
++		}
++		if (shown++ == 0) {
++			printf("A34 BT: br: the last packets before bluetoothd left (newest last):\n");
++		}
++		m = br_ring[i].n < 14 ? br_ring[i].n : 14;
++		for (uint32_t j = 0; j < m; j++) {
++			snprintf(text + 3 * j, 4, " %02x", br_ring[i].b[j]);
++		}
++		text[3 * m] = 0;
++		printf("A34 BT: br:   -%u ms %s %u:%s%s\n", now - br_ring[i].ms, br_ring[i].dir, br_ring[i].n, text,
++		    br_ring[i].n > m ? " ..." : "");
++	}
++	bzero(br_ring, sizeof(br_ring));
++	br_ring_at = 0;
++}
++
+ static void
+ br_dump(const char *dir, const uint8_t *b, uint32_t n)
+ {
+ 	static uint32_t data_said;
++	uint32_t i = br_ring_at++ % BR_RING;
++
++	strlcpy(br_ring[i].dir, dir, sizeof(br_ring[i].dir));
++	br_ring[i].n = (uint16_t)(n < 0xffff ? n : 0xffff);
++	memcpy(br_ring[i].b, b, n < sizeof(br_ring[i].b) ? n : sizeof(br_ring[i].b));
++	br_ring[i].ms = bt_ms();
+ 
+ 	if (b[0] == 2 || b[0] == 3 || b[0] == 5) {             /* data: only the first few */
+ 		if (data_said++ >= 32) {
+@@ -1459,9 +1516,18 @@ static void
+ br_quirks(uint8_t *p, uint32_t n)
+ {
+ 	static bool commands_said;
+-	static uint32_t unknown_said;
++	static uint32_t unknown_said, status_said;
+ 	uint16_t op;
+ 
++	if (n >= 7 && p[0] == 0x04 && (p[1] == 0x0e || p[1] == 0x0f)) {                     /* (0975) */
++		uint8_t status = p[1] == 0x0e ? p[6] : p[2];
++
++		op = p[1] == 0x0e ? (uint16_t)(p[4] | (p[5] << 8)) : (uint16_t)(p[5] | (p[6] << 8));
++		if (status != 0 && status != 0x01 && op != 0 && status_said++ < 64) {
++			printf("A34 BT: br: the controller answers %04x with status %#x%s\n", op, status,
++			    status == 0x0c ? " (command disallowed)" : status == 0x12 ? " (invalid parameters)" : "");
++		}
++	}
+ 	if (n >= 7 && p[0] == 0x04 && p[1] == 0x0e) {
+ 		op = (uint16_t)(p[4] | (p[5] << 8));
+ 		if (op == 0x0c5b && p[6] != 0) {                       /* Write_Default_Erroneous_Data_Reporting */
+@@ -1567,6 +1633,105 @@ br_standard_here(const uint8_t *cmd, uint32_t n)
+ 	return true;
+ }
+ 
++/*
++ * (0975) The controller's LE scanning as the enables answered with success left it. A command it refuses while
++ * scanning (LE_Set_Random_Address, LE_Set_Scan_Parameters, LE_Set_Extended_Scan_Parameters) is sent with scanning
++ * off around it: off now (br_scan_command), on again with the same parameters when its answer comes, before
++ * bluetoothd sees that answer (br_scan_event). An enable or disable refused (0x0C) because scanning already is so is
++ * answered as done.
++ */
++static struct {
++	bool on, ext;                   /* the controller scans; enabled with the extended command */
++	uint8_t params[6];              /* that enable command's parameters (2 legacy, 6 extended) */
++	uint16_t want_op;               /* an enable command in flight ... */
++	uint8_t want[6];                /* ... and its parameters */
++	uint16_t resume_op;             /* scanning off for this command: on again once it is answered */
++} br_scan;
++
++static bool
++br_scan_set(bool on, uint16_t around)
++{
++	static uint8_t ans[BT_PKT_MAX];
++	static uint32_t said;
++	uint8_t cmd[10] = { 0x01, 0x0c, 0x20, 2, 0, 0, 0, 0, 0, 0 };
++	uint32_t len = 6, got;
++
++	if (br_scan.ext) {
++		cmd[1] = 0x42;
++		cmd[3] = 6;
++		len = 10;
++	}
++	if (on) {
++		memcpy(cmd + 4, br_scan.params, cmd[3]);
++	}
++	got = bt_command(cmd, len, 0x0e, ans, 500);
++	if (got < 7 || ans[6] != 0) {
++		printf("A34 BT: br: scanning %s %04x: %s %#x\n", on ? "back on after" : "off for", around,
++		    got < 7 ? "no answer" : "status", got < 7 ? 0u : ans[6]);
++		return false;
++	}
++	br_scan.on = on;
++	if (on && said++ < 8) {
++		printf("A34 BT: br: command %04x sent with scanning off around it (the controller refuses it while it scans)\n",
++		    around);
++	}
++	return true;
++}
++
++static void
++br_scan_command(const uint8_t *pkt, uint32_t n)
++{
++	uint16_t op;
++
++	if (pkt[0] != 0x01 || n < 4) {
++		return;
++	}
++	op = (uint16_t)(pkt[1] | (pkt[2] << 8));
++	if ((op == 0x200c && n >= 6) || (op == 0x2042 && n >= 10)) {
++		br_scan.want_op = op;
++		bzero(br_scan.want, sizeof(br_scan.want));
++		memcpy(br_scan.want, pkt + 4, op == 0x200c ? 2 : 6);
++	} else if ((op == 0x2005 || op == 0x200b || op == 0x2041) && br_scan.on && br_scan.resume_op == 0 &&
++	    br_scan_set(false, op)) {
++		br_scan.resume_op = op;
++	}
++}
++
++static void
++br_scan_event(uint8_t *p, uint32_t n)
++{
++	static uint32_t said;
++	uint16_t op;
++
++	if (n < 7 || p[0] != 0x04 || p[1] != 0x0e) {
++		return;
++	}
++	op = (uint16_t)(p[4] | (p[5] << 8));
++	if (op == 0x0c03 && p[6] == 0) {                                /* HCI_Reset: not scanning */
++		bzero(&br_scan, sizeof(br_scan));
++	} else if (op != 0 && op == br_scan.want_op) {
++		bool on = br_scan.want[0] != 0;
++
++		br_scan.want_op = 0;
++		if (p[6] == 0x0c && on == br_scan.on) {
++			if (said++ < 8) {
++				printf("A34 BT: br: scanning already %s: %04x answered as done\n", on ? "on" : "off", op);
++			}
++			p[6] = 0;
++		}
++		if (p[6] == 0) {
++			br_scan.on = on;
++			br_scan.ext = op == 0x2042;
++			if (on) {
++				memcpy(br_scan.params, br_scan.want, sizeof(br_scan.params));
++			}
++		}
++	} else if (op != 0 && op == br_scan.resume_op) {
++		br_scan.resume_op = 0;
++		(void)br_scan_set(true, op);
++	}
++}
++
+ /*
+  * (0974) When long frames do not get through (bt_long_setup): a command over 16 bytes answered here, Command
+  * Complete with status 0 (and LE_Set_Extended_Advertising_Parameters' selected TX power, 0 dBm); data dropped.
+@@ -1676,6 +1841,7 @@ br_drain(void)
+ 			br_long_here(pkt, n);
+ 			continue;
+ 		}
++		br_scan_command(pkt, n);                               /* (0975) scanning off around it, if need be */
+ 		br_dump("br>", pkt, n);
+ 		if (bt_btif_write(pkt, n) == 0 && pkt[0] == 0x01) {
+ 			br_waiting = true;
+@@ -1844,6 +2010,8 @@ static errno_t
+ br_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
+ {
+ 	printf("A34 BT: br: com.apple.uart.sk.bluetooth unit %u disconnected\n", unit);
++	br_ring_pending = true;                                         /* (0975) the bridge's thread says its last packets */
++	thread_wakeup(&bt_sleep_chan);
+ 	return 0;
+ }
+ 
+@@ -2168,6 +2336,7 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 				memcpy(a, reset, n);
+ 			}
+ 			if (bt_level >= 2) {
++				br_scan_event(a, n);                    /* (0975) */
+ 				br_quirks(a, n);
+ 				a34_btsk_deliver(a, n);
+ 			}
+@@ -2176,6 +2345,10 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 		if (bt_level >= 2) {
+ 			br_le_say();
+ 			br_watch();
++			if (br_ring_pending) {                          /* (0975) bluetoothd left */
++				br_ring_pending = false;
++				br_ring_say();
++			}
+ 			if (!busy) {
+ 				bt_idle(bt_ms() - bt_last_rx_ms() < 1000 ? 1 : 4);
+ 			}

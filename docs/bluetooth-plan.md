@@ -51,6 +51,18 @@ Status (2026-11-15):
   (`a34btpace`) if the DMA fails it, long commands answered in the kernel if both fail; and when a
   command of bluetoothd's stays unanswered for 2 s, BTIF/DMA state, the BGF MCU's pc, BGF_SW_IRQ and the
   firmware's coredump text (EMI `+0x43C00`) are logged.
+- **Boot 0999-120-a (kernel with 0974)**: HCI init and power-on work: "Stack initialization complete" and
+  "power state changed ... powerstate: 1" in each of 15 runs (the switch shows on), Change_Local_Name and
+  the other long commands answered. Each run then restarted with reason 712 after "Could not start LE scan
+  (leScanParamsLPCoreCb): STATUS 712". 712 is `OI_HCIERR_COMMAND_DISALLOWED` (700 + HCI 0x0C; status names
+  at `+0x1c5e84`), and that callback (`+0x19a05c`) completes bluetoothd's LE_Set_Scan_Parameters
+  (0x200B) or LE_Set_Extended_Scan_Parameters (0x2041) (`+0x199fa4`, `+0x199fd4`, ids 0xab/0xd7): it
+  changes scan parameters while the controller scans, which Apple's controllers take and the Core spec
+  (7.8.10; 7.8.4 for LE_Set_Random_Address) refuses. 0975 follows the scan state in the kernel and sends
+  those commands with scanning off around them, answers a redundant enable/disable refused with 0x0C as
+  done, logs every non-zero controller status and the bridge's last 24 packets when bluetoothd leaves.
+  33077 `bt:` lines flooded that boot's log: `liba34bt-btd` is quiet now (errors, restarts, the last 30
+  lines at an exit, a count every 10 s; `/a34/bluetoothd.verbose` for everything).
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).

@@ -1,0 +1,36 @@
+Darwin: a target only read by framebuffer fetch is preloaded only while it is valid, in a Metal process.
+
+A34 (local to this port; nothing here goes upstream). Patch 0017 adds the targets a fragment shader
+reads by framebuffer fetch to batch->read, and panfrost_batch_to_fb_info preloads every target in
+batch->read whatever its validity. In a process drawing through Metal such a target is now
+preloaded only while its level is valid as well. What is not valid was never drawn, or its old
+contents were let go by a DontCare load action (redwood_pan_forget, patch 0018): CoreAnimation's
+second colour attachment, which it loads with DontCare and draws and reads back within one pass,
+was read back in full for every screen-sized drawable pass in boot 0975-modes120-a -- and with a
+kept clear in the same batch that preload ran over the whole screen (ALWAYS). A batch that
+continues a pass cut short still preloads it: the batch before it made the level valid when it
+was submitted.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -793,10 +793,17 @@
+       fb->rts[i].view = &rts[i];
+ 
+       /* Preload if the RT is read or updated */
++      bool valid = BITSET_TEST(prsrc->valid.data, fb->rts[i].view->first_level);
++      /* A34 (patch 0020): in a process drawing through Metal, a target the batch only READS (a
++       * fragment shader's framebuffer fetch, patch 0017) is preloaded only while its level is
++       * valid too. What is not valid was never drawn, or its old contents were let go by a
++       * DontCare load (redwood_pan_forget, 0018): CoreAnimation's second attachment, which it
++       * loads with DontCare and draws and reads within one pass, was read back in full -- a
++       * whole screen for every drawable pass (boot 0975-modes120-a). A batch that continues a
++       * pass cut short still preloads it: the batch before it made the level valid. */
+       if (!(batch->clear & mask) &&
+-          ((batch->read & mask) ||
+-           ((batch->draws & mask) &&
+-            BITSET_TEST(prsrc->valid.data, fb->rts[i].view->first_level))))
++          (((batch->read & mask) && (valid || !redwood_pan_metal)) ||
++           ((batch->draws & mask) && valid)))
+          fb->rts[i].preload = true;
+    }
+ 

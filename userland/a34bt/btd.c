@@ -6,8 +6,8 @@
  *   - stdout and stderr on the console (the kernel's log): bluetoothd writes its start-up steps and failures with
  *     fprintf(stderr) as well as os_log ("Bluetooth Super Server Robot Destroyer", "Unable to attach local
  *     bluetooth session: %d", ...), and its job has no StandardErrorPath
- *   - OS_ACTIVITY_DT_MODE=1: its os_log lines are written to stderr too (the stack's "Bluetooth error - restarting
- *     { reason=... }", "HCI Transport is set to H4BC", ...). The file /a34/bluetoothd.quiet turns this off.
+ *   - OS_ACTIVITY_DT_MODE=1 only with the file /a34/bluetoothd.verbose (0975: by default the library writes the
+ *     os_log lines that matter itself, quietly; see btdlib.c, 5).
  *   - DYLD_INSERT_LIBRARIES gets /a34/liba34bt-btd.dylib (btdlib.c): BlueTool answered inside bluetoothd, and
  *     every exit said with where it came from. The file /a34/bluetoothd.nolib leaves it out.
  */
@@ -38,7 +38,7 @@ main(int argc, char **argv)
 			close(fd);
 		}
 	}
-	if (access("/a34/bluetoothd.quiet", F_OK) != 0) {
+	if (access("/a34/bluetoothd.verbose", F_OK) == 0 && access("/a34/bluetoothd.quiet", F_OK) != 0) {
 		setenv("OS_ACTIVITY_DT_MODE", "1", 1);
 	}
 	if (access("/a34/bluetoothd.nolib", F_OK) != 0) {
