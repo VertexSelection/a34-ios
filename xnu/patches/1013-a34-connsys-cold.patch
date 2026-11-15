@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/a34_connsys.c b/bsd/dev/a34_connsys.c
-index 4d31392..7cdb560 100644
+index 4d31392..3151bf5 100644
 --- a/bsd/dev/a34_connsys.c
 +++ b/bsd/dev/a34_connsys.c
-@@ -167,6 +167,7 @@ static vm_offset_t cs_rgu, cs_cfg, cs_therm, cs_afe, cs_spi, cs_slp, cs_clkgen,
+@@ -61,6 +61,7 @@
+ #include "ruby_hal.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);      /* (1013) */
+ 
+ int a34_connsys_on(void);
+ int a34_connsys_get(uint32_t radio);
+@@ -167,6 +168,7 @@ static vm_offset_t cs_rgu, cs_cfg, cs_therm, cs_afe, cs_spi, cs_slp, cs_clkgen,
      cs_hc, cs_sema, cs_infra, cs_gpio, cs_spm, cs_toprgu, cs_rc, cs_pwrap, cs_iocfg;
  static uint64_t cs_emi_pa = CS_EMI_DEFAULT;
  static uint32_t cs_mpu = 1, cs_vcn33 = 1, cs_lp, cs_deep = 1, cs_force;
@@ -10,7 +18,7 @@ index 4d31392..7cdb560 100644
  static bool cs_up, cs_tried;
  static uint32_t cs_adie_id;
  static uint32_t cs_radios;              /* CS_RADIO_BIT() of every radio got */
-@@ -456,6 +457,85 @@ cs_map(void)
+@@ -456,6 +458,85 @@ cs_map(void)
  	       cs_sysram && cs_hc && cs_sema && cs_infra && cs_gpio && cs_spm && cs_toprgu && cs_rc && cs_pwrap && cs_iocfg;
  }
  
@@ -96,7 +104,7 @@ index 4d31392..7cdb560 100644
  /* ---- ph1: VCN18 and VCN13 (consys_plt_pmic_common_power_ctrl_mt6877, RC mode) ---- */
  
  static bool
-@@ -612,6 +692,8 @@ cs_ph8_adie(void)
+@@ -612,6 +693,8 @@ cs_ph8_adie(void)
  	wr(cs_gpio, 0x164, 1u << 12);
  	field(cs_gpio, 0x490, 0x70000u, 0);                                     /* ... as a GPIO while 26 MHz is set up */
  	cs_top_ck(true);
@@ -105,7 +113,7 @@ index 4d31392..7cdb560 100644
  	setb(cs_cfg, 0x030, 1u << 0);                                           /* A-die reset released */
  	if (!cs_sema_get(SEMA_RFSPI)) {
  		cs_top_ck(false);
-@@ -904,6 +986,7 @@ cs_first_on(uint32_t radio)
+@@ -904,6 +987,7 @@ cs_first_on(uint32_t radio)
  	(void)PE_parse_boot_argn("a34btlp", &cs_lp, sizeof(cs_lp));
  	(void)PE_parse_boot_argn("a34btdeep", &cs_deep, sizeof(cs_deep));
  	(void)PE_parse_boot_argn("a34btforce", &cs_force, sizeof(cs_force));
@@ -113,7 +121,7 @@ index 4d31392..7cdb560 100644
  	if ((cs_emi_pa & 0xfffffu) != 0 || cs_emi_pa + CS_EMI_SIZE > 0x100000000ull || cs_emi_pa < 0x40000000ull) {
  		printf("A34 CONNSYS: a34btemi=%#llx is not 1 MB aligned in DRAM below 4 GB\n", cs_emi_pa);
  		return EINVAL;
-@@ -922,6 +1005,10 @@ cs_first_on(uint32_t radio)
+@@ -922,6 +1006,10 @@ cs_first_on(uint32_t radio)
  	if (cs_mpu) {
  		cs_emi_mpu();
  	}
