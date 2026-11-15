@@ -35,7 +35,7 @@ bool busy;                              /* a job taken off the queue and not yet
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	rwm_keep(line);
 }
 
 void *

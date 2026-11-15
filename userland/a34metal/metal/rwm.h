@@ -52,8 +52,15 @@ struct rwm_perf {
 	uint64_t worker_cpu;            /* ... and how much of it the worker ran */
 	/* made to committed on the thread that makes them: the time, and how much of it that thread ran */
 	uint64_t made_cbs, made_ns, made_cpu;
+	/* A34: surfaces the GPU could not draw into in place, copied back by the processor after the buffer */
+	uint64_t copyouts, copyout_bytes, copyout_ns;
 };
 extern struct rwm_perf rwm_perf;
+/* A34: a line HackiOS kept with their kernel's sysctl kern.redwood.say (which ours has not): written to
+ * stdout as "redwoodmetal kept: ...", which in backboardd reaches the kernel log through the devnull tee */
+void rwm_keep(const char *line);
+/* A34: the profile's period in seconds (boot-arg camprof=N, environment A34METAL_CAMPROF=N); 0: off */
+unsigned rwm_camprof(void);
 uint64_t rwm_ns(void);
 uint64_t rwm_thread_cpu_ns(void);
 void rwm_perf_report(uint64_t now);

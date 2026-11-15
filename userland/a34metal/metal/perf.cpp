@@ -21,7 +21,9 @@ namespace {
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	/* A34: through stdout (the devnull tee in backboardd), as "redwoodmetal camprof: ..." */
+	printf("redwoodmetal camprof: %s\n", line);
+	fflush(stdout);
 }
 
 /* one of the compiler library's profile calls, if it is loaded and has it (not part of the contract) */
@@ -93,11 +95,15 @@ rwm_perf_report(uint64_t now)
 	char line[320];
 	const uint64_t span = now - p.since, cbs = p.cbs ? p.cbs : 1;
 
+	if (rwm_camprof() == 0) {
+		memset(&p, 0, sizeof(p));      /* (A34: off unless camprof=N) */
+		return;
+	}
 	if (p.since == 0) {
 		p.since = now;
 		return;
 	}
-	if (span < 5000000000ull) {
+	if (span < rwm_camprof() * 1000000000ull) {
 		return;
 	}
 	snprintf(line, sizeof(line), "rwm perf %llus: %llu cb (%.1f/s), %llu draws, cpu %.1f ms/cb, "
@@ -106,6 +112,10 @@ rwm_perf_report(uint64_t now)
 		 span / 1000000000ull, p.cbs, p.cbs * 1e9 / span, p.draws, p.encode / 1e6 / cbs, p.wait / 1e6 / cbs,
 		 p.worst / 1e6, p.pipes, p.compile / 1e6, p.recording / 1e6 / cbs, p.between / 1e6 / cbs, p.copyins,
 		 p.copyin_bytes >> 10, p.copyin_ns / 1e6);
+	say(line);
+	snprintf(line, sizeof(line), "rwm copied back (surfaces drawn by the GPU elsewhere, copied by the processor): "
+		 "%llu, %llu KB, %.1f ms; per cb %.1f ms", p.copyouts, p.copyout_bytes >> 10, p.copyout_ns / 1e6,
+		 p.copyout_ns / 1e6 / cbs);
 	say(line);
 	snprintf(line, sizeof(line), "rwm waits: queue full x%llu %.0f ms, until processed x%llu %.0f ms, "
 		 "until completed x%llu %.0f ms; the worker %.1f ms a buffer", p.queue_waits, p.queue_ns / 1e6,

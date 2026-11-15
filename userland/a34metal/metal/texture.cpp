@@ -381,6 +381,13 @@ rwm_texture_sync_surface(struct rwm_texture *texture, char *why, size_t why_size
 	if (surface == nullptr || air->texture_read == nullptr) {
 		return 0;
 	}
+	/* A34: counted for camprof */
+	struct copied {
+		uint64_t began = rwm_ns();
+		size_t bytes;
+		explicit copied(size_t b) : bytes(b) {}
+		~copied() { rwm_perf.copyouts++; rwm_perf.copyout_bytes += bytes; rwm_perf.copyout_ns += rwm_ns() - began; }
+	} counted(row * rows);
 	/* one buffer per call: the window server commits from more than one thread, and a buffer
 	   shared between them was freed under a copy (signal 11 in memmove) */
 	block scratch((uint8_t *)malloc(row * rows));

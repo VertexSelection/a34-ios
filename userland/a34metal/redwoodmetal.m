@@ -1160,7 +1160,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 		snprintf(line, sizeof(line), "!rwm %s: %s; the nearest specialized one instead",
 		         [[descriptor label] UTF8String], [[mine localizedDescription] UTF8String] ?: "(no reason)");
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 		mine = nil;
 		rw_plib_allow_near = YES;
 		state = [self redwoodRenderPipelineWithDescriptor:descriptor error:&mine];
@@ -1171,7 +1171,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 		snprintf(line, sizeof(line), "!rwm %s: %s", [[descriptor label] UTF8String] ?: "(no label)",
 		         [[mine localizedDescription] UTF8String] ?: "(no reason)");
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 		rw_print("%s\n", line + 1);
 	}
 	if (cacheable && state != nil) {
@@ -1192,7 +1192,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		         [[[descriptor label] stringByReplacingOccurrencesOfString:@"com.apple.coreanimation."
 		                                                         withString:@""] UTF8String] ?: "?",
 		         (rw_ns() - built) / 1000000ull, state == nil ? " (failed)" : "", getprogname());
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 	}
 	if (error != NULL) {
 		*error = mine;
@@ -1213,7 +1213,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 	snprintf(line, sizeof(line), "!rwm tile pipeline %s: not supported",
 	         [[descriptor label] UTF8String] ?: "(no label)");
-	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+	rwm_keep(line);
 	return [self fail:error with:@"tile render pipelines: not on this GPU"];
 }
 
@@ -3601,7 +3601,7 @@ redwood_clear_semaphore_debt(id commandBuffer)
 		char line[80];
 
 		snprintf(line, sizeof(line), "!rwm blit encoder made (%d) in %s", told, getprogname());
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 	}
 	return [[[RedwoodMetalBlitEncoder alloc] initWithRedwoodCommandBuffer:self] autorelease];
 }
@@ -3758,7 +3758,7 @@ rw_say_blit(unsigned kind, const unsigned size[3], id from, id to)
 
 		snprintf(line, sizeof(line), "!rwm blit %u: %ux%u from %s to %s (surface %u)", kind, size[0], size[1],
 		         object_getClassName(from), object_getClassName(to), core != NULL ? rwm_texture_in_place(core) : 0);
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 	}
 }
 

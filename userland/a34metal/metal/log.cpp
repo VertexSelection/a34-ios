@@ -64,3 +64,29 @@ rwm_print(const char *fmt, ...)
 		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
 	}
 }
+
+/* A34: see rwm.h */
+extern "C" void
+rwm_keep(const char *line)
+{
+	printf("redwoodmetal kept: %s\n", line[0] == '!' ? line + 1 : line);
+	fflush(stdout);
+}
+
+extern "C" unsigned
+rwm_camprof(void)
+{
+	static int period = -1;
+
+	if (period < 0) {
+		const char *environment = getenv("A34METAL_CAMPROF");
+		const char *at = strstr(rwm_boot_args(), "camprof=");
+
+		period = environment != NULL ? atoi(environment) :
+		    at != NULL && (at == rwm_boot_args() || at[-1] == ' ') ? atoi(at + 8) : 0;
+		if (period < 0) {
+			period = 0;
+		}
+	}
+	return (unsigned)period;
+}

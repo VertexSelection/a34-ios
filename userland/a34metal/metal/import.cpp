@@ -20,7 +20,7 @@ namespace {
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	rwm_keep(line);
 }
 
 /* the first, second, fourth, eighth... time a site says it (as the plug-in's RW_AGAIN) */

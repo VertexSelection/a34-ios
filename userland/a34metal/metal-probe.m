@@ -23,6 +23,11 @@
  *                          clears and draws a34_tri_vs/a34_tri_fs's red triangle, checked at
  *                          places inside and outside it
  *
+ *   metal-probe --post-recipes SECONDS
+ *                          only this: wait SECONDS, then post the notification on which every
+ *                          process with the driver writes its pipeline recipes into the log
+ *                          ("rwr ..." lines; tools/rwm-recipes.py makes /a34/rwm-recipes.txt of
+ *                          them, which the driver builds ahead at its next start)
  *   metal-probe --time [N]   then N times (default 30) a full-screen pass (1125x2436 BGRA IOSurface:
  *                          clear + the triangle), each committed and waited for: milliseconds
  *                          a pass, min / average / max, and the same for a clear alone (uses LIB)
@@ -46,6 +51,8 @@
 #include "a34metal_iokit.h"
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
+#include <notify.h>
+#include <unistd.h>
 
 #define DEFAULT_TESTS "/a34/a34metal-tests.metallib"
 
@@ -553,6 +560,14 @@ main(int argc, char **argv)
 			{ "GPUFamily5_v1", 16 },
 		};
 
+		if (argc == 3 && strcmp(argv[1], "--post-recipes") == 0) {
+			unsigned seconds = (unsigned)strtoul(argv[2], NULL, 10);
+
+			say("metal-probe: posting com.redwood.rwm_recipes in %u s", seconds);
+			sleep(seconds);
+			say("metal-probe: com.redwood.rwm_recipes posted: %u", notify_post("com.redwood.rwm_recipes"));
+			return 0;
+		}
 		for (i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--direct") == 0) {
 				want_direct = true;

@@ -88,7 +88,7 @@ rwm_drawn_add(struct rwm_drawn *d, uint32_t surface)
 			if (++over <= 4 || (over & 255) == 0) {
 				snprintf(line, sizeof(line), "!rwm %s: surface %u drawn into while the display holds it (%u so far)",
 					 getprogname(), surface, over);
-				sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+				rwm_keep(line);
 			}
 		}
 		CFRelease(held);

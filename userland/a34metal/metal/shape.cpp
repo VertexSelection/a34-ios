@@ -117,7 +117,7 @@ rwm_shape_say(const char *label, const struct rwa_render_shape *shape, bool has_
 					      buffer < RWA_MAX_VERTEX_BUFFERS ? shape->vertex_layout[buffer].stride : 0);
 			}
 		}
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 	}
 
 	unsigned configured = 0, highest = 0;

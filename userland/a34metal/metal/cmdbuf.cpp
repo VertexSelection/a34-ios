@@ -100,7 +100,7 @@ say_first_drawn(struct rwm_work *const *works, unsigned count, const char *(*lab
 		seen_ids[seen_n++] = sid0;
 		snprintf(line, sizeof(line), "!rwm surface %u first drawn: %u draws (%u clearing, to %.2f %.2f %.2f %.2f), first %s",
 			 sid0, draws, clears, cc[0], cc[1], cc[2], cc[3], label);
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		rwm_keep(line);
 	}
 }
 

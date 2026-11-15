@@ -118,6 +118,24 @@ device is served to backboardd (`camtl=1`), the tests, programs named in
 `/a34/A34Metal.clients`, and everyone only with `a34metalall=1`; never to SpringBoard (`sbmtl=1`)
 or chronod/widgets.
 
+## Profiling CoreAnimation on Metal (boot-arg camprof=N)
+
+Every N seconds of backboardd's drawing, `|backboardd| redwoodmetal camprof:` lines (HackiOS's
+profile, now in our log): command buffers a second, draws, the processor's time per buffer, the
+GPU wait per buffer, the worst buffer, pipelines built and their time; surfaces copied in (sampled
+surfaces the GPU cannot read in place) and copied back (drawn elsewhere and copied by the
+processor), count, KB and ms; the waits (queue, processed, completed); batches submitted and their
+time; shader variants compiled at draw time; the CPU time of a draw by stage. Lines HackiOS kept
+with their kernel's sysctl come as `redwoodmetal kept: ...` (slow pipelines with their ms, pipelines
+it could not build, surfaces copied back). Boot 63's first sign: SpringBoard's 1125x2436 surface 31
+(rows of 4512 bytes, not a multiple of 64) is drawn by Metal into a texture of Mesa's and copied
+back by the processor, 11 MB, after each command buffer that draws into it.
+
+Pipelines ahead of time: `metal-probe --post-recipes 180` (a job) has every process with the driver
+write its pipelines' recipes into the log three minutes into the boot (`rwr ...` lines);
+`tools/rwm-recipes.py LOG` makes `build/rwm-recipes.txt` of them; as `/a34/rwm-recipes.txt` the
+driver builds those pipelines on a thread of its own at its next start (`rwm_warm=0`: not).
+
 ## Credits and licence
 
 HackiOS (OOSEX GANG) wrote everything here but `metal-probe.m` and `a34_watch.c`, and the
