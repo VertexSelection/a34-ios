@@ -175,6 +175,13 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   before every command buffer that reads it, also when its seed has not moved (a program's
   memory written without a lock keeps its seed).
 
+- **The pass's area is the smallest attachment's** (Metal's rule). Boot 67: the blur's passes
+  into level 1 (352x128) carry a full-size second attachment (704x256), and all 97 were refused
+  ("colour attachment 1 is 704x256 and attachment 0 is 352x128"), so no blur was drawn. y2sios
+  found and fixed the same. Boot-arg `rwm_area=strict`: refused as before.
+- **`rwm_blurdump=N`**: for the first N draws into a level below the first, the texel at the
+  centre of that level and of level 0 after the draw (lines `blurdump:`; waits for the GPU).
+
 Files: `userland/mesa/air/air_metal.[ch]` (the library), `metal/render.cpp`, `draw.cpp`,
 `blit.cpp`, `texture.cpp`, `import.cpp`, `air.cpp`, `rwm.h`, `redwoodmetal.m` (attachments, views
 and formats only).

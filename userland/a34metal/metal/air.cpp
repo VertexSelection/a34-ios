@@ -6,6 +6,7 @@
 #include "rwm.h"
 
 #include <dlfcn.h>
+#include <stdlib.h>
 #include <mutex>
 
 namespace {
@@ -38,6 +39,10 @@ load()
 		return;
 	}
 
+	/* (metal-fx) boot-arg rwm_area=strict: attachments of different sizes refused by the library, as before */
+	if (rwm_boot_arg("rwm_area=strict")) {
+		setenv("RWA_RENDER_AREA", "strict", 1);
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),
@@ -60,6 +65,7 @@ load()
 		call("rwa_render_clear", &c.render_clear, false),
 		call("rwa_render_clear_attachments", &c.render_clear_attachments, false),
 		call("rwa_texture_view", &c.texture_view, false),
+		call("rwa_texture_probe", &c.texture_probe, false),
 		call("rwa_depth_read", &c.depth_read, false),
 		call("rwa_texture_destroy", &c.texture_destroy, false),
 		call("rwa_sampler_create", &c.sampler_create, true),

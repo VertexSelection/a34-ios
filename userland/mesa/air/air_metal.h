@@ -240,6 +240,10 @@ struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned pixel
 				     unsigned type, unsigned level_base, unsigned level_count,
 				     unsigned slice_base, unsigned slice_count, char *why,
 				     size_t why_size);
+/* A34 (metal-fx): the bytes of the texel at the centre of `level` of a texture (a view's, from its first) and
+ * the level's size; the number of bytes, or -1 and a sentence. For rwm_blurdump. */
+int rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, uint8_t texel[16],
+		      unsigned *width, unsigned *height, char *why, size_t why_size);
 /* -generateMipmapsForTexture:: every level below the base, filtered from the one above it */
 int rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
 int rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t value,

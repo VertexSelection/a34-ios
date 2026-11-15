@@ -5,8 +5,57 @@
 #include "rwm.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static_assert(RWM_MAX_BUFFERS <= 32, "the stream mask is 32 bits");
+
+/*
+ * (metal-fx) Boot-arg rwm_blurdump=N: for the first N draws into a level below the first of a texture (a blur's
+ * smaller copies, CoreAnimation's pyramid), the texel at the centre of that level and of the first, after the draw
+ * (waits for the GPU: those draws are slow). Lines "blurdump:".
+ */
+static void
+blur_dump(const struct rwm_draw *d)
+{
+	static long left = -1;
+
+	if (left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_blurdump=");
+
+		left = at != nullptr ? atol(at + 13) : 0;
+	}
+	if (left <= 0 || d->color_count == 0 || !d->color_levels || d->color_level[0] == 0 || d->color[0] == nullptr ||
+	    rwm_air()->texture_probe == nullptr) {
+		return;
+	}
+	left--;
+
+	char line[256];
+	size_t used = 0;
+	const unsigned levels[2] = { d->color_level[0], 0 };
+
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: a pass into level %u (attachments %u):",
+				 d->color_level[0], d->color_count);
+	for (unsigned k = 0; k < 2 && used < sizeof(line) - 64; k++) {
+		uint8_t texel[16] = {};
+		unsigned w = 0, h = 0;
+		char why[160] = {};
+		int bytes = rwm_air()->texture_probe(d->color[0], levels[k], d->color_slice[0], texel, &w, &h, why,
+						     sizeof(why));
+
+		if (bytes <= 0) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " level %u: %s;", levels[k], why);
+			continue;
+		}
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " level %u (%ux%u) centre", levels[k], w, h);
+		for (int b = 0; b < bytes && b < 8 && used < sizeof(line) - 4; b++) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " %02x", texel[b]);
+		}
+		used += (size_t)snprintf(line + used, sizeof(line) - used, ";");
+	}
+	rwm_print("%s\n", line);
+}
 
 extern "C" int
 rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
@@ -136,5 +185,6 @@ rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
 	if (air->render_draw(d->render, &draw, why, why_size) != 0) {
 		return -2;
 	}
+	blur_dump(d);
 	return 0;
 }

@@ -94,6 +94,7 @@ struct rwm_air {
 	__typeof__(&rwa_render_clear) render_clear;
 	__typeof__(&rwa_render_clear_attachments) render_clear_attachments;   /* optional (metal-fx) */
 	__typeof__(&rwa_texture_view) texture_view;                           /* optional (metal-fx) */
+	__typeof__(&rwa_texture_probe) texture_probe;                         /* optional (metal-fx) */
 	__typeof__(&rwa_depth_read) depth_read;
 	__typeof__(&rwa_texture_destroy) texture_destroy;
 	__typeof__(&rwa_sampler_create) sampler_create;

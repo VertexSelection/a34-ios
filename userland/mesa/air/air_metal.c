@@ -2047,7 +2047,10 @@ render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsign
       }
       fb.cbufs[i] = *surface;
       fb.nr_cbufs = i + 1;
-      texture_level_size(t, level, &fb.width, &fb.height);
+      unsigned tw, th;
+      texture_level_size(t, level, &tw, &th);
+      fb.width = fb.width ? MIN2(fb.width, tw) : tw;     /* (the smallest attachment's area) */
+      fb.height = fb.height ? MIN2(fb.height, th) : th;
    }
    if (depth && depth->res) {
       struct pipe_surface *surface = texture_surface(depth, 0, 0);
@@ -2091,6 +2094,45 @@ render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsign
       pipe->clear(pipe, mask, 0xffffffffu, 0xff, NULL, &clear, clear_depth ? (double)*clear_depth : 0.0,
                   clear_stencil ? *clear_stencil & 0xff : 0);
    return 0;
+}
+
+/*
+ * (A34 metal-fx) One texel at the centre of a level of a texture, as its bytes, and the level's size: what a pass
+ * left there, for the plug-in's rwm_blurdump. The map waits for the GPU's writes to it.
+ */
+int
+rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, uint8_t texel[16],
+                  unsigned *width, unsigned *height, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   struct pipe_resource *res = texture ? texture->res : NULL;
+   struct pipe_transfer *transfer = NULL;
+   struct pipe_box box;
+
+   if (!res) {
+      say(why, why_size, "a probe of no texture");
+      return -1;
+   }
+   level += texture->level_base;
+   layer += texture->layer_base;
+   if (level > res->last_level || res->nr_samples > 1 || format_is_depth_stencil(res->format)) {
+      say(why, why_size, "level %u of a %s texture is not one to probe", level, texture->format_name);
+      return -1;
+   }
+   unsigned w = u_minify(res->width0, level), h = u_minify(res->height0 ? res->height0 : 1, level);
+   u_box_3d(w / 2, h / 2, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
+   const uint8_t *map = texture->device->pipe->texture_map(texture->device->pipe, res, level, PIPE_MAP_READ,
+                                                         &box, &transfer);
+   if (!map) {
+      say(why, why_size, "the driver would not map level %u of a %s texture", level, texture->format_name);
+      return -1;
+   }
+   unsigned bytes = MIN2(util_format_get_blocksize(res->format), 16);
+   memcpy(texel, map, bytes);
+   texture->device->pipe->texture_unmap(texture->device->pipe, transfer);
+   *width = w;
+   *height = h;
+   return (int)bytes;
 }
 
 int
@@ -7427,6 +7469,19 @@ xr_compatible(unsigned a, unsigned b)
    return ((a == 554 || a == 80) && (b == 554 || b == 80)) || ((a == 555 || a == 81) && (b == 555 || b == 81));
 }
 
+/* (A34 metal-fx) RWA_RENDER_AREA=strict (the plug-in's boot-arg rwm_area=strict): attachments of different
+ * sizes refused, as before; otherwise the pass draws the smallest one's area, which is Metal's rule */
+static bool
+render_area_strict(void)
+{
+   static int strict = -1;
+   if (strict < 0) {
+      const char *v = getenv("RWA_RENDER_AREA");
+      strict = v && strcmp(v, "strict") == 0;
+   }
+   return strict != 0;
+}
+
 static bool
 attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char *what,
                       char *why, size_t why_size)
@@ -7700,10 +7755,16 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       if (i == 0) {
          w = tw;
          h = th;
-      } else if (tw != w || th != h) {
+      } else if ((tw != w || th != h) && render_area_strict()) {
          say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,
              tw, th, w, h);
          return -1;
+      } else {
+         /* Metal's rule: the pass's area is the smallest attachment's (boot 67: CoreAnimation's blur
+          * draws level 1 of its pyramid, 352x128, beside a full-size second attachment, 704x256 -- 97
+          * draws refused, and no blur) */
+         w = MIN2(w, tw);
+         h = MIN2(h, th);
       }
    }
 
@@ -7737,10 +7798,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       if (draw->color_count == 0) {
          w = tw;        /* a depth-only pass: the depth attachment is the pass's size */
          h = th;
-      } else if (tw != w || th != h) {
+      } else if ((tw != w || th != h) && render_area_strict()) {
          say(why, why_size, "the depth attachment is %ux%u and colour attachment 0 is %ux%u",
              tw, th, w, h);
          return -1;
+      } else {
+         w = MIN2(w, tw);       /* (the smallest attachment's area, as above) */
+         h = MIN2(h, th);
       }
    }
 
