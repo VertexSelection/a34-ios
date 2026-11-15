@@ -39,6 +39,9 @@ jobs:
           xcodebuild -version
           echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
 
+      - name: e2fsprogs (mke2fs for the ext4 reader's test images)
+        run: brew install e2fsprogs
+
       - name: Host tests and the iOS binary (userland/a34cell/build.sh)
         run: |
           A34CELL_OUT="$WORK/out" userland/a34cell/build.sh

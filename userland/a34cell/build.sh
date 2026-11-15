@@ -28,6 +28,7 @@ SAN=(-fsanitize=address,undefined)
 (cd "$HERE" && "$HOSTCC" -std=c11 -O1 -g "${WARN[@]}" "${SAN[@]}" -pthread \
 	-o "$WORK/host/test_a34cell" tests/test_a34cell.c "${SRC[@]}")
 "$WORK/host/test_a34cell"
+"$HERE/tests/test_ext4ro.sh" "$WORK/ext4" "$HOSTCC"
 
 [ "${A34CELL_HOST_ONLY:-0}" = 1 ] && exit 0
 
