@@ -72,8 +72,11 @@
 #include "util/u_gen_mipmap.h"
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#include <mach/mach_time.h>
 #endif
+#include <time.h>
 #include "util/u_sampler.h"
+#include "redwood_pan_prof.h"
 #include "drm-uapi/drm_fourcc.h"
 
 /*
@@ -600,6 +603,23 @@ static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, 
  * of work (since the last finish or rwa_flush_seq): each such pass is a second batch with a
  * preload of its own where one would have done, unless something in between read it */
 static uint64_t rwa_bind_returns, rwa_bind_span;
+/* passes that went back into a pass kept open and joined its batch (RWA_OPEN_PASSES) */
+static uint64_t rwa_bind_merges;
+/* draw_vbo on the processor (the thread's own time) against the clock: what of a draw's time
+ * is work and what is the thread waiting to run */
+static uint64_t rwa_bind_vbo_wall_ns, rwa_bind_vbo_cpu_ns;
+/* constant buffers bound from a mapping, and of them those bound as the mapping alone (an
+ * offset the GPU cannot fetch from), which panfrost copies out of write-combined memory */
+static uint64_t rwa_bind_ubos, rwa_bind_ubo_copies;
+
+static uint64_t
+thread_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static bool
 rebind_all(void)
@@ -1786,19 +1806,26 @@ rwa_bind_profile(char *line, size_t size)
    uint64_t draws = rwa_bind_fresh_draws + rwa_bind_steady_draws;
    if (!draws || !line || !size)
       return 0;
-   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch "
-            "(%llu back into one left before); "
-            "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu); "
-            "states set %llu, skipped %llu%s",
+   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes sent on a switch; "
+            "%llu back into one left before, %llu of them joined to it; "
+            "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
+            "%llu%% of it on the processor; states set %llu, skipped %llu%s; "
+            "constant buffers %llu, %llu of them copied",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
-            (unsigned long long)rwa_bind_returns,
+            (unsigned long long)rwa_bind_returns, (unsigned long long)rwa_bind_merges,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
             (unsigned long long)rwa_bind_fresh_draws,
             (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
-            (unsigned long long)rwa_bind_steady_draws, (unsigned long long)rwa_bind_sets,
-            (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "");
+            (unsigned long long)rwa_bind_steady_draws,
+            (unsigned long long)(rwa_bind_vbo_wall_ns ? rwa_bind_vbo_cpu_ns * 100 / rwa_bind_vbo_wall_ns : 0),
+            (unsigned long long)rwa_bind_sets,
+            (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "",
+            (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies);
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
+   rwa_bind_merges = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
+   rwa_bind_vbo_wall_ns = rwa_bind_vbo_cpu_ns = 0;
+   rwa_bind_ubos = rwa_bind_ubo_copies = 0;
    return 1;
 }
 
@@ -2230,6 +2257,14 @@ int
 rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, uint8_t texel[16],
                   unsigned *width, unsigned *height, char *why, size_t why_size)
 {
+   return rwa_texture_probe_at(texture, level, layer, ~0u, ~0u, texel, width, height, why, why_size);
+}
+
+int
+rwa_texture_probe_at(struct rwa_texture *texture, unsigned level, unsigned layer, unsigned x,
+                     unsigned y, uint8_t texel[16], unsigned *width, unsigned *height, char *why,
+                     size_t why_size)
+{
    RWA_GUARD();
    struct pipe_resource *res = texture ? texture->res : NULL;
    struct pipe_transfer *transfer = NULL;
@@ -2246,7 +2281,8 @@ rwa_texture_probe(struct rwa_texture *texture, unsigned level, unsigned layer, u
       return -1;
    }
    unsigned w = u_minify(res->width0, level), h = u_minify(res->height0 ? res->height0 : 1, level);
-   u_box_3d(w / 2, h / 2, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
+   unsigned px = x == ~0u ? w / 2 : MIN2(x, w - 1), py = y == ~0u ? h / 2 : MIN2(y, h - 1);
+   u_box_3d(px, py, res->target == PIPE_TEXTURE_3D ? 0 : layer, 1, 1, 1, &box);
    const uint8_t *map = texture->device->pipe->texture_map(texture->device->pipe, res, level, PIPE_MAP_READ,
                                                          &box, &transfer);
    if (!map) {
@@ -4521,6 +4557,15 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
           * and its passes did up to 17 such loads a pixel, 12 to 17 ms of the Mali a pass
           * (pan_shader.c pushable_ubos). A buffer without a mapping still goes as itself.
           */
+         /*
+          * ...and since 15 November, at an offset the GPU can fetch from, the buffer AS WELL
+          * as its mapping (Mesa patch 0012): the GPU reads what is not pushed from the buffer
+          * itself, and panfrost reads only the pushed words from the mapping, in one copy.
+          * The mapping alone made panfrost copy the whole of what the shader may read out of
+          * write-combined memory for every draw -- 0.1 us a word, ~360 us of a draw's ~400
+          * (boot 0962, "ubos"). An offset it cannot fetch from still goes as the mapping
+          * alone, copied ("constant buffers copied" in the profile).
+          */
          if (b->map == NULL) {
             cb.buffer = b->res;
          } else {
@@ -4529,9 +4574,17 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             if (r->reads && r->reads < want)
                want = r->reads;
 
-            cb.user_buffer = (const char *)b->map + boffset;
-            cb.buffer_offset = 0;
+            if (boffset % device->ubo_offset_align == 0) {
+               cb.buffer = b->res;
+               cb.buffer_offset = (unsigned)boffset;
+               cb.user_buffer = b->map;
+            } else {
+               cb.user_buffer = (const char *)b->map + boffset;
+               cb.buffer_offset = 0;
+               rwa_bind_ubo_copies++;
+            }
             cb.buffer_size = (unsigned)want;
+            rwa_bind_ubos++;
          }
          pipe->set_constant_buffer(pipe, stage, r->index, &cb);
          break;
@@ -4858,6 +4911,170 @@ rwa_submit_profile(uint64_t out[5])
       redwood_pan_submit_ns = 0;
       redwood_pan_blend_compiles = 0;
    }
+}
+
+/* redwood-drm's own count of its requests to the kernel (redwood_drm.h, struct
+ * redwood_drm_stats; laid out the same here): calls and mach_absolute_time ticks by selector */
+struct rwa_drm_stats {
+   uint64_t calls[256];
+   uint64_t ticks[256];
+   uint64_t maps, map_ticks;
+   uint64_t unmaps, unmap_ticks;
+   uint64_t local_waits, local_madvises;
+   uint64_t queued_jobs, failed_jobs;
+};
+extern void redwood_drm_stats(struct rwa_drm_stats *stats) __attribute__((weak_import));
+
+static const char *
+drm_selector_name(unsigned selector)
+{
+   switch (selector) {
+   case 0x40: return "SUBMIT";
+   case 0x41: return "WAIT_BO";
+   case 0x42: return "CREATE_BO";
+   case 0x43: return "MMAP_BO";
+   case 0x44: return "GET_PARAM";
+   case 0x45: return "GET_BO_OFFSET";
+   case 0x48: return "MADVISE";
+   case 0x09: return "GEM_CLOSE";
+   case 0x7a: return "SET_MODE";
+   case 0x7b: return "WAIT_SEQ";
+   case 0x7c: return "PENDING";
+   case 0x7e: return "SURFACE";
+   default: return NULL;
+   }
+}
+
+static uint64_t
+ticks_ns(uint64_t ticks)
+{
+#ifdef __APPLE__
+   static mach_timebase_info_data_t tb;
+   if (tb.denom == 0)
+      mach_timebase_info(&tb);
+   return tb.denom ? ticks * tb.numer / tb.denom : ticks;
+#else
+   return ticks;
+#endif
+}
+
+/*
+ * panfrost's own profile since the last call (patch 0011, redwood_pan_prof.h) and redwood-drm's
+ * requests to the kernel, as lines for the plug-in's camprof: line `which` (0, 1, ...) into
+ * `line`; 0 when there is no such line. Line 0 clears what the others report, so they are read
+ * in order, 0 first, under one lock each but between the same two draws.
+ */
+int
+rwa_pan_profile(unsigned which, char *line, size_t size)
+{
+   RWA_GUARD();
+   static uint64_t p[RWP_SLOTS];
+   static const char *reason[RWP_REASONS];
+   static uint64_t reason_count[RWP_REASONS];
+   static struct rwa_drm_stats now, before;
+   static bool have_before;
+
+   if (!line || !size)
+      return 0;
+   if (which == 0) {
+      memcpy(p, redwood_pan_prof, sizeof(p));
+      memset(redwood_pan_prof, 0, sizeof(redwood_pan_prof));
+      memcpy(reason, redwood_pan_reason, sizeof(reason));
+      memcpy(reason_count, redwood_pan_reason_count, sizeof(reason_count));
+      memset(redwood_pan_reason, 0, sizeof(redwood_pan_reason));
+      memset(redwood_pan_reason_count, 0, sizeof(redwood_pan_reason_count));
+      if (redwood_drm_stats) {
+         before = now;
+         redwood_drm_stats(&now);
+      }
+   }
+   uint64_t draws = p[RWP_DRAWS] ? p[RWP_DRAWS] : 1;
+#define RWP_US(i) ((unsigned long long)(p[i] / 1000 / draws))
+#define RWP_EACH(n, ns) ((unsigned long long)(p[n] ? p[ns] / 1000 / p[n] : 0))
+   switch (which) {
+   case 0:
+      if (!p[RWP_DRAWS])
+         return 0;
+      snprintf(line, size, "rwm pan draw us: prepare %llu, count %llu, state3d %llu (zs %llu, blend %llu, "
+               "vertex %llu), stages %llu (textures %llu, samplers %llu, shaders %llu, ubos %llu, images %llu), "
+               "launch %llu; %llu draws, %llu with all state dirty",
+               RWP_US(RWP_PREPARE), RWP_US(RWP_VCOUNT), RWP_US(RWP_STATE3D), RWP_US(RWP_ZS),
+               RWP_US(RWP_BLEND), RWP_US(RWP_VERTEX), RWP_US(RWP_STAGES), RWP_US(RWP_TEX),
+               RWP_US(RWP_SAMP), RWP_US(RWP_SHADER), RWP_US(RWP_UBO), RWP_US(RWP_IMG),
+               RWP_US(RWP_LAUNCH), (unsigned long long)p[RWP_DRAWS], (unsigned long long)p[RWP_REBINDS]);
+      return 1;
+   case 1:
+      snprintf(line, size, "rwm pan memory: %llu batches begun (%llu us each), %llu pool buffers (%llu us each), "
+               "%llu buffers made (%llu us each), %llu of them new from the kernel (%llu us each); %llu batches "
+               "sent from inside a draw (%llu us each); %llu sent with work (%llu us each), %llu empty; "
+               "4 KB of a batch pool's memory: stored a word at a time %.1f us, memcpy %.1f us, loaded %.1f us "
+               "(malloc's: %.1f, %.1f, %.1f)",
+               (unsigned long long)p[RWP_BATCH_INITS], RWP_EACH(RWP_BATCH_INITS, RWP_BATCH_INIT_NS),
+               (unsigned long long)p[RWP_POOL_ALLOCS], RWP_EACH(RWP_POOL_ALLOCS, RWP_POOL_ALLOC_NS),
+               (unsigned long long)p[RWP_BO_CREATES], RWP_EACH(RWP_BO_CREATES, RWP_BO_CREATE_NS),
+               (unsigned long long)p[RWP_BO_FRESH], RWP_EACH(RWP_BO_FRESH, RWP_BO_FRESH_NS),
+               (unsigned long long)p[RWP_DEP_FLUSHES], RWP_EACH(RWP_DEP_FLUSHES, RWP_DEP_FLUSH_NS),
+               (unsigned long long)p[RWP_JOB_SUBMITS], RWP_EACH(RWP_JOB_SUBMITS, RWP_JOB_SUBMIT_NS),
+               (unsigned long long)p[RWP_EMPTY_SUBMITS],
+               redwood_pan_memtest[RWP_MEM_POOL_STORE] / 1e3, redwood_pan_memtest[RWP_MEM_POOL_COPY] / 1e3,
+               redwood_pan_memtest[RWP_MEM_POOL_LOAD] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_STORE] / 1e3,
+               redwood_pan_memtest[RWP_MEM_RAM_COPY] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_LOAD] / 1e3);
+      return 1;
+   case 2: {
+      size_t at = (size_t)snprintf(line, size, "rwm pan batches sent for:");
+      bool any = false;
+      for (unsigned i = 0; i < RWP_REASONS && reason[i] && at < size; i++) {
+         at += (size_t)snprintf(line + at, size - at, "%s %s x%llu", any ? "," : "", reason[i],
+                                (unsigned long long)reason_count[i]);
+         any = true;
+      }
+      return any;
+   }
+   case 3: {
+      if (!redwood_drm_stats)
+         return 0;
+      if (!have_before) {
+         have_before = true;     /* the first call has nothing to subtract */
+         return 0;
+      }
+      size_t at = (size_t)snprintf(line, size, "rwm kernel calls:");
+      bool taken[256] = { false };
+      /* the five that took longest, by name */
+      for (unsigned k = 0; k < 5 && at < size; k++) {
+         unsigned best = 256;
+         uint64_t best_ticks = 0;
+         for (unsigned s = 0; s < 256; s++) {
+            uint64_t t = now.ticks[s] - before.ticks[s];
+            if (!taken[s] && now.calls[s] != before.calls[s] && t >= best_ticks) {
+               best = s;
+               best_ticks = t;
+            }
+         }
+         if (best == 256)
+            break;
+         taken[best] = true;
+         const char *name = drm_selector_name(best);
+         char hex[8];
+         snprintf(hex, sizeof(hex), "%#04x", best);
+         at += (size_t)snprintf(line + at, size - at, "%s %s x%llu %.1f ms", k ? "," : "", name ? name : hex,
+                                (unsigned long long)(now.calls[best] - before.calls[best]),
+                                ticks_ns(best_ticks) / 1e6);
+      }
+      if (at < size)
+         snprintf(line + at, size - at, "; maps x%llu %.1f ms, unmaps x%llu %.1f ms; answered here: %llu waits, "
+                  "%llu madvises",
+                  (unsigned long long)(now.maps - before.maps), ticks_ns(now.map_ticks - before.map_ticks) / 1e6,
+                  (unsigned long long)(now.unmaps - before.unmaps),
+                  ticks_ns(now.unmap_ticks - before.unmap_ticks) / 1e6,
+                  (unsigned long long)(now.local_waits - before.local_waits),
+                  (unsigned long long)(now.local_madvises - before.local_madvises));
+      return 1;
+   }
+   default:
+      return 0;
+   }
+#undef RWP_US
+#undef RWP_EACH
 }
 
 uint64_t
@@ -8003,29 +8220,86 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * the end of a pool's mapping (24 October, twice). The passes are sent in the order
     * CoreAnimation made them either way.
     */
-   static int flush_on_switch = -1;
+   /*
+    * ...and since 15 November not all of them: a pass that is left is kept open for the next
+    * RWA_OPEN_PASSES passes (3 unless set; the plug-in's rwm_passes=N), so that a pass going
+    * back into the same attachments joins it -- one batch, one preload, one write-back where
+    * there were two; 1204 of 4515 passes went back into one left before (boot 0980) -- and is
+    * sent off when it falls out of that window (redwood_pan_pass_flush, Mesa 0013). panfrost
+    * sends it earlier whenever another batch reads or writes what it draws (the order Metal
+    * requires is kept by that; a blur that samples the pass it returns to still splits it), and
+    * everything goes at the end of the command buffer. The GPU still has the passes before the
+    * window to draw while the processor records the rest. RWA_FLUSH_ON_SWITCH=all: every switch
+    * sends everything, as from 26 October to 15 November; =0: no switch sends anything.
+    */
+   static int flush_on_switch = -1;       /* 0 never, 1 everything, 2 the window */
+   static unsigned open_window = 3;
    if (flush_on_switch < 0) {
       /* on unless RWA_FLUSH_ON_SWITCH=0, since 26 October: a frame's passes kept until its end left
        * the GPU idle while the processor recorded them and the processor idle while the GPU drew,
        * 8 + 11 ms one after the other -- 28 frames a second (run 148) */
       const char *flag = getenv("RWA_FLUSH_ON_SWITCH");
-      flush_on_switch = flag == NULL || strcmp(flag, "0") != 0;
+      const char *window = getenv("RWA_OPEN_PASSES");
+      flush_on_switch = flag == NULL ? 2 : strcmp(flag, "0") == 0 ? 0 : strcmp(flag, "all") == 0 ? 1 : 2;
+      if (window != NULL && *window != '\0')
+         open_window = MIN2((unsigned)strtoul(window, NULL, 10), 15u);
    }
    if (flush_on_switch) {
       static struct pipe_surface *last_cbuf, *last_zs;
       static struct pipe_surface *left[16];
       static unsigned nleft;
       static uint64_t left_span;
+      /* the passes left and kept open, oldest first, by value (a texture may go meanwhile; its
+       * batch holds the resource, so no other can take its address while the batch is open) */
+      static struct { struct pipe_surface c, z; } open[16];
+      static unsigned nopen;
       if ((fb.nr_cbufs ? surf[0] : NULL) != last_cbuf || zsurf != last_zs) {
-         if (last_cbuf || last_zs) {
-            pipe->flush(pipe, NULL, 0);
-            rwa_bind_flushes++;
-         }
-         /* counted for the profile only: a pass back into colour attachments left before */
          if (left_span != rwa_bind_span) {
             nleft = 0;
+            nopen = 0;
             left_span = rwa_bind_span;
          }
+         if (flush_on_switch == 1 && (last_cbuf || last_zs)) {
+            pipe->flush(pipe, NULL, 0);
+            rwa_bind_flushes++;
+         } else if (flush_on_switch == 2) {
+            const struct pipe_surface *to_c = fb.nr_cbufs ? surf[0] : NULL;
+            /* going back into a pass kept open: joined, if panfrost still has it */
+            for (unsigned i = 0; i < nopen; i++) {
+               bool same_c = to_c ? pipe_surface_equal(&open[i].c, to_c) : !open[i].c.texture;
+               bool same_z = zsurf ? pipe_surface_equal(&open[i].z, zsurf) : !open[i].z.texture;
+               if (same_c && same_z) {
+                  if (redwood_pan_pass_open(pipe, open[i].c.texture ? &open[i].c : NULL,
+                                            open[i].z.texture ? &open[i].z : NULL))
+                     rwa_bind_merges++;
+                  memmove(&open[i], &open[i + 1], (nopen - i - 1) * sizeof(open[0]));
+                  nopen--;
+                  break;
+               }
+            }
+            /* the pass left joins the window; what falls out of it is sent */
+            if (last_cbuf || last_zs) {
+               if (nopen == ARRAY_SIZE(open)) {
+                  redwood_pan_pass_flush(pipe, open[0].c.texture ? &open[0].c : NULL,
+                                         open[0].z.texture ? &open[0].z : NULL);
+                  memmove(&open[0], &open[1], (nopen - 1) * sizeof(open[0]));
+                  nopen--;
+               }
+               memset(&open[nopen], 0, sizeof(open[0]));
+               if (last_cbuf)
+                  open[nopen].c = *last_cbuf;
+               if (last_zs)
+                  open[nopen].z = *last_zs;
+               nopen++;
+            }
+            while (nopen > open_window) {
+               rwa_bind_flushes += redwood_pan_pass_flush(pipe, open[0].c.texture ? &open[0].c : NULL,
+                                                          open[0].z.texture ? &open[0].z : NULL);
+               memmove(&open[0], &open[1], (nopen - 1) * sizeof(open[0]));
+               nopen--;
+            }
+         }
+         /* counted for the profile only: a pass back into colour attachments left before */
          for (unsigned i = 0; fb.nr_cbufs && surf[0] && i < nleft; i++) {
             if (left[i] == surf[0]) {
                rwa_bind_returns++;
@@ -8289,9 +8563,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .count = draw->vertex_count,
          .index_bias = index_size ? draw->base_vertex : 0,
       };
+      uint64_t c4 = thread_ns();
       t4 = os_time_get_nano();
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
       t5 = os_time_get_nano();
+      rwa_bind_vbo_cpu_ns += thread_ns() - c4;
+      rwa_bind_vbo_wall_ns += t5 - t4;
       rwa_draw_ns[3] += t4 - t3;
       rwa_draw_ns[4] += t5 - t4;
       /* a draw after a framebuffer set, which panfrost answers by emitting all its state */

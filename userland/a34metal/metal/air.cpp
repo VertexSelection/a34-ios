@@ -6,6 +6,7 @@
 #include "rwm.h"
 
 #include <dlfcn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
@@ -62,6 +63,29 @@ load()
 	if (rwm_boot_arg("rwm_rebind=all")) {
 		setenv("RWA_REBIND_ALL", "1", 1);
 	}
+	/* boot-arg rwm_pushubo=0: panfrost pushes only UBO 0 of a Metal shader, as upstream (Mesa patch
+	 * 0012; shaders compiled from then on -- the disk cache keeps what it has) */
+	if (rwm_boot_arg("rwm_pushubo=0")) {
+		setenv("REDWOOD_PAN_PUSHUBO", "0", 1);
+	}
+	/* boot-arg rwm_passes=all: every pass switch sends every batch (26 October to 15 November); rwm_passes=none: no
+	 * switch sends anything; rwm_passes=N: a pass left is kept open for N passes more (air_metal.c; 3 unless set) */
+	{
+		const char *args = rwm_boot_args(), *at = strstr(args, "rwm_passes=");
+
+		if (at != nullptr && (at == args || at[-1] == ' ')) {
+			char value[8] = { 0 };
+
+			sscanf(at + 11, "%7[^ ]", value);
+			if (strcmp(value, "all") == 0) {
+				setenv("RWA_FLUSH_ON_SWITCH", "all", 1);
+			} else if (strcmp(value, "none") == 0) {
+				setenv("RWA_FLUSH_ON_SWITCH", "0", 1);
+			} else if (value[0] != 0) {
+				setenv("RWA_OPEN_PASSES", value, 1);
+			}
+		}
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),
@@ -85,6 +109,7 @@ load()
 		call("rwa_render_clear_attachments", &c.render_clear_attachments, false),
 		call("rwa_texture_view", &c.texture_view, false),
 		call("rwa_texture_probe", &c.texture_probe, false),
+		call("rwa_texture_probe_at", &c.texture_probe_at, false),
 		call("rwa_depth_read", &c.depth_read, false),
 		call("rwa_texture_destroy", &c.texture_destroy, false),
 		call("rwa_sampler_create", &c.sampler_create, true),

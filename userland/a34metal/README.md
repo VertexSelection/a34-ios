@@ -188,6 +188,12 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   the clip mask) and of level 0 of every texture it reads (`reads t3 ...`), and probes the
   texture-to-texture copies ("a copy of WxH from ... the source's centre ..., the
   destination's ...").
+- **`rwm_framedump=N`**: once a blur has been drawn, the next N draws into a target of the
+  screen's size, whatever their pipeline (lines `framedump:`), each with its target's `#id`,
+  whether it cleared it, and a 4x4 grid over the whole level after the draw. Boot
+  0938-metal120-d: the target the blur samples and composites into (`#d76b`) held only black and
+  the materials' tint, while the screen showed the wallpaper. This shows where the wallpaper and
+  icons are drawn and whether anything clears that target in between.
 - **`rwm_pandebug=FLAGS`**: Mesa's `PAN_MESA_DEBUG` for the driver's screen (`sync`: every GPU
   job waited for; `nocrc`, `noafbc`, `linear`). The first test: `rwm_pandebug=sync` shows whether
   the blur's black is a read of a texture before the GPU wrote it.

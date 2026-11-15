@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 9c63c2b..076e5c5 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -18,6 +18,9 @@
+  *   6  and 7 (0961, milestone 2): the running firmware's command channel and one passive scan,
+  *      every network heard said in the log -- see milestone 2's part below
+  *
++ * A34 (0963): the station's address is this phone's own, kept on the iOS root in /a34/wifi/mac
++ * (random, locally administered; userland/a34wifi writes it once); never from nvram/nvdata/efs.
++ *
+  * A34 (0960): steps 2 and 3 were 0940's own conninfra power-up; they now use a34_connsys.c so
+  * that Wi-Fi and Bluetooth can run in one boot, and Wi-Fi uses CONNSYS's one memory region
+  * ("EMI", a34_connsys_emi_pa(): Bluetooth's images live there too) instead of its own; step 4
+@@ -55,6 +58,7 @@
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/uio.h>
++#include <sys/random.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+@@ -583,8 +587,9 @@ static uint32_t a34w_tx_cidx, a34w_rx_cidx;
+ static uint8_t a34w_seq;
+ static bool a34w_mbox_reset(void);       /* (0961) milestone 2's part, below: step 5 calls it */
+ 
++/* /a34/wifi/<name>, whole, between `least` bytes and 8 MB; `who` says who puts it there when it is not */
+ static uint8_t *
+-a34w_file(const char *name, uint32_t *size)
++a34w_file(const char *name, uint32_t least, const char *who, uint32_t *size)
+ {
+ 	char path[96];
+ 	vfs_context_t context = vfs_context_kernel();
+@@ -601,12 +606,12 @@ a34w_file(const char *name, uint32_t *size)
+ 	}
+ 	snprintf(path, sizeof(path), A34W_FW_DIR "%s", name);
+ 	if ((error = vnode_lookup(path, 0, &vnode, context)) != 0) {
+-		a34w_say("%s: not found (%d): tools/wifi-fw.sh puts it there", path, error);
++		a34w_say("%s: not found (%d): %s", path, error, who);
+ 		return NULL;
+ 	}
+ 	VATTR_INIT(&attributes);
+ 	VATTR_WANTED(&attributes, va_data_size);
+-	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size < 64u ||
++	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size < least ||
+ 	    attributes.va_data_size > (8u << 20)) {
+ 		a34w_say("%s: no size, or not a plausible one", path);
+ 		vnode_put(vnode);
+@@ -678,7 +683,7 @@ static bool
+ a34w_rom_emi_load(void)
+ {
+ 	uint32_t size = 0, addr, offset;
+-	uint8_t *file = a34w_file(FW_ROM_EMI, &size);
++	uint8_t *file = a34w_file(FW_ROM_EMI, 64u, "tools/wifi-fw.sh puts it there", &size);
+ 	char date[17];
+ 
+ 	if (file == NULL) {
+@@ -1048,7 +1053,7 @@ static bool
+ a34w_ram_code_load(void)
+ {
+ 	uint32_t size = 0, regions, at = 0, end;
+-	uint8_t *file = a34w_file(FW_RAM_CODE, &size);
++	uint8_t *file = a34w_file(FW_RAM_CODE, 64u, "tools/wifi-fw.sh puts it there", &size);
+ 	const uint8_t *tailer;
+ 	bool ok = true;
+ 
+@@ -1365,7 +1370,7 @@ a34w_heard_report(const char *what)
+ static uint32_t a34w_mbox_offset;               /* the mailbox's offset in CONNSYS's memory */
+ static bool a34w_mbox_ready;
+ static uint8_t a34w_cmd_seq;
+-static uint8_t a34w_mac[6] = { 0x02, 0x41, 0x33, 0x34, 0x57, 0x46 };   /* (locally administered: "A34WF") */
++static uint8_t a34w_mac[6];             /* (0963) step 6 chooses it: a34w_mac_choose() */
+ static uint8_t a34w_scan_seq;
+ static uint32_t a34w_rx_events, a34w_rx_frames, a34w_rx_other;
+ static uint8_t a34w_rxbuf[SLOT_SIZE];
+@@ -1551,6 +1556,82 @@ a34w_wait_event(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, uint32_t
+ 
+ /* ---- step 6: the running firmware answers ---- */
+ 
++/*
++ * (0963) The station's address. This phone's efuse holds none (00:00:00:00:00:00 on the
++ * phone); Android takes Samsung's from /efs, which is never read here. Instead every phone keeps
++ * its own on its iOS root: /a34/wifi/mac, one line "xx:xx:xx:xx:xx:xx", a random locally
++ * administered unicast address that userland/a34wifi writes once (when the file is not there)
++ * and never changes, so two A34s on one network do not share one. Without the file: the
++ * efuse's, if it ever has one, else a random one for this boot only.
++ */
++#define A34W_MAC_FILE                   "mac"
++
++static int
++a34w_hex(uint8_t c)
++{
++	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
++}
++
++/* "xx:xx:xx:xx:xx:xx" (':' or '-'), then nothing but white space; locally administered, unicast, not all zero */
++static bool
++a34w_mac_parse(const uint8_t *text, uint32_t length, uint8_t mac[6])
++{
++	uint32_t at = 0;
++
++	while (at < length && (text[at] == ' ' || text[at] == '\t')) {
++		at++;
++	}
++	for (unsigned i = 0; i < 6u; i++) {
++		int hi, lo;
++
++		if (i != 0u) {
++			if (at >= length || (text[at] != ':' && text[at] != '-')) {
++				return false;
++			}
++			at++;
++		}
++		if (at + 2u > length || (hi = a34w_hex(text[at])) < 0 || (lo = a34w_hex(text[at + 1u])) < 0) {
++			return false;
++		}
++		mac[i] = (uint8_t)(hi << 4 | lo);
++		at += 2u;
++	}
++	for (; at < length; at++) {
++		if (text[at] != ' ' && text[at] != '\t' && text[at] != '\r' && text[at] != '\n') {
++			return false;
++		}
++	}
++	return (mac[0] & 3u) == 2u;     /* locally administered (bit 1), unicast (bit 0 clear): so never all zero */
++}
++
++/* `efuse`: the chip's own address, or NULL; leaves the one to use in a34w_mac and says where it came from */
++static const char *
++a34w_mac_choose(const uint8_t *efuse)
++{
++	uint32_t size = 0;
++	uint8_t *text = a34w_file(A34W_MAC_FILE, 12u, "userland/a34wifi writes it once", &size);
++	uint8_t kept[6];
++
++	if (text != NULL) {
++		bool good = size <= 64u && a34w_mac_parse(text, size, kept);
++
++		kfree_data(text, (vm_size_t)size);
++		if (good) {
++			memcpy(a34w_mac, kept, 6);
++			return "this phone's, kept in " A34W_FW_DIR A34W_MAC_FILE;
++		}
++		a34w_say("step 6: " A34W_FW_DIR A34W_MAC_FILE " (%u bytes) is not one line \"xx:xx:xx:xx:xx:xx\" with a "
++		    "locally administered unicast address: not used", size);
++	}
++	if (efuse != NULL) {
++		memcpy(a34w_mac, efuse, 6);
++		return "the chip's";
++	}
++	read_random(a34w_mac, 6);
++	a34w_mac[0] = (uint8_t)((a34w_mac[0] & 0xfcu) | 0x02u);
++	return "random, for this boot only: 'a34wifi mac' keeps one";
++}
++
+ static bool
+ a34w_step6(void)
+ {
+@@ -1558,7 +1639,9 @@ a34w_step6(void)
+ 	uint8_t basic[12], seq;
+ 	uint32_t count, at = 4;
+ 	int got;
+-	bool mac = false;
++	uint8_t efuse[6];
++	bool have_efuse = false;
++	const char *source;
+ 
+ 	if (!a34w_conn_reachable()) {
+ 		a34w_say("step 6: the CONN domain is off or protected: not touched");
+@@ -1601,18 +1684,19 @@ a34w_step6(void)
+ 			a34w_say("step 6: MAC address in the efuse: %02x:%02x:%02x:%02x:%02x:%02x%s", b[0], b[1], b[2], b[3],
+ 			    b[4], b[5], none ? " (none: a locally administered one is used)" : "");
+ 			if (!none) {
+-				memcpy(a34w_mac, b, 6);
+-				mac = true;
++				memcpy(efuse, b, 6);
++				have_efuse = true;
+ 			}
+ 		} else if (tag == TAG_CAP_HW_ADIE_VERSION && length >= 4u) {
+ 			a34w_say("step 6: A-die 0x%04x ECO %u", (unsigned)(b[0] | b[1] << 8), (unsigned)(b[2] | b[3] << 8));
+ 		}
+ 		at += 8u + length;
+ 	}
++	source = a34w_mac_choose(have_efuse ? efuse : NULL);
+ 	bzero(basic, sizeof(basic));                    /* CMD_BASIC_CONFIG: native 802.11 off, asserts and debug level 0 */
+ 	seq = a34w_cmd(CMD_ID_BASIC_CONFIG, CMD_SET, basic, sizeof(basic));
+ 	a34w_say("step 6: BASIC_CONFIG %s; MAC %02x:%02x:%02x:%02x:%02x:%02x (%s)", seq != 0 ? "sent" : "NOT SENT", a34w_mac[0],
+-	    a34w_mac[1], a34w_mac[2], a34w_mac[3], a34w_mac[4], a34w_mac[5], mac ? "the chip's" : "locally administered");
++	    a34w_mac[1], a34w_mac[2], a34w_mac[3], a34w_mac[4], a34w_mac[5], source);
+ 	return seq != 0;
+ }
+ 

@@ -4103,7 +4103,9 @@ rw_core_of(id texture)
 		[self retain];
 		[scheduled release];
 		dispatch_async(completions, ^{
+			rwm_on_completion_queue = true;         /* (counted apart: rwm waits) */
 			[self waitUntilCompleted];
+			rwm_on_completion_queue = false;
 			[self redwoodReleaseSampled];
 			for (id handler in completed) {
 				[self redwoodDeliver:(void (^)(id))handler];
@@ -4213,7 +4215,7 @@ rw_core_of(id texture)
 	RedwoodMetalRenderPipeline *p = state;
 
 	rwm_render_set_pipeline(&_state, p, [p render], [p vertexStreamMask], [p vertexStreamCount], [p writesDepth]);
-	if (rwm_blurdump_on()) {        /* (metal-fx) which draws rwm_blurdump probes */
+	if (rwm_blurdump_on() || rwm_framedump_on()) {  /* (metal-fx) which draws rwm_blurdump/rwm_framedump probe */
 		rwm_render_set_label(&_state, [[p label] UTF8String]);
 	}
 }

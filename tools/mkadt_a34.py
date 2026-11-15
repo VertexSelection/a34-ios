@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the Apple Device Tree for the sweet/ruby XNU on the Galaxy A34 (MT6877).
 
-  mkadt_a34.py OUT.adt [--dump] [--d22ap PATH]
+  mkadt_a34.py OUT.adt [--dump] [--d22ap PATH] [--bootargs LINE --commandline-out FILE]
 
 Based on ios-sweet's tools/mkadt.py (MIT, third_party/ios-sweet): same node
 layout, because the ruby kernel is the sweet kernel plus MT6877 patches and
@@ -12,6 +12,14 @@ Every MT6877/A34 value below comes from the phone's live FDT
 The framebuffer entries are defaults: the shim checks which LK buffer the
 display engine is scanning and rewrites /sweet-fbcon reg and stride before
 starting XNU.
+
+Boot-args longer than boot_args.CommandLine (607 characters; tools/build-xnu.sh
+hands the whole line over with --bootargs): CommandLine gets as many whole
+arguments as fit -- the ones the kernel looks at first (debug, serial, cpus,
+rd, ufs*, ...) put first -- and written to --commandline-out, for mkpayload.py;
+the rest goes into /chosen/a34-bootargs, where the kernel joins it on
+(xnu/patches/0990-a34-long-bootargs.patch). A line that fits stays as it is,
+and there is no property. In all at most 4095 characters.
 """
 import argparse, hashlib, os, struct, sys
 
@@ -53,6 +61,39 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
+COMMAND_LINE_MAX = 607         # boot_args.CommandLine: BOOT_LINE_LENGTH 608, with its NUL
+BOOT_ARGS_MAX = 4095            # 0990: the kernel's whole line (KERNEL_BOOT_INFO_MAX 4096, with its NUL)
+# What the kernel parses first (arm_init: serial, cpus, debug; the root's rd/ufs*): kept in
+# CommandLine, which is there even without the device tree's part.
+EARLY_ARGS = ('debug', 'serial', 'cpus', 'keepsyms', '-noprogress', 'rd', 'maxmem', 'wdt', 'wdt_test', 'rootrw')
+EARLY_PREFIXES = ('ufs',)
+
+
+def arg_name(arg):
+    return arg.split('=', 1)[0]
+
+
+def split_bootargs(line):
+    """(CommandLine, the rest) for a boot-args line: see the top."""
+    args = line.split()
+    whole = ' '.join(args)
+    if len(whole.encode()) > BOOT_ARGS_MAX:
+        raise SystemExit(f'boot-args: {len(whole)} characters, at most {BOOT_ARGS_MAX}')
+    if len(whole.encode()) <= COMMAND_LINE_MAX:
+        return whole, ''
+    early = lambda a: arg_name(a) in EARLY_ARGS or arg_name(a).startswith(EARLY_PREFIXES)
+    # (stable: an argument given twice keeps its order, and the last one counts as before)
+    ordered = [a for a in args if early(a)] + [a for a in args if not early(a)]
+    head, used = [], 0
+    for i, a in enumerate(ordered):
+        n = len(a.encode()) + (1 if head else 0)
+        if used + n > COMMAND_LINE_MAX:
+            return ' '.join(head), ' '.join(ordered[i:])
+        head.append(a)
+        used += n
+    return ' '.join(head), ''
+
+
 def node(name, props=(), children=()):
     n = adt.Node()
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
@@ -73,7 +114,7 @@ def d22ap_product(path):
     raise SystemExit(f'{path}: no /product node')
 
 
-def build(d22ap=D22AP_ADT, seed=None):
+def build(d22ap=D22AP_ADT, seed=None, bootargs_more=''):
     phys_base, mem_size = PHYS_BASE, MEM_SIZE
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -99,7 +140,8 @@ def build(d22ap=D22AP_ADT, seed=None):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + ([('a34-bootargs', cstr(bootargs_more))] if bootargs_more else []),
+        [node('memory-map', [ph()]),
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
     # MT6877: cores 0-5 Cortex-A55 (MPIDR 0x000-0x500), 6-7 big cores
@@ -204,8 +246,18 @@ if __name__ == '__main__':
     ap.add_argument('out')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--d22ap', default=D22AP_ADT)
+    ap.add_argument('--bootargs', help='the whole boot-args line (split: see the top)')
+    ap.add_argument('--commandline-out', help='where the part for boot_args.CommandLine goes')
     a = ap.parse_args()
-    blob = adt.serialize(build(a.d22ap))
+    more = ''
+    if a.bootargs is not None:
+        if not a.commandline_out:
+            ap.error('--bootargs needs --commandline-out')
+        head, more = split_bootargs(a.bootargs)
+        open(a.commandline_out, 'w').write(head)
+        print(f'boot-args: {len(head)} characters in CommandLine' +
+              (f', {len(more)} in /chosen/a34-bootargs (needs kernel patch 0990)' if more else ''), file=sys.stderr)
+    blob = adt.serialize(build(a.d22ap, bootargs_more=more))
     open(a.out, 'wb').write(blob)
     if a.dump:
         adt.dump(adt.parse(blob)[0])

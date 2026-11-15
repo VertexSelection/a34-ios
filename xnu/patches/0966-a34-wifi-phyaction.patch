@@ -1,0 +1,178 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 398efc0..8d745de 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -23,6 +23,8 @@
+  *      (TX 0, RX 2-5) and the DMA scheduler (DMASHDL), as Android does before the firmware runs.
+  *   9  (0965): the network interface (a34_wifi_net.c, "enN", kern.a34wifi.ifname) on the data
+  *      rings; an address comes by DHCP from user space (a34wifi dhcp: configd's IPConfiguration)
++ *   (0966) opt-in, boot-arg a34wifiphy=1 or sysctl kern.a34wifi.phyaction=1 before step 5:
++ *      PHY_ACTION (calibration, the vendor's default NVRAM tags, no FEM) before the RAM code
+  *
+  * A34 (0963): the station's address is this phone's own, kept on the iOS root in /a34/wifi/mac
+  * (random, locally administered; userland/a34wifi writes it once); never from nvram/nvdata/efs.
+@@ -567,6 +569,9 @@ a34w_step3(void)
+ #define INIT_CMD_ID_DYN_MEM_MAP_FW_FINISH 0x41u
+ #define INIT_EVENT_ID_CMD_RESULT        1u
+ #define INIT_EVENT_ID_ACCESS_REG        2u
++#define INIT_CMD_ID_PHY_ACTION          8u              /* (0966) */
++#define INIT_EVENT_ID_PHY_ACTION        5u
++#define INIT_CMD_PAYLOAD_MOST           640u
+ #define INIT_CMD_PACKET_TYPE_ID         0xa0u
+ #define TXD_SIZE                        32u
+ #define INIT_CMD_HEADER_SIZE            64u             /* TXD + INIT_HIF_TX_HEADER */
+@@ -1094,11 +1099,11 @@ a34w_rx(uint8_t *frame, uint32_t room, uint32_t wait_ms)
+ static uint8_t
+ a34w_init_cmd(uint8_t cid, const void *payload, uint32_t payload_length)
+ {
+-	static uint8_t frame[INIT_CMD_HEADER_SIZE + 64u];
++	static uint8_t frame[INIT_CMD_HEADER_SIZE + INIT_CMD_PAYLOAD_MOST];
+ 	const uint32_t length = INIT_CMD_HEADER_SIZE + payload_length;
+ 	uint32_t dw;
+ 
+-	if (payload_length > 64u) {
++	if (payload_length > INIT_CMD_PAYLOAD_MOST) {
+ 		return 0;
+ 	}
+ 	bzero(frame, sizeof(frame));
+@@ -1164,6 +1169,113 @@ a34w_access_reg(uint32_t address, uint32_t *value)
+ 	return true;
+ }
+ 
++/*
++ * (0966) PHY_ACTION, opt-in (boot-arg a34wifiphy=1, or sysctl kern.a34wifi.phyaction=1 before step
++ * 5): what Android's wlanPreCal sends when it has no calibration of its own to give back
++ * (pre_cal.c:576-645): INIT command 8 {magic 0x556789aa, 3 tags, version 1, length} with CAL
++ * {force calibration}, NVRAM (tags 7-9 of the vendor's default image /vendor/firmware/WIFI, as
++ * wlanGetEpaElnaFromNvram cuts them: with their 3-byte headers, padded to 4, 512 at most -- never
++ * the phone's own nvdata copy) and COM_FEM (104 zero bytes: connfem never binds on the MT6877, so
++ * Android's is all zeros too), before the RAM code; INIT event 5 answers it. Off by default:
++ * steps 1-7 ran without it on the phone; it is for when the AP never acknowledges our frames.
++ */
++#define PHY_ACTION_MAGIC                0x556789aau
++#define PHY_ACTION_NVRAM_MOST           512u
++#define A34W_NVRAM_FILE                 "WIFI"
++
++static int a34w_phyaction;
++
++static void
++a34w_le32_put(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++/* the NVRAM tag's body out of an NVRAM image: from tag 7 up to tag 10, then tag 21 if any; its length */
++static uint32_t
++a34w_nvram_body(const uint8_t *d, uint32_t size, uint8_t *out)
++{
++	uint32_t at = 256u, end, start = 0, n = 0;
++
++	if (size < 262u) {
++		return 0;
++	}
++	end = (uint32_t)(d[at + 4u] | d[at + 5u] << 8) + 256u;          /* the control tag says the tags' length */
++	if (end > size) {
++		end = size;
++	}
++	while (at + 3u <= end) {
++		uint32_t tag = d[at], length = (uint32_t)(d[at + 1u] | d[at + 2u] << 8);
++
++		if ((tag == 0 && length == 0) || at + 3u + length > size) {
++			break;
++		}
++		if (tag == 7u) {
++			start = at;
++		} else if (tag == 10u && start != 0) {
++			n = at - start > PHY_ACTION_NVRAM_MOST ? PHY_ACTION_NVRAM_MOST : at - start;
++			memcpy(out, d + start, n);
++		} else if (tag == 21u && n != 0 && n + 3u + length <= PHY_ACTION_NVRAM_MOST) {
++			memcpy(out + n, d + at, 3u + length);
++			n += 3u + length;
++		}
++		at += 3u + length;
++	}
++	while ((n & 3u) != 0) {
++		out[n++] = 0;
++	}
++	return n;
++}
++
++static bool
++a34w_phy_action(void)
++{
++	static uint8_t message[8u + 8u + 4u + PHY_ACTION_NVRAM_MOST + 4u + 104u];
++	uint8_t answer[64], eid = 0, seq;
++	uint32_t size = 0, nvram, n = 8;
++	uint8_t *image = a34w_file(A34W_NVRAM_FILE, 512u, "tools/wifi-fw.sh copies the vendor's default", &size);
++	const uint8_t *r;
++	int got;
++
++	if (image == NULL) {
++		a34w_say("step 5: PHY_ACTION NOT SENT (no NVRAM image)");
++		return false;
++	}
++	bzero(message, sizeof(message));
++	message[n] = 1;                                 /* CAL: force calibration */
++	message[n + 2u] = 4;
++	message[n + 4u] = 0x01;
++	n += 8u;
++	nvram = a34w_nvram_body(image, size, message + n + 4u);    /* NVRAM */
++	message[n + 2u] = (uint8_t)nvram;
++	message[n + 3u] = (uint8_t)(nvram >> 8);
++	n += 4u + nvram;
++	message[n] = 2;                                 /* COM_FEM: none */
++	message[n + 2u] = 104;
++	n += 4u + 104u;
++	a34w_le32_put(message, PHY_ACTION_MAGIC);
++	message[4] = 3;                                 /* tags */
++	message[5] = 1;                                 /* version */
++	message[6] = (uint8_t)(n - 8u);
++	message[7] = (uint8_t)((n - 8u) >> 8);
++	kfree_data(image, (vm_size_t)size);
++	seq = a34w_init_cmd(INIT_CMD_ID_PHY_ACTION, message, n);
++	got = seq != 0 ? a34w_init_event(seq, &eid, answer, sizeof(answer), 3000) : -1;
++	if (got < 28 || eid != INIT_EVENT_ID_PHY_ACTION || a34w_le32(answer) != PHY_ACTION_MAGIC) {
++		a34w_say("step 5: PHY_ACTION (%u bytes, NVRAM part %u) %s (event 0x%02x, %d bytes)", n, nvram,
++		    seq == 0 ? "NOT SENT" : "NOT ANSWERED", eid, got);
++		return false;
++	}
++	r = answer + 12;                                /* after the header and the tag's own 4 bytes */
++	a34w_say("step 5: PHY_ACTION (force calibration; the default NVRAM's tags 7-9, %u bytes; no FEM): event 0x%02x "
++	    "status %u (0x81/0 calibrated, 0x82/2 recalibrated), calibration data %u bytes at 0x%08x, temperature %u",
++	    nvram, r[0], r[1], a34w_le32(r + 8), a34w_le32(r + 4), a34w_le32(r + 12));
++	return (r[0] == 0x81u && r[1] == 0) || (r[0] == 0x82u && r[1] == 2u);
++}
++
+ /* the RAM code's regions (fw_dl.c: wlanImageSectionDownloadStage with dynamic memory mapping) */
+ static bool
+ a34w_ram_code_load(void)
+@@ -1275,6 +1387,9 @@ a34w_step5(void)
+ 		return false;
+ 	}
+ 	a34w_say("step 5: the ROM answers: TOP_HVR 0x%08x TOP_FVR 0x%08x", hvr, fvr);
++	if (a34w_phyaction != 0) {
++		(void)a34w_phy_action();                /* (0966) opt-in; said in the log either way, the start goes on */
++	}
+ 
+ 	a34w_wr(a34w_ap, PCCIF_WF_PWR_ON, 0);           /* wlanConnacPccifon(): "Wi-Fi on" for the modem's PCCIF */
+ 	if (!a34w_ram_code_load()) {
+@@ -3402,6 +3517,8 @@ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, rescan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+     a34w_sysctl_rescan, "I", "write 1: scan again (after step 7)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, phyaction, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_phyaction, 0,
++    "(0966) 1: PHY_ACTION before the RAM code (set before step 5)");
+ 
+ /* (0964) 1 while joined to the network of /a34/wifi/network */
+ static int
+@@ -3485,6 +3602,7 @@ a34_wifi_init(void)
+ {
+ 	int step = 0;
+ 
++	(void)PE_parse_boot_argn("a34wifiphy", &a34w_phyaction, sizeof(a34w_phyaction));       /* (0966) */
+ 	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
+ 		return;
+ 	}

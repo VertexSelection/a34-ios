@@ -106,6 +106,8 @@ say_first_drawn(struct rwm_work *const *works, unsigned count, const char *(*lab
 
 } // namespace
 
+__thread bool rwm_on_completion_queue;
+
 extern "C" bool
 rwm_copyin_late(void)
 {
@@ -252,8 +254,13 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 		if (air->wait_seq(c->seq, 5000000000ll) != 0) {
 			rwm_print("THE GPU DID NOT FINISH job %llu\n", (unsigned long long)c->seq);
 		}
-		rwm_perf.completed_waits++;
-		rwm_perf.completed_ns += rwm_ns() - from;
+		if (rwm_on_completion_queue) {
+			rwm_perf.completed_q_waits++;
+			rwm_perf.completed_q_ns += rwm_ns() - from;
+		} else {
+			rwm_perf.completed_waits++;
+			rwm_perf.completed_ns += rwm_ns() - from;
+		}
 		c->status = RWM_CB_COMPLETED;
 		return 0;
 	}

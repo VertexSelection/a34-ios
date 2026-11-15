@@ -4,6 +4,7 @@
  */
 #include "rwm.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,21 +29,54 @@ rwm_blurdump_on(void)
 	return blur_dumps_left > 0;
 }
 
-/* " WxH bytes" of the texel at the centre of `level` (and `slice`) of a texture, appended to `line` */
+/*
+ * A summary of sixteen texels on a 4 x 4 grid over a rectangle of a level of a texture: how many are opaque
+ * (alpha > 0xf0), how many are nothing (all zero), and the mean colour, appended to `line` as
+ * " #id WxH [x,y wxh] o/z mean bbggrraa". `#id` tells the textures of one frame apart (the same number is the same
+ * texture); a rectangle of 0 x 0 is the whole level.
+ */
 static size_t
-probe_into(char *line, size_t used, size_t size, struct rwa_texture *texture, unsigned level, unsigned slice)
+probe_into(char *line, size_t used, size_t size, struct rwa_texture *texture, unsigned level, unsigned slice,
+	   const unsigned box_in[4])
 {
 	uint8_t texel[16] = {};
-	unsigned w = 0, h = 0;
+	unsigned w = 0, h = 0, opaque = 0, empty = 0, sum[4] = {}, got = 0, bytes = 0;
 	char why[120] = {};
-	int bytes = rwm_air()->texture_probe(texture, level, slice, texel, &w, &h, why, sizeof(why));
+	const struct rwm_air *air = rwm_air();
+	int first = air->texture_probe(texture, level, slice, texel, &w, &h, why, sizeof(why));
 
-	if (bytes <= 0) {
-		return used + (size_t)snprintf(line + used, size - used, " (%s)", why);
+	if (first <= 0) {
+		return used + (size_t)snprintf(line + used, size - used, " #%04x (%s)",
+					       (unsigned)((uintptr_t)texture >> 4 & 0xffff), why);
 	}
-	used += (size_t)snprintf(line + used, size - used, " %ux%u", w, h);
-	for (int b = 0; b < bytes && b < 8 && used < size - 4; b++) {
-		used += (size_t)snprintf(line + used, size - used, "%s%02x", b == 0 ? " " : "", texel[b]);
+	bytes = (unsigned)first;
+	unsigned box[4] = { 0, 0, w, h };
+
+	if (box_in != nullptr && box_in[2] != 0 && box_in[3] != 0) {
+		box[0] = box_in[0] < w ? box_in[0] : w - 1;
+		box[1] = box_in[1] < h ? box_in[1] : h - 1;
+		box[2] = box_in[2] < w - box[0] ? box_in[2] : w - box[0];
+		box[3] = box_in[3] < h - box[1] ? box_in[3] : h - box[1];
+	}
+	for (unsigned gy = 0; gy < 4 && air->texture_probe_at != nullptr; gy++) {
+		for (unsigned gx = 0; gx < 4; gx++) {
+			unsigned x = box[0] + (2 * gx + 1) * box[2] / 8, y = box[1] + (2 * gy + 1) * box[3] / 8;
+
+			if (air->texture_probe_at(texture, level, slice, x, y, texel, &w, &h, why, sizeof(why)) <= 0) {
+				continue;
+			}
+			got++;
+			opaque += bytes >= 4 && texel[3] > 0xf0;
+			empty += texel[0] == 0 && texel[1] == 0 && (bytes < 3 || texel[2] == 0) && (bytes < 4 || texel[3] == 0);
+			for (unsigned c = 0; c < 4 && c < bytes; c++) {
+				sum[c] += texel[c];
+			}
+		}
+	}
+	used += (size_t)snprintf(line + used, size - used, " #%04x %ux%u [%u,%u %ux%u] %u/%u", (unsigned)((uintptr_t)texture >> 4 & 0xffff),
+				 w, h, box[0], box[1], box[2], box[3], opaque, empty);
+	for (unsigned c = 0; c < 4 && c < bytes && got != 0; c++) {
+		used += (size_t)snprintf(line + used, size - used, "%s%02x", c == 0 ? " " : "", sum[c] / got);
 	}
 	return used;
 }
@@ -55,42 +89,118 @@ rwm_blurdump_used(void)
 	}
 }
 
+/*
+ * (metal-fx) Boot-arg rwm_framedump=N: once a blur has been drawn (a downsample, a narrow blur, a variable blur), the
+ * next N draws into a target of the screen's size (whatever their pipeline), a line each ("framedump:"): the pipeline,
+ * the target (#id), whether the draw cleared it, and a 4 x 4 grid over its whole first level after the draw. Boot
+ * 0938-metal120-d: the target the blur samples and composites into held black and the materials' tint only, while
+ * the screen showed the wallpaper -- this shows into which target the wallpaper and the icons are drawn, and whether
+ * anything clears that target in between.
+ */
+static long frame_dumps_left = -1;
+static bool blur_seen;
+
+extern "C" bool
+rwm_framedump_on(void)
+{
+	if (frame_dumps_left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_framedump=");
+
+		frame_dumps_left = at != nullptr ? atol(at + 14) : 0;
+	}
+	return frame_dumps_left > 0;
+}
+
+static size_t probe_into(char *line, size_t used, size_t size, struct rwa_texture *texture, unsigned level,
+			 unsigned slice, const unsigned box_in[4]);
+
+static void
+frame_dump(const struct rwm_draw *d)
+{
+	if (!rwm_framedump_on() || d->color_count == 0 || d->color[0] == nullptr || rwm_air()->texture_probe == nullptr) {
+		return;
+	}
+	if (!blur_seen) {
+		blur_seen = strstr(d->label, "_Tds") != nullptr || strstr(d->label, "_Tn1") != nullptr ||
+			    strstr(d->label, "_Tn2") != nullptr || strstr(d->label, "_Tvr") != nullptr;
+		if (!blur_seen) {
+			return;
+		}
+	}
+
+	uint8_t texel[16];
+	unsigned w = 0, h = 0;
+	char why[64], line[400];
+
+	if (rwm_air()->texture_probe(d->color[0], 0, 0, texel, &w, &h, why, sizeof(why)) <= 0 || w < 1000) {
+		return;
+	}
+	frame_dumps_left--;
+
+	size_t used = (size_t)snprintf(line, sizeof(line), "framedump: %s%s%s:", d->label[0] ? d->label : "?",
+				       (d->clear_color_mask & 1) != 0 ? " (clears a0)" : "",
+				       d->clear_color != nullptr ? " (clears)" : "");
+
+	used = probe_into(line, used, sizeof(line), d->color[0], d->color_levels ? d->color_level[0] : 0, 0, nullptr);
+	if (d->scissor != nullptr && used < sizeof(line) - 40) {
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " scissor %u,%u %ux%u", d->scissor[0], d->scissor[1],
+					 d->scissor[2], d->scissor[3]);
+	}
+	rwm_print("%s\n", line);
+}
+
 static void
 blur_dump(const struct rwm_draw *d)
 {
 	const unsigned level = d->color_levels ? d->color_level[0] : 0;
+	static unsigned lub_dumps;
 
 	/* a draw into a level below the first (a pyramid), or one of a blur's or a material's pipelines (any target) */
 	if (!rwm_blurdump_on() || d->color_count == 0 || d->color[0] == nullptr || (level == 0 && d->probe[0] == '\0') ||
 	    rwm_air()->texture_probe == nullptr) {
 		return;
 	}
+	/* (the luma boost runs over every frame: two of it, and the budget kept for the blurs) */
+	if (strstr(d->probe, "_Tlub") != nullptr && lub_dumps++ >= 2) {
+		return;
+	}
 	blur_dumps_left--;
 
-	char line[400];
+	char line[480];
 	size_t used = 0;
+	/* where it draws: the scissor, else the viewport, else the whole attachment */
+	unsigned area[4] = {};
 
-	/* what it drew: the centre of every attachment (the second is CoreAnimation's clip mask) */
+	if (d->scissor != nullptr) {
+		memcpy(area, d->scissor, sizeof(area));
+	} else if (d->viewport != nullptr) {
+		area[0] = (unsigned)d->viewport[0];
+		area[1] = (unsigned)d->viewport[1];
+		area[2] = (unsigned)d->viewport[2];
+		area[3] = (unsigned)d->viewport[3];
+	}
+	/* what it drew, over where it draws: every attachment (the second is CoreAnimation's clip mask); "o/z" are how
+	 * many of 16 texels are opaque and how many all zero, then the mean B G R A */
 	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: %s into level %u:", d->probe[0] ? d->probe
 												: "a pass", level);
-	for (unsigned i = 0; i < d->color_count && i < 3 && used < sizeof(line) - 80; i++) {
+	for (unsigned i = 0; i < d->color_count && i < 3 && used < sizeof(line) - 100; i++) {
 		if (d->color[i] == nullptr) {
 			continue;
 		}
 		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s a%u", i ? ";" : "", i);
 		used = probe_into(line, used, sizeof(line), d->color[i], d->color_levels ? d->color_level[i] : 0,
-				  d->color_levels ? d->color_slice[i] : 0);
+				  d->color_levels ? d->color_slice[i] : 0, area);
 	}
 	rwm_print("%s\n", line);
 
-	/* and what it read: the centre of level 0 of every texture bound for the fragment stage */
+	/* and what it read: level 0 of every texture bound for the fragment stage, the whole of it */
 	used = (size_t)snprintf(line, sizeof(line), "blurdump:   reads");
-	for (unsigned i = 0, n = 0; i < d->texture_count && i < RWM_MAX_BUFFERS && n < 6 && used < sizeof(line) - 80; i++) {
+	for (unsigned i = 0, n = 0; i < d->texture_count && i < RWM_MAX_BUFFERS && n < 5 && used < sizeof(line) - 100; i++) {
 		if (d->textures[i] == nullptr) {
 			continue;
 		}
 		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s t%u", n++ ? ";" : "", i);
-		used = probe_into(line, used, sizeof(line), d->textures[i], 0, 0);
+		used = probe_into(line, used, sizeof(line), d->textures[i], 0, 0, nullptr);
 	}
 	rwm_print("%s\n", line);
 }
@@ -224,5 +334,6 @@ rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
 		return -2;
 	}
 	blur_dump(d);
+	frame_dump(d);
 	return 0;
 }
