@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..91b3628
+index 0000000..ecdc24f
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,2141 @@
+@@ -0,0 +1,2163 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -2091,7 +2091,29 @@ index 0000000..91b3628
 +		return;
 +	}
 +	ap = ap_ccif;
-+	(void)PE_parse_boot_argn("a34cellsbp", &sbp_code, (int)sizeof(sbp_code));
++	/*
++	 * The SBP code, as ccci_mdinit picks it (get_md_sbp_code): the CIP file's, else the project's
++	 * MTK_MD_SBP_CUSTOM_VALUE, else the AP NVRAM record APCFG/APRDCL/MD_SBP (u32 at +0 for md1).
++	 * This phone's vendor sets no project value and has no CIP file here, so the NVRAM record:
++	 * read in place, its value sent to the modem only (the log says its size and whether it is
++	 * used). Boot-arg a34cellsbp overrides.
++	 */
++	if (!PE_parse_boot_argn("a34cellsbp", &sbp_code, (int)sizeof(sbp_code))) {
++		uint8_t rec[64];
++		uint32_t sz = 0;
++		int e = a34_cellfs_nvdata_file("/APCFG/APRDCL/MD_SBP", rec, sizeof(rec), &sz);
++		if (e == 0 && sz == 24) {
++			uint32_t v = le32(rec);
++			if ((int32_t)v > 0)
++				sbp_code = v;
++			printf("A34 CELL: SBP: nvdata APCFG/APRDCL/MD_SBP (%u bytes): %s\n", sz,
++			    (int32_t)v > 0 ? "its md1 value is sent, as ccci_mdinit" : "no md1 value: 0 is sent");
++		} else {
++			printf("A34 CELL: SBP: nvdata APCFG/APRDCL/MD_SBP %s (%u bytes): 0 is sent\n",
++			    e == 0 ? "has an unknown layout" : sz ? "not readable" : "not found", sz);
++		}
++		memset(rec, 0, sizeof(rec));
++	}
 +	(void)PE_parse_boot_argn("a34cellrat", &rat_bitmap, (int)sizeof(rat_bitmap));
 +	(void)PE_parse_boot_argn("a34celldbg", &dbg_level, (int)sizeof(dbg_level));
 +	if (f[0] != MD_PATTERN || f[17] != MD_PATTERN)
@@ -2162,10 +2184,10 @@ index 0000000..91b3628
 +#endif
 diff --git a/bsd/dev/a34_ccci.h b/bsd/dev/a34_ccci.h
 new file mode 100644
-index 0000000..0e1aaf3
+index 0000000..b722443
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,47 @@
 +/*
 + * A34 (0951): the modem's control path (CCCI over CCIF) and its file server, shared declarations.
 + * bsd/dev/a34_ccci.c (shared memory, rings, handshake, ports), bsd/dev/a34_cellfs.c (the modem's
@@ -2206,6 +2228,8 @@ index 0000000..0e1aaf3
 +/* a34_cellfs.c: one packet from CCCI_FS_RX (header included), and the session's counters. */
 +void a34_cellfs_rx(const uint8_t *pkt, uint32_t len);
 +void a34_cellfs_report(void);
++/* a34_cellfs.c: a small file from nvdata's root, read in place (0, or < 0 with *size set if found). */
++int a34_cellfs_nvdata_file(const char *path, void *buf, uint32_t max, uint32_t *size);
 +
 +/* sweet_ufs.c (0950/0951): read only, partitions on a fixed list. */
 +int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes);
@@ -3248,10 +3272,10 @@ index 0000000..8c9615f
 +#endif
 diff --git a/bsd/dev/a34_cellfs.c b/bsd/dev/a34_cellfs.c
 new file mode 100644
-index 0000000..8910512
+index 0000000..6930ac6
 --- /dev/null
 +++ b/bsd/dev/a34_cellfs.c
-@@ -0,0 +1,1368 @@
+@@ -0,0 +1,1389 @@
 +/*
 + * A34 (0951): the modem's file server, in the kernel and read only.
 + *
@@ -3348,6 +3372,27 @@ index 0000000..8910512
 +		printf("A34 CELL FS: %s %s (block %u)\n", f->part, f->ok ? "mounted read only" : "not readable", f->ok ? f->fs.bsize : 0);
 +	}
 +	return f->ok ? &f->fs : NULL;
++}
++
++/*
++ * A small file from nvdata's root (ccci_mdinit's AP NVRAM settings, e.g. APCFG/APRDCL/MD_SBP),
++ * read in place. Its bytes go only into what is sent to the modem; callers log sizes only.
++ */
++int
++a34_cellfs_nvdata_file(const char *path, void *buf, uint32_t max, uint32_t *size)
++{
++	struct ext4ro *fs = fs_of(0);
++	struct ext4ro_stat st;
++	uint32_t ino = 0;
++
++	*size = 0;
++	if (!fs || ext4ro_lookup(fs, path, false, &ino) || ext4ro_stat(fs, ino, &st))
++		return E_NOT_FOUND;
++	*size = (uint32_t)st.size;
++	if (st.size > max)
++		return E_GENERAL;
++	long r = ext4ro_pread(fs, ino, 0, buf, (uint32_t)st.size);
++	return r == (long)st.size ? 0 : E_GENERAL;
 +}
 +
 +/* ---- paths: UCS-2 from the modem -> "D:/rest" key, file system and its path ---- */
