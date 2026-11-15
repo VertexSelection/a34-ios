@@ -245,7 +245,11 @@ at_cmd(struct at_chan *ch, const char *cmd, int timeout_ms, struct at_resp *resp
 	memset(r, 0, sizeof(*r));
 	enum policy_verdict v = policy_check(cmd);
 	if (v != POLICY_ALLOW) {
-		fprintf(stderr, "a34cell: %.12s... %s\n", cmd, policy_verdict_name(v));
+		/* the command's name only, never its arguments */
+		int n = 0;
+		while (n < 12 && cmd[n] && cmd[n] != '=' && cmd[n] != '?' && cmd[n] != ';')
+			n++;
+		fprintf(stderr, "a34cell: %.*s: %s\n", n, cmd, policy_verdict_name(v));
 		return r->result = AT_REFUSED;
 	}
 	if (ch->trace)
