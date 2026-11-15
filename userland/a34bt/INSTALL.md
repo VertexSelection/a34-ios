@@ -166,3 +166,16 @@ unchanged. And it formats bluetoothd's os_log onto the console (`bt: ...`), sinc
 Expected: `a34bt-btd: bluetoothd[N]: keychain: copy Identity Root ...: 0 found`, `keychain: add ...: 0`,
 then `bt: ...` lines of its start, `com.apple.BlueTool asked ... boot`, `bt: HCI Transport is set to
 H4BC`, and the kernel's `A34 BT: br: com.apple.uart.sk.bluetooth connected by bluetoothd`.
+
+## 8. The crash of boot 0988-btkc-a was liba34bt-btd's
+
+With the keychain kept, bluetoothd went much further (H4BC chosen, DeviceManager, paired-device list
+read, cloud keys absent) and then died: `CRASH bluetoothd sig 11 ... far 0x68736160`, frames
+`liba34bt-btd` (the os_log formatter) <- `bluetoothd+0x3847d8`, its os_log "statedump:
+MagicPairingManager: SignedIn: %d, loginID: %{private, mask.hash}s". A `mask.hash` annotation puts an
+extra item holding the bytes "hash" ahead of the string; the formatter took it for the string pointer
+(0x...68736168). Fixed: os_log items are read by their type (masks skipped; only string, object and
+pointer items followed, and only above 4 GB). A crash in bluetoothd is now also said by the library:
+`a34bt-btd: bluetoothd[N]: crash: signal 11 at ...: pc IMAGE+OFF lr ... frames ...`.
+
+Same kernel and wraps; only `/a34` (`root-add-job.py --copy /mnt /a34 a34`) from the new artifact.

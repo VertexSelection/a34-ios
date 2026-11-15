@@ -24,6 +24,9 @@ Status (2026-11-15):
   (service `MobileBluetooth`; securityd cannot wrap keys on this kernel's AppleKeyStore, selector 10).
   `liba34bt-btd` now keeps bluetoothd's `MobileBluetooth` items in
   `/var/mobile/Library/Bluetooth/com.a34.keychain.plist` and puts its os_log on the console.
+- **Boot 0988-btkc-a**: keychain answered; bluetoothd chose H4BC, read its (empty) paired-device list,
+  then crashed in `liba34bt-btd`'s own os_log formatter (an os_log `mask.hash` item taken for a string
+  pointer). Fixed; the library now also reports crashes as image+offset frames.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
