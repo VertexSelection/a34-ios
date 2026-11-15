@@ -9,7 +9,12 @@ upstream's eviction of BOs idle more than 2 s each burst found the cache empty a
 and a mapping in the kernel per buffer -- 91 in a 5 s window of boot 0980-b, ~1 ms each and as
 much again for the mapping, inside the command buffers that stuttered. In a process drawing
 through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cache holds at most
-64 MB, the oldest let go first. A process that only uses OpenGL ES keeps upstream's 2 s.
+64 MB, the oldest let go first -- of 1 MB and more first (16 November): a batch pool's 64 KB BOs
+are made again for every new batch, and each new one costs a CREATE_BO and a mapping, which took
+the kernel up to 46 ms in boot 0994-perf-a, so a small BO is kept for its 30 s whatever the large
+ones do. A process that only uses OpenGL ES keeps upstream's 2 s. Counted for the Metal driver's
+profile: fetches answered, refused because the oldest fitting BO was still busy, or with none of
+that size; the KB new from the kernel and the KB held.
 
 --- a/src/gallium/drivers/panfrost/pan_bo.c
 +++ b/src/gallium/drivers/panfrost/pan_bo.c
@@ -34,7 +39,24 @@ through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cac
  static struct panfrost_bo *
  panfrost_bo_cache_fetch(struct panfrost_device *dev, size_t size,
                          uint32_t flags, const char *label, bool dontwait)
-@@ -214,6 +228,7 @@
+@@ -200,6 +214,7 @@
+    pthread_mutex_lock(&dev->bo_cache.lock);
+    struct list_head *bucket = pan_bucket(dev, size);
+    struct panfrost_bo *bo = NULL;
++   bool redwood_busy = false;
+ 
+    /* Iterate the bucket looking for something suitable */
+    list_for_each_entry_safe(struct panfrost_bo, entry, bucket, bucket_link) {
+@@ -208,12 +223,15 @@
+ 
+       /* If the oldest BO in the cache is busy, likely so is
+        * everything newer, so bail. */
+-      if (!panfrost_bo_wait(entry, dontwait ? 0 : INT64_MAX, true))
++      if (!panfrost_bo_wait(entry, dontwait ? 0 : INT64_MAX, true)) {
++         redwood_busy = true;
+          break;
++      }
+ 
        /* This one works, splice it out of the cache */
        list_del(&entry->bucket_link);
        list_del(&entry->lru_link);
@@ -42,16 +64,35 @@ through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cac
  
        if (!pan_kmod_bo_make_unevictable(entry->kmod_bo)) {
           panfrost_bo_free(entry);
-@@ -244,11 +259,18 @@
+@@ -223,6 +241,11 @@
+       bo = entry;
+       break;
+    }
++   if (redwood_pan_metal && dontwait) {
++      /* (A34, patch 0014: what the cache answered, for the Metal driver's profile) */
++      redwood_pan_prof[bo ? RWP_CACHE_HITS : redwood_busy ? RWP_CACHE_BUSY : RWP_CACHE_NONE]++;
++      redwood_pan_prof[RWP_CACHED_KB] = redwood_bo_cached_bytes >> 10;
++   }
+    pthread_mutex_unlock(&dev->bo_cache.lock);
+ 
+    return bo;
+@@ -244,11 +267,25 @@
         * seconds old, but we don't really care, as long as unused BOs
         * are dropped at some point.
         */
 -      if (time.tv_sec - entry->last_used <= 2)
-+      /* (A34: kept longer and within a budget in a Metal process, above) */
++      /* (A34: kept longer and within a budget in a Metal process, above. Over the budget the oldest
++       * BOs of 1 MB and more go first; a smaller one -- a batch pool's 64 KB, made again for every
++       * new batch, and each new one a CREATE_BO and a mapping that took the kernel up to 46 ms in boot
++       * 0994-perf-a -- is kept for its 30 s whatever the large ones did) */
 +      if (redwood_pan_metal) {
-+         if (time.tv_sec - entry->last_used <= REDWOOD_BO_IDLE_S &&
-+             redwood_bo_cached_bytes <= REDWOOD_BO_BUDGET)
++         bool young = time.tv_sec - entry->last_used <= REDWOOD_BO_IDLE_S;
++         bool over = redwood_bo_cached_bytes > REDWOOD_BO_BUDGET;
++
++         if (young && !over)
 +            break;
++         if (young && panfrost_bo_size(entry) < (1u << 20))
++            continue;
 +      } else if (time.tv_sec - entry->last_used <= 2) {
           break;
 +      }
@@ -62,7 +103,7 @@ through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cac
        panfrost_bo_free(entry);
     }
  }
-@@ -274,6 +296,7 @@
+@@ -274,6 +311,7 @@
  
     /* Add us to the bucket */
     list_addtail(&bo->bucket_link, bucket);
@@ -70,7 +111,7 @@ through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cac
  
     /* Add us to the LRU list and update the last_used field. */
     list_addtail(&bo->lru_link, &dev->bo_cache.lru);
-@@ -312,6 +335,7 @@
+@@ -312,6 +350,7 @@
           panfrost_bo_free(entry);
        }
     }
@@ -78,3 +119,12 @@ through Metal (redwood_pan_metal) an idle BO is now kept up to 30 s, and the cac
     pthread_mutex_unlock(&dev->bo_cache.lock);
  }
  
+@@ -394,6 +433,8 @@
+       bo = panfrost_bo_alloc(dev, size, flags, label);
+       rwp_count(RWP_BO_FRESH);
+       rwp_lap(RWP_BO_FRESH_NS, &rwp_f);
++      if (redwood_pan_metal)
++         redwood_pan_prof[RWP_FRESH_KB] += size >> 10;
+    }
+    if (!bo)
+       bo = panfrost_bo_cache_fetch(dev, size, flags, label, false);

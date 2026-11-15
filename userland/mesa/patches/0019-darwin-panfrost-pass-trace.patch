@@ -16,12 +16,14 @@ the framebuffer and the drawn area, draws, whether colour 0 was cleared, preload
 that was a re-entry) or not loaded and whether it was written back, the same for depth/stencil, and
 why the batch was sent, and its GPU jobs' numbers, first and last (redwood_drm_last_seq around the
 submission), which the Metal driver asks the kernel's per-job trace for (kernel 0992, 0x79): the
-passes then meet their GPU times one for one. The counting of patch 0018 moves into the same
-function.
+passes then meet their GPU times one for one; colour attachment 1 the same way as 0 (CoreAnimation's
+passes have two); and whether a clean-tile write is forced (a cleared attachment kept), which makes
+every preload of the batch run over the whole drawn area (ALWAYS, TSIX-2033) instead of only where
+geometry falls (INTERSECT). The counting of patch 0018 moves into the same function.
 
 --- a/src/gallium/drivers/panfrost/pan_job.c
 +++ b/src/gallium/drivers/panfrost/pan_job.c
-@@ -211,6 +211,135 @@
+@@ -211,6 +211,146 @@
  static void panfrost_batch_submit(struct panfrost_context *ctx,
                                    struct panfrost_batch *batch);
  
@@ -125,8 +127,19 @@ function.
 +         rec.writeback = !fb->rts[0].discard;
 +         rec.clear = fb->rts[0].clear;
 +         rec.reentry = reentry;
++      } else if (i == 1) {
++         rec.rt1 = true;
++         rec.res1_w = res->width0;
++         rec.res1_h = res->height0;
++         rec.preload1 = fb->rts[1].preload;
++         rec.writeback1 = !fb->rts[1].discard;
++         rec.clear1 = fb->rts[1].clear;
 +      }
++      if (fb->rts[i].clear && !fb->rts[i].discard)
++         rec.always = true;
 +   }
++   if ((fb->zs.clear.z && !fb->zs.discard.z) || (fb->zs.clear.s && !fb->zs.discard.s))
++      rec.always = true;
 +   if (fb->zs.view.zs) {
 +      uint64_t kb = area * util_format_get_blocksize(fb->zs.view.zs->format) *
 +                    MAX2(fb->zs.view.zs->nr_samples, 1) / 1024;
@@ -157,7 +170,7 @@ function.
  static struct panfrost_batch *
  find_best_render_batch(struct panfrost_context *ctx)
  {
-@@ -838,50 +967,29 @@
+@@ -838,50 +978,29 @@
  
     panfrost_batch_to_fb_info(batch, &fb, rts, &zs, &s, false);
  
