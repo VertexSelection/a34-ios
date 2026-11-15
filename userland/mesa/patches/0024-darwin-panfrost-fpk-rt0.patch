@@ -1,0 +1,42 @@
+Darwin: forward pixel kill on colour attachment 0 alone, an experiment (REDWOOD_PAN_FPK=rt0).
+
+A34 (local to this port; nothing here goes upstream). pan_allow_forward_pixel_to_kill lets a draw
+kill the fragments under it only when it writes every bound colour target. Every CoreAnimation
+pass binds a second, memoryless attachment that almost no draw writes, so no draw of the Metal
+driver could kill: an opaque full-screen layer neither killed the drawable's preload under it nor
+the layers it covers. Boot 1011-120-b: a full-screen drawable pass reads and writes 22 MB of the
+drawable, ~2 ms at the DRAM's 4266 Mbps. With REDWOOD_PAN_FPK=rt0 (the plug-in's rwm_fpk=rt0), in a
+process drawing through Metal, only attachment 0 has to be written. Off by default: a fragment that
+wrote the second attachment for a later draw to read could be killed under an opaque one, and the
+experiment is there to show whether CoreAnimation ever does that.
+
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.h
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.h
+@@ -102,6 +102,27 @@
+    unsigned rt_mask = ctx->fb_rt_mask;
+    uint64_t rt_written = (fs->info.outputs_written >> FRAG_RESULT_DATA0) &
+                          ctx->blend->enabled_mask;
++#ifdef __APPLE__
++   /* A34 (patch 0024), an experiment, off unless REDWOOD_PAN_FPK=rt0 (the plug-in's rwm_fpk=rt0):
++    * in a process drawing through Metal, only colour attachment 0 must be written for a draw to
++    * kill the fragments under it. Every CoreAnimation pass has a second attachment, memoryless,
++    * which almost no draw writes, so forward pixel kill was off for every draw: an opaque
++    * full-screen layer did not kill the drawable's preload under it nor the layers it covers
++    * (boot 1011-120-b: a full-screen drawable pass reads and writes 22 MB, ~2 ms). The danger is a
++    * fragment that wrote the second attachment for a later draw to read, killed under an opaque
++    * one: what the switch is there to show. */
++   {
++      extern bool redwood_pan_metal;
++      static int rt0_only = -1;
++
++      if (rt0_only < 0) {
++         const char *e = getenv("REDWOOD_PAN_FPK");
++         rt0_only = e != NULL && strcmp(e, "rt0") == 0;
++      }
++      if (redwood_pan_metal && rt0_only)
++         rt_mask &= 1;
++   }
++#endif
+    bool blend_reads_dest = (ctx->blend->load_dest_mask & rt_mask);
+    bool alpha_to_coverage = ctx->blend->base.alpha_to_coverage;
+ 

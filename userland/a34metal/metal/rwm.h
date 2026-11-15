@@ -56,6 +56,8 @@ struct rwm_perf {
 	uint64_t scheduled_handlers, completed_handlers;
 	/* A34: textures made memoryless, and attachments of a pass that were one (their actions DontCare) */
 	uint64_t memoryless_textures, memoryless_attachments;
+	/* A34: draws of CoreAnimation's luma boost (_Tlub) skipped, boot-arg rwm_skiplub=1 (a measurement) */
+	uint64_t lub_skipped;
 	uint64_t drains, drain_ns;      /* a texture written or read at once, after the worker's queue */
 	uint64_t worker_cbs, worker_ns;  /* the worker's whole time for a buffer, waits in it included */
 	uint64_t worker_cpu;            /* ... and how much of it the worker ran */
