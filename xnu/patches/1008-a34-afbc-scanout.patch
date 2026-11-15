@@ -1,0 +1,379 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f485e72..8a034a3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -111,6 +111,18 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * A34 (1008): an AFBC scan-out frame's OVL layer registers (AppleCLCD::
++ * afbcRegs(), set by scanOut(), written by the kick: ovlAfbc()). on 0: the
++ * frame is linear.
++ */
++struct sweet_fb_afbc {
++	uint32_t on, surface;
++	uint32_t addr, hdrAddr;         /* Ln_ADDR: the first body slot read; Ln_HDR_ADDR: its header */
++	uint32_t pitch, pitchMsb;       /* Ln_PITCH [15:0]; Ln_PITCH_MSB (YTR, second half-superblock, pitch [19:16]) */
++	uint32_t hdrPitch, srcSize, clip;
++};
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -209,6 +221,20 @@ public:
+ 	SweetSurface *fScanLast;
+ 	uintptr_t     fScanLastVA;
+ 	uint32_t      fScanLastPitch;
++	/* A34 (1008): a34fbafbc=1, AFBC scan-out frames (scanOut(), kickOne(); 1007's request 0x78 marks the surfaces) */
++	bool          fAfbc;
++	uint32_t      fAfbcCon;                 /* the colour-format bits of an AFBC layer's CON (a34fbafbcfmt) */
++	struct sweet_fb_afbc fScanAfbc[6];      /* with fFlipLock: frame k's AFBC registers (on 0: linear) */
++	bool          fOvlAfbc;                 /* the kick's: the layers read an AFBC frame now */
++	bool          fOvlLinSaved;
++	uint32_t      fOvlLin[2][4][4];         /* each layer's CON, SRC_SIZE, CLIP, PITCH_MSB as the loader set them */
++	uint32_t      fOvlLinPath[2];           /* each OVL's DATAPATH_CON as found */
++	volatile uint32_t *fAfbcRdma;           /* RDMA0, for its underflow bit */
++	uint32_t      fAfbcSaid, fAfbcErrSaid;
++	bool afbcRegs(SweetSurface *s, const int32_t r[6], struct sweet_fb_afbc *a);
++	void ovlAfbc(const struct sweet_fb_afbc *a);
++	void ovlLinear(void);
++	void afbcCheck(bool afbc);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	bool xferWait(uint64_t started, uint64_t *xfer);
+@@ -495,6 +521,26 @@ static uint64_t sweet_fb_scan_align = 4;        /* a34fbscanalign: the window's
+ #define SWEET_FB_OVL_PITCH(n)   (0x044u + 0x20u * (n))
+ #define SWEET_FB_OVL_PITCH_MSB(n) (0x040u + 0x20u * (n))
+ #define SWEET_FB_SCAN_POOL      4u              /* a34fbscanpool: buffers in the scan-out pool */
++/*
++ * A34 (1008): a layer reading AFBC (mtk_disp_ovl.c: compr_l_config_AFBC_V1_2,
++ * the MT6877's "AFBC_V1_2_MTK_1"; mt6877_ovl_driver_data has no FBDC clock).
++ */
++#define SWEET_FB_OVL_INTSTA     0x008u          /* [2] FME_UND, [8:5] EOF_ABNORMAL, [12:9] SMI_UNDERFLOW, [13] ABNORMAL_SOF */
++#define SWEET_FB_OVL_INT_ERRORS 0x3fe4u         /* (a bit is cleared by writing 0 to it, as mtk_disp_ovl_irq_handler) */
++#define SWEET_FB_OVL_DATAPATH   0x024u          /* DATAPATH_CON: [4 + n] layer n's AFBC decoder (Lx_FBDC_EN) */
++#define SWEET_FB_OVL_CON(n)     (0x030u + 0x20u * (n))  /* [15:12] colour format, [23] manual, [24] byte swap, [25] RGB swap */
++#define SWEET_FB_OVL_SRC_SIZE(n) (0x038u + 0x20u * (n))
++#define SWEET_FB_OVL_CLIP(n)    (0x04cu + 0x20u * (n))  /* [7:0] left, [15:8] right, [23:16] top, [31:24] bottom */
++#define SWEET_FB_OVL_HDR_ADDR(n) (0xf44u + 0x20u * (n))
++#define SWEET_FB_OVL_HDR_PITCH(n) (0xf48u + 0x20u * (n))
++#define SWEET_FB_OVL_SYSRAM(n)  (0x880u + 0x10u * (n))  /* SYSRAM_CFG, BUF0_ADDR, BUF1_ADDR: 0 */
++#define SWEET_FB_OVL_CON_FMT    ((0xfu << 12) | (7u << 23))
++#define SWEET_FB_OVL_CON_AFBC   ((2u << 12) | (1u << 24))      /* RGBA8888 + byte swap: R,G,B,A (ovl_fmt_convert's ABGR8888) */
++#define SWEET_FB_PITCH_YTR      (1u << 20)      /* L_PITCH_MSB_FLD_YUV_TRANS, always set for AFBC */
++#define SWEET_FB_PITCH_2ND      (1u << 16)      /* L_PITCH_MSB_FLD_2ND_SUBBUF: start in a superblock's lower half */
++#define SWEET_FB_RDMA_INT_ERRORS ((1u << 3) | (1u << 4))        /* RDMA0 EOF_ABNORMAL, FIFO_UNDERFLOW */
++static uint64_t sweet_fb_afbc_stats[6];
++static uint64_t sweet_fb_afbc_last[6];
+ /* A34 (0996): a scan-out frame (2..5): free; swapped, its GPU jobs perhaps still running; the kick's; being sent */
+ #define SWEET_FB_SCAN_FREE      0u
+ #define SWEET_FB_SCAN_PENDING   1u
+@@ -915,6 +961,20 @@ AppleCLCD::start(IOService *provider)
+ 		    "full-panel frames of a pool surface go to the OVL as they are" : "off: it needs a34fbflip=1 and 2 pool buffers",
+ 		    made, (unsigned long long)sweet_fb_scan_align);
+ 	}
++	/* A34 (1008): a34fbafbc=1: pool surfaces the GPU driver drew as AFBC (request 0x78) are scanned out as such */
++	uint32_t afbcOn = 0, afbcFmt = SWEET_FB_OVL_CON_AFBC;
++	(void)PE_parse_boot_argn("a34fbafbc", &afbcOn, sizeof(afbcOn));
++	(void)PE_parse_boot_argn("a34fbafbcfmt", &afbcFmt, sizeof(afbcFmt));
++	fAfbcCon = afbcFmt & SWEET_FB_OVL_CON_FMT;
++	if (afbcOn != 0) {
++		fAfbc = fScanOn && sweet_surface_afbc_on();
++		if (fAfbc) {
++			fAfbcRdma = fRdma != NULL ? fRdma : (volatile uint32_t *)ml_io_map(SWEET_FB_RDMA0, 0x1000);
++			afbcCheck(false);       /* (error bits from before: said and cleared) */
++		}
++		IOLog("A34 FB AFBC: a34fbafbc: %s (layer colour bits 0x%08x, a34fbafbcfmt)\n", fAfbc ? "AFBC 32x8 pool surfaces "
++		    "(request 0x78) scanned out compressed" : "off: it needs a34fbscanout=1 and the pool", fAfbcCon);
++	}
+ 	uint32_t presentNow = 0;
+ 	(void)PE_parse_boot_argn("a34fbnow", &presentNow, sizeof(presentNow));     /* A34 (0935) */
+ 	if (presentNow != 0) {
+@@ -1310,6 +1370,20 @@ sweet_fb_flip_log(void)
+ 		    (unsigned long long)c[2], (unsigned long long)c[3], (unsigned long long)c[4], (unsigned long long)c[5],
+ 		    (unsigned long long)c[6], (unsigned long long)c[7]);
+ 	}
++	/* A34 (1008): a34fbafbc */
++	uint64_t f[6];
++	bool afbcAny = false;
++
++	for (unsigned i = 0; i < 6; i++) {
++		f[i] = sweet_fb_afbc_stats[i] - sweet_fb_afbc_last[i];
++		sweet_fb_afbc_last[i] = sweet_fb_afbc_stats[i];
++		afbcAny = afbcAny || f[i] != 0;
++	}
++	if (afbcAny) {
++		IOLog("A34 FB AFBC: 10 s: %llu AFBC frames sent, %llu linear; OVL error bits after %llu AFBC, %llu linear; RDMA0 "
++		    "underflow after %llu AFBC; %llu AFBC frames not shown\n", (unsigned long long)f[0], (unsigned long long)f[1],
++		    (unsigned long long)f[2], (unsigned long long)f[3], (unsigned long long)f[4], (unsigned long long)f[5]);
++	}
+ }
+ 
+ 
+@@ -2974,8 +3048,21 @@ AppleCLCD::kickOne(void)
+ 	}
+ 	uint64_t again = 0;
+ 	(void)a34_dsi_wait_idle(&again, fTEBit ? SWEET_FB_TE_XFER_MS : 1000);  /* (the console may have started one) */
++	/* A34 (1008): an AFBC frame: its layer registers each time; the linear ones back after one */
++	bool afbcFrame = fAfbc && t >= 2 && fScanAfbc[t].on != 0;
++
++	if (afbcFrame) {
++		ovlAfbc(&fScanAfbc[t]);
++		fOvlPA = fScanAfbc[t].addr;
++		fOvlPitch = ~0u;                /* (the next linear frame writes its pitch) */
++		sweet_fb_flip_stats[5]++;
++		sweet_fb_scan_stats[5]++;
++	} else if (fOvlAfbc) {
++		ovlLinear();
++		fOvlPitch = ~0u;
++	}
+ 	/* A34 (0983): by address and pitch (a scan-out frame 2 or 3 is a new surface each time) */
+-	if (fBufPA[t] != fOvlPA || fPitch[t] != fOvlPitch) {
++	if (!afbcFrame && (fBufPA[t] != fOvlPA || fPitch[t] != fOvlPitch)) {
+ 		for (unsigned o = 0; o < 2; o++) {
+ 			for (unsigned n = 0; n < 4; n++) {
+ 				if ((fOvlFlip[o] & (1u << n)) != 0) {
+@@ -3044,6 +3131,9 @@ AppleCLCD::kickOne(void)
+ 	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
+ 	sweet_fb_hs_say(xfer);
+ 	sweet_fb_con_check(xfer);       /* A34 (0939) */
++	if (fAfbc) {
++		afbcCheck(afbcFrame);   /* A34 (1008): the OVLs' and RDMA0's error bits after the frame */
++	}
+ 	if (fBLWant != fBLSent) {
+ 		blPoll(false);          /* A34 (1004): the backlight's level, the link idle between frames */
+ 	}
+@@ -3197,6 +3287,182 @@ AppleCLCD::queuedAt(uint64_t now)
+ 	fQueuedAt = now;
+ }
+ 
++/*
++ * A34 (1008): an AFBC frame's layer registers, as MediaTek's
++ * compr_l_config_AFBC_V1_2() works them out for a 32x8 superblock, 4 bytes
++ * a pixel, not rotated: the window (r: left, top, width, height) widened to
++ * whole superblocks across and half superblocks (4 rows) down, the rest
++ * clipped; Ln_ADDR at the window's first body slot (1 KB each, in raster
++ * order from the surface's bodies), Ln_HDR_ADDR at its header (16 bytes
++ * each), Ln_PITCH = a linear row of the aligned width * 8 (one row of
++ * superblocks), HDR_PITCH = a row of headers, YTR always, the second-half
++ * bit when the window starts 4 rows into a superblock. 1125x2436 at x 22
++ * y 48 for 1080x2400: 36 superblocks a row, 1120x2400 read, 22 clipped left
++ * and 18 right. False: not possible (outside the surface, above 4 GB).
++ */
++bool
++AppleCLCD::afbcRegs(SweetSurface *s, const int32_t r[6], struct sweet_fb_afbc *a)
++{
++	uint64_t base = s->scanPA + s->offset, hdr = base + s->scanHeader, body = base + s->scanBody;
++	uint32_t cols = (s->width + SWEET_SURFACE_AFBC_W - 1) / SWEET_SURFACE_AFBC_W;
++	uint32_t rows = (s->height + SWEET_SURFACE_AFBC_H - 1) / SWEET_SURFACE_AFBC_H;
++	uint32_t pitch8 = cols * SWEET_SURFACE_AFBC_W * 4 * SWEET_SURFACE_AFBC_H;
++	uint32_t x, y, w, h, xa, wa, ya, yh, ye, hh, tile;
++
++	if (r[0] < 0 || r[1] < 0 || r[4] <= 0 || r[5] <= 0) {
++		return false;
++	}
++	x = (uint32_t)r[0];
++	y = (uint32_t)r[1];
++	w = (uint32_t)r[4];
++	h = (uint32_t)r[5];
++	if (x + w > cols * SWEET_SURFACE_AFBC_W || y + h > rows * SWEET_SURFACE_AFBC_H || (pitch8 >> 16) > 0xfu ||
++	    body + (uint64_t)cols * rows * SWEET_SURFACE_AFBC_SLOT > (1ull << 32)) {
++		return false;
++	}
++	xa = x / SWEET_SURFACE_AFBC_W * SWEET_SURFACE_AFBC_W;
++	wa = (1 + (x + w - 1) / SWEET_SURFACE_AFBC_W) * SWEET_SURFACE_AFBC_W - xa;
++	ya = y / SWEET_SURFACE_AFBC_H * SWEET_SURFACE_AFBC_H;
++	yh = y / (SWEET_SURFACE_AFBC_H / 2) * (SWEET_SURFACE_AFBC_H / 2);
++	ye = (1 + (y + h - 1) / (SWEET_SURFACE_AFBC_H / 2)) * (SWEET_SURFACE_AFBC_H / 2) - 1;
++	hh = ye - yh + 1;
++	tile = xa / SWEET_SURFACE_AFBC_W + cols * (ya / SWEET_SURFACE_AFBC_H);
++	a->on = 1;
++	a->surface = s->id;
++	a->addr = (uint32_t)(body + (uint64_t)tile * SWEET_SURFACE_AFBC_SLOT);
++	a->hdrAddr = (uint32_t)(hdr + (uint64_t)tile * SWEET_SURFACE_AFBC_HDR);
++	a->pitch = pitch8 & 0xffffu;
++	a->pitchMsb = SWEET_FB_PITCH_YTR | (ya != yh ? SWEET_FB_PITCH_2ND : 0) | ((pitch8 >> 16) & 0xfu);
++	a->hdrPitch = cols * SWEET_SURFACE_AFBC_HDR;
++	a->srcSize = (hh << 16) | wa;
++	a->clip = (x - xa) | ((xa + wa - x - w) << 8) | ((y - yh) << 16) | ((yh + hh - y - h) << 24);
++	return true;
++}
++
++/*
++ * A34 (1008), the kick's, with the display lock held and the link idle (the
++ * layer registers take effect at once: BYPASS_SHADOW): the layers that read
++ * picture 0 read the AFBC frame `a`. The loader's linear settings are kept
++ * the first time for ovlLinear().
++ */
++void
++AppleCLCD::ovlAfbc(const struct sweet_fb_afbc *a)
++{
++	if (!fOvlLinSaved) {
++		for (unsigned o = 0; o < 2; o++) {
++			if (fOvl[o] == NULL) {
++				continue;
++			}
++			fOvlLinPath[o] = fOvl[o][SWEET_FB_OVL_DATAPATH / 4];
++			for (unsigned n = 0; n < 4; n++) {
++				if ((fOvlFlip[o] & (1u << n)) == 0) {
++					continue;
++				}
++				fOvlLin[o][n][0] = fOvl[o][SWEET_FB_OVL_CON(n) / 4];
++				fOvlLin[o][n][1] = fOvl[o][SWEET_FB_OVL_SRC_SIZE(n) / 4];
++				fOvlLin[o][n][2] = fOvl[o][SWEET_FB_OVL_CLIP(n) / 4];
++				fOvlLin[o][n][3] = fOvl[o][SWEET_FB_OVL_PITCH_MSB(n) / 4];
++				IOLog("A34 FB AFBC: %s layer %u as the loader left it: CON 0x%08x SRC_SIZE 0x%08x CLIP 0x%08x PITCH_MSB "
++				    "0x%08x; DATAPATH_CON 0x%08x\n", o == 0 ? "OVL0_2L" : "OVL0", n, fOvlLin[o][n][0], fOvlLin[o][n][1],
++				    fOvlLin[o][n][2], fOvlLin[o][n][3], fOvlLinPath[o]);
++			}
++		}
++		fOvlLinSaved = true;
++	}
++	for (unsigned o = 0; o < 2; o++) {
++		volatile uint32_t *ovl = fOvl[o];
++
++		for (unsigned n = 0; ovl != NULL && n < 4; n++) {
++			if ((fOvlFlip[o] & (1u << n)) == 0) {
++				continue;
++			}
++			ovl[SWEET_FB_OVL_DATAPATH / 4] = ovl[SWEET_FB_OVL_DATAPATH / 4] | (1u << (4 + n));
++			ovl[SWEET_FB_OVL_SYSRAM(n) / 4] = 0;
++			ovl[SWEET_FB_OVL_SYSRAM(n) / 4 + 1] = 0;
++			ovl[SWEET_FB_OVL_SYSRAM(n) / 4 + 2] = 0;
++			ovl[SWEET_FB_OVL_CON(n) / 4] = (fOvlLin[o][n][0] & ~SWEET_FB_OVL_CON_FMT) | fAfbcCon;
++			ovl[SWEET_FB_OVL_SRC_SIZE(n) / 4] = a->srcSize;
++			ovl[SWEET_FB_OVL_CLIP(n) / 4] = a->clip;
++			ovl[SWEET_FB_OVL_PITCH_MSB(n) / 4] = a->pitchMsb;
++			ovl[SWEET_FB_OVL_PITCH(n) / 4] = (ovl[SWEET_FB_OVL_PITCH(n) / 4] & ~0xffffu) | a->pitch;
++			ovl[SWEET_FB_OVL_HDR_ADDR(n) / 4] = a->hdrAddr;
++			ovl[SWEET_FB_OVL_HDR_PITCH(n) / 4] = a->hdrPitch;
++			ovl[SWEET_FB_OVL_ADDR(n) / 4] = a->addr;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fOvlAfbc = true;
++	if (fAfbcSaid < 8) {
++		fAfbcSaid++;
++		IOLog("A34 FB AFBC: frame of surface %u: headers 0x%08x (%u a row), bodies 0x%08x, read %ux%u, clip 0x%08x, pitch "
++		    "0x%04x msb 0x%06x\n", a->surface, a->hdrAddr, a->hdrPitch, a->addr, a->srcSize & 0xffffu, a->srcSize >> 16,
++		    a->clip, a->pitch, a->pitchMsb);
++	}
++}
++
++/* A34 (1008): the kick's, as ovlAfbc(): the layers linear again, as the loader set them */
++void
++AppleCLCD::ovlLinear(void)
++{
++	for (unsigned o = 0; o < 2; o++) {
++		volatile uint32_t *ovl = fOvl[o];
++
++		for (unsigned n = 0; ovl != NULL && fOvlLinSaved && n < 4; n++) {
++			if ((fOvlFlip[o] & (1u << n)) == 0) {
++				continue;
++			}
++			ovl[SWEET_FB_OVL_DATAPATH / 4] = (ovl[SWEET_FB_OVL_DATAPATH / 4] & ~(1u << (4 + n))) |
++			    (fOvlLinPath[o] & (1u << (4 + n)));
++			ovl[SWEET_FB_OVL_CON(n) / 4] = fOvlLin[o][n][0];
++			ovl[SWEET_FB_OVL_SRC_SIZE(n) / 4] = fOvlLin[o][n][1];
++			ovl[SWEET_FB_OVL_CLIP(n) / 4] = fOvlLin[o][n][2];
++			ovl[SWEET_FB_OVL_PITCH_MSB(n) / 4] = fOvlLin[o][n][3];
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fOvlAfbc = false;
++}
++
++/*
++ * A34 (1008): after a transfer (and once at start): the OVLs' and RDMA0's
++ * error bits (frame underflow, EOF abnormal, SMI underflow, abnormal SOF;
++ * RDMA0 EOF abnormal, FIFO underflow), counted by the kind of frame just
++ * sent, the first 16 logged, cleared.
++ */
++void
++AppleCLCD::afbcCheck(bool afbc)
++{
++	uint32_t st[2] = { 0, 0 }, rdma = 0;
++
++	for (unsigned o = 0; o < 2; o++) {
++		if (fOvl[o] != NULL) {
++			st[o] = fOvl[o][SWEET_FB_OVL_INTSTA / 4] & SWEET_FB_OVL_INT_ERRORS;
++			if (st[o] != 0) {
++				fOvl[o][SWEET_FB_OVL_INTSTA / 4] = ~st[o];
++			}
++		}
++	}
++	if (fAfbcRdma != NULL) {
++		rdma = fAfbcRdma[SWEET_FB_RDMA_INT_STA / 4] & SWEET_FB_RDMA_INT_ERRORS;
++		if (rdma != 0) {
++			fAfbcRdma[SWEET_FB_RDMA_INT_STA / 4] = ~rdma;
++		}
++	}
++	sweet_fb_afbc_stats[afbc ? 0 : 1]++;
++	if ((st[0] | st[1]) != 0) {
++		sweet_fb_afbc_stats[afbc ? 2 : 3]++;
++	}
++	if (afbc && rdma != 0) {
++		sweet_fb_afbc_stats[4]++;
++	}
++	if ((st[0] | st[1] | rdma) != 0 && fAfbcErrSaid < 16) {
++		fAfbcErrSaid++;
++		IOLog("A34 FB AFBC: error bits after %s: OVL0_2L INTSTA 0x%04x, OVL0 0x%04x, RDMA0 0x%x (%llu AFBC frames sent so far)\n",
++		    afbc ? "an AFBC frame" : "a linear frame (or from before)", st[0], st[1], rdma,
++		    (unsigned long long)sweet_fb_afbc_stats[0]);
++	}
++}
++
+ /*
+  * A34 (0983): a34fbscanout=1, Stage 5 of research/120hz/plan.md. A swap whose
+  * one layer covers the panel with a surface of the scan-out pool
+@@ -3244,7 +3510,20 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 		s->release();
+ 		return false;
+ 	}
+-	if ((addr & (sweet_fb_scan_align - 1)) != 0 || (s->bytesPerRow & 3u) != 0 || s->bytesPerRow > 0xfffffu ||
++	/* A34 (1008): a surface the GPU driver drew as AFBC (request 0x78): its OVL registers, or not shown */
++	struct sweet_fb_afbc afbc;
++	bool isAfbc = __atomic_load_n(&s->scanLayout, __ATOMIC_ACQUIRE) == SWEET_SURFACE_AFBC;
++
++	bzero(&afbc, sizeof(afbc));
++	if (isAfbc) {
++		if (!fAfbc || !afbcRegs(s, r, &afbc)) {
++			sweet_fb_afbc_stats[5]++;
++			sweet_fb_scan_stats[4]++;
++			s->release();
++			return false;           /* (present() copies no AFBC layer) */
++		}
++		addr = afbc.addr;
++	} else if ((addr & (sweet_fb_scan_align - 1)) != 0 || (s->bytesPerRow & 3u) != 0 || s->bytesPerRow > 0xfffffu ||
+ 	    end > s->scanPA + s->memory->getLength() || end > (1ull << 32)) {
+ 		sweet_fb_scan_stats[4]++;
+ 		s->release();
+@@ -3311,6 +3590,7 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 	fScanSwapID[k] = get32(rec, 0x50);      /* A34 (0998) */
+ 	fBufPA[k] = addr;
+ 	fPitch[k] = s->bytesPerRow;
++	fScanAfbc[k] = afbc;                    /* A34 (1008) */
+ 	queuedAt(now);
+ 	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
+ 	IOLockUnlock(fFlipLock);
+@@ -3327,6 +3607,9 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 		fScanLastVA += s->offset + (uint64_t)r[1] * s->bytesPerRow + (uint64_t)r[0] * 4;
+ 	}
+ 	fScanLastPitch = s->bytesPerRow;
++	if (isAfbc) {
++		fScanLastVA = 0;        /* A34 (1008): a partial frame after it is not drawn over its (compressed) bytes */
++	}
+ 	sweet_fb_scan_stats[0]++;
+ 	if (sweet_fb_scan_stats[0] <= 8) {
+ 		IOLog("A34 FB SCAN: swap %u: surface %u (%ux%u, %u bytes a row) at 0x%llx, window at 0x%llx: frame %d\n",
+@@ -3615,7 +3898,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		uint64_t last = (uint64_t)s->wrapDelta + (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
++		    s->memory == NULL || last > s->memory->getLength() ||
++		    __atomic_load_n(&s->scanLayout, __ATOMIC_ACQUIRE) != SWEET_SURFACE_LINEAR) {    /* A34 (1008): AFBC */
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
