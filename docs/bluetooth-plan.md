@@ -121,6 +121,18 @@ Status (2026-11-15):
   bluetoothd instead of dropped (ACL data, Number Of Completed Packets); every 10 s with ACL traffic the
   bridge counts packets each way, completions and outstanding buffers, and says a stall; L2CAP signalling
   is always traced; the last 24 packets are said at each Disconnection Complete.
+- **Boot 0983-120-a**: the AirPods connect; no audio; links drop and come back; ANC/Transparency do nothing.
+  The ACL accounting is clean (every packet completed, 0 of 8 buffers outstanding). The cause:
+  bluetoothd enables Encryption Change v2 (0x59, Set_Event_Mask_Page_2 bit 25) and completes
+  Set_Connection_Encryption (0x0413) only on it; the MT6635 sends v1 (0x08). The command stayed pending,
+  the security manager stayed busy (`deferredEnforcerCB busy ... PMAN_ST_SECMGR_ENFORCE`; the AirPods'
+  incoming L2CAP channels got no configuration: "cid ... not found", CONFIG_RSP timeouts), and when it timed
+  out ("HCI expected event 89 with opcode OI_DHCI_SET_CNCT_ENCRYPTION_OPCODE timedout") bluetoothd restarted
+  (reason 621) just after mediaserverd's "audio started" and AVDTP_Start: the audio route, the AudioPipe
+  ("Registering Audio skywalk server channel", "Starting AudioSkywalk read loop") and the BT audio HAL
+  plug-in (com.apple.BTAudioHALPlugin.xpc) were all up. 0984 hands bluetoothd each v1 event as v2 (key
+  size 16, 0 when off) while it has v2 enabled, and cuts LE scan windows to a quarter of their interval
+  while a connection is up (bluetoothd's active 30/40 ms scans ran during the AirPods' L2CAP setup).
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
