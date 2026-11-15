@@ -30,10 +30,41 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <sys/kern_control.h>
 #include <sys/socket.h>
-#include <sys/sys_domain.h>
 #include <sys/sysctl.h>
+#include <sys/types.h>
+
+/*
+ * The iPhoneOS SDK has neither sys/kern_control.h nor sys/sys_domain.h; the ABI they describe is the
+ * kernel's (xnu bsd/sys/kern_control.h, sys_domain.h) and has not changed in years.
+ */
+#if __has_include(<sys/kern_control.h>)
+#include <sys/kern_control.h>
+#include <sys/sys_domain.h>
+#else
+#ifndef AF_SYSTEM
+#define AF_SYSTEM       32
+#endif
+#ifndef PF_SYSTEM
+#define PF_SYSTEM       AF_SYSTEM
+#endif
+#define SYSPROTO_CONTROL 2
+#define AF_SYS_CONTROL  2
+#define MAX_KCTL_NAME   96
+struct ctl_info {
+	u_int32_t ctl_id;
+	char ctl_name[MAX_KCTL_NAME];
+};
+struct sockaddr_ctl {
+	u_char sc_len;
+	u_char sc_family;
+	u_int16_t ss_sysaddr;
+	u_int32_t sc_id;
+	u_int32_t sc_unit;
+	u_int32_t sc_reserved[5];
+};
+#define CTLIOCGINFO     _IOWR('N', 3, struct ctl_info)
+#endif
 
 #define A34BT_CONTROL   "com.a34.bt.hci"
 #define A34BT_SYSCTL    "kern.a34bt"
