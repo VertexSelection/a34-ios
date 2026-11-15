@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index eade716..f0e5bf3 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -142,6 +142,18 @@
+  * 400), Apple's vendor answers and Number Of Completed Packets no longer use up its budget (now 1200), and on each
+  * Disconnection Complete the last 24 packets are said.
+  *
++ * A34 (0984): Encryption Change v2. Boot 0983-120-a: the ACL path was sound (every packet completed, nothing
++ * outstanding), but bluetoothd enables Encryption Change v2 (event 0x59, Set_Event_Mask_Page_2 bit 25) and then
++ * waits for it to complete Set_Connection_Encryption (0x0413); the MT6635 sends the v1 event (0x08) all the same.
++ * bluetoothd took the v1 event as an encryption change, but the command stayed pending: its security manager kept
++ * incoming L2CAP channels waiting ("deferredEnforcerCB busy ... PMAN_ST_SECMGR_ENFORCE", "cid ... not found",
++ * CONFIG_RSP timeouts), and when the command timed out ("HCI expected event 89 with opcode OI_DHCI_SET_CNCT_
++ * ENCRYPTION_OPCODE timedout") bluetoothd restarted (reason 621), dropping the AirPods right after mediaserverd's
++ * "audio started" and AVDTP_Start. Now, while bluetoothd has v2 enabled, each v1 event is given to it as v2 with a
++ * key size of 16 (0 when off); bluetoothd reads the real size itself (Read_Encryption_Key_Size). Also: while a
++ * connection is up, an LE scan window is cut to a quarter of its interval (bluetoothd's active 30/40 ms scans ran
++ * through the AirPods' L2CAP setup, whose answers came seconds late).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1742,6 +1754,8 @@ br_standard_here(const uint8_t *cmd, uint32_t n)
+  * answered as done.
+  */
+ static bool br_dup_on;                          /* (0979) the duplicate filter is applied here (br_dup_report) */
++static bool br_enc_v2;                          /* (0984) bluetoothd enabled Encryption Change v2 (page 2, bit 25) */
++static uint32_t br_links;                       /* (0984) connections up (Connection Complete minus Disconnection) */
+ 
+ static struct {
+ 	bool on, ext;                   /* the controller scans; enabled with the extended command */
+@@ -2194,6 +2208,9 @@ br_drain(void)
+ 			}
+ 		}
+ 		br_dup_command(pkt, n);                                /* (0979) the duplicate filter here */
++		if (pkt[0] == 0x01 && n >= 12 && pkt[1] == 0x63 && pkt[2] == 0x0c) {
++			br_enc_v2 = (pkt[4 + 3] & 0x02) != 0;          /* (0984) Set_Event_Mask_Page_2, bit 25 */
++		}
+ 		if (pkt[0] == 0x01 && n >= 9 && ((pkt[1] == 0x0b && pkt[2] == 0x20) || (pkt[1] == 0x41 && pkt[2] == 0x20))) {
+ 			/* (0978) an LE scan window over half its interval cut to half: the radio is Wi-Fi's too */
+ 			uint32_t at = pkt[1] == 0x0b ? 5 : 8, end = n;
+@@ -2203,13 +2220,15 @@ br_drain(void)
+ 				uint32_t window = (uint32_t)(pkt[at + 2] | (pkt[at + 3] << 8));
+ 				static uint32_t said;
+ 
+-				if (interval >= 8 && window > interval / 2) {
+-					if (said++ < 4) {
+-						printf("A34 BT: br: LE scan window %u of interval %u (x0.625 ms) cut to %u\n", window,
+-						    interval, interval / 2);
++				uint32_t most = br_links != 0 ? interval / 4 : interval / 2;   /* (0984) a link up: a quarter */
++
++				if (interval >= 8 && window > most) {
++					if (said++ < 8) {
++						printf("A34 BT: br: LE scan window %u of interval %u (x0.625 ms) cut to %u%s\n", window,
++						    interval, most, br_links != 0 ? " (a connection is up)" : "");
+ 					}
+-					pkt[at + 2] = (uint8_t)((interval / 2) & 0xff);
+-					pkt[at + 3] = (uint8_t)((interval / 2) >> 8);
++					pkt[at + 2] = (uint8_t)(most & 0xff);
++					pkt[at + 3] = (uint8_t)(most >> 8);
+ 				}
+ 			}
+ 		}
+@@ -2641,6 +2660,38 @@ br_acl_say(void)
+ 	br_acl.start_ms = (br_acl.outstanding != 0) ? now : 0;
+ }
+ 
++/*
++ * (0984) connections counted; Encryption Change (v1, 0x08) given as v2 (0x59: status, handle, enabled, key size)
++ * while bluetoothd has v2 enabled. a has room for the byte more. The new length.
++ */
++static uint32_t
++br_link_event(uint8_t *a, uint32_t n)
++{
++	static uint32_t said;
++
++	if (n >= 6 && a[0] == 0x04 && a[1] == 0x03 && a[3] == 0) {                     /* Connection Complete */
++		br_links++;
++	} else if (n >= 6 && a[0] == 0x04 && a[1] == 0x3e && (a[3] == 0x01 || a[3] == 0x0a) && a[4] == 0) {
++		br_links++;                                                             /* LE (Enhanced) Connection Complete */
++	} else if (n >= 7 && a[0] == 0x04 && a[1] == 0x05 && a[3] == 0) {              /* Disconnection Complete */
++		br_links -= br_links != 0 ? 1u : 0u;
++	} else if (n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
++		br_links = 0;                                                           /* HCI_Reset */
++		br_enc_v2 = false;
++	} else if (br_enc_v2 && n == 7 && a[0] == 0x04 && a[1] == 0x08) {             /* Encryption Change v1 */
++		a[1] = 0x59;
++		a[2] = 5;
++		a[7] = a[3] == 0 && a[6] != 0 ? 16 : 0;
++		if (said++ < 8) {
++			printf("A34 BT: br: Encryption Change (status %#x, handle %#x, %s) given to bluetoothd as v2, key size %u\n",
++			    a[3], (unsigned)(a[4] | ((a[5] & 0x0f) << 8)), a[6] == 0 ? "off" : a[6] == 2 ? "AES-CCM" : "E0",
++			    a[7]);
++		}
++		return 8;
++	}
++	return n;
++}
++
+ /*
+  * (0983) one packet from the controller on its way to bluetoothd: counted, logged, fixed up, delivered. nested: it
+  * came while the kernel waited for an answer of its own (bt_command), so nothing here sends a command again.
+@@ -2666,6 +2717,7 @@ br_event_in(uint8_t *a, uint32_t n, bool nested)
+ 	if (!nested) {
+ 		br_scan_event(a, n);                            /* (0975) */
+ 	}
++	n = br_link_event(a, n);                                /* (0984) */
+ 	n = br_xl_event(a, n);                                  /* (0976) */
+ 	if (n != 0) {
+ 		n = br_dup_report(a, n);                        /* (0979) */
