@@ -1,0 +1,209 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0084b12..7a456a4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -234,6 +234,18 @@ public:
+ 	uint64_t      fBLSaidAt;                /* mach time of the last summary line */
+ 	uint32_t blNits16(uint32_t level);
+ 	void blLevel(uint32_t level, const char *who);
++	/* A34 (1004): the level to the panel (S6E3FC5 DBV, DCS 0x51), sent from the kick work loop */
++	bool          fBLPanel;                 /* a34blpanel (default 1) */
++	uint32_t      fBLPanelNits;             /* nits at DBV 0x3FF, the panel's normal maximum (a34blpanelnits) */
++	volatile uint32_t fBLWant;              /* the DBV wanted (0: none yet) */
++	uint32_t      fBLSent;                  /* the DBV last sent (0: none) */
++	uint64_t      fBLSentAt;                /* ... mach time */
++	volatile UInt32 fBLArmed;               /* fBLTimer set and not fired yet */
++	IOTimerEventSource *fBLTimer;           /* on the kick work loop */
++	uint32_t      fBLSends, fBLFails;
++	void blArm(uint32_t ms);
++	void blPoll(bool timer);
++	bool panelBLSend(uint32_t dbv, uint64_t *took);
+ 	void kickFlip(void);
+ 	bool kickOne(void);
+ 	int32_t drawTarget(bool full, bool *seed);
+@@ -2129,6 +2141,11 @@ AppleCLCD::publishRefresh(uint32_t hz)
+ #define SWEET_FB_BL_NITS_MAX    480u
+ #define SWEET_FB_BL_STEPS       101u
+ #define SWEET_FB_BL_SAY         24u     /* requests logged one by one, then a line every 2 s at most */
++#define SWEET_FB_BL_DBV_MIN     0x002u  /* A34 (1004): Samsung's UI level 0 */
++#define SWEET_FB_BL_DBV_MAX     0x3ffu  /* ... 255, the normal maximum (no HBM) */
++#define SWEET_FB_BL_PANEL_NITS  480u    /* nits at DBV 0x3FF (a34blpanelnits) */
++#define SWEET_FB_BL_GAP_MS      33u     /* one level to the panel every 33 ms at most */
++#define SWEET_FB_BL_IDLE_MS     20u     /* the link waited for that long (a transfer is 4-8 ms) */
+ 
+ uint32_t
+ AppleCLCD::blNits16(uint32_t level)
+@@ -2145,17 +2162,135 @@ AppleCLCD::blLevel(uint32_t level, const char *who)
+ {
+ 	uint64_t now = mach_absolute_time(), every;
+ 
++	uint32_t n16, dbv;
++
+ 	if (level == fBLValue) {
+ 		return;
+ 	}
+ 	fBLValue = level;
++	n16 = blNits16(level);
++	/* A34 (1004): DBV linear in nits up to 0x3FF, the normal maximum (Samsung's UI 255); 0x400.. would be HBM */
++	dbv = fBLPanelNits != 0 ? (uint32_t)(((uint64_t)n16 * SWEET_FB_BL_DBV_MAX + ((uint64_t)fBLPanelNits << 15)) /
++	    ((uint64_t)fBLPanelNits << 16)) : 0;
++	dbv = dbv < SWEET_FB_BL_DBV_MIN ? SWEET_FB_BL_DBV_MIN : (dbv > SWEET_FB_BL_DBV_MAX ? SWEET_FB_BL_DBV_MAX : dbv);
++	if (fBLPanel) {
++		fBLWant = dbv;
++		blArm(1);
++	}
+ 	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &every);
+ 	if (fBLSaidAt == 0 || now - fBLSaidAt >= every) {
+-		uint32_t n16 = blNits16(level);
+-
+ 		fBLSaidAt = now;
+-		IOLog("A34 BL: level %u of %u from %s: %u.%02u nits on the curve (%u..%u)\n", level, SWEET_FB_BL_MAX, who,
+-		    n16 >> 16, (uint32_t)(((uint64_t)(n16 & 0xffffu) * 100) >> 16), fBLMin, fBLMax);
++		IOLog("A34 BL: level %u of %u from %s: %u.%02u nits on the curve (%u..%u), panel DBV 0x%03x%s (%u sent, %u "
++		    "failed)\n", level, SWEET_FB_BL_MAX, who, n16 >> 16, (uint32_t)(((uint64_t)(n16 & 0xffffu) * 100) >> 16),
++		    fBLMin, fBLMax, dbv, fBLPanel ? "" : " not sent (a34blpanel=0)", fBLSends, fBLFails);
++	}
++}
++
++/*
++ * A34 (1004): the panel's brightness. Samsung's sequence for the S6E3FC5
++ * (smcdsd_panel_send_msg, a34x_s6e3fc5_sdc_param.h), the parts that change
++ * with the level: the keys 9F/F0/FC open, 53 28 (dimming: smooth, normal
++ * mode -- E0 would be HBM), 51 DBV (2 bytes, 0x002..0x3FF: Samsung's UI
++ * levels 0..255; its 256..510 are HBM and not used), F7 0F (update), the
++ * keys closed. ACL, IRC and TSET stay as the loader set them. Sent like the
++ * 120 Hz commands (panelHzSend): display lock held, the link idle, the frame
++ * header put back. From the kick work loop only: right after a transfer
++ * (kickOne) or from fBLTimer when no frame goes out; one every
++ * SWEET_FB_BL_GAP_MS at most (CoreBrightness fades in many small steps; the
++ * panel's smooth dimming fills in), the newest level wins.
++ */
++void
++AppleCLCD::blArm(uint32_t ms)
++{
++	if (fBLTimer != NULL && OSCompareAndSwap(0, 1, &fBLArmed)) {
++		fBLTimer->setTimeoutMS(ms);
++	}
++}
++
++bool
++AppleCLCD::panelBLSend(uint32_t dbv, uint64_t *took)
++{
++	static const uint8_t keyOn[3][3] = { { 0x9F, 0xA5, 0xA5 }, { 0xF0, 0x5A, 0x5A }, { 0xFC, 0x5A, 0x5A } };
++	static const uint8_t keyOff[3][3] = { { 0xFC, 0xA5, 0xA5 }, { 0xF0, 0xA5, 0xA5 }, { 0x9F, 0x5A, 0x5A } };
++	static const uint8_t dimming[2] = { 0x53, 0x28 }, update[2] = { 0xF7, 0x0F };
++	uint8_t level[3] = { 0x51, (uint8_t)((dbv >> 8) & 0x03u), (uint8_t)(dbv & 0xffu) };
++	uint32_t cmdq0, cmdqCon, type1;
++	uint64_t t, t0 = mach_absolute_time();
++	bool ok = true, closed = true;
++
++	*took = 0;
++	if (dbv < SWEET_FB_BL_DBV_MIN || dbv > SWEET_FB_BL_DBV_MAX || !a34_dsi_lock()) {
++		return false;
++	}
++	if (!a34_dsi_wait_idle(&t, SWEET_FB_BL_IDLE_MS)) {
++		a34_dsi_unlock();
++		return false;
++	}
++	cmdq0 = a34_dsi_rd(SWEET_FB_DSI_CMDQ(0));
++	cmdqCon = a34_dsi_rd(SWEET_FB_DSI_CMDQ_CON);
++	type1 = a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS);
++	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, type1 & ~SWEET_FB_HS_BLANKING);
++	for (unsigned i = 0; i < 3 && ok; i++) {
++		ok = sweet_fb_dcs(keyOn[i], 3);
++	}
++	ok = ok && sweet_fb_dcs(dimming, 2);
++	ok = ok && sweet_fb_dcs(level, 3);
++	ok = ok && sweet_fb_dcs(update, 2);
++	for (unsigned i = 0; i < 3; i++) {
++		closed = sweet_fb_dcs(keyOff[i], 3) && closed;
++	}
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ(0), cmdq0);
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ_CON, cmdqCon);
++	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, type1);
++	a34_dsi_unlock();
++	*took = mach_absolute_time() - t0;
++	return ok && closed;
++}
++
++/* A34 (1004): on the kick work loop: the wanted DBV sent if it is new and the last one is SWEET_FB_BL_GAP_MS old */
++void
++AppleCLCD::blPoll(bool timer)
++{
++	uint32_t want = fBLWant;
++	uint64_t now = mach_absolute_time(), gap, took = 0, ns = 0;
++	bool ok;
++
++	if (timer) {
++		(void)OSCompareAndSwap(1, 0, &fBLArmed);
++	}
++	if (!fBLPanel || want == 0 || want == fBLSent) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_BL_GAP_MS * NSEC_PER_MSEC, &gap);
++	if (fBLSentAt != 0 && now - fBLSentAt < gap) {
++		absolutetime_to_nanoseconds(gap - (now - fBLSentAt), &ns);
++		blArm((uint32_t)(ns / NSEC_PER_MSEC) + 1);
++		return;
++	}
++	ok = panelBLSend(want, &took);
++	fBLSentAt = mach_absolute_time();
++	absolutetime_to_nanoseconds(took, &ns);
++	if (ok) {
++		fBLSent = want;
++		fBLSends++;
++	} else {
++		fBLFails++;
++		blArm(SWEET_FB_BL_GAP_MS);
++	}
++	if ((ok && (fBLSends <= 8 || (fBLSends % 256) == 0)) || (!ok && fBLFails <= 8)) {
++		IOLog("A34 BL: panel DBV 0x%03x %s in %llu us (%s; %u sent, %u failed)\n", want, ok ? "sent" : "NOT sent",
++		    (unsigned long long)(ns / NSEC_PER_USEC), timer ? "timer" : "after a frame", fBLSends, fBLFails);
++	}
++}
++
++static void
++sweet_fb_bl_fired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = OSDynamicCast(AppleCLCD, owner);
++
++	(void)sender;
++	if (fb != NULL) {
++		fb->blPoll(true);
+ 	}
+ }
+ 
+@@ -2305,6 +2440,23 @@ sweet_fb_backlight_publish(AppleCLCD *fb)
+ 	for (uint32_t i = 0; i < SWEET_FB_BL_STEPS; i++) {
+ 		table[i] = fb->blNits16(i * SWEET_FB_BL_MAX / (SWEET_FB_BL_STEPS - 1));
+ 	}
++	uint32_t panel = 1;     /* A34 (1004) */
++	fb->fBLPanelNits = SWEET_FB_BL_PANEL_NITS;
++	(void)PE_parse_boot_argn("a34blpanel", &panel, sizeof(panel));
++	(void)PE_parse_boot_argn("a34blpanelnits", &fb->fBLPanelNits, sizeof(fb->fBLPanelNits));
++	if (fb->fBLPanelNits < 100 || fb->fBLPanelNits > 1000) {
++		fb->fBLPanelNits = SWEET_FB_BL_PANEL_NITS;
++	}
++	if (panel != 0 && a34_kick_wl != NULL) {
++		fb->fBLTimer = IOTimerEventSource::timerEventSource(fb, &sweet_fb_bl_fired);
++		if (fb->fBLTimer != NULL && a34_kick_wl->addEventSource(fb->fBLTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fb->fBLTimer);
++		}
++	}
++	fb->fBLPanel = fb->fBLTimer != NULL;
++	IOLog("A34 BL: the panel's level %s (a34blpanel=%u): DBV 0x%03x..0x%03x for 0..%u nits, smooth dimming, no HBM\n",
++	    fb->fBLPanel ? "follows the backlight" : "is not changed", panel, SWEET_FB_BL_DBV_MIN, SWEET_FB_BL_DBV_MAX,
++	    fb->fBLPanelNits);
+ 	marketing = OSData::withBytes(table, sizeof(table));
+ 	if (backlight != NULL && marketing != NULL && backlight->init()) {
+ 		backlight->fFB = fb;
+@@ -2819,6 +2971,9 @@ AppleCLCD::kickOne(void)
+ 	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
+ 	sweet_fb_hs_say(xfer);
+ 	sweet_fb_con_check(xfer);       /* A34 (0939) */
++	if (fBLWant != fBLSent) {
++		blPoll(false);          /* A34 (1004): the backlight's level, the link idle between frames */
++	}
+ 	if (fTE) {
+ 		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);      /* A34 (0938): see teWait() */
+ 	}
