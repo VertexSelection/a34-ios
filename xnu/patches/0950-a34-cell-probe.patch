@@ -1,21 +1,21 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 4c12ac2..196919b 100644
+index 70c2540..058916d 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,7 @@ bsd/dev/a34_touch.c			standard
- bsd/dev/a34_diag.c			standard
- bsd/dev/a34_mali.c			standard
- bsd/dev/a34_clocks.c			standard
+@@ -115,6 +115,7 @@ bsd/dev/a34_clocks.c			standard
+ bsd/dev/a34_connsys.c			standard
+ bsd/dev/a34_bt.c			standard
+ bsd/dev/a34_wifi.c			standard
 +bsd/dev/a34_cell.c			standard
  bsd/dev/ruby_hal.c			standard
  bsd/dev/ruby_eint.c			standard
  bsd/dev/ruby_irq.c			standard
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..18302c5
+index 0000000..7a6d372
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,540 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -31,7 +31,8 @@ index 0000000..18302c5
 + *     normal boot and skips it on a recovery boot, LK's own log string "recovery mode, no need
 + *     load modem"), and /reserved-memory names the modem's and the shared memory's regions.
 + *     The struct is MediaTek's _ccci_lk_info_v2 (Samsung kernel ccci_util_lib_fo.c), copied as
-+ *     raw little-endian bytes into the property.
++ *     raw little-endian bytes into the property. When LK loaded the modem, its tag table
++ *     (reserved "ccci_tag_mem") is listed: tag names, sizes, small values in hex.
 + *  2. The SPM's power status of the modem's MTCMOS domain: PWR_STATUS 0x10006EF0 and
 + *     PWR_STATUS_2ND 0x10006EF4, bit 0 = MD1; MD1_PWR_CON 0x10006E00 (clk-mt6877-pg.c).
 + *  3. The infracfg_ao clock gates of the CCIF blocks (status registers, 1 = gated):
@@ -40,7 +41,8 @@ index 0000000..18302c5
 + *     registers can stall the bus).
 + *  4. Only when the MD1 domain is on: the modem's boot status through the secure monitor,
 + *     SMC 0xC2000505 (MTK_SIP_KERNEL_CCCI_CONTROL) with MD_POWER_CONFIG (6) / MD_BOOT_STATUS
-+ *     (4), the same query Android's ccci driver makes for its logs (md_sys1_platform.c).
++ *     (4), the same query Android's ccci driver makes for its logs, and MD_CHECK_DONE (3), the
++ *     boot ROM check Android polls before its first start (md_sys1_platform.c).
 + *  5. The md1img partition, through sweet_ufs_read_part() (read only, a fixed list of
 + *     partitions): its MediaTek section headers (magic 0x58881688, name, size; a 512-byte
 + *     header per section, 16-byte alignment) and md1rom's CHECK_HEADER (version, platform,
@@ -153,6 +155,8 @@ index 0000000..18302c5
 +#define FDT_END         9
 +
 +static int ac_lk_md = -1;       /* -1 unknown, 0 not loaded, 1 loaded */
++static uint64_t ac_tag_base;
++static uint32_t ac_tag_size, ac_tag_count, ac_tag_version;
 +
 +static void
 +ac_modem_info(const char *node, const uint8_t *v, uint32_t len)
@@ -177,6 +181,66 @@ index 0000000..18302c5
 +		    tags, flag, err, mderr, loaded ? "LOADED by LK" : "not loaded");
 +	if (ac_lk_md != 1)
 +		ac_lk_md = loaded ? 1 : 0;
++	if (loaded && ac_tag_base == 0) {
++		ac_tag_base = base;
++		ac_tag_size = size;
++		ac_tag_count = tags;
++		ac_tag_version = version;
++	}
++}
++
++/*
++ * LK's tag table (reserved "ccci_tag_mem", which Android's ccci_util maps and reads the same
++ * way): tags {char name[64]; u32 data_offset, data_size, next_tag_offset} for version >= 2
++ * (16-byte names before), offsets from the table's start. They carry the modem's memory and
++ * shared-memory layout (smem_layout, nc/c_smem_layout*, md_mpu_inf, ...) that the kernel's
++ * start sequence needs. Small values are printed in hex; nothing in them is an identity.
++ */
++static void
++ac_lk_tags(void)
++{
++	uint32_t size = ac_tag_size;
++
++	if (ac_tag_base == 0 || size == 0 || size > 0x10000 || ac_tag_count > 256)
++		return;
++	vm_offset_t m = ml_io_map((vm_offset_t)ac_tag_base, ((vm_size_t)size + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++	uint8_t *t = kalloc_data(size + 4, Z_WAITOK | Z_ZERO);
++	if (!m || !t) {
++		if (t)
++			kfree_data(t, size + 4);
++		return;
++	}
++	for (uint32_t o = 0; o + 4 <= size; o += 4) {
++		uint32_t w = ac_rd32(m, o);
++		memcpy(t + o, &w, 4);
++	}
++	uint32_t namelen = ac_tag_version >= 2 ? 64 : 16, cur = 0;
++	for (uint32_t i = 0; i < ac_tag_count && cur + namelen + 12 <= size; i++) {
++		char name[68];
++		ac_printable(name, sizeof(name), t + cur, namelen);
++		uint32_t off = le32(t + cur + namelen), len = le32(t + cur + namelen + 4);
++		uint32_t next = le32(t + cur + namelen + 8);
++		char hex[3 * 64 + 1];
++		size_t h = 0;
++		if (off <= size && len <= size - off && len <= 64) {
++			for (uint32_t k = 0; k < len; k++)
++				h += (size_t)snprintf(hex + h, sizeof(hex) - h, "%02x", t[off + k]);
++		}
++		hex[h] = 0;
++		if (len > 64 && strcmp(name, "md1_chk") == 0 && off <= size && len <= size - off && len >= 168) {
++			char plat[20], build[70];
++			ac_printable(plat, sizeof(plat), t + off + 24, 16);
++			ac_printable(build, sizeof(build), t + off + 40, 64);
++			printf("A34 CELL: LK tag %-24s %u bytes: check header in modem memory, %s %s\n", name,
++			    len, plat, build);
++		} else {
++			printf("A34 CELL: LK tag %-24s %u bytes%s%s\n", name, len, h ? ": " : "", hex);
++		}
++		if (next <= cur || next >= size)
++			break;
++		cur = next;
++	}
++	kfree_data(t, size + 4);
 +}
 +
 +static void
@@ -275,6 +339,7 @@ index 0000000..18302c5
 +	}
 +	kfree_data(f, total);
 +	printf("A34 CELL: LK modem regions in reserved-memory: %d\n", nregions);
++	ac_lk_tags();
 +	AC_NOTE("lk=%s mdregions=%d", ac_lk_md == 1 ? "loaded" : ac_lk_md == 0 ? "notloaded" : "noinfo",
 +	    nregions);
 +}
@@ -331,6 +396,31 @@ index 0000000..18302c5
 +	printf("A34 CELL: MD boot status (SMC MD_POWER_CONFIG/MD_BOOT_STATUS): ret 0x%llx status0 "
 +	    "0x%llx status1 0x%llx\n", x0, x1, x2);
 +	AC_NOTE("mdboot=0x%llx", x1);
++}
++
++/* MD_POWER_CONFIG / MD_CHECK_DONE (3): 0 once the modem's boot ROM check passed ("BROM PASS"
++ * in Android's md_start_platform, which polls it the same way). */
++static void
++ac_brom_check(void)
++{
++	register uint64_t x0 __asm__("x0") = AC_SMC_CCCI_CONTROL;
++	register uint64_t x1 __asm__("x1") = AC_MD_POWER_CONFIG;
++	register uint64_t x2 __asm__("x2") = 3;
++	register uint64_t x3 __asm__("x3") = 0;
++
++	__asm__ volatile(
++	    "mov x4, xzr\n\t"
++	    "mov x5, xzr\n\t"
++	    "mov x6, xzr\n\t"
++	    "mov x7, xzr\n\t"
++	    "smc #0\n\t"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
++	      "x17", "memory");
++	printf("A34 CELL: MD boot ROM check (SMC MD_POWER_CONFIG/MD_CHECK_DONE): 0x%llx%s\n", x0,
++	    x0 == 0 ? " = BROM PASS" : "");
++	AC_NOTE("brom=%s", x0 == 0 ? "pass" : "no");
 +}
 +
 +/* ---- 5. the md1img partition ---- */
@@ -434,8 +524,10 @@ index 0000000..18302c5
 +	ac_lk_fdt();
 +	bool on = ac_md1_power();
 +	ac_ccif_clocks();
-+	if (on)
++	if (on) {
 +		ac_boot_status();
++		ac_brom_check();
++	}
 +	else
 +		printf("A34 CELL: MD1 is off: no boot status query\n");
 +	ac_partitions();
@@ -465,18 +557,18 @@ index 0000000..18302c5
 +}
 +#endif
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 9b19d93..8d63511 100644
+index be6457f..923e7b3 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -55,6 +55,7 @@ extern void ruby_keys_init(void);
- extern void a34_touch_init(void);
- extern void a34_diag_init(void);
- extern void a34_mali_init(void);
-+extern void a34_cell_init(void);
+@@ -58,6 +58,7 @@ extern void a34_mali_init(void);
  extern void a34_clocks_init(void);
+ extern void a34_bt_init(void);           /* A34 (0939): bsd/dev/a34_bt.c, a34bt=1 */
+ extern void a34_wifi_init(void);         /* A34 (0940): bsd/dev/a34_wifi.c */
++extern void a34_cell_init(void);         /* A34 (0950): bsd/dev/a34_cell.c, a34cell=1 */
  extern void sweet_touch_init(void);
  extern void sweet_goodix_spi_kick(void);
-@@ -307,7 +308,7 @@ ufs_sync_cache(void)
+ extern void sweet_usb_probe(void);
+@@ -309,7 +310,7 @@ ufs_sync_cache(void)
  }
  
  static int
@@ -485,7 +577,7 @@ index 9b19d93..8d63511 100644
  {
  	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
  	int error = ufs_read_blocks(0, 1);
-@@ -382,14 +383,82 @@ ufs_find_partition(const char *want)
+@@ -384,14 +385,82 @@ ufs_find_partition(const char *want)
  		if (last < first) {
  			return ENXIO;
  		}
@@ -570,7 +662,7 @@ index 9b19d93..8d63511 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -670,7 +739,7 @@ sweet_ufs_init(void)
+@@ -672,7 +741,7 @@ sweet_ufs_init(void)
  		}
  	}
  	if (!error) {
@@ -579,11 +671,11 @@ index 9b19d93..8d63511 100644
  	}
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
-@@ -712,6 +781,7 @@ sweet_ufs_init(void)
- 	a34_clocks_init();      /* 0921: clocks and voltages as the boot loader left them; a34gpumhz */
- 	a34_diag_init();
+@@ -716,6 +785,7 @@ sweet_ufs_init(void)
  	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
-+	a34_cell_init();        /* 0950: cellular stage 0 probe, read only, its own thread; a34cell=1 */
+ 	a34_bt_init();          /* 0939: Bluetooth milestone 1, its own thread; a34bt=1 */
+ 	a34_wifi_init();        /* 0940: Wi-Fi bring-up, its own thread; a34wifi=N or sysctl kern.a34wifi.want */
++	a34_cell_init();        /* 0950: cellular probe, read only, its own thread; a34cell=1 */
  	int keys = 0;
  	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
  		ruby_keys_init();
