@@ -39,7 +39,8 @@ log "a34bt-bluetool (bluetool.c: BlueTool's stand-in for bluetoothd)"
 
 log "a34bt-btd (btd.c: bluetoothd's wrapper) and liba34bt-btd.dylib (btdlib.c: inserted into bluetoothd)"
 "${CC[@]}" -o "$A/a34bt-btd" "$HERE/btd.c"
-"${CC[@]}" -fblocks -dynamiclib -install_name "$INSTALL_DIR/liba34bt-btd.dylib" -o "$A/liba34bt-btd.dylib" "$HERE/btdlib.c"
+"${CC[@]}" -fblocks -dynamiclib -install_name "$INSTALL_DIR/liba34bt-btd.dylib" -o "$A/liba34bt-btd.dylib" "$HERE/btdlib.c" \
+	-framework CoreFoundation -framework Security
 
 log "package"
 mv "$A"/*.dSYM "$OUT/dSYM/" 2>/dev/null || true
