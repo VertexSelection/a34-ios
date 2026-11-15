@@ -144,3 +144,25 @@ In the log:
     A34 BT: br> / br< / br= ...
     a34bt-btd: bluetoothd[N]: _exit(1) from bluetoothd+0x... (if it still restarts: where from)
     A34 BT: LE Apple types (type:count, 07 = proximity pairing): 07:.. 10:.. 12:..
+
+## 7. bluetoothd's keychain (boot 0988-all-a)
+
+bluetoothd passed BlueTool's place in 0988-all-a and then `_exit(1)` from `bluetoothd+0x90778 <-
++0x487edc <- +0x5993e4 <- +0x42a5d4 <- +0x42b174 <- +0x429084 <- main`: its stack's init
+(`+0x599048`) reads its root keys (`readRootKeys`, `+0x594fac`) -- LE identity root, encryption root,
+cloud keys, static random address -- from the system keychain (generic passwords of service
+`MobileBluetooth`) and stores new ones when there are none. securityd cannot store an item on this
+kernel (AppleKeyStore selector 10, wrap key: `SWEET AKS: securityd sel 10 ... -> 0xe00002c7`), so
+"Failed to set new identity root!" and a restart. (The only other way past it is
+`/product/boot-ios-diagnostics` in the device tree, which turns the whole system into iOS Diagnostics.)
+
+`liba34bt-btd` now keeps bluetoothd's `MobileBluetooth` items itself, in
+`/var/mobile/Library/Bluetooth/com.a34.keychain.plist` (not encrypted); every other keychain use is
+unchanged. And it formats bluetoothd's os_log onto the console (`bt: ...`), since
+`OS_ACTIVITY_DT_MODE` showed nothing. Only `/a34` changes (same kernel, same wraps):
+
+    sudo python3 -I tools/root-add-job.py --copy /mnt /a34 a34
+
+Expected: `a34bt-btd: bluetoothd[N]: keychain: copy Identity Root ...: 0 found`, `keychain: add ...: 0`,
+then `bt: ...` lines of its start, `com.apple.BlueTool asked ... boot`, `bt: HCI Transport is set to
+H4BC`, and the kernel's `A34 BT: br: com.apple.uart.sk.bluetooth connected by bluetoothd`.

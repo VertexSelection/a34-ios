@@ -19,6 +19,11 @@ Status (2026-11-15):
   power result=1" and `_exit` (`+0x3a6128`). Next round: `a34bt-btd` + `liba34bt-btd.dylib` answer
   BlueTool inside bluetoothd and put its stderr/os_log on the console; 0972 fixes the LE counter and
   counts Apple advert types.
+- **Boot 0988-all-a (0972, `a34bt-btd`)**: BlueTool answered in-process; bluetoothd then `_exit(1)`
+  from its stack init: `readRootKeys` (`+0x594fac`) could not store its identity root in the keychain
+  (service `MobileBluetooth`; securityd cannot wrap keys on this kernel's AppleKeyStore, selector 10).
+  `liba34bt-btd` now keeps bluetoothd's `MobileBluetooth` items in
+  `/var/mobile/Library/Bluetooth/com.a34.keychain.plist` and puts its os_log on the console.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
