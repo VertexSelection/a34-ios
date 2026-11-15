@@ -139,8 +139,9 @@ rwm_perf_report(uint64_t now)
 		 p.copyout_ns / 1e6 / cbs);
 	say(line);
 	snprintf(line, sizeof(line), "rwm waits: queue full x%llu %.0f ms, until processed x%llu %.0f ms, "
-		 "until completed x%llu %.0f ms; the worker %.1f ms a buffer", p.queue_waits, p.queue_ns / 1e6,
-		 p.processed_waits, p.processed_ns / 1e6, p.completed_waits, p.completed_ns / 1e6,
+		 "until completed x%llu %.0f ms (and on the completion queue x%llu %.0f ms); the worker %.1f ms a buffer",
+		 p.queue_waits, p.queue_ns / 1e6, p.processed_waits, p.processed_ns / 1e6, p.completed_waits,
+		 p.completed_ns / 1e6, p.completed_q_waits, p.completed_q_ns / 1e6,
 		 p.worker_cbs ? p.worker_ns / 1e6 / p.worker_cbs : 0.0);
 	{
 		size_t at = strlen(line);

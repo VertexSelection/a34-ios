@@ -4103,7 +4103,9 @@ rw_core_of(id texture)
 		[self retain];
 		[scheduled release];
 		dispatch_async(completions, ^{
+			rwm_on_completion_queue = true;         /* (counted apart: rwm waits) */
 			[self waitUntilCompleted];
+			rwm_on_completion_queue = false;
 			[self redwoodReleaseSampled];
 			for (id handler in completed) {
 				[self redwoodDeliver:(void (^)(id))handler];

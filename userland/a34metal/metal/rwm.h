@@ -47,6 +47,9 @@ struct rwm_perf {
 	/* where the threads that make command buffers wait for this driver: a full worker queue at -commit, a
 	 * buffer's work at -waitUntilScheduled and the like, its GPU work at -waitUntilCompleted */
 	uint64_t queue_waits, queue_ns, processed_waits, processed_ns, completed_waits, completed_ns;
+	/* A34: ... of those, the ones on the driver's own completion queue (redwoodDeliverHandlers), which hold no
+	 * thread of the program's: counted apart */
+	uint64_t completed_q_waits, completed_q_ns;
 	uint64_t drains, drain_ns;      /* a texture written or read at once, after the worker's queue */
 	uint64_t worker_cbs, worker_ns;  /* the worker's whole time for a buffer, waits in it included */
 	uint64_t worker_cpu;            /* ... and how much of it the worker ran */
@@ -56,6 +59,8 @@ struct rwm_perf {
 	uint64_t copyouts, copyout_bytes, copyout_ns;
 };
 extern struct rwm_perf rwm_perf;
+/* A34: set on the driver's completion queue while it waits for a buffer's GPU work (redwoodmetal.m) */
+extern __thread bool rwm_on_completion_queue;
 /* A34: a line HackiOS kept with their kernel's sysctl kern.redwood.say (which ours has not): written to
  * stdout as "redwoodmetal kept: ...", which in backboardd reaches the kernel log through the devnull tee */
 void rwm_keep(const char *line);
