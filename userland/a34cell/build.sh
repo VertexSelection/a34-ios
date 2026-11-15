@@ -46,7 +46,9 @@ if otool -l "$OUT/a34/a34cell" | grep -q LC_RPATH; then
 	echo "error: a34cell has an LC_RPATH"
 	exit 1
 fi
-dsymutil "$OUT/a34/a34cell" -o "$WORK/a34cell.dSYM" >/dev/null 2>&1 || true
+rm -rf "$WORK/a34cell.dSYM"
+dsymutil -o "$WORK/a34cell.dSYM" "$OUT/a34/a34cell" >/dev/null 2>&1 || true
+rm -rf "$OUT/a34/a34cell.dSYM"     # only the binary goes to the phone
 strip -S "$OUT/a34/a34cell"
 codesign -f -s - "$OUT/a34/a34cell"     # last: nothing changes the file after this
 codesign -v "$OUT/a34/a34cell"
