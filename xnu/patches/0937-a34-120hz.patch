@@ -1,0 +1,458 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ccde905..65696da 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -87,6 +87,7 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++#define SWEET_FB_HOLD_LOG_TICKS         600     /* vsyncs: 10 s at 60 Hz (A34 (0937): fLogTicks; moved up for start()) */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -165,6 +166,10 @@ public:
+ 	uint64_t      fTELast, fTEPeriod;       /* mach time of the last TE seen, the TE period */
+ 	IOTimerEventSource *fNow;               /* A34 (0935): a34fbnow: a swap copied at once, not at the next vsync */
+ 	bool          fPresentNow;
++	/* A34 (0937): 120 Hz, see panelHz() */
++	uint32_t      fPanelHz;                 /* the rate the panel was switched to and measured at (0: as LK left it) */
++	bool          fVsyncTE;                 /* a34vsync=te: the vsync tick on the TE's grid, its period sent */
++	uint32_t      fLogTicks;                /* vsyncs between the 10 s lines */
+ 	bool          fTEBitWanted;             /* A34 (0931): a34fbte=2 and TE only with EXT_TE_EN: set it at the first kick */
+ 	bool          fTEBit;                   /* ... it is set by us: a transfer that does not end clears it */
+ 	bool          fTEMissSaid;
+@@ -175,6 +180,10 @@ public:
+ 	uint32_t teCount(uint32_t ms, uint64_t *period);
+ 	void teProbe(uint32_t *asFound, uint32_t *withBit, bool *bitFound);
+ 	void teBitOff(const char *why);
++	void panelHz(uint32_t hz);
++	bool panelHzSend(bool to120);
++	uint32_t vsyncUS(void);
++	void publishRefresh(uint32_t hz);
+ 	void kickFlip(void);
+ 	int32_t drawTarget(bool full);
+ 	void drawDone(int32_t target);
+@@ -344,6 +353,8 @@ static uint64_t sweet_fb_flip_last[10];
+ #define SWEET_FB_DRAW_WAIT_MS   100u            /* present() waits so long at most for a transfer of the picture it draws into */
+ #define SWEET_FB_TE_PROBE_MS    100u            /* A34 (0931): the TE probe watches so long, each way */
+ #define SWEET_FB_TE_XFER_MS     100u            /* ... with EXT_TE_EN set by us, a transfer longer than this clears it */
++#define SWEET_FB_HZ_SETTLE_MS   50u             /* A34 (0937): after the rate command, before the TE is measured again */
++#define SWEET_FB_VSYNC_LEAD_US  4000u           /* A34 (0937): a34vsync=te: the tick this long before the TE (the copy fits) */
+ 
+ static bool
+ a34_dsi_wait_idle(uint64_t *ticks, uint32_t ms)
+@@ -371,6 +382,98 @@ extern "C" void a34_dsi_recover(void);
+ extern "C" uint32_t a34_mutex_rd(uint32_t off);
+ extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pexpert/arm/pe_serial.c */
+ 
++/*
++ * A34 (0937): 120 Hz (research/120hz/plan.md; MediaTek's mtk_dsi.c of Samsung's
++ * kernel for our firmware, DYG1: mtk_dsi_config_trigger(),
++ * _mtk_mipi_dsi_write_gce(), mt6877_dsi_driver_data; panel bytes from
++ * a34x_s6e3fc5_sdc_param.h). Every stage behind its own boot-arg, all off by
++ * default.
++ *
++ * Stage 0, a34dsihs=1: DSI 0x6C bit 16 (CMD_HS_HFP_BLANKING_HS_EN) set before
++ * a frame's start and cleared when the frame is over, as Android's trigger
++ * loop does: the link stays in HS between lines (2.70 us a line instead of
++ * 3.29: ~6.3 ms a frame instead of 7.6). The console's frames go as before.
++ */
++#define SWEET_FB_DSI_START      0x000u
++#define SWEET_FB_DSI_CMDQ_CON   0x060u          /* [7:0] words to send, [15] size select */
++#define SWEET_FB_DSI_TYPE1_HS   0x06cu
++#define SWEET_FB_HS_BLANKING    (1u << 16)
++#define SWEET_FB_DSI_CMDQ(n)    (0x200u + 4u * (n))
++#define SWEET_FB_DCS_IDLE_MS    20u
++static bool sweet_fb_dsi_hs;                    /* a34dsihs */
++static bool sweet_fb_hs_said;
++
++static void
++sweet_fb_hs(bool on)
++{
++	uint32_t v;
++
++	if (!sweet_fb_dsi_hs) {
++		return;
++	}
++	v = a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS);
++	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, on ? (v | SWEET_FB_HS_BLANKING) : (v & ~SWEET_FB_HS_BLANKING));
++}
++
++/* A34 (0937) stage 0: the first frame sent with it, said once. */
++static void
++sweet_fb_hs_say(uint64_t xfer)
++{
++	uint64_t ns;
++
++	if (!sweet_fb_dsi_hs || sweet_fb_hs_said) {
++		return;
++	}
++	sweet_fb_hs_said = true;
++	absolutetime_to_nanoseconds(xfer, &ns);
++	IOLog("A34 FB 120: a34dsihs: the first frame with the link in HS between lines took %llu us (7.6 ms without; "
++	    "the 10 s KICK lines have the average)\n", (unsigned long long)(ns / NSEC_PER_USEC));
++}
++
++/*
++ * A34 (0937) stage 1: one DCS write from the CPU to the command-mode panel,
++ * the display lock held and the link idle (no frame in flight), as
++ * MediaTek's _mtk_mipi_dsi_write_gce() packs it for command mode: 1 byte a
++ * DCS short write (0x05), 2 bytes one with a parameter (0x15), more a DCS
++ * long write (0x39, payload from CMDQ1, little-endian); HS (config bit 3,
++ * no LPM for this panel), CMDQ_CON = words | bit 15, DSI_START 0, 1, 0, the
++ * link idle again. CMDQ0 is the frame header's register too: the caller puts
++ * it back.
++ */
++static bool
++sweet_fb_dcs(const uint8_t *buf, uint32_t len)
++{
++	uint64_t t;
++	uint32_t hdr, words;
++
++	if (len == 0 || len > 12 || !a34_dsi_wait_idle(&t, SWEET_FB_DCS_IDLE_MS)) {
++		return false;
++	}
++	if (len > 2) {
++		for (uint32_t i = 0; i < len; i += 4) {
++			uint32_t w = 0;
++
++			for (uint32_t k = 0; k < 4 && i + k < len; k++) {
++				w |= (uint32_t)buf[i + k] << (8u * k);
++			}
++			a34_dsi_wr(SWEET_FB_DSI_CMDQ(1u + i / 4u), w);
++		}
++		hdr = (len << 16) | (0x39u << 8) | 0x02u | 0x08u;
++		words = 1u + (len + 3u) / 4u;
++	} else {
++		hdr = (len == 2 ? (uint32_t)buf[1] << 24 : 0u) | ((uint32_t)buf[0] << 16) |
++		    ((len == 2 ? 0x15u : 0x05u) << 8) | 0x08u;
++		words = 1u;
++	}
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ(0), hdr);
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ_CON, (a34_dsi_rd(SWEET_FB_DSI_CMDQ_CON) & ~0xffu) | words | 0x8000u);
++	a34_dsi_wr(SWEET_FB_DSI_START, 0);
++	a34_dsi_wr(SWEET_FB_DSI_START, 1);
++	a34_dsi_wr(SWEET_FB_DSI_START, 0);
++	IODelay(20);
++	return a34_dsi_wait_idle(&t, SWEET_FB_DCS_IDLE_MS);
++}
++
+ /*
+  * A34 (0910): the first time a frame transfer does not finish, log the DSI,
+  * the display mutex, RDMA0 and both OVLs once, to see what the pipe waits on.
+@@ -440,6 +543,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 		a34_disp_dump("busy for 1 s before a start");
+ 		a34_dsi_recover();
+ 	}
++	sweet_fb_hs(true);              /* A34 (0937): a34dsihs */
+ 	a34_dsi_trigger();
+ 	a34_dsi_unlock();
+ 	IODelay(50);
+@@ -457,6 +561,8 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 			    ok ? "transfer done" : "still busy", again / 13, a34_dsi_rd(0x0c));
+ 		}
+ 	}
++	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
++	sweet_fb_hs_say(xfer);
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+ 	a34_kick_stats[2] += xfer;
+@@ -540,9 +646,42 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: a34fbnow: swaps are copied %s\n", fPresentNow ? "as soon as they come" :
+ 		    "at the vsync (it needs a34fbflip=1 with two pictures)");
+ 	}
++	/* A34 (0937): 120 Hz, stages 0-2 (stage 3 below, before registerService()) */
++	uint32_t dsiHS = 0, panelRate = 0, rate = 60;
++	char vsyncArg[8] = "";
++	(void)PE_parse_boot_argn("a34dsihs", &dsiHS, sizeof(dsiHS));
++	sweet_fb_dsi_hs = dsiHS != 0;
++	if (sweet_fb_dsi_hs) {
++		IOLog("A34 FB 120: a34dsihs: frames go with DSI 0x6C bit 16 set (was 0x%08x)\n", a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS));
++	}
++	(void)PE_parse_boot_argn("a34panelhz", &panelRate, sizeof(panelRate));
++	if (panelRate == 60 || panelRate == 120) {
++		panelHz(panelRate);
++	} else if (panelRate != 0) {
++		IOLog("A34 FB 120: a34panelhz=%u: only 60 or 120\n", panelRate);
++	}
++	fLogTicks = SWEET_FB_HOLD_LOG_TICKS;
++	if (PE_parse_boot_arg_str("a34vsync", vsyncArg, (int)sizeof(vsyncArg)) && vsyncArg[0] == 't' && vsyncArg[1] == 'e' &&
++	    vsyncArg[2] == '\0') {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(fTEPeriod, &ns);
++		if (ns >= 4000000ull && ns <= 34000000ull) {
++			fVsyncTE = true;
++			rate = (uint32_t)((NSEC_PER_SEC + ns / 2) / ns);
++			fLogTicks = rate * 10u;
++		}
++		IOLog("A34 FB 120: a34vsync=te: %s\n", fVsyncTE ? "the vsync on the TE's grid, its period in the vsync's "
++		    "arguments 4/5" : "no TE period known (a34fbte or a34panelhz measures it): the vsync stays 16667 us");
++		if (fVsyncTE) {
++			IOLog("A34 FB 120: vsync every %llu us (%u Hz), %u us before the TE\n",
++			    (unsigned long long)(ns / NSEC_PER_USEC), rate, SWEET_FB_VSYNC_LEAD_US);
++		}
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	/* A34 (0937): 60 or more: every vsync, whatever its rate; less: a cap */
++	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : (rate / hz > 0 ? rate / hz : 1);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	a34_kick_wl = IOWorkLoop::workLoop();
+ 	a34_kick_timer = IOTimerEventSource::timerEventSource(this, &a34_kick_action);
+@@ -573,6 +712,11 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(linear);
+ 		OSSafeReleaseNULL(alignment);
+ 	}
++	uint32_t iomfbHz = 0;
++	(void)PE_parse_boot_argn("a34iomfbhz", &iomfbHz, sizeof(iomfbHz));     /* A34 (0937) stage 3 */
++	if (iomfbHz != 0) {
++		publishRefresh(iomfbHz);
++	}
+ 	registerService();
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
+@@ -622,7 +766,6 @@ static uint64_t sweet_fb_hold_stats[8];
+ static uint64_t sweet_fb_hold_last[8];
+ static SInt32 sweet_fb_touch_last[2];
+ #define SWEET_FB_SWAP_WAIT_MS           1000    /* longer than present()'s 500 ms wait for GPU jobs */
+-#define SWEET_FB_HOLD_LOG_TICKS         600     /* vsyncs: 10 s */
+ 
+ /* The surfaces of a swap's enabled layers, retained and marked held. */
+ static void
+@@ -717,10 +860,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/* A34 (0937) stage 2: args 4/5, the refresh period (QuartzCore predicts the next vblank as time + period) */
++	uint64_t period = fb->fVsyncTE ? fb->fTEPeriod : 0;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+@@ -729,7 +874,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if ((count % SWEET_FB_HOLD_LOG_TICKS) == 0) {
++	if ((count % (fb->fLogTicks != 0 ? fb->fLogTicks : SWEET_FB_HOLD_LOG_TICKS)) == 0) {
+ 		sweet_fb_hold_log();
+ 		sweet_fb_flip_log();    /* A34 (0930) */
+ 		sweet_surface_report(); /* A34 (0935) */
+@@ -761,7 +906,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fb->vsyncUS());
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -770,7 +915,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	/* A34 (0905): re-arm first; the present below must not stretch the
+ 	 * vsync period that backboardd paces its frames by. */
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->vsyncUS());
+ 	a34_fb_stats[5]++;
+ 	if (rec != NULL) {
+ 		fb->presentTaken(rec, presenting);
+@@ -1176,6 +1321,176 @@ AppleCLCD::teProbe(uint32_t *asFound, uint32_t *withBit, bool *bitFound)
+ 	    idleAfter ? "idle" : "BUSY");
+ }
+ 
++/*
++ * A34 (0937) stage 1, boot-arg a34panelhz=120 (60: back to 60): the panel's
++ * refresh rate by its own command, in AppleCLCD::start, before the GUI's
++ * first frame: test keys on (9F A5 A5, F0 5A 5A, FC 5A 5A), 60 00 00 (120 Hz)
++ * or 60 08 00 (60 Hz), F7 0F (the panel latches it), keys off -- the minimal
++ * part of what Samsung's smcdsd_panel_set_mode() sends; the DSI data rate
++ * does not change (806 Mbps either way). Only with the TE listened to
++ * (EXT_TE_EN): the TE period is measured before and SWEET_FB_HZ_SETTLE_MS
++ * after; not within 10% of the rate asked: 60 Hz is sent again. On success
++ * the TE-timed transfers (a34fbte, 0933) and a34vsync=te go by the new period.
++ * a34fbte=1 belongs with it: at 120 Hz a transfer not started at the TE tears.
++ */
++void
++AppleCLCD::panelHz(uint32_t hz)
++{
++	uint32_t mode = a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL), txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL), nBefore, nAfter;
++	uint64_t before = 0, after = 0, beforeNs = 0, afterNs = 0, wantNs = NSEC_PER_SEC / hz;
++	bool sent;
++
++	IOLog("A34 FB 120: a34panelhz=%u: DSI MODE_CTRL 0x%08x TXRX_CTRL 0x%08x CMDQ0 0x%08x CMDQ_CON 0x%08x 0x6C 0x%08x\n",
++	    hz, mode, txrx, a34_dsi_rd(SWEET_FB_DSI_CMDQ(0)), a34_dsi_rd(SWEET_FB_DSI_CMDQ_CON),
++	    a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS));
++	if (mode == 0xdeadbeefu || (mode & 3u) != 0 || (txrx & SWEET_FB_EXT_TE_EN) == 0) {
++		IOLog("A34 FB 120: not switched: it needs a command-mode DSI that listens to the TE (EXT_TE_EN)\n");
++		return;
++	}
++	nBefore = teCount(SWEET_FB_TE_PROBE_MS, &before);
++	absolutetime_to_nanoseconds(before, &beforeNs);
++	if (nBefore < 2) {
++		IOLog("A34 FB 120: not switched: no TE before (%u in %u ms): the new rate could not be checked\n", nBefore,
++		    SWEET_FB_TE_PROBE_MS);
++		return;
++	}
++	sent = panelHzSend(hz == 120);
++	IOSleep(SWEET_FB_HZ_SETTLE_MS);
++	nAfter = teCount(SWEET_FB_TE_PROBE_MS, &after);
++	absolutetime_to_nanoseconds(after, &afterNs);
++	if (sent && nAfter >= 2 && afterNs + wantNs / 10 > wantNs && afterNs < wantNs + wantNs / 10) {
++		fTEPeriod = after;
++		fTELast = 0;
++		fPanelHz = hz;
++		IOLog("A34 FB 120: the panel at %u Hz: TE every %llu us (%u in %u ms; before: every %llu us)%s\n", hz,
++		    (unsigned long long)(afterNs / NSEC_PER_USEC), nAfter, SWEET_FB_TE_PROBE_MS,
++		    (unsigned long long)(beforeNs / NSEC_PER_USEC), fTE ? "" : "; transfers are not started at the TE "
++		    "(a34fbte=1 is not on): expect tearing");
++		return;
++	}
++	IOLog("A34 FB 120: the panel did not settle at %u Hz (commands %s; TE every %llu us, %u in %u ms): 60 Hz sent "
++	    "again\n", hz, sent ? "sent" : "NOT all sent", (unsigned long long)(afterNs / NSEC_PER_USEC), nAfter,
++	    SWEET_FB_TE_PROBE_MS);
++	sent = panelHzSend(false);
++	IOSleep(SWEET_FB_HZ_SETTLE_MS);
++	nAfter = teCount(SWEET_FB_TE_PROBE_MS, &after);
++	absolutetime_to_nanoseconds(after, &afterNs);
++	if (nAfter >= 2) {
++		fTEPeriod = after;
++		fTELast = 0;
++	}
++	IOLog("A34 FB 120: back at 60 Hz (commands %s): TE every %llu us, %u in %u ms\n", sent ? "sent" : "NOT all sent",
++	    (unsigned long long)(afterNs / NSEC_PER_USEC), nAfter, SWEET_FB_TE_PROBE_MS);
++}
++
++/*
++ * A34 (0937): the rate commands, between frames: the display lock held (the
++ * console's kicks only try it; the kick work loop does not exist yet), the
++ * link idle first, the keys closed whatever happened, and the frame header
++ * (CMDQ0, CMDQ_CON) put back as it was found -- MediaTek writes 0x002c3909
++ * there before every frame, our frames reuse what LK left.
++ */
++bool
++AppleCLCD::panelHzSend(bool to120)
++{
++	static const uint8_t keyOn[3][3] = { { 0x9F, 0xA5, 0xA5 }, { 0xF0, 0x5A, 0x5A }, { 0xFC, 0x5A, 0x5A } };
++	static const uint8_t keyOff[3][3] = { { 0xFC, 0xA5, 0xA5 }, { 0xF0, 0xA5, 0xA5 }, { 0x9F, 0x5A, 0x5A } };
++	static const uint8_t rate120[3] = { 0x60, 0x00, 0x00 }, rate60[3] = { 0x60, 0x08, 0x00 };
++	static const uint8_t update[2] = { 0xF7, 0x0F };
++	uint32_t cmdq0, cmdqCon;
++	uint64_t t;
++	bool ok = true, closed = true;
++
++	if (!a34_dsi_lock()) {
++		return false;
++	}
++	if (!a34_dsi_wait_idle(&t, SWEET_FB_TE_PROBE_MS)) {
++		a34_dsi_unlock();
++		return false;
++	}
++	cmdq0 = a34_dsi_rd(SWEET_FB_DSI_CMDQ(0));
++	cmdqCon = a34_dsi_rd(SWEET_FB_DSI_CMDQ_CON);
++	for (unsigned i = 0; i < 3 && ok; i++) {
++		ok = sweet_fb_dcs(keyOn[i], 3);
++	}
++	ok = ok && sweet_fb_dcs(to120 ? rate120 : rate60, 3);
++	ok = ok && sweet_fb_dcs(update, 2);
++	for (unsigned i = 0; i < 3; i++) {
++		closed = sweet_fb_dcs(keyOff[i], 3) && closed;
++	}
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ(0), cmdq0);
++	a34_dsi_wr(SWEET_FB_DSI_CMDQ_CON, cmdqCon);
++	a34_dsi_unlock();
++	return ok && closed;
++}
++
++/*
++ * A34 (0937) stage 2: microseconds to the next vsync tick. a34vsync=te: on
++ * the TE's grid (the last TE the kick saw, or the measured period from now),
++ * SWEET_FB_VSYNC_LEAD_US before a TE so a copy started on the tick is done for
++ * it; never less than a quarter period away. Otherwise 16667 us as before.
++ */
++uint32_t
++AppleCLCD::vsyncUS(void)
++{
++	uint64_t now, next, lead, ns, last = fTELast, p = fTEPeriod;
++
++	if (!fVsyncTE || p == 0) {
++		return SWEET_FB_VSYNC_US;
++	}
++	now = mach_absolute_time();
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_LEAD_US * NSEC_PER_USEC, &lead);
++	if (last == 0 || last > now) {
++		next = now + p;
++	} else {
++		next = last + ((now - last) / p + 1) * p;
++		next = next > lead ? next - lead : next;
++		while (next < now + p / 4) {
++			next += p;
++		}
++	}
++	absolutetime_to_nanoseconds(next - now, &ns);
++	return (uint32_t)(ns / NSEC_PER_USEC);
++}
++
++/*
++ * A34 (0937) stage 3, boot-arg a34iomfbhz=120: IOMFBDisplayRefresh on this
++ * service before backboardd starts (QuartzCore reads it once, at its start:
++ * AppleCLCDDisplay::heartbeat_rate(); CA_HEARTBEAT_RATE overrides it), after
++ * ios-viva 0189 (MIT) and HackiOS's publishRefresh() (MIT):
++ * displayMinRefreshInterval/MaxRefreshInterval/RefreshStep = 2^32 / Hz
++ * (seconds, 0.32 fixed point), displayRefreshStepMachTime = one refresh in
++ * mach time. Only a rate the panel was measured at (a34panelhz), or 60.
++ */
++void
++AppleCLCD::publishRefresh(uint32_t hz)
++{
++	OSDictionary *refresh;
++	OSNumber *interval, *step;
++	uint64_t ticks = 0;
++
++	if ((hz != 60 && hz != fPanelHz) || hz > 240) {
++		IOLog("A34 FB 120: a34iomfbhz=%u: not published: the panel was not measured at %u Hz (a34panelhz)\n", hz, hz);
++		return;
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &ticks);
++	refresh = OSDictionary::withCapacity(4);
++	interval = OSNumber::withNumber((unsigned long long)((1ull << 32) / hz), 32);
++	step = OSNumber::withNumber((unsigned long long)ticks, 32);
++	if (refresh != NULL && interval != NULL && step != NULL) {
++		refresh->setObject("displayMinRefreshInterval", interval);
++		refresh->setObject("displayMaxRefreshInterval", interval);
++		refresh->setObject("displayRefreshStep", interval);
++		refresh->setObject("displayRefreshStepMachTime", step);
++		setProperty("IOMFBDisplayRefresh", refresh);
++		IOLog("A34 FB 120: IOMFBDisplayRefresh published: %u Hz (interval %llu in 0.32 s, step %llu mach ticks)\n", hz,
++		    (unsigned long long)((1ull << 32) / hz), (unsigned long long)ticks);
++	}
++	OSSafeReleaseNULL(interval);
++	OSSafeReleaseNULL(step);
++	OSSafeReleaseNULL(refresh);
++}
++
+ /*
+  * A34 (0931): the kick's: EXT_TE_EN, set by us (a34fbte=2), cleared again
+  * because a transfer did not end with it (no TE: the frame waits for one);
+@@ -1309,6 +1624,7 @@ AppleCLCD::kickFlip(void)
+ 		fShown = t;
+ 		IOLockUnlock(fFlipLock);
+ 	}
++	sweet_fb_hs(true);              /* A34 (0937): a34dsihs */
+ 	a34_dsi_trigger();
+ 	a34_dsi_unlock();
+ 	sweet_fb_flip_stats[6]++;
+@@ -1330,6 +1646,8 @@ AppleCLCD::kickFlip(void)
+ 			}
+ 		}
+ 	}
++	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
++	sweet_fb_hs_say(xfer);
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+ 	a34_kick_stats[2] += xfer;
