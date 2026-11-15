@@ -12,10 +12,10 @@ index 70c2540..5317fe7 100644
  bsd/dev/sweet_goodix_spi.c		standard
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..c4a8930
+index 0000000..db40023
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,738 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -697,20 +697,32 @@ index 0000000..c4a8930
 +	clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
 +	(void)assert_wait_deadline(&ac_mode, THREAD_UNINT, deadline);
 +	(void)thread_block(THREAD_CONTINUE_NULL);
-+	printf("A34 CELL: stage 0 probe (a34cell=%u): read only, nothing is written\n", ac_mode);
++	/* Parts can be left out, to find which one matters (defaults: everything):
++	 *   a34cellfdt=0    LK's device tree and tag table not read
++	 *   a34cellsmc=0    no secure-monitor queries
++	 *   a34cellparts=N  0: no partition I/O at all, 1: GPT bounds only, 2: and md1img's headers */
++	uint32_t want_fdt = 1, want_smc = 1, want_parts = 2;
++	(void)PE_parse_boot_argn("a34cellfdt", &want_fdt, (int)sizeof(want_fdt));
++	(void)PE_parse_boot_argn("a34cellsmc", &want_smc, (int)sizeof(want_smc));
++	(void)PE_parse_boot_argn("a34cellparts", &want_parts, (int)sizeof(want_parts));
++	printf("A34 CELL: stage 0 probe (a34cell=%u fdt=%u smc=%u parts=%u): read only, nothing is written\n",
++	    ac_mode, want_fdt, want_smc, want_parts);
 +	strlcpy(ac_state, "stage0", sizeof(ac_state));
-+	ac_lk_fdt();
++	if (want_fdt)
++		ac_lk_fdt();
 +	bool on = ac_md1_power();
 +	ac_ccif_clocks();
 +	bool brom = false;
-+	if (on) {
++	if (on && want_smc) {
 +		ac_boot_status();
 +		brom = ac_brom_check();
 +	}
 +	else
-+		printf("A34 CELL: MD1 is off: no boot status query\n");
-+	ac_partitions();
-+	ac_md1img();
++		printf("A34 CELL: no boot status query (MD1 %s, a34cellsmc=%u)\n", on ? "on" : "off", want_smc);
++	if (want_parts >= 1)
++		ac_partitions();
++	if (want_parts >= 2)
++		ac_md1img();
 +	if (ac_mode >= 2) {
 +		if (ac_lk_md == 1 && on && brom)
 +			ac_first_contact();
