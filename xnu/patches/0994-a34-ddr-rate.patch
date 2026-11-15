@@ -1,0 +1,154 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index 91148c8..0d2698c 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -118,6 +118,7 @@ uint32_t a34_vcore_uv(void);
+ bool a34_disp_clock_set(uint32_t sel);
+ uint32_t a34_clocks_gpu_khz(void);      /* A34 (0991): A34Mali.cpp's 10 s line */
+ int a34_ddr_state(uint32_t r[4]);       /* A34 (0991): DVFSRC, see below */
++uint32_t a34_ddr_mbps(uint32_t *shuffle); /* A34 (0994): DRAM's data rate, see below */
+ bool a34_ddr_top(bool on);
+ 
+ /* ---- where things are ---- */
+@@ -1274,6 +1275,12 @@ a34_clocks_init(void)
+ 		printf("A34 CLOCKS: a34cpufreq=%u does nothing: a34cpuopp=<L MHz>,<LL MHz> asks MCUPM's firmware, "
+ 		    "never the PLLs or Vproc directly\n", cpu);
+ 	}
++	{
++		uint32_t shu = 0, mbps = a34_ddr_mbps(&shu);
++
++		printf("A34 CLOCKS: DRAM %u Mbps (DDRPHY shuffle %u; Android's steps 4266 4266 3733 2667 1866 1600 1200 800)\n",
++		    mbps, shu);         /* A34 (0994) */
++	}
+ 	ck_bat_boot();                  /* A34 (0929) */
+ 	if (ck_bat_low_boot) {
+ 		ck_gpu_want_mhz = 0;    /* (a34_clocks_gpu_wanted(): no) */
+@@ -1772,4 +1779,90 @@ a34_ddr_top(bool on)
+ 	ruby_wr32(ck_dvfsrc, DVFSRC_SW_REQ3, req);
+ 	return true;
+ }
++/*
++ * ---- DRAM's data rate (A34 0994) ----
++ *
++ * Read only, as Android's dramc.c fmeter_v1() computes it from the DDRPHY
++ * PLL of channel 0 with the phone's device tree (recon/android-DYG1/live.dts
++ * dramc@10230000: fmeter-version 1, crystal-freq 52, shu-of 0x700, shu-lv
++ * and pll-id in DDRPHY NAO 0x50c, the PLL fields in DDRPHY AO at the
++ * offsets below plus 0x700 a shuffle; resources 6 and 4 of its reg:
++ * DDRPHY NAO ch0 0x10236000, AO ch0 0x10238000). freq_step of the same node
++ * (Mbps by DDR OPP): 4266 4266 3733 2667 1866 1600 1200 800. With DVFSRC off
++ * (boot 0991: BASIC_CONTROL 0x00000008) DRAM stays at the shuffle the boot
++ * loader left.
++ */
++#define CK_DDRPHY_NAO_PA        0x10236000u
++#define CK_DDRPHY_AO_PA         0x10238000u
++#define CK_DDRPHY_AO_SIZE       0x2000u
++static vm_offset_t ck_ddrphy_nao, ck_ddrphy_ao;
++
++struct ck_ddr_field {
++	uint16_t off[2];        /* by PLL id */
++	uint32_t mask;
++	uint8_t shift;
++};
++static const struct ck_ddr_field ck_ddr_sdmpcw = { { 0x704, 0x724 }, 0xffff0000u, 16 };
++static const struct ck_ddr_field ck_ddr_prediv = { { 0x708, 0x728 }, 0x000c0000u, 18 };
++static const struct ck_ddr_field ck_ddr_posdiv = { { 0x708, 0x728 }, 0x00000007u, 0 };
++static const struct ck_ddr_field ck_ddr_ckdiv4 = { { 0x874, 0x874 }, 0x00000004u, 2 };
++static const struct ck_ddr_field ck_ddr_pllmd = { { 0x744, 0x744 }, 0x00000100u, 8 };
++static const struct ck_ddr_field ck_ddr_cldiv2 = { { 0x8b4, 0x8b4 }, 0x00000002u, 1 };
++static const struct ck_ddr_field ck_ddr_fbksel = { { 0x70c, 0x70c }, 0x00000040u, 6 };
++static const struct ck_ddr_field ck_ddr_dqsopen = { { 0x870, 0x870 }, 0x00100000u, 20 };
++static const struct ck_ddr_field ck_ddr_dqopen = { { 0x870, 0x870 }, 0x00200000u, 21 };
++static const struct ck_ddr_field ck_ddr_ckdiv4ca = { { 0xb74, 0xb74 }, 0x00000004u, 2 };
++
++static uint32_t
++ck_ddr_get(const struct ck_ddr_field *f, uint32_t pll, uint32_t shu)
++{
++	return (ruby_rd32(ck_ddrphy_ao, f->off[pll] + 0x700u * shu) & f->mask) >> f->shift;
++}
++
++/* dramc.c decode_freq(): the measured rate to its nominal one */
++static uint32_t
++ck_ddr_decode(uint32_t v)
++{
++	static const uint16_t raw[] = { 8528, 6378, 6370, 5490, 5486, 4095, 4264, 3718, 3588, 3068, 2652, 2664, 2366,
++		                        2106, 2132, 1859, 1846, 1794, 1542, 1534, 1144, 1196, 754, 799, 396 };
++	static const uint16_t nom[] = { 8533, 6400, 6400, 5500, 5500, 4100, 4266, 3733, 3733, 3200, 2667, 2667, 2400,
++		                        2133, 2133, 1866, 1866, 1866, 1600, 1600, 1200, 1200, 800, 800, 400 };
++
++	for (uint32_t i = 0; i < sizeof(raw) / sizeof(raw[0]); i++) {
++		if (raw[i] == v) {
++			return nom[i];
++		}
++	}
++	return v;
++}
++
++/* DRAM's data rate in Mbps (0: not read); *shuffle: the DDRPHY shuffle level in use. */
++uint32_t
++a34_ddr_mbps(uint32_t *shuffle)
++{
++	uint32_t nao, shu, pll, vco;
++
++	if (ck_ddrphy_nao == 0) {
++		ck_ddrphy_nao = ml_io_map(CK_DDRPHY_NAO_PA, CK_PAGE);
++	}
++	if (ck_ddrphy_ao == 0) {
++		ck_ddrphy_ao = ml_io_map(CK_DDRPHY_AO_PA, CK_DDRPHY_AO_SIZE);
++	}
++	if (ck_ddrphy_nao == 0 || ck_ddrphy_ao == 0) {
++		return 0;
++	}
++	nao = ruby_rd32(ck_ddrphy_nao, 0x50cu);
++	shu = (nao & 0x30000u) >> 16;
++	pll = (nao & 0x100u) >> 8;
++	if (shuffle != NULL) {
++		*shuffle = shu;
++	}
++	vco = ((52u >> ck_ddr_get(&ck_ddr_prediv, pll, shu)) * (ck_ddr_get(&ck_ddr_sdmpcw, pll, shu) >> 7)) >>
++	    ck_ddr_get(&ck_ddr_posdiv, pll, shu) >> 1 >> ck_ddr_get(&ck_ddr_ckdiv4, pll, shu) >>
++	    ck_ddr_get(&ck_ddr_pllmd, pll, shu) >> ck_ddr_get(&ck_ddr_cldiv2, pll, shu) << ck_ddr_get(&ck_ddr_fbksel, pll, shu);
++	if (ck_ddr_get(&ck_ddr_dqsopen, pll, shu) == 1 || ck_ddr_get(&ck_ddr_dqopen, pll, shu) == 1) {
++		vco >>= ck_ddr_get(&ck_ddr_ckdiv4ca, pll, shu) == 1 ? 2 : 1;
++	}
++	return ck_ddr_decode(vco);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 801fb3d..b035776 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -192,6 +192,7 @@ uint32_t a34_clocks_gpu_khz(void);                       /* A34 (0991): bsd/dev/
+ extern uint64_t a34_mali_asflush[2];                     /* A34 (0993): bsd/dev/a34_mali.c */
+ int a34_ddr_state(uint32_t r[4]);
+ bool a34_ddr_top(bool on);
++uint32_t a34_ddr_mbps(uint32_t *shuffle);                /* A34 (0994) */
+ bool a34_mali_spin_unbound(bool bind_failed);            /* A34 (0985): no spin where the worker is not bound */
+ extern uint32_t a34_mali_napped;                         /* A34 (0928): jobs that outlasted the spin */
+ 
+@@ -928,8 +929,8 @@ RedwoodMaliStart(void)
+ 		int ddr = a34_ddr_state(r);
+ 
+ 		IOLog("A34 MALI UC: DVFSRC BASIC_CONTROL 0x%08x CURRENT_LEVEL 0x%08x (DDR OPP %d of 0..7) SW_REQ3 0x%08x "
+-		    "TARGET_LEVEL 0x%08x; GPU %u kHz; a34ddrboost=%u\n", r[0], r[1], ddr, r[2], r[3], a34_clocks_gpu_khz(),
+-		    gA34MaliDdrBoost);
++		    "TARGET_LEVEL 0x%08x; DRAM %u Mbps; GPU %u kHz; a34ddrboost=%u\n", r[0], r[1], ddr, r[2], r[3],
++		    a34_ddr_mbps(NULL), a34_clocks_gpu_khz(), gA34MaliDdrBoost);
+ 	}
+ 	IOLog("A34 MALI UC: cache upkeep visits %s (a34maliscan); a job is watched spinning for %u us, then in 100 us "
+ 	    "naps (a34malispin)\n", gA34MaliScan ? "every handle" : "only the handles that can need it",
+@@ -1584,12 +1585,12 @@ gpuWindow(const struct a34_mali_job *job, uint64_t now)
+ 
+ 	absolutetime_to_nanoseconds(gA34MaliWinIdle, &idle);
+ 	IOLog("A34 MALI: %llu s: GPU busy %llu ms at %u MHz: vertex/tiler %u x %llu us (most %llu), fragment %u x %llu us "
+-	    "(most %llu); DDR OPP %d\n", (unsigned long long)(win / NSEC_PER_SEC),
++	    "(most %llu); DRAM %u Mbps, DVFSRC %d\n", (unsigned long long)(win / NSEC_PER_SEC),
+ 	    (unsigned long long)((gA34MaliWinNs[0] + gA34MaliWinNs[1]) / NSEC_PER_MSEC), a34_clocks_gpu_khz() / 1000u,
+ 	    gA34MaliWinN[1], (unsigned long long)(gA34MaliWinN[1] != 0 ? gA34MaliWinNs[1] / 1000u / gA34MaliWinN[1] : 0),
+ 	    (unsigned long long)(gA34MaliWinMost[1] / 1000u), gA34MaliWinN[0],
+ 	    (unsigned long long)(gA34MaliWinN[0] != 0 ? gA34MaliWinNs[0] / 1000u / gA34MaliWinN[0] : 0),
+-	    (unsigned long long)(gA34MaliWinMost[0] / 1000u), ddr);
++	    (unsigned long long)(gA34MaliWinMost[0] / 1000u), a34_ddr_mbps(NULL), ddr);
+ 	/* A34 (0993): what the GPU waited for between jobs that were ready */
+ 	uint64_t asN = a34_mali_asflush[0] - gA34MaliAsSeen[0], asNs, yieldNs, scanNs;
+ 
