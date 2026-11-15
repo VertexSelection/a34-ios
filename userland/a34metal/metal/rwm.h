@@ -54,6 +54,8 @@ struct rwm_perf {
 	 * finished (of those, how long after its end, and how many within 1 ms); handlers delivered */
 	uint64_t begun_overlapped, begun_after_done, begun_gap_n, begun_gap_ns, begun_soon;
 	uint64_t scheduled_handlers, completed_handlers;
+	/* A34: textures made memoryless, and attachments of a pass that were one (their actions DontCare) */
+	uint64_t memoryless_textures, memoryless_attachments;
 	uint64_t drains, drain_ns;      /* a texture written or read at once, after the worker's queue */
 	uint64_t worker_cbs, worker_ns;  /* the worker's whole time for a buffer, waits in it included */
 	uint64_t worker_cpu;            /* ... and how much of it the worker ran */

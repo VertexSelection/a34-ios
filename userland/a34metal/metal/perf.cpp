@@ -164,7 +164,7 @@ extern "C" void
 rwm_perf_report(uint64_t now)
 {
 	struct rwm_perf &p = rwm_perf;
-	char line[320];
+	char line[640];
 	const uint64_t span = now - p.since, cbs = p.cbs ? p.cbs : 1;
 
 	if (rwm_camprof() == 0) {
@@ -206,9 +206,10 @@ rwm_perf_report(uint64_t now)
 	say(line);
 	snprintf(line, sizeof(line), "rwm frames in flight: %llu buffers begun while the GPU still drew the one committed before, "
 		 "%llu after it had finished (%llu of them within 1 ms of its end as the completion queue saw it, %.1f ms "
-		 "after it on average); handlers delivered: %llu scheduled, %llu completed", p.begun_overlapped,
+		 "after it on average); handlers delivered: %llu scheduled, %llu completed; memoryless: %llu textures made, "
+		 "%llu attachments of passes", p.begun_overlapped,
 		 p.begun_after_done, p.begun_soon, p.begun_gap_n ? p.begun_gap_ns / 1e6 / p.begun_gap_n : 0.0,
-		 p.scheduled_handlers, p.completed_handlers);
+		 p.scheduled_handlers, p.completed_handlers, p.memoryless_textures, p.memoryless_attachments);
 	say(line);
 
 	static void (*profile)(uint64_t *);

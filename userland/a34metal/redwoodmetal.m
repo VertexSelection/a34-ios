@@ -599,6 +599,8 @@ gpu_param(io_connect_t gpu, uint32_t which, uint64_t *value)
 	struct rwm_texture *_core; /* the texture, its shape, its surfaces: src/metal/texture.cpp */
 	id _parent;                /* (metal-fx) a view's texture, kept as long as the view is */
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
+@public
+	BOOL _memoryless;          /* A34: made MTLStorageModeMemoryless: its contents never outlive a pass */
 }
 @property (readonly) struct rwa_texture *mesaTexture;
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device core:(struct rwm_texture *)core;
@@ -1792,9 +1794,21 @@ rw_trace_install(Class cls)
 		rw_print("%s\n", why);
 		return nil;
 	}
-	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
-							 texture:texture
-							   shape:&shape];
+	RedwoodMetalTexture *made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
+									  texture:texture
+									    shape:&shape];
+	/*
+	 * A34: MTLStorageModeMemoryless (3). On Apple's GPUs such a texture lives in the tile memory of one pass and
+	 * nowhere else -- Metal allows it no Load and no Store -- and CoreAnimation's second attachment, which it
+	 * draws and reads back by framebuffer fetch within one pass, may be one. Here it is real memory, so a pass
+	 * over it treats both of its actions as DontCare (the render encoder below): it is never read back into the
+	 * tiles at a pass's start nor written out at its end -- a whole screen each way for a screen-sized one.
+	 */
+	if (made != nil && [descriptor storageMode] == 3) {
+		made->_memoryless = YES;
+		rwm_perf.memoryless_textures++;
+	}
+	return made;
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
@@ -4223,6 +4237,13 @@ rw_core_of(id texture)
 			}
 			if ([attachment storeAction] == MTLStoreActionDontCare) {
 				store |= 1u << i;
+			}
+			/* (a memoryless texture: neither, whatever the actions say -- Metal allows it no other) */
+			if ([[attachment texture] isKindOfClass:[RedwoodMetalTexture class]] &&
+			    ((RedwoodMetalTexture *)[attachment texture])->_memoryless) {
+				load |= ([attachment loadAction] != MTLLoadActionClear) ? 1u << i : 0;
+				store |= 1u << i;
+				rwm_perf.memoryless_attachments++;
 			}
 		}
 		if (ztex != nil) {
