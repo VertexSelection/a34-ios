@@ -1,0 +1,217 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 83570d6..239a1e7 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -403,6 +403,14 @@ static_assert(sizeof(struct a34_surface_seq) == 16, "kRedwoodSurfaceSeq is 16 by
+  * kIOReturnUnsupported; too small: kIOReturnNoSpace. Set it before the
+  * first frame drawn so, and back to 0 before one drawn linear: the display
+  * reads the surface as the last request said. No lock of the client's.
++ *
++ * A34 (1009): rows of superblocks counted as panfrost lays them out, the
++ * height rounded up to 16 lines (1125x2436: 306; headers 176256 bytes, so
++ * bodies from +176256, to +11456640). 32 bytes in: also `cpu_locks` back,
++ * the IOSurfaceLocks of the surface while it was AFBC since it was marked
++ * (the CPU saw compressed bytes; the driver should draw it linear again).
++ * layout 0xffffffff: changes nothing; gives back layout, header, body,
++ * header_row (and size, cpu_locks) as they are.
+  */
+ struct a34_surface_layout {
+ 	uint32_t surface;
+@@ -410,8 +418,10 @@ struct a34_surface_layout {
+ 	uint32_t header, body;
+ 	uint32_t header_row;
+ 	uint32_t size;
++	uint32_t cpu_locks, pad;        /* A34 (1009): only with 32 bytes in */
+ };
+-static_assert(sizeof(struct a34_surface_layout) == 24, "SURFACE_LAYOUT is 24 bytes");
++static_assert(sizeof(struct a34_surface_layout) == 32, "SURFACE_LAYOUT is 24 or 32 bytes");
++#define A34_SURFACE_LAYOUT_V0   24u
+ #define A34_PENDING_STALE_NS    NSEC_PER_SEC
+ 
+ union a34_request {
+@@ -3447,14 +3457,15 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				ret = kIOReturnSuccess;
+ 			}
+ 		} else if (selector == kA34SurfaceLayout) {
+-			/* A34 (1007): no lock of the client's: three words of the surface's */
+-			SweetSurface *s = insize == sizeof(r.layout) ? sweet_surface_copy(r.layout.surface) : NULL;
++			/* A34 (1007): no lock of the client's: three words of the surface's (1009: 24 or 32 bytes) */
++			bool sized = insize == A34_SURFACE_LAYOUT_V0 || insize == sizeof(r.layout);
++			SweetSurface *s = sized ? sweet_surface_copy(r.layout.surface) : NULL;
+ 
+ 			if (s == NULL) {
+-				ret = insize == sizeof(r.layout) ? kIOReturnNotFound : kIOReturnBadArgument;
++				ret = sized ? kIOReturnNotFound : kIOReturnBadArgument;
+ 			} else {
+-				ret = sweet_surface_set_layout(s, r.layout.layout, r.layout.header, r.layout.body, r.layout.header_row,
+-				    &r.layout.size);
++				ret = sweet_surface_set_layout(s, &r.layout.layout, &r.layout.header, &r.layout.body,
++				    &r.layout.header_row, &r.layout.size, &r.layout.cpu_locks);
+ 				OSSafeReleaseNULL(s);
+ 			}
+ 			if (ret != kIOReturnSuccess && fErrors++ < A34_LOGGED_ERRORS) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b9e9ec1..7d16bc5 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -575,6 +575,7 @@ static int           sweet_scan_base[SWEET_SCAN_MAX];        /* retain count as
+ static uint32_t      sweet_scan_n, sweet_scan_w, sweet_scan_h, sweet_scan_size;
+ static bool          sweet_scan_afbc;                         /* A34 (1007): a34fbafbc=1 */
+ static uint32_t      sweet_scan_afbc_said;
++static uint32_t      sweet_scan_afbc_lock_said;               /* A34 (1009) */
+ static IOLock       *sweet_scan_lock;
+ static char          sweet_scan_names[SWEET_SURFACE_ROW_FIX_NAMES] = "backboardd";
+ static uint32_t      sweet_scan_taken, sweet_scan_full;
+@@ -620,14 +621,15 @@ sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count)
+ 	/*
+ 	 * A34 (1007): a34fbafbc=1: room for the surface as AFBC too (see
+ 	 * SweetSurface.h): the headers, rounded up to 1 KB as MediaTek lays them
+-	 * out, then a 1 KB body slot per superblock. 1125x2436: 172 + 10980 KB,
+-	 * 176 KB more than the rows.
++	 * out, then a 1 KB body slot per superblock. A34 (1009): the rows as
++	 * panfrost counts them (SWEET_SURFACE_AFBC_ROWS): 1125x2436, 306 rows:
++	 * 173 + 11016 KB.
+ 	 */
+ 	uint32_t afbc = 0;
+ 	(void)PE_parse_boot_argn("a34fbafbc", &afbc, sizeof(afbc));
+ 	if (afbc != 0) {
+ 		uint64_t blocks = (uint64_t)((width + SWEET_SURFACE_AFBC_W - 1) / SWEET_SURFACE_AFBC_W) *
+-		    ((height + SWEET_SURFACE_AFBC_H - 1) / SWEET_SURFACE_AFBC_H);
++		    SWEET_SURFACE_AFBC_ROWS(height);
+ 		uint64_t need = ((blocks * SWEET_SURFACE_AFBC_HDR + 1023u) & ~1023ull) + blocks * SWEET_SURFACE_AFBC_SLOT;
+ 
+ 		if (round_page(need) > sweet_scan_size) {
+@@ -724,12 +726,14 @@ sweet_surface_afbc_on(void)
+ }
+ 
+ IOReturn
+-sweet_surface_set_layout(SweetSurface *s, uint32_t layout, uint32_t header, uint32_t body, uint32_t header_row,
+-    uint32_t *size)
++sweet_surface_set_layout(SweetSurface *s, uint32_t *layoutp, uint32_t *headerp, uint32_t *bodyp, uint32_t *header_rowp,
++    uint32_t *size, uint32_t *cpu_locks)
+ {
++	uint32_t layout = *layoutp, header = *headerp, body = *bodyp, header_row = *header_rowp;
+ 	uint64_t length, cols, rows, end;
+ 
+ 	*size = 0;
++	*cpu_locks = (uint32_t)__atomic_load_n(&s->scanCpuLocks, __ATOMIC_RELAXED);
+ 	if (s->scanPA == 0 || s->memory == NULL) {
+ 		return kIOReturnUnsupported;    /* (only the pool's buffers are scanned out) */
+ 	}
+@@ -738,6 +742,15 @@ sweet_surface_set_layout(SweetSurface *s, uint32_t layout, uint32_t header, uint
+ 		return kIOReturnUnsupported;
+ 	}
+ 	*size = (uint32_t)(length - s->offset);
++	if (layout == SWEET_SURFACE_QUERY) {
++		/* A34 (1009): only told */
++		*layoutp = __atomic_load_n(&s->scanLayout, __ATOMIC_ACQUIRE);
++		*headerp = s->scanHeader;
++		*bodyp = s->scanBody;
++		*header_rowp = *layoutp == SWEET_SURFACE_AFBC ?
++		    (s->width + SWEET_SURFACE_AFBC_W - 1) / SWEET_SURFACE_AFBC_W * SWEET_SURFACE_AFBC_HDR : 0;
++		return kIOReturnSuccess;
++	}
+ 	if (layout == SWEET_SURFACE_LINEAR) {
+ 		__atomic_store_n(&s->scanLayout, SWEET_SURFACE_LINEAR, __ATOMIC_RELEASE);
+ 		return kIOReturnSuccess;
+@@ -749,7 +762,7 @@ sweet_surface_set_layout(SweetSurface *s, uint32_t layout, uint32_t header, uint
+ 		return kIOReturnUnsupported;
+ 	}
+ 	cols = (s->width + SWEET_SURFACE_AFBC_W - 1) / SWEET_SURFACE_AFBC_W;
+-	rows = (s->height + SWEET_SURFACE_AFBC_H - 1) / SWEET_SURFACE_AFBC_H;
++	rows = SWEET_SURFACE_AFBC_ROWS(s->height);     /* A34 (1009): as panfrost lays them out */
+ 	end = (uint64_t)body + cols * rows * SWEET_SURFACE_AFBC_SLOT;
+ 	if (header_row != cols * SWEET_SURFACE_AFBC_HDR || (header & 127u) != 0 || (body & 127u) != 0 ||
+ 	    (uint64_t)header + cols * rows * SWEET_SURFACE_AFBC_HDR > body) {
+@@ -764,10 +777,12 @@ sweet_surface_set_layout(SweetSurface *s, uint32_t layout, uint32_t header, uint
+ 	}
+ 	s->scanHeader = header;
+ 	s->scanBody = body;
++	__atomic_store_n(&s->scanCpuLocks, 0, __ATOMIC_RELAXED);
++	*cpu_locks = 0;
+ 	__atomic_store_n(&s->scanLayout, SWEET_SURFACE_AFBC, __ATOMIC_RELEASE);
+ 	if (sweet_scan_afbc_said++ < 8) {
+-		IOLog("SWEET SURF: surface %u (%ux%u) is AFBC 32x8: headers at +%u, %llu bytes a row, bodies at +%u to +%llu of "
+-		    "%llu\n", s->id, s->width, s->height, header, cols * SWEET_SURFACE_AFBC_HDR, body, end,
++		IOLog("SWEET SURF: surface %u (%ux%u) is AFBC 32x8: headers at +%u, %llu bytes a row, %llu rows, bodies at +%u to "
++		    "+%llu of %llu\n", s->id, s->width, s->height, header, cols * SWEET_SURFACE_AFBC_HDR, rows, body, end,
+ 		    (unsigned long long)(length - s->offset));
+ 	}
+ 	return kIOReturnSuccess;
+@@ -1894,6 +1909,19 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	}
+ 	uint64_t began = mach_absolute_time(), took;
+ 
++	if (__atomic_load_n(&s->scanLayout, __ATOMIC_ACQUIRE) == SWEET_SURFACE_AFBC) {
++		/* A34 (1009): the CPU sees compressed bytes: counted for the driver (request 0x78) and said */
++		SInt32 n = OSIncrementAtomic(&s->scanCpuLocks) + 1;
++
++		if (sweet_scan_afbc_lock_said < 16) {
++			char who[32];
++
++			sweet_scan_afbc_lock_said++;
++			proc_selfname(who, sizeof(who));
++			IOLog("SWEET SURF: %s locked surface %u, drawn AFBC: the CPU sees compressed bytes (lock %d of it since "
++			    "marked; request 0x78 tells the driver)\n", who, s->id, (int)n);
++		}
++	}
+ 	sweet_surface_cpu_begin(s);     /* A34 (0915): what the GPU wrote, visible to the CPU */
+ 	took = mach_absolute_time() - began;
+ 	OSAddAtomic64(1, &sweet_surface_lock_stats[0]);         /* A34 (0935) */
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 0e69fa0..716b23a 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -94,8 +94,9 @@ public:
+ 	 * (offset). Read by the display's scan-out (SweetFramebuffer.cpp).
+ 	 */
+ 	uint32_t                  scanLayout, scanHeader, scanBody;
++	SInt32                    scanCpuLocks;     /* A34 (1009): IOSurfaceLocks while it was AFBC (since marked) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; scanPA = 0; scanHeld = 0; scanLayout = 0; scanHeader = 0; scanBody = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; scanPA = 0; scanHeld = 0; scanLayout = 0; scanHeader = 0; scanBody = 0; scanCpuLocks = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -171,15 +172,28 @@ extern SInt32 sweet_surface_scan_total;
+  * pool surface in: SWEET_SURFACE_AFBC is DRM_FORMAT_MOD_ARM_AFBC(32x8 |
+  * SPARSE | SPLIT | YTR) of the surface's width x height, R8G8B8A8 order
+  * (panfrost's for B8G8R8A8), headers not tiled: a 16-byte header per 32x8
+- * superblock, rows of ceil(width / 32) of them, ceil(height / 8) rows, and
+- * a 1024-byte body slot per superblock in the same order -- what MediaTek's
++ * superblock, rows of ceil(width / 32) of them, and a 1024-byte body slot
++ * per superblock in the same order -- what MediaTek's
+  * OVL reads (mtk_disp_ovl.c, compr_l_config_AFBC_V1_2, MT6877
+  * "AFBC_V1_2_MTK_1"). sweet_surface_afbc_on(): the pool's buffers have room
+  * for it and the display scans it out. sweet_surface_set_layout(): checks
+  * and sets it (headers at `header`, bodies at `body`, bytes from the first
+  * pixel, both multiples of 128; `header_row` must be 16 * ceil(width / 32));
+  * *size: the bytes the surface's memory has from its first pixel.
++ *
++ * A34 (1009): rows of superblocks: panfrost lays out the height rounded up
++ * to the GPU's 16-line blocks (1125x2436: 306 rows, headers 176256 bytes,
++ * bodies from +176256 to +11456640), so the pool's buffers, the request's
++ * checks and the bodies' room count SWEET_SURFACE_AFBC_ROWS(height); the
++ * display reads only the rows it shows (the last one is padding).
++ * sweet_surface_set_layout() takes its arguments in and gives them back:
++ * layout SWEET_SURFACE_QUERY changes nothing and gives back the layout,
++ * header, body and header_row the surface has; *cpu_locks: IOSurfaceLocks
++ * of it while it was AFBC since it was marked (the CPU saw compressed
++ * bytes: the driver should draw it linear again).
+  */
++#define SWEET_SURFACE_QUERY     0xffffffffu
++#define SWEET_SURFACE_AFBC_ROWS(h) (((h) + 15u) / 16u * 2u)
+ #define SWEET_SURFACE_LINEAR    0u
+ #define SWEET_SURFACE_AFBC      1u
+ #define SWEET_SURFACE_AFBC_W    32u     /* superblock: 32 x 8 pixels, 4 bytes each */
+@@ -187,8 +201,8 @@ extern SInt32 sweet_surface_scan_total;
+ #define SWEET_SURFACE_AFBC_HDR  16u     /* bytes of header a superblock */
+ #define SWEET_SURFACE_AFBC_SLOT (SWEET_SURFACE_AFBC_W * SWEET_SURFACE_AFBC_H * 4u)
+ bool sweet_surface_afbc_on(void);
+-IOReturn sweet_surface_set_layout(SweetSurface *surface, uint32_t layout, uint32_t header, uint32_t body,
+-    uint32_t header_row, uint32_t *size);
++IOReturn sweet_surface_set_layout(SweetSurface *surface, uint32_t *layout, uint32_t *header, uint32_t *body,
++    uint32_t *header_row, uint32_t *size, uint32_t *cpu_locks);
+ 
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
