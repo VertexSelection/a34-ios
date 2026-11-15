@@ -141,17 +141,22 @@ modem's boot status via SMC (only if MD1 is on), `md1img`'s sections and build, 
 bounds of the modem partitions (bounds only). `kern.a34cell` holds a one-line summary;
 `a34cell` prints it and exits when there is no modem port.
 
-First phone test:
-- Kernel: artifact of xnu-a34 on branch `cellular` (main 0938 + 0950).
-- Boot args: the README's set plus `a34cell=1` (433 characters; the 607 limit holds).
-- Optional user space: artifact `a34cell` of `.github/workflows/a34cell.yml`;
-  `sudo tools/root-add-job.py /mnt com.a34.cell /a34 a34cell/a34 a34cell`.
-- Success, in `tools/pull-log.sh`'s log: `A34 CELL: stage 0 probe`, an LK line that says
-  `all zero: the boot loader did not load the modem` (expected on this recovery boot), `MD1 power
-  domain off` (or on), `md1img ... md1rom ... CHECK_HEADER v6: platform MT6877_S00`, 24
-  sections, the partition bounds, and the summary. With the daemon: `a34cell: kernel: stage0 ...`
-  then `no modem port /dev/a34at0 ... nothing to do`. Any hang: the probe touches only SPM and
-  infracfg status registers, LK's DTB copy and md1img; report the last `A34 CELL` line.
+First phone test (ready, not flashed):
+- Image: `build/xnu-recovery-0950-cell.img` (kernel of xnu-a34 run 43677350436 on `cellular` =
+  main 0938 + 0950, copied as `build/kernel-0950-cell.development.sweet`; boot args = the README's
+  set plus `a34cell=1`, 433 characters). Flash and boot it like the other test images
+  (`tools/run-test.sh build/xnu-recovery-0950-cell.img`).
+- Optional user space: `build/a34cell` (artifact of `.github/workflows/a34cell.yml`), into the
+  root image with `sudo tools/root-add-job.py /mnt com.a34.cell /a34 build/a34cell/a34 a34cell`.
+- Success, in `tools/pull-log.sh`'s log, about 3 s after "SWEET UFS": `A34 CELL: stage 0 probe`;
+  `LK device tree at 0x47c80000` (the `dtb_addr_mrdump` block LK reserves for its DTB) and a
+  `ccci,modem_info_v2 all zero: the boot loader did not load the modem` line (expected on this
+  recovery boot); `MD1 power domain off` (or on, with a boot status line); the CCIF clock gates;
+  partition bounds of md1img/md_udc/nvcfg/nvdata/nvram/protect1/protect2/proinfo (bounds only);
+  24 `md1img` section lines with `md1rom CHECK_HEADER v6: platform MT6877_S00`; the summary.
+  With the daemon: `a34cell: kernel: stage0 lk=... md1=... ccifclk=... md1img=24sec,MT6877_S00`,
+  then `no modem port /dev/a34at0 ... nothing to do`. If anything hangs, the last `A34 CELL`
+  line names the step (it only reads SPM/infracfg status registers, LK's DTB and md1img).
 
 ### Stage 1a -- boot so that LK loads the modem (needs the user's decision)
 
