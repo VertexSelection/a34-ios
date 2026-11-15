@@ -1,0 +1,693 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 860775e..bbea5aa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -137,8 +137,35 @@ public:
+ 	SweetSurface *fPendingHeld[SWEET_FB_LAYERS];
+ 	bool          fHold;                    /* a34fbhold: SwapWait waits for them */
+ 	bool          fFlushCopy;               /* A34 (0928): the copy is flushed to memory (the panel's mapping is cacheable) */
++	/*
++	 * A34 (0930): a34fbflip, a34fbte (see flipStart()). The pictures: 0 is
++	 * fPixels (LK's buffer 0), 1 the second one. With fFlipLock: fShown, the
++	 * one the OVL layers read (the last transfer's); fQueued, one drawn and
++	 * not yet sent; fTaken, the one the kick is sending (from its start
++	 * until the transfer is over); fWriting, the one present() draws into.
++	 * -1: none.
++	 */
++	bool          fFlip;
++	bool          fTE;
++	bool          fNewPath;                 /* fFlip or fTE: present() and the kick go by the state below */
++	uintptr_t     fBufVA[2];
++	uint64_t      fBufPA[2];
++	uintptr_t     fDraw;                    /* where present() draws the frame it is drawing */
++	uint64_t      fDrawPA;
++	IOLock       *fFlipLock;
++	int32_t       fShown, fQueued, fTaken, fWriting;
++	volatile uint32_t *fOvl[2];             /* OVL0_2L, OVL0 */
++	uint32_t      fOvlFlip[2];              /* their enabled layers that read picture 0 at start, a bit each */
++	uint64_t      fTELast, fTEPeriod;       /* mach time of the last TE seen, the TE period */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void flipStart(void);
++	bool teWait(uint64_t *waited);
++	void kickFlip(void);
++	int32_t drawTarget(bool full);
++	void drawDone(int32_t target);
++	void layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6]);
++	bool fullFrame(const uint8_t *rec, uint32_t mask);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -200,6 +227,33 @@ extern "C" uint64_t a34_kick_stats[6];   /* kicks, wait, transfer, wait max, tra
+ uint64_t a34_kick_stats[6];
+ static IOWorkLoop *a34_kick_wl;
+ static IOTimerEventSource *a34_kick_timer;
++/*
++ * A34 (0930), for the 10 s line: frames drawn into the picture not shown, into
++ * the latest one; queued frames replaced before being sent; draws that waited
++ * for a transfer, the longest wait (mach time); OVL switches; transfers; TE
++ * waits, their time (mach time), TE not seen.
++ */
++static uint64_t sweet_fb_flip_stats[10];
++static uint64_t sweet_fb_flip_last[10];
++
++/* A34 (0930): the display engine (MT6877; mt6877.dts, MediaTek's mtk_disp_ovl.c and mtk_dsi.c) */
++#define SWEET_FB_OVL0_2L        0x14006000u
++#define SWEET_FB_OVL0           0x14005000u
++#define SWEET_FB_OVL_EN         0x00cu          /* [22] BYPASS_SHADOW: layer registers take effect at once */
++#define SWEET_FB_OVL_SRC_CON    0x02cu          /* [3:0] layers enabled */
++#define SWEET_FB_OVL_ADDR(n)    (0xf40u + 0x20u * (n))
++#define SWEET_FB_LK_FB          0x74180000ull   /* LK's framebuffer reservation (mblock-23-framebuffer) ... */
++#define SWEET_FB_LK_FB_END      0x75f00000ull   /* ... up to the TEE carve-out (tools/mkadt_a34.py, a34-baseline.py) */
++#define SWEET_FB_SECOND         0x74b54000ull   /* picture 1: where LK's own OVL0 layer 1 read at hand-off */
++#define SWEET_FB_DSI_INTSTA     0x00cu
++#define SWEET_FB_DSI_MODE_CTRL  0x014u          /* [1:0] 0: command mode */
++#define SWEET_FB_DSI_TXRX_CTRL  0x018u
++#define SWEET_FB_DSI_INTEN      0x008u
++#define SWEET_FB_TE_RDY         (1u << 2)       /* DSI_INTSTA TE_RDY_INT_FLAG; cleared by writing 0 to it */
++#define SWEET_FB_EXT_TE_EN      (1u << 9)       /* DSI_TXRX_CTRL EXT_TE_EN: the panel's TE pin is listened to */
++#define SWEET_FB_TE_MAX_MS      40u             /* a TE wait gives up after this (2.4 periods at 60 Hz) */
++#define SWEET_FB_TE_WAKE_US     2500u           /* a TE wait sleeps until this long before the TE it expects, then spins */
++#define SWEET_FB_DRAW_WAIT_MS   100u            /* present() waits so long at most for a transfer of the picture it draws into */
+ 
+ static bool
+ a34_dsi_wait_idle(uint64_t *ticks)
+@@ -225,6 +279,8 @@ extern "C" int a34_dsi_lock(void);
+ extern "C" void a34_dsi_unlock(void);
+ extern "C" void a34_dsi_recover(void);
+ extern "C" uint32_t a34_mutex_rd(uint32_t off);
++extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pexpert/arm/pe_serial.c */
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /*
+  * A34 (0910): the first time a frame transfer does not finish, log the DSI,
+@@ -278,9 +334,13 @@ static void
+ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	uint64_t wait, xfer;
+-	(void)owner;
++	AppleCLCD *fb = OSDynamicCast(AppleCLCD, owner);
+ 	(void)sender;
+ 
++	if (fb != NULL && fb->fNewPath) {
++		fb->kickFlip();         /* A34 (0930) */
++		return;
++	}
+ 	/* A34 (0913): wait-for-idle and start under the console's lock too. */
+ 	if (!a34_dsi_lock()) {
+ 		a34_kick_stats[5]++;
+@@ -377,6 +437,7 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t flushCopy = 0;
+ 	(void)PE_parse_boot_argn("a34fbflush", &flushCopy, sizeof(flushCopy));
+ 	fFlushCopy = flushCopy != 0 || fSurface->wrapped || fSurface->mapCache != kIOMapWriteCombineCache;
++	flipStart();                    /* A34 (0930), before the first vsync */
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -500,6 +561,33 @@ sweet_fb_hold_log(void)
+ 	sweet_fb_touch_last[1] = t[1];
+ }
+ 
++/* A34 (0930): every 10 s from the vsync work loop, when anything happened (a34fbflip, a34fbte). */
++static void
++sweet_fb_flip_log(void)
++{
++	uint64_t d[10], most, te;
++	bool any = false;
++
++	for (unsigned i = 0; i < 10; i++) {
++		d[i] = sweet_fb_flip_stats[i] - (i == 4 ? 0 : sweet_fb_flip_last[i]);
++		sweet_fb_flip_last[i] = sweet_fb_flip_stats[i];
++		any = any || (i != 4 && d[i] != 0);
++	}
++	sweet_fb_flip_stats[4] = 0;
++	if (!any) {
++		return;
++	}
++	absolutetime_to_nanoseconds(d[4], &most);
++	absolutetime_to_nanoseconds(d[8], &te);
++	IOLog("A34 FB FLIP: 10 s: %llu frames drawn into the picture not shown, %llu into the latest one, %llu replaced "
++	    "before being sent; %llu draws waited for a transfer (longest %llu us); %llu flips, %llu transfers; %llu TE "
++	    "waits (%llu us each on average, %llu without a TE in %u ms)\n", (unsigned long long)d[0],
++	    (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3],
++	    (unsigned long long)(most / NSEC_PER_USEC), (unsigned long long)d[5], (unsigned long long)d[6],
++	    (unsigned long long)d[7], (unsigned long long)(d[7] != 0 ? te / NSEC_PER_USEC / d[7] : 0),
++	    (unsigned long long)d[9], SWEET_FB_TE_MAX_MS);
++}
++
+ 
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -521,6 +609,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if ((count % SWEET_FB_HOLD_LOG_TICKS) == 0) {
+ 		sweet_fb_hold_log();
++		sweet_fb_flip_log();    /* A34 (0930) */
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -542,7 +631,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sweet_fb_unhold(dropped);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)((fb->fNewPath ? fb->fBufVA[fb->fShown] : fb->fPixels) +
++				    (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+@@ -698,6 +788,397 @@ AppleCLCD::swapWait(uint32_t id, uint32_t options)
+ 	return ret;
+ }
+ 
++/*
++ * A34 (0930): two pictures and the panel's TE, after HackiOS's fb_flip
++ * (MiniIOMobileFramebuffer.cpp, APSL 2.0: "no frame copied into the
++ * picture the panel is scanning out"; two pictures of the boot framebuffer
++ * drawn in turn, OVL0's address switched), for a command-mode panel.
++ *
++ * What tore: the panel (s6e3fc5, DSI command mode, its own 60 Hz scan of
++ * its own memory) is written by each transfer (7.6 ms) whenever the kick
++ * started it, wherever the panel's scan was: where the scan overtook the
++ * write, the screen showed the frame before below that row and the new one
++ * above it (the Settings photos: rows twice, ~50 px apart). The panel says
++ * when its scan starts with its TE pin; Android's trigger loop
++ * (mtk_crtc_start_trig_loop) waits for that event before the mutex and
++ * DSI start. A transfer started at the TE stays ahead of the scan (2340
++ * rows in 7.6 ms against 16.7 ms). And with one picture, a copy into it
++ * while a late transfer read it mixed two frames in memory.
++ *
++ * a34fbte=1: the kick waits for TE_RDY in DSI_INTSTA (cleared, then
++ * polled; it sleeps until SWEET_FB_TE_WAKE_US before the TE it expects
++ * from the period measured at start) and starts the transfer at once. The
++ * DSI listens to the TE pin only with EXT_TE_EN in DSI_TXRX_CTRL (Android
++ * writes 0x0001023c after the panel's init); without it there is no TE,
++ * and a34fbte=2 sets it. No TE in SWEET_FB_TE_MAX_MS: started anyway.
++ *
++ * a34fbflip=1: picture 1 at SWEET_FB_SECOND (inside LK's reservation, the
++ * buffer LK's OVL0 layer 1 read), same rows. A frame whose bottom layer
++ * covers the panel is drawn into the picture that is neither being sent
++ * nor about to be; one that does not is drawn into the latest picture,
++ * after its transfer. The kick, with the DSI idle, takes the queued
++ * picture, points every OVL0_2L/OVL0 layer that read picture 0 at it (on
++ * the MT6877 the layer registers are not shadowed: BYPASS_SHADOW), and
++ * only then starts the transfer. No picture is written while a transfer
++ * reads it. A swap is still done when its copy is (0927). Kernel text
++ * (the console unmuted, a panic) is drawn into picture 0 and shows only
++ * while picture 0 is the one shown.
++ */
++void
++AppleCLCD::flipStart(void)
++{
++	static const uint32_t ovlPA[2] = { SWEET_FB_OVL0_2L, SWEET_FB_OVL0 };
++	static const char *const ovlName[2] = { "OVL0_2L", "OVL0" };
++	uint32_t flip = 0, te = 0, txrx, size = fRowBytes * fHeight;
++	bool cmdMode = (a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL) & 3u) == 0;
++
++	fShown = 0;
++	fQueued = fTaken = fWriting = -1;
++	fBufVA[0] = fPixels;
++	fBufPA[0] = fPhys;
++	fDraw = fPixels;
++	fDrawPA = fPhys;
++	(void)PE_parse_boot_argn("a34fbflip", &flip, sizeof(flip));
++	(void)PE_parse_boot_argn("a34fbte", &te, sizeof(te));
++	for (unsigned o = 0; o < 2; o++) {
++		fOvl[o] = (volatile uint32_t *)ml_io_map(ovlPA[o], 0x1000);
++		fOvlFlip[o] = 0;
++		if (fOvl[o] == NULL) {
++			continue;
++		}
++		uint32_t en = fOvl[o][SWEET_FB_OVL_SRC_CON / 4];
++		for (unsigned n = 0; n < 4; n++) {
++			if ((en & (1u << n)) != 0 && fOvl[o][SWEET_FB_OVL_ADDR(n) / 4] == (uint32_t)fPhys) {
++				fOvlFlip[o] |= 1u << n;
++			}
++		}
++		IOLog("A34 FB FLIP: %s EN 0x%08x SRC_CON 0x%08x, layer addresses 0x%08x 0x%08x 0x%08x 0x%08x: layers 0x%x "
++		    "read picture 0\n", ovlName[o], fOvl[o][SWEET_FB_OVL_EN / 4], en, fOvl[o][SWEET_FB_OVL_ADDR(0) / 4],
++		    fOvl[o][SWEET_FB_OVL_ADDR(1) / 4], fOvl[o][SWEET_FB_OVL_ADDR(2) / 4], fOvl[o][SWEET_FB_OVL_ADDR(3) / 4],
++		    fOvlFlip[o]);
++	}
++	txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
++	IOLog("A34 FB FLIP: DSI MODE_CTRL 0x%08x TXRX_CTRL 0x%08x (EXT_TE_EN %u) INTEN 0x%08x INTSTA 0x%08x (TE_RDY %u)\n",
++	    a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL), txrx, (txrx & SWEET_FB_EXT_TE_EN) != 0, a34_dsi_rd(SWEET_FB_DSI_INTEN),
++	    a34_dsi_rd(SWEET_FB_DSI_INTSTA), (a34_dsi_rd(SWEET_FB_DSI_INTSTA) & SWEET_FB_TE_RDY) != 0);
++	fFlipLock = IOLockAlloc();
++	if (fFlipLock == NULL || !cmdMode || txrx == 0xdeadbeefu) {
++		if (flip != 0 || te != 0) {
++			IOLog("A34 FB FLIP: a34fbflip/a34fbte not done (%s)\n", fFlipLock == NULL ? "no lock" :
++			    "the DSI is not a command-mode one here");
++		}
++		return;
++	}
++	if (flip != 0) {
++		if (fPhys != SWEET_FB_LK_FB || SWEET_FB_SECOND + size > SWEET_FB_LK_FB_END || (fOvlFlip[0] | fOvlFlip[1]) == 0) {
++			IOLog("A34 FB FLIP: not flipping: picture 0 at 0x%llx, %u bytes, no OVL layer reads it or picture 1 "
++			    "would not fit in LK's reservation\n", fPhys, size);
++		} else {
++			fBufVA[1] = (uintptr_t)ml_io_map_wcomb((vm_offset_t)SWEET_FB_SECOND,
++			    (vm_size_t)(((uint64_t)size + 0x3fffu) & ~(uint64_t)0x3fffu));
++			fBufPA[1] = SWEET_FB_SECOND;
++			fFlip = fBufVA[1] != 0;
++		}
++	}
++	if (te != 0) {
++		if ((txrx & SWEET_FB_EXT_TE_EN) == 0 && te >= 2) {
++			a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, txrx | SWEET_FB_EXT_TE_EN);
++			txrx = a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL);
++		}
++		if ((txrx & SWEET_FB_EXT_TE_EN) == 0) {
++			IOLog("A34 FB FLIP: no TE: EXT_TE_EN is clear in DSI_TXRX_CTRL 0x%08x (a34fbte=2 sets it)\n", txrx);
++		} else {
++			uint64_t w1 = 0, w2 = 0, first;
++
++			fTE = true;
++			fTELast = 0;
++			fTEPeriod = 0;
++			if (teWait(&w1)) {
++				first = fTELast;
++				if (teWait(&w2)) {
++					fTEPeriod = fTELast - first;
++				}
++			}
++			if (fTEPeriod == 0) {
++				fTE = false;
++				IOLog("A34 FB FLIP: no TE seen in %u ms with EXT_TE_EN set (TXRX_CTRL 0x%08x): transfers not timed "
++				    "by it\n", SWEET_FB_TE_MAX_MS, txrx);
++			} else {
++				uint64_t ns;
++
++				absolutetime_to_nanoseconds(fTEPeriod, &ns);
++				IOLog("A34 FB FLIP: the panel's TE every %llu us: transfers start at it\n",
++				    (unsigned long long)(ns / NSEC_PER_USEC));
++			}
++		}
++	}
++	fNewPath = fFlip || fTE;
++	IOLog("A34 FB FLIP: %s, %s (a34fbflip=%u, a34fbte=%u)\n", fFlip ? "two pictures, at 0x74180000 and 0x74b54000" :
++	    "one picture", fTE ? "transfers at the TE" : "transfers at once", flip, te);
++}
++
++/* A34 (0930): the kick's thread: until the panel's next TE (up to SWEET_FB_TE_MAX_MS); false if none came. */
++bool
++AppleCLCD::teWait(uint64_t *waited)
++{
++	uint64_t t0 = mach_absolute_time(), now, limit, wake, second;
++
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_TE_MAX_MS * NSEC_PER_MSEC, &limit);
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_TE_WAKE_US * NSEC_PER_USEC, &wake);
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
++	if (fTELast != 0 && fTEPeriod != 0 && t0 - fTELast < second) {
++		uint64_t next = fTELast + ((t0 - fTELast) / fTEPeriod + 1) * fTEPeriod, ns;
++
++		if (next - t0 > wake + wake) {
++			absolutetime_to_nanoseconds(next - t0 - wake, &ns);
++			IOSleep((unsigned)(ns / NSEC_PER_MSEC));
++		}
++	}
++	a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);
++	for (;;) {
++		now = mach_absolute_time();
++		if ((a34_dsi_rd(SWEET_FB_DSI_INTSTA) & SWEET_FB_TE_RDY) != 0) {
++			break;
++		}
++		if (now - t0 > limit) {
++			*waited = now - t0;
++			return false;
++		}
++	}
++	*waited = now - t0;
++	fTELast = now;
++	return true;
++}
++
++/*
++ * A34 (0930): the kick (its own work loop) with fNewPath: the DSI idle, the
++ * queued picture taken, the TE, the OVL layers pointed at it, the start, the
++ * transfer waited for.
++ */
++void
++AppleCLCD::kickFlip(void)
++{
++	uint64_t wait = 0, xfer = 0, tew = 0;
++	int32_t t;
++
++	if (!a34_dsi_wait_idle(&wait)) {
++		a34_kick_stats[5]++;
++		a34_disp_dump("busy for 1 s before a start");
++		if (a34_dsi_lock()) {
++			a34_dsi_recover();
++			a34_dsi_unlock();
++		}
++	}
++	IOLockLock(fFlipLock);
++	t = fQueued;
++	if (t < 0 || t == fWriting) {
++		IOLockUnlock(fFlipLock);
++		return;
++	}
++	fQueued = -1;
++	fTaken = t;
++	IOLockUnlock(fFlipLock);
++	if (fTE) {
++		sweet_fb_flip_stats[7]++;
++		if (!teWait(&tew)) {
++			sweet_fb_flip_stats[9]++;
++		}
++		sweet_fb_flip_stats[8] += tew;
++	}
++	if (!a34_dsi_lock()) {
++		a34_kick_stats[5]++;
++		IOLockLock(fFlipLock);
++		fTaken = -1;
++		if (fQueued < 0) {
++			fQueued = t;            /* (sent by the next kick) */
++		}
++		IOLockWakeup(fFlipLock, &fTaken, false);
++		IOLockUnlock(fFlipLock);
++		return;
++	}
++	uint64_t again = 0;
++	(void)a34_dsi_wait_idle(&again);        /* (the console may have started one meanwhile) */
++	if (t != fShown) {
++		for (unsigned o = 0; o < 2; o++) {
++			for (unsigned n = 0; n < 4; n++) {
++				if ((fOvlFlip[o] & (1u << n)) != 0) {
++					fOvl[o][SWEET_FB_OVL_ADDR(n) / 4] = (uint32_t)fBufPA[t];
++				}
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		sweet_fb_flip_stats[5]++;
++		IOLockLock(fFlipLock);
++		fShown = t;
++		IOLockUnlock(fFlipLock);
++	}
++	a34_dsi_trigger();
++	a34_dsi_unlock();
++	sweet_fb_flip_stats[6]++;
++	IODelay(50);
++	if (!a34_dsi_wait_idle(&xfer)) {
++		a34_kick_stats[5]++;
++		a34_disp_dump("transfer did not finish in 1 s");
++		if (a34_dsi_lock()) {
++			a34_dsi_recover();
++			a34_dsi_trigger();
++			a34_dsi_unlock();
++			IODelay(50);
++			(void)a34_dsi_wait_idle(&again);
++		}
++	}
++	a34_kick_stats[0]++;
++	a34_kick_stats[1] += wait;
++	a34_kick_stats[2] += xfer;
++	if (wait > a34_kick_stats[3]) {
++		a34_kick_stats[3] = wait;
++	}
++	if (xfer > a34_kick_stats[4]) {
++		a34_kick_stats[4] = xfer;
++	}
++	IOLockLock(fFlipLock);
++	fTaken = -1;
++	IOLockWakeup(fFlipLock, &fTaken, false);
++	IOLockUnlock(fFlipLock);
++}
++
++/*
++ * A34 (0930): present()'s, with fNewPath: the picture this frame is drawn
++ * into. `full`: its bottom layer covers the panel and there are two
++ * pictures: the one neither being sent nor about to be (a queued one is
++ * drawn over, replaced). Otherwise the latest picture (the queued one, else
++ * the one sent last), after its transfer.
++ */
++int32_t
++AppleCLCD::drawTarget(bool full)
++{
++	int32_t t;
++
++	IOLockLock(fFlipLock);
++	if (full) {
++		t = fTaken >= 0 ? (fTaken ^ 1) : (fQueued >= 0 ? fQueued : (fShown ^ 1));
++		sweet_fb_flip_stats[0]++;
++	} else {
++		if (fTaken >= 0 && fQueued < 0) {
++			uint64_t t0 = mach_absolute_time(), deadline, waited;
++
++			clock_interval_to_deadline(SWEET_FB_DRAW_WAIT_MS, kMillisecondScale, &deadline);
++			while (fTaken >= 0 && fQueued < 0) {
++				if (IOLockSleepDeadline(fFlipLock, &fTaken, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++					break;
++				}
++			}
++			waited = mach_absolute_time() - t0;
++			sweet_fb_flip_stats[3]++;
++			if (waited > sweet_fb_flip_stats[4]) {
++				sweet_fb_flip_stats[4] = waited;
++			}
++		}
++		t = fQueued >= 0 ? fQueued : (fTaken >= 0 ? fTaken : fShown);
++		sweet_fb_flip_stats[1]++;
++	}
++	if (fQueued == t) {
++		fQueued = -1;                   /* (drawn over: not to be taken while it is) */
++		sweet_fb_flip_stats[2]++;
++	}
++	fWriting = t;
++	IOLockUnlock(fFlipLock);
++	return t;
++}
++
++/* A34 (0930): present()'s: the frame is in picture `target`, for the kick to send. */
++void
++AppleCLCD::drawDone(int32_t target)
++{
++	IOLockLock(fFlipLock);
++	fWriting = -1;
++	fQueued = target;
++	IOLockUnlock(fFlipLock);
++}
++
++/*
++ * A34 (0930): a layer's rectangle as present() copies it: r = source x, y,
++ * panel x, y, width, height, after the defaults, the shift from the
++ * presented size to the panel's and the clipping (moved from present()).
++ */
++void
++AppleCLCD::layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6])
++{
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++	int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	if (sx < 0 || sy < 0) {
++		sx = sy = 0;
++	}
++	if (dx < 0 || dy < 0) {
++		dx = dy = 0;
++	}
++	/* Logical (presented) display coordinates -> panel coordinates. */
++	dx -= fOffX;
++	dy -= fOffY;
++	if (dx < 0) {
++		sx -= dx;
++		w += dx;
++		dx = 0;
++	}
++	if (dy < 0) {
++		sy -= dy;
++		h += dy;
++		dy = 0;
++	}
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fWidth - dx) {
++		w = (int32_t)fWidth - dx;
++	}
++	if (h > (int32_t)fHeight - dy) {
++		h = (int32_t)fHeight - dy;
++	}
++	r[0] = sx;
++	r[1] = sy;
++	r[2] = dx;
++	r[3] = dy;
++	r[4] = w;
++	r[5] = h;
++}
++
++/* A34 (0930): whether present() will cover the whole panel with the swap's bottom layer (copied as present() does). */
++bool
++AppleCLCD::fullFrame(const uint8_t *rec, uint32_t mask)
++{
++	uint32_t id = get32(rec, 0x54);
++	SweetSurface *s;
++	bool full = false;
++
++	if ((mask & 1u) == 0 || id == 0) {
++		return false;
++	}
++	s = sweet_surface_copy(id);
++	if (s != NULL && s != fSurface && s->kernelAddress() != 0 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) &&
++	    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
++		int32_t r[6];
++
++		layerRect(rec, 0, s, r);
++		uint64_t last = (uint64_t)s->wrapDelta + (uint64_t)s->offset + (uint64_t)(r[1] + r[5] - 1) * s->bytesPerRow +
++		    (uint64_t)(r[0] + r[4]) * 4;
++		full = r[2] == 0 && r[3] == 0 && r[4] == (int32_t)fWidth && r[5] == (int32_t)fHeight &&
++		    last <= s->memory->getLength();
++	}
++	OSSafeReleaseNULL(s);
++	return full;
++}
++
+ /* A34: command-mode DSI panel, see pexpert/arm/pe_serial.c fbcon_kick(). */
+ extern "C" void a34_display_kick(void);
+ /* A34 (0914): bsd/dev/a34_mali.c, dc civac over a kernel range (no state: no lock needed) */
+@@ -707,6 +1188,16 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	int32_t target = -1;
++
++	/* A34 (0930): which picture this frame is drawn into (a34fbflip, a34fbte) */
++	fDraw = fPixels;
++	fDrawPA = fPhys;
++	if (fNewPath) {
++		target = drawTarget(fFlip && fullFrame(rec, mask));
++		fDraw = fBufVA[target];
++		fDrawPA = fBufPA[target];
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -748,41 +1239,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (src != 0) {
+ 			src += s->wrapDelta;
+ 		}
+-		if (w <= 0 || h <= 0) {
+-			w = (int32_t)s->width;
+-			h = (int32_t)s->height;
+-		}
+-		if (sx < 0 || sy < 0) {
+-			sx = sy = 0;
+-		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
+-		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
+-		}
+-		if (w > (int32_t)s->width - sx) {
+-			w = (int32_t)s->width - sx;
+-		}
+-		if (h > (int32_t)s->height - sy) {
+-			h = (int32_t)s->height - sy;
+-		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
+-		}
++		int32_t r[6];
++
++		layerRect(rec, layer, s, r);    /* A34 (0930): the clipping, shared with fullFrame() */
++		sx = r[0];
++		sy = r[1];
++		dx = r[2];
++		dy = r[3];
++		w = r[4];
++		h = r[5];
+ 		uint64_t last = (uint64_t)s->wrapDelta + (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+@@ -790,7 +1255,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			uint64_t dst_pa = (uint64_t)fPhys + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			uint64_t dst_pa = fDrawPA + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
+ 			const uint32_t *src0p = (const uint32_t *)(src + s->offset +
+ 			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
+ 			const uint32_t *srccp = (const uint32_t *)(src + s->offset +
+@@ -818,14 +1283,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4);
+ 			}
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fDraw + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 			uint64_t t_flush = mach_absolute_time();
+ 			/* ruby: the DSI scanout reads DRAM; flush the CPU copy to it (A34 (0928): when cacheable) */
+ 			if (fFlushCopy) {
+-				flush_dcache64((addr64_t)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
++				flush_dcache64((addr64_t)(fDraw + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
+ 				    (uint32_t)((uint64_t)h * fRowBytes), FALSE);
+ 			}
+ 			__asm__ __volatile__("dsb sy" ::: "memory");
+@@ -836,14 +1301,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 				sweet_fb_dbg_logged++;
+ 				IOLog("SWEET FB DBG: layer %u id %u src_va=%p dst_va=%p dst_pa=0x%llx w=%d h=%d src0=%08x srcc=%08x dst0=%08x dstc=%08x\n",
+ 				    layer, id, (void *)src,
+-				    (void *)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
++				    (void *)(fDraw + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
+ 				    dst_pa, w, h, *src0p, *srccp,
+-				    *(const uint32_t *)(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
+-				    *(const uint32_t *)(fPixels + (uint64_t)(fHeight / 2) * fRowBytes + (uint64_t)(fWidth / 2) * 4));
++				    *(const uint32_t *)(fDraw + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4),
++				    *(const uint32_t *)(fDraw + (uint64_t)(fHeight / 2) * fRowBytes + (uint64_t)(fWidth / 2) * 4));
+ 			}
+ 		}
+ 		s->release();
+ 	}
++	if (target >= 0) {
++		drawDone(target);       /* A34 (0930): drawn, for the kick to send */
++	}
+ 	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
+ 	uint64_t t_kick = mach_absolute_time();
+ 	if (a34_kick_timer != NULL) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 30642be..477f464 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -847,6 +847,17 @@ a34_mutex_rd(uint32_t off)
+ 	return fbcon_mutex != NULL ? fbcon_mutex[off / 4] : 0xdeadbeef;
+ }
+ 
++/* A34 (0930): a DSI register written, for SweetFramebuffer's TE wait (DSI_INTSTA, DSI_TXRX_CTRL). */
++void a34_dsi_wr(uint32_t off, uint32_t val);
++void
++a34_dsi_wr(uint32_t off, uint32_t val)
++{
++	if (fbcon_dsi != NULL) {
++		fbcon_dsi[off / 4] = val;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
+ void a34_dsi_trigger(void);
+ void
+ a34_dsi_trigger(void)
