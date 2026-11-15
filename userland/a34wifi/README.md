@@ -1,7 +1,7 @@
 # a34wifi
 
 The user-space half of milestone 1 of the Galaxy A34's Wi-Fi (`docs/wifi-plan.md`): a small
-tool that asks the kernel's Wi-Fi bring-up (`xnu/patches/0939-a34-wifi-m1.patch`,
+tool that asks the kernel's Wi-Fi bring-up (`xnu/patches/0940-a34-wifi-m1.patch`,
 `bsd/dev/a34_wifi.c`) for its steps and prints what the kernel says.
 
 The kernel does nothing for Wi-Fi until it is asked, by boot-arg `a34wifi=N` or by this tool

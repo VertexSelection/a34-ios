@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <string.h>
+/* Darwin arm64: uint64_t is unsigned long long (Linux x86_64: unsigned long), so %llx checks as on the real build */
+typedef unsigned long long darwin_u64;
+#define uint64_t darwin_u64
 typedef uintptr_t vm_offset_t;
 typedef uintptr_t vm_size_t;
 typedef int kern_return_t;
@@ -36,6 +39,7 @@ typedef uint64_t addr64_t;
 #define ENOENT 2
 #define EFBIG 27
 #define ETIMEDOUT 60
+#define EBUSY 16
 #define __unused __attribute__((unused))
 #define __printflike(a, b) __attribute__((format(printf, a, b)))
 #define LCK_GRP_DECLARE(n, s) lck_grp_t *n
@@ -87,6 +91,8 @@ extern int sysctl_io_number(struct sysctl_req *req, long long bigValue, size_t v
 #define CTLFLAG_LOCKED 0
 #define OID_AUTO (-1)
 /* machine */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);

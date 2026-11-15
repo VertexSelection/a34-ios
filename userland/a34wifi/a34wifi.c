@@ -1,7 +1,7 @@
 /*
  * a34wifi -- the Galaxy A34's Wi-Fi bring-up from user space (milestone 1 of docs/wifi-plan.md).
  *
- * The kernel side is xnu/patches/0939-a34-wifi-m1.patch (bsd/dev/a34_wifi.c). It does nothing
+ * The kernel side is xnu/patches/0940-a34-wifi-m1.patch (bsd/dev/a34_wifi.c). It does nothing
  * until it is asked, either by boot-arg a34wifi=N or by this tool, which writes the same N into
  * sysctl kern.a34wifi.want (root only). The steps, in order, each needing the ones before it:
  *
@@ -67,7 +67,7 @@ state(void)
 	int want = 0, done = 0, busy = 0;
 
 	if (get_int("kern.a34wifi.want", &want) != 0) {
-		printf("a34wifi: no kern.a34wifi in this kernel (%s): it needs patch 0939\n", strerror(errno));
+		printf("a34wifi: no kern.a34wifi in this kernel (%s): it needs patch 0940\n", strerror(errno));
 		return 1;
 	}
 	(void)get_int("kern.a34wifi.done", &done);

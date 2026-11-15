@@ -193,7 +193,7 @@ nobody has tried it, and ios-sweet's USB `ue0` (no IOKit object) was ignored.
 
 ## 3. Milestone 1, as built
 
-**Kernel**: `xnu/patches/0939-a34-wifi-m1.patch` (against the A34 tree at 0938, `543f537`):
+**Kernel**: `xnu/patches/0940-a34-wifi-m1.patch` (written as 0939 against 0938, `543f537`; on main as 0940 after Bluetooth's 0939):
 `bsd/dev/a34_wifi.c` (~1 900 lines), one line in `bsd/conf/files`, one call in
 `bsd/dev/sweet_ufs.c` after `a34_mali_init()`. **Off by default**: without boot-arg
 `a34wifi=N` and without a write to sysctl `kern.a34wifi.want` nothing is mapped or touched.
@@ -232,7 +232,7 @@ the AP2WF window and the DMA rings: the ROM-EMI image lands at EMI + 0x380000 an
 +0x4954e0, regions 3/4 at +0x4ad400/+0x5bd400, region 2 in the window with `0x18400120` =
 0x00404000, the FW_FINISH frame is `DW0 0x01000048 DW1 0x00010000`, CID 0x41, 0xa0, length 40,
 and `GLO_CFG` ends at 0x50209075 -- byte for byte against the files. **CI built the kernel with
-0939** (`xnu-a34` on branch `wifi`, run
+0940** (then numbered 0939; `xnu-a34` on branch `wifi`, run
 [43678571231](https://github.com/VertexSelection/a34-ios/actions/runs/43678571231), commit
 `8276cdc`, artifact `xnu-a34-kernel`): the patch applied and `a34_wifi.c` compiled with no
 error; its 13 warnings are 10 `-Wcast-function-type-strict` from XNU's own `LCK_*_DECLARE`,
@@ -247,9 +247,39 @@ with their A346EXXSADYG1 checksums. Install: `sudo tools/root-add-job.py /mnt co
 persistent log). The tool exists because the boot-args are near the 607 characters XNU keeps
 (the 120 Hz Metal image uses 605).
 
+### 0960: one CONNSYS power-up for Bluetooth and Wi-Fi
+
+Bluetooth's 0939 (`bsd/dev/a34_connsys.c`) and Wi-Fi's 0940 each powered CONNSYS on their own,
+so they could not run in one boot. `xnu/patches/0960-a34-connsys-shared.patch` (against
+`e927304`) makes `a34_connsys.c` the one owner of the PMIC rails and of the A-die's set-up:
+
+- `a34_connsys_get(radio)` / `a34_connsys_put(radio)` (radio = conninfra's `CONNDRV_TYPE_*`:
+  0 Bluetooth, 3 Wi-Fi), counted, under one lock; `a34_connsys_on()` stays Bluetooth's get, so
+  `a34_bt.c` is unchanged.
+- The first radio of a boot gets the whole first power-on with its own choices
+  (`conninfra/.../mt6877_pos.c`): the sleep controller's A-die table and the A-die clock buffer
+  "Bluetooth only" (`ON3/4`, `OFF3/4` = `0x74e03f75`... ; XTAL `0x100`/`0x70ff0000`) only when
+  that radio is Bluetooth, else the full values (`0x74e0fff5`...; XTAL `0xc180`/`0x50550080`);
+  its bit in sysram's radio status; Bluetooth's VCN13/VS2 raise only for Bluetooth
+  (`consys_plt_pmic_raise_voltage_mt6877` acts on `drv_type == 0` only).
+- A later radio gets `consys_hw_pwr_on()`'s `curr_status != 0` path: conn_infra woken (its TOP
+  wake-up bit, version polled), the radio's status bit, the sleep table and the A-die clock
+  buffer redone for the radios now on, conn_infra let sleep again.
+- Each radio's rails: Bluetooth VCN33_1 (its `EN_0`); Wi-Fi VCN33_1's `EN_1` (`MULTI_SW` bit 15)
+  and VCN33_2 at 3.3 V (`consys_plt_pmic_wifi_power_ctrl_mt6877`, RC mode as the rest).
+- `put` only drops the count: nothing is powered off before a reboot.
+- Wi-Fi's steps 2 and 3 are now `a34_connsys_get(Wi-Fi)` and a check from Wi-Fi's side (its own
+  wake-up bit `0x180601a4`, `a34_connsys_readable()`, the A-die id, the radio status, the LDOs);
+  Wi-Fi uses CONNSYS's one memory region (`a34_connsys_emi_pa()`, default 0x60000000,
+  `a34btemi=`) and clears only its own parts of it (log 0x465400 + 192 KB, dump 0x495400 +
+  0x18000), since Bluetooth's images live there too. Its DMA memory stays at 0x58000000.
+- Gained from 0939: the EMI-MPU region over CONNSYS's memory (SiP SMC, `a34btmpu=1`), which was
+  unknown 3 below. Lost: 0940's legacy (non-RC) LDO branch -- `a34_connsys.c` is RC mode's, and
+  step 1 says which mode the phone is in.
+
 ### The first phone test
 
-Kernel with 0939, root with the `com.a34.wifi` job, **no new boot-arg**. Cautious order:
+Kernel with 0940 (and 0960, below), root with the `com.a34.wifi` job, **no new boot-arg**. Cautious order:
 `a34wifi up 1` (read only), then `up 3` (CONNSYS on, A-die found), then `up 5`; each is one
 boot, or one run of the job's command by hand. What to read in `tools/pull-log.sh`'s log
 (`grep 'A34 WIFI'`):
@@ -289,7 +319,7 @@ user-space piece; each is held against what Android's driver does on this phone.
 
 | | Goal | Kernel | User space | Size (new lines) | Main risks |
 | --- | --- | --- | --- | --- | --- |
-| **M1** | CONNSYS powered, A-die found, the Wi-Fi MCU running Samsung's firmware (its ready bits), all in the log | 0939 (`a34_wifi.c` steps 1-5) | `a34wifi` (sysctl), `tools/wifi-fw.sh` | ~1 900 (built) | see section 3 |
+| **M1** | CONNSYS powered, A-die found, the Wi-Fi MCU running Samsung's firmware (its ready bits), all in the log | 0940, 0960 (`a34_wifi.c` steps 1-5) | `a34wifi` (sysctl), `tools/wifi-fw.sh` | ~1 900 (built) | see section 3 |
 | **M2** | scan results in the kernel log | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
 | **M3** | join an open network, then WPA2-PSK; an IP by DHCP; apps reach the internet | steps 8-9: BSS/STA records, channel privilege, auth/assoc frames, EAPOL through the command ring, keys (`ADD_REMOVE_KEY`), data TX/RX descriptors (connac2x TXD/RXD), an Ethernet `ifnet` (HackiOS `redwood_net.c`), WPA2 four-way/group handshake in the kernel (`redwood_wpa.c`) | `a34wifi join SSID [PASS]`, then the IPConfiguration `setservice` call (HackiOS `net_test.m`, MIT) | ~2 000 + ~900 ported | MediaTek firmware quirks HackiOS hit (runs 448-459) on a different firmware generation; the WPA2 offload settings of this firmware; MAC address source (eFuse may be empty: a fixed locally administered address, never NVRAM writes) |
 | **M4** | Settings' Wi-Fi: networks listed, password typed, joined | the wifid layer (section 2): `IO80211Controller`/`IONetworkInterface`, Apple80211 ioctls and events, `IONetworkStack`; ADT `wlan` node with `local-mac-address` | wifid, configd, mDNSResponder, trustd, securityd, nsurlsessiond, CFNetworkAgent enabled in the root | ~1 100 ported + ~200 | boot stalls if IOKit never quiesces (ios-topaz 0128) or InterfaceNamer never reports quiet; wifid holding SpringBoard (ios-sapphire); the 16.7.16 structure layouts (sizes match, field offsets to confirm from the log) |

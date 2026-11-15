@@ -52,6 +52,13 @@ void a34_pmic_lock(void) {}
 void a34_pmic_unlock(void) {}
 int ruby_pwrap_read(uintptr_t p, uint16_t r, uint16_t *v) { (void)p; (void)r; *v = 0; return 0; }
 struct region { uintptr_t pa; size_t size; uint8_t *mem; } regions[8]; static int nregions;
+/* a34_connsys.c (0960), as seen from Wi-Fi: CONNSYS up, its memory at the default 0x60000000 */
+int a34_connsys_get(uint32_t radio) { (void)radio; return 0; }
+bool a34_connsys_readable(const char *when) { (void)when; return true; }
+uint64_t a34_connsys_emi_pa(void) { return 0x60000000ull; }
+uint32_t a34_connsys_emi_size(void) { return 0x780000u; }
+uint32_t a34_connsys_adie_id(void) { return 0x66358a10u; }
+void sweet_log_flush(void) {}
 vm_offset_t ml_io_map_unmappable(vm_offset_t pa, vm_size_t size, uint32_t flags)
 {
 	(void)flags;
@@ -76,7 +83,10 @@ int main(int argc, char **argv)
 	fw_dir = argv[1];
 	(void)argc;
 	if (!a34w_map() || !a34w_map_wf()) { puts("map failed"); return 1; }
+	memset((uint8_t *)a34w_emi, 0xb7, 0x80000);     /* Bluetooth's images (a34_bt.c) must survive Wi-Fi's load */
 	if (!a34w_rom_emi_load()) { puts("rom emi load failed"); return 1; }
+	for (size_t i = 0; i < 0x80000; i++) { if (((uint8_t *)a34w_emi)[i] != 0xb7) { bad = 1; break; } }
+	printf("Bluetooth's part of the EMI left alone: %s\n", bad ? "WRONG" : "ok");
 	snprintf(p, sizeof(p), "%s/" FW_ROM_EMI, fw_dir);
 	uint8_t *rom = slurp(p, &n);
 	bad |= memcmp((uint8_t *)a34w_emi + 0x380000, rom + 48, n - 48) != 0;
