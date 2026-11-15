@@ -1,0 +1,589 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4c12ac2..196919b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/a34_touch.c			standard
+ bsd/dev/a34_diag.c			standard
+ bsd/dev/a34_mali.c			standard
+ bsd/dev/a34_clocks.c			standard
++bsd/dev/a34_cell.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
+new file mode 100644
+index 0000000..18302c5
+--- /dev/null
++++ b/bsd/dev/a34_cell.c
+@@ -0,0 +1,448 @@
++/*
++ * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
++ *
++ * Boot-arg a34cell=1 (default 0: nothing here runs, nothing is mapped). One thread, a few
++ * seconds after the disk is up, logs "A34 CELL:" lines and fills the read-only sysctl
++ * kern.a34cell with a one-line summary (userland/a34cell prints it). Plan and evidence:
++ * docs/cellular-plan.md.
++ *
++ * Nothing is written anywhere. What is read:
++ *  1. The boot loader's flattened device tree, which LK leaves in DRAM below the memory XNU
++ *     manages (0x47c80000 on this phone, a34lkfdt=ADDR to change): /chosen's
++ *     "ccci,modem_info_v2" says whether LK loaded and verified the modem image (it does on a
++ *     normal boot and skips it on a recovery boot, LK's own log string "recovery mode, no need
++ *     load modem"), and /reserved-memory names the modem's and the shared memory's regions.
++ *     The struct is MediaTek's _ccci_lk_info_v2 (Samsung kernel ccci_util_lib_fo.c), copied as
++ *     raw little-endian bytes into the property.
++ *  2. The SPM's power status of the modem's MTCMOS domain: PWR_STATUS 0x10006EF0 and
++ *     PWR_STATUS_2ND 0x10006EF4, bit 0 = MD1; MD1_PWR_CON 0x10006E00 (clk-mt6877-pg.c).
++ *  3. The infracfg_ao clock gates of the CCIF blocks (status registers, 1 = gated):
++ *     CG1 status 0x10001094 bits 23 (CCIF_AP), 26 (CCIF_MD), 12 (CCIF1_AP), 13 (CCIF1_MD)
++ *     (clk-mt6877.c). The CCIF registers themselves are not touched (a gated block's
++ *     registers can stall the bus).
++ *  4. Only when the MD1 domain is on: the modem's boot status through the secure monitor,
++ *     SMC 0xC2000505 (MTK_SIP_KERNEL_CCCI_CONTROL) with MD_POWER_CONFIG (6) / MD_BOOT_STATUS
++ *     (4), the same query Android's ccci driver makes for its logs (md_sys1_platform.c).
++ *  5. The md1img partition, through sweet_ufs_read_part() (read only, a fixed list of
++ *     partitions): its MediaTek section headers (magic 0x58881688, name, size; a 512-byte
++ *     header per section, 16-byte alignment) and md1rom's CHECK_HEADER (version, platform,
++ *     build strings) at the end of its data. The GPT bounds of the other modem partitions are
++ *     printed (names and sizes only; their contents are never read here).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++/* bsd/dev/sweet_ufs.c (A34 0950) */
++extern int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len,
++    uint64_t *part_bytes);
++extern int sweet_ufs_part_bounds(const char *name, uint64_t *first_block, uint64_t *nblocks);
++void a34_cell_init(void);
++
++#define AC_LK_FDT_PA            0x47c80000ull   /* LK's DTB (README: "DTB 0x47c80000") */
++#define AC_FDT_MAX              (2u << 20)
++#define AC_SPM_PA               0x10006000ull
++#define AC_SPM_MD1_PWR_CON      0xE00u
++#define AC_SPM_MD_BUCK_ISO      0xEE8u
++#define AC_SPM_PWR_STATUS       0xEF0u
++#define AC_SPM_PWR_STATUS_2ND   0xEF4u
++#define AC_INFRA_PA             0x10001000ull
++#define AC_INFRA_CG1_STA        0x094u
++#define AC_SMC_CCCI_CONTROL     0xC2000505ull
++#define AC_MD_POWER_CONFIG      6u
++#define AC_MD_BOOT_STATUS       4u
++
++static uint32_t ac_mode;
++static char ac_state[256] = "a34cell=0";
++SYSCTL_STRING(_kern, OID_AUTO, a34cell, CTLFLAG_RD | CTLFLAG_LOCKED, ac_state, sizeof(ac_state),
++    "A34 cellular stage 0 summary");
++
++/* Appends " <text>" to the sysctl's summary. */
++#define AC_NOTE(...) do {                                                       \
++	size_t n_ = strlen(ac_state);                                            \
++	if (n_ + 2 < sizeof(ac_state)) {                                         \
++		ac_state[n_] = ' ';                                              \
++		snprintf(ac_state + n_ + 1, sizeof(ac_state) - n_ - 1, __VA_ARGS__); \
++	}                                                                        \
++} while (0)
++
++/* Does s contain w? (no strstr here) */
++static bool
++ac_has(const char *s, const char *w)
++{
++	size_t n = strlen(w);
++
++	for (; *s; s++)
++		if (strncmp(s, w, n) == 0)
++			return true;
++	return false;
++}
++
++static uint32_t
++ac_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dsb ld" ::: "memory");
++	return v;
++}
++
++static uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint64_t
++le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32;
++}
++
++/* Keeps printable ASCII of a fixed-size field, for the log. */
++static void
++ac_printable(char *out, size_t outsz, const uint8_t *in, size_t inlen)
++{
++	size_t o = 0;
++
++	for (size_t i = 0; i < inlen && in[i] && o + 1 < outsz; i++)
++		out[o++] = (in[i] >= 0x20 && in[i] < 0x7f) ? (char)in[i] : '.';
++	out[o] = 0;
++}
++
++/* ---- 1. LK's device tree ---- */
++
++#define FDT_BEGIN_NODE  1
++#define FDT_END_NODE    2
++#define FDT_PROP        3
++#define FDT_NOP         4
++#define FDT_END         9
++
++static int ac_lk_md = -1;       /* -1 unknown, 0 not loaded, 1 loaded */
++
++static void
++ac_modem_info(const char *node, const uint8_t *v, uint32_t len)
++{
++	if (len < 32) {
++		printf("A34 CELL: LK %s ccci,modem_info_v2: %u bytes (expected 32+)\n", node, len);
++		return;
++	}
++	/* struct _ccci_lk_info_v2 { u64 base; u32 size; s32 err_no; s32 version; s32 tag_num;
++	 * u32 ld_flag; s32 ld_md_errno; } -- raw little-endian bytes */
++	uint64_t base = le64(v);
++	uint32_t size = le32(v + 8), version = le32(v + 16), tags = le32(v + 20), flag = le32(v + 24);
++	int32_t err = (int32_t)le32(v + 12), mderr = (int32_t)le32(v + 28);
++	bool loaded = base != 0 && err == 0 && (flag & 1);
++
++	if (base == 0 && err == 0 && flag == 0)
++		printf("A34 CELL: LK %s ccci,modem_info_v2 all zero: the boot loader did not load the "
++		    "modem (it skips it on a recovery boot)\n", node);
++	else
++		printf("A34 CELL: LK %s ccci,modem_info_v2: tag table 0x%llx (+0x%x) v%u, %u tags, "
++		    "load flags 0x%x, err %d, md errno %d -> modem %s\n", node, base, size, version,
++		    tags, flag, err, mderr, loaded ? "LOADED by LK" : "not loaded");
++	if (ac_lk_md != 1)
++		ac_lk_md = loaded ? 1 : 0;
++}
++
++static void
++ac_lk_fdt(void)
++{
++	uint64_t pa = AC_LK_FDT_PA;
++	uint8_t hdr[40];
++
++	(void)PE_parse_boot_argn("a34lkfdt", &pa, (int)sizeof(pa));
++	vm_offset_t m = ml_io_map((vm_offset_t)pa, PAGE_SIZE);
++	if (!m) {
++		printf("A34 CELL: LK FDT 0x%llx: no mapping\n", pa);
++		return;
++	}
++	for (int i = 0; i < 10; i++) {
++		uint32_t w = ac_rd32(m, (uint32_t)(4 * i));
++		memcpy(hdr + 4 * i, &w, 4);
++	}
++	uint32_t magic = be32(hdr), total = be32(hdr + 4), off_struct = be32(hdr + 8);
++	uint32_t off_strings = be32(hdr + 12), size_strings = be32(hdr + 32), size_struct = be32(hdr + 36);
++	if (magic != 0xd00dfeedu || total < 64 || total > AC_FDT_MAX ||
++	    off_struct >= total || off_strings >= total || size_struct > total - off_struct ||
++	    size_strings > total - off_strings) {
++		printf("A34 CELL: no LK device tree at 0x%llx (magic 0x%08x, size %u)\n", pa, magic, total);
++		AC_NOTE("lkfdt=none");
++		return;
++	}
++	vm_offset_t all = ml_io_map((vm_offset_t)pa, ((vm_size_t)total + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++	uint8_t *f = kalloc_data(total, Z_WAITOK);
++	if (!all || !f) {
++		printf("A34 CELL: LK FDT: no memory for %u bytes\n", total);
++		if (f)
++			kfree_data(f, total);
++		return;
++	}
++	for (uint32_t o = 0; o + 4 <= total; o += 4) {
++		uint32_t w = ac_rd32(all, o);   /* aligned 32-bit reads only: it is mapped as device */
++		memcpy(f + o, &w, 4);
++	}
++	printf("A34 CELL: LK device tree at 0x%llx, %u bytes\n", pa, total);
++
++	/* Walk the structure block: /chosen props, /reserved-memory children, and any node's
++	 * ccci,modem_info_v2 (the mddriver node carries a copy). */
++	const uint8_t *s = f + off_struct, *end = s + size_struct;
++	const char *strs = (const char *)f + off_strings;
++	int depth = 0, nregions = 0;
++	char names[8][48];
++	bool in_resv = false;
++
++	memset(names, 0, sizeof(names));
++	while (s + 4 <= end) {
++		uint32_t tok = be32(s);
++		s += 4;
++		if (tok == FDT_BEGIN_NODE) {
++			const char *nm = (const char *)s;
++			size_t l = 0;
++			while (s + l < end && nm[l])
++				l++;
++			if (depth < 8)
++				strlcpy(names[depth], nm, sizeof(names[depth]));
++			depth++;
++			in_resv = depth == 3 && strcmp(names[1], "reserved-memory") == 0;
++			s += (l + 1 + 3) & ~(size_t)3;
++		} else if (tok == FDT_END_NODE) {
++			if (depth > 0)
++				depth--;
++			in_resv = false;
++		} else if (tok == FDT_PROP) {
++			if (s + 8 > end)
++				break;
++			uint32_t len = be32(s), nameoff = be32(s + 4);
++			const uint8_t *v = s + 8;
++			s += 8 + ((len + 3) & ~3u);
++			if (s > end || nameoff >= size_strings)
++				break;
++			const char *pn = strs + nameoff;
++			const char *node = depth >= 1 && depth <= 8 ? names[depth - 1] : "?";
++			if (strcmp(pn, "ccci,modem_info_v2") == 0) {
++				ac_modem_info(depth == 2 && strcmp(node, "chosen") == 0 ? "/chosen" : node, v, len);
++			} else if (depth == 2 && strcmp(node, "chosen") == 0 && strcmp(pn, "atag,mdinfo") == 0) {
++				printf("A34 CELL: LK /chosen atag,mdinfo: %u bytes, first word 0x%08x\n", len,
++				    len >= 4 ? be32(v) : 0);
++			} else if (in_resv && strcmp(pn, "reg") == 0 && len >= 16 &&
++			    (ac_has(node, "md") || ac_has(node, "ccci") || ac_has(node, "MD"))) {
++				uint64_t rb = (uint64_t)be32(v) << 32 | be32(v + 4);
++				uint64_t rs = (uint64_t)be32(v + 8) << 32 | be32(v + 12);
++				printf("A34 CELL: LK reserved %s: 0x%llx-0x%llx (%llu KiB)\n", node, rb,
++				    rb + rs, rs >> 10);
++				nregions++;
++			}
++		} else if (tok == FDT_NOP) {
++			continue;
++		} else {
++			break;  /* FDT_END or garbage */
++		}
++	}
++	kfree_data(f, total);
++	printf("A34 CELL: LK modem regions in reserved-memory: %d\n", nregions);
++	AC_NOTE("lk=%s mdregions=%d", ac_lk_md == 1 ? "loaded" : ac_lk_md == 0 ? "notloaded" : "noinfo",
++	    nregions);
++}
++
++/* ---- 2..4. power, clocks, boot status ---- */
++
++static bool
++ac_md1_power(void)
++{
++	vm_offset_t spm = ml_io_map((vm_offset_t)AC_SPM_PA, PAGE_SIZE);
++	if (!spm)
++		return false;
++	uint32_t con = ac_rd32(spm, AC_SPM_MD1_PWR_CON), iso = ac_rd32(spm, AC_SPM_MD_BUCK_ISO);
++	uint32_t st1 = ac_rd32(spm, AC_SPM_PWR_STATUS), st2 = ac_rd32(spm, AC_SPM_PWR_STATUS_2ND);
++	bool on = (st1 & 1) && (st2 & 1);
++	printf("A34 CELL: MD1 power domain %s (PWR_STATUS 0x%08x / 2ND 0x%08x, MD1_PWR_CON 0x%08x, "
++	    "MD_BUCK_ISO 0x%08x)\n", on ? "ON" : (st1 & 1) || (st2 & 1) ? "half on" : "off",
++	    st1, st2, con, iso);
++	AC_NOTE("md1=%s", on ? "on" : "off");
++	return on;
++}
++
++static void
++ac_ccif_clocks(void)
++{
++	vm_offset_t infra = ml_io_map((vm_offset_t)AC_INFRA_PA, PAGE_SIZE);
++	if (!infra)
++		return;
++	uint32_t cg1 = ac_rd32(infra, AC_INFRA_CG1_STA);
++	printf("A34 CELL: CCIF clocks (infracfg_ao CG1 status 0x%08x, 1 = gated): CCIF_AP %u "
++	    "CCIF_MD %u CCIF1_AP %u CCIF1_MD %u\n", cg1, cg1 >> 23 & 1, cg1 >> 26 & 1, cg1 >> 12 & 1,
++	    cg1 >> 13 & 1);
++	AC_NOTE("ccifclk=%s", (cg1 >> 23 & 1) ? "gated" : "on");
++}
++
++static void
++ac_boot_status(void)
++{
++	register uint64_t x0 __asm__("x0") = AC_SMC_CCCI_CONTROL;
++	register uint64_t x1 __asm__("x1") = AC_MD_POWER_CONFIG;
++	register uint64_t x2 __asm__("x2") = AC_MD_BOOT_STATUS;
++	register uint64_t x3 __asm__("x3") = 0;
++
++	__asm__ volatile(
++	    "mov x4, xzr\n\t"
++	    "mov x5, xzr\n\t"
++	    "mov x6, xzr\n\t"
++	    "mov x7, xzr\n\t"
++	    "smc #0\n\t"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
++	      "x17", "memory");
++	printf("A34 CELL: MD boot status (SMC MD_POWER_CONFIG/MD_BOOT_STATUS): ret 0x%llx status0 "
++	    "0x%llx status1 0x%llx\n", x0, x1, x2);
++	AC_NOTE("mdboot=0x%llx", x1);
++}
++
++/* ---- 5. the md1img partition ---- */
++
++#define MD_MAGIC        0x58881688u
++#define MD_EXT_MAGIC    0x58891689u
++
++static void
++ac_md1img(void)
++{
++	uint8_t h[512];
++	uint64_t part = 0, off = 0;
++	int nsec = 0;
++	char platform[20] = "", build[70] = "", ver[70] = "";
++	const uint32_t tsz = 4096;
++	uint8_t *t = kalloc_data(tsz, Z_WAITOK);
++
++	if (!t)
++		return;
++	if (sweet_ufs_read_part("md1img", 0, h, sizeof(h), &part) != 0) {
++		printf("A34 CELL: md1img: cannot read\n");
++		AC_NOTE("md1img=unreadable");
++		kfree_data(t, tsz);
++		return;
++	}
++	for (int i = 0; i < 48; i++) {
++		if (i > 0 && sweet_ufs_read_part("md1img", off, h, sizeof(h), NULL) != 0)
++			break;
++		if (le32(h) != MD_MAGIC)
++			break;
++		uint32_t dsize = le32(h + 4);
++		char name[36];
++		ac_printable(name, sizeof(name), h + 8, 32);
++		uint32_t hsz = 512, align = 16, last = 0;
++		if (le32(h + 48) == MD_EXT_MAGIC) {
++			hsz = le32(h + 52);
++			last = le32(h + 64);
++			align = le32(h + 68);
++			if (hsz < 64 || hsz > 4096)
++				hsz = 512;
++			if (align == 0 || align > 4096)
++				align = 16;
++		}
++		nsec++;
++		printf("A34 CELL: md1img 0x%08llx %-24s %u bytes\n", off, name, dsize);
++		if (strcmp(name, "md1rom") == 0 && dsize >= tsz) {
++			/* CHECK_HEADER sits at the end of md1rom's data (v6: platform at +24,
++			 * build time at +40, build version at +104). */
++			uint64_t tail = off + hsz + dsize - tsz;
++			if (sweet_ufs_read_part("md1img", tail, t, tsz, NULL) == 0) {
++				for (int k = (int)tsz - 168; k >= 0; k -= 4) {
++					if (memcmp(t + k, "CHECK_HEADER", 12) == 0) {
++						ac_printable(platform, sizeof(platform), t + k + 24, 16);
++						ac_printable(build, sizeof(build), t + k + 40, 64);
++						ac_printable(ver, sizeof(ver), t + k + 104, 64);
++						printf("A34 CELL: md1rom CHECK_HEADER v%u: platform %s, built %s, %s\n",
++						    le32(t + k + 12), platform, build, ver);
++						break;
++					}
++				}
++			}
++		}
++		off += (uint64_t)hsz + dsize;
++		off = (off + align - 1) / align * align;
++		if (last || off + 512 > part)
++			break;
++	}
++	kfree_data(t, tsz);
++	printf("A34 CELL: md1img: %d sections, partition %llu MiB\n", nsec, part >> 20);
++	AC_NOTE("md1img=%dsec,%s", nsec, platform[0] ? platform : "?");
++}
++
++static void
++ac_partitions(void)
++{
++	static const char *const names[] = {
++		"md1img", "md_udc", "nvcfg", "nvdata", "nvram", "protect1", "protect2", "proinfo",
++	};
++
++	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		uint64_t first = 0, n = 0;
++		if (sweet_ufs_part_bounds(names[i], &first, &n) == 0)
++			printf("A34 CELL: partition %-9s first block 0x%llx, %llu KiB (bounds only; never "
++			    "written, contents not read)\n", names[i], first, n * 4);
++		else
++			printf("A34 CELL: partition %-9s not found\n", names[i]);
++	}
++}
++
++static void
++ac_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	uint64_t deadline;
++	clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&ac_mode, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++	printf("A34 CELL: stage 0 probe (a34cell=%u): read only, nothing is written\n", ac_mode);
++	strlcpy(ac_state, "stage0", sizeof(ac_state));
++	ac_lk_fdt();
++	bool on = ac_md1_power();
++	ac_ccif_clocks();
++	if (on)
++		ac_boot_status();
++	else
++		printf("A34 CELL: MD1 is off: no boot status query\n");
++	ac_partitions();
++	ac_md1img();
++	printf("A34 CELL: summary: %s\n", ac_state);
++	if (ac_lk_md != 1)
++		printf("A34 CELL: the modem cannot be started from this boot: LK loads and verifies "
++		    "md1img only on a normal (non-recovery) boot (docs/cellular-plan.md, stage 1)\n");
++}
++
++void
++a34_cell_init(void)
++{
++	thread_t t;
++
++	(void)PE_parse_boot_argn("a34cell", &ac_mode, (int)sizeof(ac_mode));
++	if (ac_mode == 0)
++		return;
++	if (kernel_thread_start(ac_thread, NULL, &t) == KERN_SUCCESS)
++		thread_deallocate(t);
++}
++#else
++void a34_cell_init(void);
++void
++a34_cell_init(void)
++{
++}
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9b19d93..8d63511 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void ruby_keys_init(void);
+ extern void a34_touch_init(void);
+ extern void a34_diag_init(void);
+ extern void a34_mali_init(void);
++extern void a34_cell_init(void);
+ extern void a34_clocks_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+@@ -307,7 +308,7 @@ ufs_sync_cache(void)
+ }
+ 
+ static int
+-ufs_find_partition(const char *want)
++ufs_find_partition(const char *want, uint64_t *first_out, uint64_t *nblocks_out)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(0, 1);
+@@ -382,14 +383,82 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_out = first;
++		*nblocks_out = last - first + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+ 
++/*
++ * A34 (0950): other partitions of the same LUN for the cellular probe (bsd/dev/a34_cell.c).
++ * sweet_ufs_part_bounds() reads the GPT only. sweet_ufs_read_part() reads data, and only from
++ * the partitions named below; there is no write counterpart (writes stay limited to the root
++ * partition by ufs_write_blocks()).
++ */
++static const char *const sweet_ufs_ro_parts[] = { "md1img" };
++
++int sweet_ufs_part_bounds(const char *name, uint64_t *first_block, uint64_t *nblocks);
++int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len,
++    uint64_t *part_bytes);
++
++int
++sweet_ufs_part_bounds(const char *name, uint64_t *first_block, uint64_t *nblocks)
++{
++	int error;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_find_partition(name, first_block, nblocks);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes)
++{
++	uint64_t first = 0, n = 0;
++	bool listed = false;
++	int error;
++
++	for (size_t i = 0; i < sizeof(sweet_ufs_ro_parts) / sizeof(sweet_ufs_ro_parts[0]); i++) {
++		if (strcmp(name, sweet_ufs_ro_parts[i]) == 0) {
++			listed = true;
++		}
++	}
++	if (!listed) {
++		printf("SWEET UFS: refusing to read partition \"%s\" (not on the read-only list)\n", name);
++		return EPERM;
++	}
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_find_partition(name, &first, &n);
++	if (!error && part_bytes) {
++		*part_bytes = n * UFS_BLOCK;
++	}
++	if (!error && (off > n * UFS_BLOCK || len > n * UFS_BLOCK - off)) {
++		error = EINVAL;
++	}
++	for (uint32_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = MIN(len - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		error = ufs_read_blocks(first + pos / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy((char *)buf + done, (const char *)(su.dma + DMA_BOUNCE) + skip, want);
++			done += want;
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -670,7 +739,7 @@ sweet_ufs_init(void)
+ 		}
+ 	}
+ 	if (!error) {
+-		error = ufs_find_partition(want);
++		error = ufs_find_partition(want, &su.first_block, &su.nblocks);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+@@ -712,6 +781,7 @@ sweet_ufs_init(void)
+ 	a34_clocks_init();      /* 0921: clocks and voltages as the boot loader left them; a34gpumhz */
+ 	a34_diag_init();
+ 	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
++	a34_cell_init();        /* 0950: cellular stage 0 probe, read only, its own thread; a34cell=1 */
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
