@@ -1,0 +1,52 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8442719..eefd8cf 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,6 +150,8 @@ public:
+ 	bool          fNewPath;                 /* fFlip or fTE: present() and the kick go by the state below */
+ 	uintptr_t     fBufVA[2];
+ 	uint64_t      fBufPA[2];
++	IOMemoryDescriptor *fMem1;              /* A34 (0933): picture 1, mapped write-combined into kernel_map */
++	IOMemoryMap  *fMap1;
+ 	uintptr_t     fDraw;                    /* where present() draws the frame it is drawing */
+ 	uint64_t      fDrawPA;
+ 	IOLock       *fFlipLock;
+@@ -288,7 +290,6 @@ extern "C" void a34_dsi_unlock(void);
+ extern "C" void a34_dsi_recover(void);
+ extern "C" uint32_t a34_mutex_rd(uint32_t off);
+ extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pexpert/arm/pe_serial.c */
+-extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /*
+  * A34 (0910): the first time a frame transfer does not finish, log the DSI,
+@@ -918,11 +919,26 @@ AppleCLCD::flipStart(void)
+ 			IOLog("A34 FB FLIP: not flipping: picture 0 at 0x%llx, %u bytes, no OVL layer reads it or picture 1 "
+ 			    "would not fit in LK's reservation\n", fPhys, size);
+ 		} else {
++			/*
++			 * A34 (0933): not ml_io_map_wcomb(): after the VM's start io_map()
++			 * takes its addresses from the small io_submap with KMA_NOFAIL, and
++			 * 10 MB there panicked in kmem_alloc (0932: "failed with 3");
++			 * picture 0 got its mapping before that (pe_serial.c, early). An
++			 * IOMemoryDescriptor mapped into kernel_map instead, as SweetSurface
++			 * maps the panel's memory; none: no flipping.
++			 */
+ 			IOLog("A34 FB FLIP: step 4: picture 1 at 0x%llx mapped write-combined\n", SWEET_FB_SECOND);
+-			fBufVA[1] = (uintptr_t)ml_io_map_wcomb((vm_offset_t)SWEET_FB_SECOND,
+-			    (vm_size_t)(((uint64_t)size + 0x3fffu) & ~(uint64_t)0x3fffu));
+-			fBufPA[1] = SWEET_FB_SECOND;
+-			fFlip = fBufVA[1] != 0;
++			fMem1 = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_SECOND,
++			    (IOByteCount)(((uint64_t)size + 0x3fffu) & ~(uint64_t)0x3fffu), kIODirectionInOut);
++			fMap1 = fMem1 != NULL ? fMem1->map(kIOMapWriteCombineCache) : NULL;
++			if (fMap1 == NULL) {
++				OSSafeReleaseNULL(fMem1);
++				IOLog("A34 FB FLIP: picture 1 could not be mapped: not flipping\n");
++			} else {
++				fBufVA[1] = (uintptr_t)fMap1->getVirtualAddress();
++				fBufPA[1] = SWEET_FB_SECOND;
++				fFlip = fBufVA[1] != 0;
++			}
+ 		}
+ 	}
+ 	if (te != 0) {
