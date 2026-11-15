@@ -90,6 +90,17 @@ Status (2026-11-15):
   that boot (0 beacons) from its first scan, before bluetoothd connected, with the same Bluetooth state as in
   0975-modes120-a (a34bt's 30/60 ms scan running), where Wi-Fi heard 5-12 beacons per scan: not 0975-0977's
   doing; that kernel was the first with Wi-Fi's 1010/1011.
+- **Boot 1002-120-a (0978)**: Bluetooth stays on. No proximity card, though the kernel hears the AirPods'
+  proximity adverts (type 0x07, -40..-50 dBm). LE reports do reach bluetoothd's scanner
+  (`LE_HCIEventHandler_AdvertisingReport` `+0x189164` -> `+0x19951c` -> the found callback; its "found event
+  when scan is stopped" error never appears); no ADV buffers are in use (`supportedADVBuffers:0`), so no
+  vendor events are expected. The difference to an Apple controller is duplicate filtering: bluetoothd scans
+  30/300 ms passive with Filter_Duplicates on and has the controller exempt Apple's adverts
+  (BD_VSC_OLYMPIC_ADV_DUPLICATE_FILTER_BYPASS_CONFIG, RETAIN_LE_SCAN_DUPLICATES_ON_START), which are only
+  answered here, so the MT6635 gave each AirPods advert once per scan start (1-4 per 10 s). 0979 scans with
+  the controller's filter off and filters here: Apple adverts (0x004C) always pass, others once per scan.
+  Settings' list of other devices comes from classic inquiry, which works (Inquiry Complete, status 0);
+  AirPods answer it only in pairing mode (the case button held until the light flashes white).
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
