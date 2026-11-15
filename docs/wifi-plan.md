@@ -797,3 +797,39 @@ WFDMA are new work here; everything above the radio is not.
 - **Measuring**: `a34wifi get [URL] [SECONDS]` (default http://speedtest.tele2.net/10MB.zip, at most
   30 s) prints the bytes each second and the Mbit/s at the end.
 
+## 1012: a deaf start, restarted
+
+Boot 0977-120-a (and earlier 0980-btmetal-a): the firmware came up, every command was answered,
+every scan finished -- and the radio heard nothing at all, on 2.4 and 5 GHz, for the whole boot
+(13 scans, "0 beacons counted by the firmware"). In both, FW_FINISH was answered early: 116 and
+426 ms, against 710-790 ms in the ~30 boots that heard networks. The firmware does its RF
+power-on calibration there; cut short, the receiver is not set up.
+
+Not Bluetooth/Wi-Fi coexistence (PTA) starving RX: PTA arbitrates 2.4 GHz air time only, and 5 GHz
+was as deaf; the firmware's own beacon counter was 0 on 22 channels. LE scanning with the same
+parameters ran during the Wi-Fi start in good boots too (1011-120-a, 1001-120-a, 0994-perf-a), so it
+is intermittent (2 of ~25 boots with Bluetooth up). On this SoC (connv2) Android sends no WMT/COEX
+command from the host: conninfra enables the coex/PTA clocks at power-on (a34_connsys.c ph13 does
+the same), the firmwares arbitrate between themselves; Wi-Fi's own extras at on are the
+co-antenna VFE28 LDO (only with NVRAM ucSupportCoAnt, modem co-antenna) and the "Wi-Fi on" flag
+for the modem's PCCIF (we write it). What Android does differently: Wi-Fi never calibrates live
+next to a busy Bluetooth -- conninfra's pre-calibration at boot runs BT's then Wi-Fi's calibration
+with nothing else on (PHY_ACTION force calibration), keeps the result in EMI, and every later Wi-Fi
+on sends PHY_ACTION "use the backup".
+
+1012, from the Wi-Fi side:
+- FW_FINISH under 600 ms is said in the log.
+- A scan is "deaf" when the firmware counted no beacon on 20+ channels and forwarded no frame.
+  Step 7 and `a34wifi scan` scan up to three times, 5 s apart, while deaf.
+- Still deaf: the Wi-Fi firmware is started again -- WFSYS off as soc5_0.c wf_pwr_off_consys_mcu
+  does it (sleep protection, WFSYS_ON_TOP off, its semaphore reset, the A-die's top clock 1 off,
+  the EMI/infra requests toggled; conn_infra and Bluetooth untouched), the ROM mailbox and ready
+  bits cleared, then steps 4-6 and the scans again. At most twice a boot
+  (`kern.a34wifi.restarts_most` / boot-arg `a34wifirestarts`; 0 keeps a deaf radio for study);
+  `kern.a34wifi.restarts` counts them. Three deaf scans by iOS while not joined do the same.
+- Before a restart the log has the radio status, the A-die's top clocks, CONN_ON_MISC, LPCTL and
+  WF sleep status.
+
+If restarts keep being needed, the next steps are Android's: calibrate with PHY_ACTION (0966,
+`a34wifiphy=1`), or have Bluetooth hold its LE scan for the ~0.8 s of Wi-Fi's FW_FINISH.
+

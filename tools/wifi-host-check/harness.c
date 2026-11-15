@@ -102,7 +102,7 @@ size_t strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) 
  * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
  * frame it put into the mailbox is taken and kept in `sent` (a copy each), as the firmware would.
  */
-static int sim_on, sim_ap, sim_ap_ht;
+static int sim_on, sim_ap, sim_ap_ht, sim_deaf;      /* (1012) sim_deaf: scans that hear nothing */
 /* (0968) an HT AP's HT Capabilities (MCS 0-15, 40 MHz, SGI 20/40) and WMM Parameter element (BE AIFSN 3 CW 15-1023, VO AIFSN 2 CW 3-7) */
 static const uint8_t sim_ht_cap[28] = { 45, 26, 0xef, 0x09, 0x17, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 static const uint8_t sim_ht_op[24] = { 61, 22, 48, 0x05, 0x04, 0x00, 0x00, 0x00 };
@@ -175,7 +175,11 @@ static void sim_react(const uint8_t *t)
 		b[k++] = 0; b[k++] = 9; memcpy(b + k, "Sim Open", 9); k += 9;      /* (9 bytes: "Sim Open" and a 0) */
 		b[k++] = 1; b[k++] = 4; memcpy(b + k, "\x82\x84\x8b\x96", 4); k += 4;
 		b[k++] = 3; b[k++] = 1; b[k++] = 6;
-		rx_mgmt(b, k, 6);
+		if (sim_deaf > 0) {
+			sim_deaf--;                     /* (1012) a deaf radio: nothing, and the firmware counted nothing */
+		} else {
+			rx_mgmt(b, k, 6);
+		}
 		done[0] = t[64]; done[4] = 22;
 		rx_event(EVENT_ID_SCAN_DONE, 0, done, 16);
 	} else if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
@@ -202,6 +206,11 @@ static void sim_react(const uint8_t *t)
 static void firmware_sim(void)
 {
 	volatile uint32_t *drv, *fw;
+	if (a34w_conn != 0) {                   /* (1012) WFSYS's power ack follows its power control */
+		uint32_t on = a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL) & 0x80u;
+		a34w_wr(a34w_conn, HOST_DBG_DUMMY_3, on ? a34w_rd(a34w_conn, HOST_DBG_DUMMY_3) | (1u << 30) :
+		    a34w_rd(a34w_conn, HOST_DBG_DUMMY_3) & ~(1u << 30));
+	}
 	if (!sim_on || !a34w_mbox_ready) return;
 	drv = a34w_mbox_word(0); fw = a34w_mbox_word(4);
 	while (*fw != *drv) {
@@ -975,6 +984,40 @@ int main(int argc, char **argv)
 			kfree_data(image, size);
 		}
 		printf("0966 PHY_ACTION frame: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+	/* ---- 1012: a deaf start: three scans 5 s apart, then the firmware started again ---- */
+	{
+		static const uint8_t ap[6] = { 0x02, 0x51, 0x4d, 0x00, 0x00, 0x01 };
+		int failed = 0, scans = 0;
+		bool ok;
+
+		a34w_joined = false;
+		a34w_wr(a34w_conn, HOST_SW_SYNC0, 3);
+		a34w_wr(a34w_conn, CONN_CFG_IP_VERSION, CONN_HW_VER);
+		a34w_wr(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL, 0x57460080u);
+		a34w_wr(a34w_wf, WF_TOP_CFG_VERSION, WFSYS_VERSION);
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		sim_on = 1; sim_ap = 1; memcpy(sim_ap_addr, ap, 6);
+		/* deaf twice, then hearing: three scans, no restart */
+		sim_deaf = 2; nsent = 0; a34w_restarts = 0; a34w_deaf_scans = 0;
+		ok = a34w_step7();
+		for (uint32_t i = 0; i < nsent; i++) scans += ((dw_of(sent[i], 1) >> 16) & 3u) == 1u && sent[i][36] == 0x03;
+		printf("1012 two deaf scans: step 7 %s, %d scans, %u restarts, %u heard\n", ok ? "done" : "FAILED", scans, a34w_restarts,
+		    a34w_heard_count);
+		failed |= !ok || scans != 3 || a34w_restarts != 0 || a34w_heard_count != 1 || a34w_last_scan_deaf;
+		/* deaf for good: three scans, WFSYS off, steps 4.. again (the harness has no ROM to answer: the restart fails) */
+		sim_deaf = 99; nsent = 0; scans = 0; a34w_deaf_scans = 0;
+		ok = a34w_step7();
+		for (uint32_t i = 0; i < nsent; i++) scans += ((dw_of(sent[i], 1) >> 16) & 3u) == 1u && sent[i][36] == 0x03;
+		printf("1012 deaf: step 7 %s, %d scans, %u restarts; WFSYS_ON_TOP_PWR_CTL 0x%08x, ROM mailbox 0x%08x, CONN_ON_MISC 0x%x\n",
+		    ok ? "done" : "failed (as it should here)", scans, a34w_restarts, a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL),
+		    a34w_rd(a34w_conn, HOST_MAILBOX_DBG), a34w_rd(a34w_conn, HOST_SW_SYNC0));
+		failed |= ok || scans != 3 || a34w_restarts != 1 || a34w_restarting || a34w_mbox_ready ||
+		    (a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL) & 0xffff0000u) != 0x57460000u ||
+		    strstr(a34w_log, "Wi-Fi off: WFSYS off;") == NULL || strstr(a34w_log, "step 4: WFSYS on") == NULL;
+		sim_deaf = 0; sim_on = 0; sim_ap = 0;
+		printf("1012 a deaf start restarted: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 	printf("log:\n%s", a34w_log);
