@@ -106,6 +106,21 @@ load()
 	} else if (rwm_boot_arg("rwm_fetchread=declared")) {
 		setenv("REDWOOD_PAN_FETCHREAD", "declared", 1);
 	}
+	/* (metal-fx) boot-arg rwm_smallafbc=1: textures of one or two bytes a texel (glyphs, masks) compressed (AFBC)
+	 * as before; without it the library makes them uncompressed */
+	if (rwm_boot_arg("rwm_smallafbc=1")) {
+		setenv("RWA_SMALL_AFBC", "1", 1);
+	}
+	/* (metal-fx) boot-arg rwm_uploads=N: the first N writes of texels into a small texture, what was given and
+	 * what reads back (lines "rwa upload:") */
+	if (const char *at = strstr(rwm_boot_args(), "rwm_uploads=")) {
+		char n[12] = { 0 };
+
+		sscanf(at + 12, "%11[0-9]", n);
+		if (n[0] != 0) {
+			setenv("RWA_UPLOADS", n, 1);
+		}
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),

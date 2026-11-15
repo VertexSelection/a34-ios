@@ -219,6 +219,16 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   batch and preloaded; for a Metal shader only the reads left after optimisation count (the uber
   shader declares three). Boot-arg `rwm_fetchread=off`: as upstream; `rwm_fetchread=declared`:
   every declared `[[color(n)]]` counts.
+- **Glyph and mask textures uncompressed.** After 0017 the app's zoom draws, but Control Center's
+  glyphs and the edit mode's texts stay missing, and boot 0988-nosleep-b's colour-burn glyph draw
+  (`TcimBcbnA2Xhf_Igrn`) read a 75x75 RG8 texture whose sixteen probed texels were all zero. A
+  texture of one or two bytes a texel that the library makes (RG8 'LA88', R8, A8: glyphs and
+  masks) is now made without AFBC (`PIPE_BIND_CONST_BW`, the bind panfrost reads as "no AFBC").
+  Boot-arg `rwm_smallafbc=1`: compressed as before.
+- **`rwm_uploads=N`**: the first N writes of texels from the processor (`-replaceRegion:`, a copy
+  from a buffer, a copy-in) into a texture of one or two bytes a texel or of at most 160x160
+  (lines `rwa upload:`): how many bytes given are not zero, how many read back from the texture
+  are, and its modifier (AFBC or not). Each one waits for the GPU.
 - **`rwm_scene=N`**: N windows of 5 s (lines `scene`): every pipeline drawn with and how often; for
   the first two draws a window of each pipeline that clips (`Ccl`), draws into the second attachment
   (`A2S1`), reads an attachment (`M0`, `M1`), blends other than source-over (`Badd`, `Bpld`, `Bcbn`,

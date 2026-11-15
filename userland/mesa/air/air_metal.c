@@ -1736,6 +1736,24 @@ texture_of_shape_timed(struct rwa_device *device, const struct rwa_texture_shape
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
       .bind = bind, .usage = PIPE_USAGE_DEFAULT };
 
+   /* A34 (metal-fx): a texture of one or two bytes a texel that this library makes (not one
+    * over another's memory) is not compressed. Control Center's glyphs and the edit mode's
+    * texts are such textures (RG8 'LA88', R8 and A8 masks) and stayed empty on screen while
+    * BGRA images drew; PIPE_BIND_CONST_BW is the one bind panfrost reads as "no AFBC"
+    * (panfrost_should_afbc) and nothing else. RWA_SMALL_AFBC=1 (the plug-in's
+    * rwm_smallafbc=1): compressed as before. */
+   if (!import && util_format_get_blocksize(fmt->pipe) <= 2 && !format_is_depth_stencil(fmt->pipe)) {
+      static int small_afbc = -1;
+
+      if (small_afbc < 0) {
+         const char *e = getenv("RWA_SMALL_AFBC");
+
+         small_afbc = e != NULL && strcmp(e, "1") == 0;
+      }
+      if (!small_afbc)
+         templ.bind |= PIPE_BIND_CONST_BW;
+   }
+
    if (import) {
       /*
        * Memory somebody else allocated, by the one route this port has: the ID goes where
@@ -2091,6 +2109,72 @@ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, siz
    return true;
 }
 
+/* A34 (metal-fx): RWA_UPLOADS=N (the plug-in's rwm_uploads=N), the first N writes of texels
+ * from the processor into a texture of one or two bytes a texel, or of at most 160 x 160: how
+ * many bytes of what was given are not zero, how many of what the texture holds there are
+ * when it is read back, and the texture's modifier (AFBC or not). Lines "rwa upload:". Whether
+ * a glyph's texels reach its texture. */
+static void
+upload_probe(struct rwa_texture *texture, unsigned level, const struct pipe_box *box,
+             const void *bytes, size_t row)
+{
+   static int left = -1;
+
+   if (left < 0) {
+      const char *e = getenv("RWA_UPLOADS");
+
+      left = e != NULL ? atoi(e) : 0;
+   }
+   if (left <= 0)
+      return;
+
+   struct pipe_resource *res = texture->res;
+   const unsigned block = util_format_get_blocksize(res->format);
+
+   if (block > 2 && (box->width > 160 || box->height > 160))
+      return;
+   left--;
+
+   const size_t line = (size_t)box->width * block;
+   unsigned given = 0, back = 0, back_rows = 0;
+
+   for (int y = 0; y < box->height; y++) {
+      const uint8_t *p = (const uint8_t *)bytes + (size_t)y * row;
+
+      for (size_t x = 0; x < line; x++)
+         given += p[x] != 0;
+   }
+
+   struct pipe_context *pipe = texture->device->pipe;
+   struct pipe_transfer *xfer = NULL;
+   const uint8_t *map = pipe->texture_map(pipe, res, level, PIPE_MAP_READ, box, &xfer);
+
+   if (map != NULL) {
+      for (int y = 0; y < box->height; y++, back_rows++) {
+         const uint8_t *p = map + (size_t)y * xfer->stride;
+
+         for (size_t x = 0; x < line; x++)
+            back += p[x] != 0;
+      }
+      pipe->texture_unmap(pipe, xfer);
+   }
+
+   uint64_t modifier = 0;
+   struct pipe_screen *screen = texture->device->screen;
+
+   if (screen->resource_get_param != NULL)
+      screen->resource_get_param(screen, pipe, res, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0,
+                                 &modifier);
+   printf("rwa upload: %s %ux%u level %u, %d,%d %dx%d, %zu bytes a row: %u of %zu bytes given "
+          "not zero, %u read back%s; modifier %#llx%s\n", texture->format_name, res->width0,
+          res->height0, level, box->x, box->y, box->width, box->height, row, given,
+          line * (size_t)box->height, back, map != NULL ? "" : " (no map)",
+          (unsigned long long)modifier,
+          (modifier >> 56) == 0x08 && ((modifier >> 52) & 0xf) == 0 &&
+                (modifier & 0x000fffffffffffffull) != 0 ? " (AFBC)" : "");
+   fflush(stdout);
+}
+
 int
 rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
@@ -2163,6 +2247,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
                                           row * box.height);
+   upload_probe(texture, level, &box, bytes, row);
    return 0;
 }
 
