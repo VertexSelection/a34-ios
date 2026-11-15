@@ -1,0 +1,362 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 65696da..4733d86 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,6 +170,11 @@ public:
+ 	uint32_t      fPanelHz;                 /* the rate the panel was switched to and measured at (0: as LK left it) */
+ 	bool          fVsyncTE;                 /* a34vsync=te: the vsync tick on the TE's grid, its period sent */
+ 	uint32_t      fLogTicks;                /* vsyncs between the 10 s lines */
++	/* A34 (0938): every TE counts */
++	uint64_t      fQueuedAt;                /* with fFlipLock: mach time the queued picture was drawn */
++	uint64_t      fXferEnd;                 /* mach time the last transfer ended */
++	uint32_t      fVsyncLeadUS;             /* a34vsynclead: the vsync tick this long before the TE */
++	bool          fKickBound;
+ 	bool          fTEBitWanted;             /* A34 (0931): a34fbte=2 and TE only with EXT_TE_EN: set it at the first kick */
+ 	bool          fTEBit;                   /* ... it is set by us: a transfer that does not end clears it */
+ 	bool          fTEMissSaid;
+@@ -185,6 +190,7 @@ public:
+ 	uint32_t vsyncUS(void);
+ 	void publishRefresh(uint32_t hz);
+ 	void kickFlip(void);
++	bool kickOne(void);
+ 	int32_t drawTarget(bool full);
+ 	void drawDone(int32_t target);
+ 	void layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6]);
+@@ -330,8 +336,8 @@ static IOTimerEventSource *a34_kick_timer;
+  * for a transfer, the longest wait (mach time); OVL switches; transfers; TE
+  * waits, their time (mach time), TE not seen.
+  */
+-static uint64_t sweet_fb_flip_stats[10];
+-static uint64_t sweet_fb_flip_last[10];
++static uint64_t sweet_fb_flip_stats[12];       /* A34 (0938): [10] TEs missed with a frame ready, [11] TEs caught just after */
++static uint64_t sweet_fb_flip_last[12];
+ 
+ /* A34 (0930): the display engine (MT6877; mt6877.dts, MediaTek's mtk_disp_ovl.c and mtk_dsi.c) */
+ #define SWEET_FB_OVL0_2L        0x14006000u
+@@ -354,7 +360,8 @@ static uint64_t sweet_fb_flip_last[10];
+ #define SWEET_FB_TE_PROBE_MS    100u            /* A34 (0931): the TE probe watches so long, each way */
+ #define SWEET_FB_TE_XFER_MS     100u            /* ... with EXT_TE_EN set by us, a transfer longer than this clears it */
+ #define SWEET_FB_HZ_SETTLE_MS   50u             /* A34 (0937): after the rate command, before the TE is measured again */
+-#define SWEET_FB_VSYNC_LEAD_US  4000u           /* A34 (0937): a34vsync=te: the tick this long before the TE (the copy fits) */
++#define SWEET_FB_VSYNC_LEAD_US  4000u           /* A34 (0937): a34vsync=te: the tick this long before the TE (a34vsynclead) */
++#define SWEET_FB_TE_LATE_US     100u            /* A34 (0938): a TE seen at most this long ago is still started on */
+ 
+ static bool
+ a34_dsi_wait_idle(uint64_t *ticks, uint32_t ms)
+@@ -400,16 +407,50 @@ extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pex
+ #define SWEET_FB_HS_BLANKING    (1u << 16)
+ #define SWEET_FB_DSI_CMDQ(n)    (0x200u + 4u * (n))
+ #define SWEET_FB_DCS_IDLE_MS    20u
+-static bool sweet_fb_dsi_hs;                    /* a34dsihs */
++static uint32_t sweet_fb_dsi_hs;                /* a34dsihs: 1 per frame (0937), 2 set once and kept, 3 also BYPASS_SHADOW */
+ static bool sweet_fb_hs_said;
++static uint32_t sweet_fb_kick_cpu = 255;        /* A34 (0938): a34kickcpu: the kick's processor (>= 8: any) */
++extern "C" bool a34_thread_bind_cpu(int cpu);   /* osfmk/kern/sched_prim.c (0928) */
++/*
++ * A34 (0938): 0937's a34dsihs=1 changed nothing (boot 69: 7631 us). MT6877's
++ * DSI registers are shadowed unless DSI_SHADOW_DEBUG (0xC00) bit 1
++ * (DSI_BYPASS_SHADOW) is set -- MediaTek sets it for this SoC
++ * (mt6877_dsi_driver_data .need_bypass_shadow, mtk_dsi_poweron()); a bit
++ * set before a start and cleared after the frame may never be live in one.
++ * a34dsihs=2: bit 16 set once at start and left set; =3: also the bypass.
++ */
++#define SWEET_FB_DSI_SHADOW     0xc00u
++#define SWEET_FB_DSI_BYPASS_SHADOW (1u << 1)
++
++/* A34 (0938): the DSI as found, once: what decides a frame's transfer time (MediaTek's values in the comments) */
++static void
++sweet_fb_dsi_dump(const char *when)
++{
++	static const uint16_t regs[] = {
++		0x010, 0x014, 0x018,    /* CON_CTRL ([27] WAIT_FIFO_FULL, MediaTek sets it on MT6877), MODE_CTRL, TXRX_CTRL */
++		0x01c, 0x02c, 0x038,    /* PSCTRL (DSC: PS_SEL 5, PS_WC 1080), VACT_NL (2340), SIZE_CON (2340 << 16 | 360) */
++		0x050, 0x054, 0x058, 0x05c,     /* HSA/HBP/HFP/BLLP word counts */
++		0x060, 0x064, 0x06c,    /* CMDQ_CON, HSTX_CKL_WC, CMD_TYPE1_HS ([16] HS between lines) */
++		0x090, 0x0a0,           /* MEM_CONTI (0x3c), TIME_CON0 */
++		0x104, 0x108, 0x110, 0x114, 0x118, 0x11c,      /* PHY_LCCON, LD0CON, PHY_TIMECON0-3 */
++		0xc00, 0xc04,           /* SHADOW_DEBUG ([1] BYPASS_SHADOW), its next word */
++	};
++	char line[420];
++	size_t n = 0;
++
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && n < sizeof(line); i++) {
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", regs[i], a34_dsi_rd(regs[i]));
++	}
++	IOLog("A34 FB 120: DSI %s:%s\n", when, line);
++}
+ 
+ static void
+ sweet_fb_hs(bool on)
+ {
+ 	uint32_t v;
+ 
+-	if (!sweet_fb_dsi_hs) {
+-		return;
++	if (sweet_fb_dsi_hs != 1) {
++		return;                 /* (0: off; 2, 3: set once, at start) */
+ 	}
+ 	v = a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS);
+ 	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, on ? (v | SWEET_FB_HS_BLANKING) : (v & ~SWEET_FB_HS_BLANKING));
+@@ -421,7 +462,7 @@ sweet_fb_hs_say(uint64_t xfer)
+ {
+ 	uint64_t ns;
+ 
+-	if (!sweet_fb_dsi_hs || sweet_fb_hs_said) {
++	if (sweet_fb_dsi_hs == 0 || sweet_fb_hs_said) {
+ 		return;
+ 	}
+ 	sweet_fb_hs_said = true;
+@@ -650,17 +691,41 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t dsiHS = 0, panelRate = 0, rate = 60;
+ 	char vsyncArg[8] = "";
+ 	(void)PE_parse_boot_argn("a34dsihs", &dsiHS, sizeof(dsiHS));
+-	sweet_fb_dsi_hs = dsiHS != 0;
+-	if (sweet_fb_dsi_hs) {
+-		IOLog("A34 FB 120: a34dsihs: frames go with DSI 0x6C bit 16 set (was 0x%08x)\n", a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS));
+-	}
+ 	(void)PE_parse_boot_argn("a34panelhz", &panelRate, sizeof(panelRate));
++	sweet_fb_dsi_hs = dsiHS <= 3 ? dsiHS : 0;
++	if ((sweet_fb_dsi_hs != 0 || panelRate != 0) && (a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL) & 3u) == 0) {
++		sweet_fb_dsi_dump("as LK left it");     /* A34 (0938) */
++	}
++	if (sweet_fb_dsi_hs != 0) {
++		IOLog("A34 FB 120: a34dsihs=%u: DSI 0x6C bit 16 %s (was 0x%08x)%s\n", sweet_fb_dsi_hs,
++		    sweet_fb_dsi_hs == 1 ? "set for each frame" : "set now and kept", a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS),
++		    sweet_fb_dsi_hs == 3 ? ", DSI shadow registers bypassed" : "");
++	}
++	if (sweet_fb_dsi_hs >= 2 && a34_dsi_lock()) {
++		uint64_t idleTicks;
++
++		(void)a34_dsi_wait_idle(&idleTicks, SWEET_FB_TE_PROBE_MS);
++		if (sweet_fb_dsi_hs == 3) {
++			a34_dsi_wr(SWEET_FB_DSI_SHADOW, a34_dsi_rd(SWEET_FB_DSI_SHADOW) | SWEET_FB_DSI_BYPASS_SHADOW);
++		}
++		a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS) | SWEET_FB_HS_BLANKING);
++		a34_dsi_unlock();
++		sweet_fb_dsi_dump("after a34dsihs");
++	}
+ 	if (panelRate == 60 || panelRate == 120) {
+ 		panelHz(panelRate);
+ 	} else if (panelRate != 0) {
+ 		IOLog("A34 FB 120: a34panelhz=%u: only 60 or 120\n", panelRate);
+ 	}
+ 	fLogTicks = SWEET_FB_HOLD_LOG_TICKS;
++	fVsyncLeadUS = SWEET_FB_VSYNC_LEAD_US;
++	uint32_t lead = 0, kickCpu = 255;
++	if (PE_parse_boot_argn("a34vsynclead", &lead, sizeof(lead)) && lead >= 500 && lead <= 8000) {
++		fVsyncLeadUS = lead;    /* A34 (0938) */
++	}
++	if (PE_parse_boot_argn("a34kickcpu", &kickCpu, sizeof(kickCpu)) && kickCpu < 8) {
++		sweet_fb_kick_cpu = kickCpu;    /* A34 (0938): kickFlip() binds itself there at its first frame */
++	}
+ 	if (PE_parse_boot_arg_str("a34vsync", vsyncArg, (int)sizeof(vsyncArg)) && vsyncArg[0] == 't' && vsyncArg[1] == 'e' &&
+ 	    vsyncArg[2] == '\0') {
+ 		uint64_t ns = 0;
+@@ -675,7 +740,7 @@ AppleCLCD::start(IOService *provider)
+ 		    "arguments 4/5" : "no TE period known (a34fbte or a34panelhz measures it): the vsync stays 16667 us");
+ 		if (fVsyncTE) {
+ 			IOLog("A34 FB 120: vsync every %llu us (%u Hz), %u us before the TE\n",
+-			    (unsigned long long)(ns / NSEC_PER_USEC), rate, SWEET_FB_VSYNC_LEAD_US);
++			    (unsigned long long)(ns / NSEC_PER_USEC), rate, fVsyncLeadUS);
+ 		}
+ 	}
+ 	uint32_t hz = 10;
+@@ -830,10 +895,10 @@ sweet_fb_hold_log(void)
+ static void
+ sweet_fb_flip_log(void)
+ {
+-	uint64_t d[10], most, te;
++	uint64_t d[12], most, te;
+ 	bool any = false;
+ 
+-	for (unsigned i = 0; i < 10; i++) {
++	for (unsigned i = 0; i < 12; i++) {
+ 		d[i] = sweet_fb_flip_stats[i] - (i == 4 ? 0 : sweet_fb_flip_last[i]);
+ 		sweet_fb_flip_last[i] = sweet_fb_flip_stats[i];
+ 		any = any || (i != 4 && d[i] != 0);
+@@ -846,11 +911,13 @@ sweet_fb_flip_log(void)
+ 	absolutetime_to_nanoseconds(d[8], &te);
+ 	IOLog("A34 FB FLIP: 10 s: %llu frames drawn into the picture not shown, %llu into the latest one, %llu replaced "
+ 	    "before being sent; %llu draws waited for a transfer (longest %llu us); %llu flips, %llu transfers; %llu TE "
+-	    "waits (%llu us each on average, %llu without a TE in %u ms)\n", (unsigned long long)d[0],
++	    "waits (%llu us each on average, %llu without a TE in %u ms); %llu TEs missed with a frame ready, %llu caught "
++	    "within %u us after they came\n", (unsigned long long)d[0],
+ 	    (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3],
+ 	    (unsigned long long)(most / NSEC_PER_USEC), (unsigned long long)d[5], (unsigned long long)d[6],
+ 	    (unsigned long long)d[7], (unsigned long long)(d[7] != 0 ? te / NSEC_PER_USEC / d[7] : 0),
+-	    (unsigned long long)d[9], SWEET_FB_TE_MAX_MS);
++	    (unsigned long long)d[9], SWEET_FB_TE_MAX_MS, (unsigned long long)d[10], (unsigned long long)d[11],
++	    SWEET_FB_TE_LATE_US);
+ }
+ 
+ 
+@@ -1410,6 +1477,8 @@ AppleCLCD::panelHzSend(bool to120)
+ 	}
+ 	cmdq0 = a34_dsi_rd(SWEET_FB_DSI_CMDQ(0));
+ 	cmdqCon = a34_dsi_rd(SWEET_FB_DSI_CMDQ_CON);
++	uint32_t type1 = a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS);    /* A34 (0938): commands as MediaTek sends them, bit 16 clear */
++	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, type1 & ~SWEET_FB_HS_BLANKING);
+ 	for (unsigned i = 0; i < 3 && ok; i++) {
+ 		ok = sweet_fb_dcs(keyOn[i], 3);
+ 	}
+@@ -1420,6 +1489,7 @@ AppleCLCD::panelHzSend(bool to120)
+ 	}
+ 	a34_dsi_wr(SWEET_FB_DSI_CMDQ(0), cmdq0);
+ 	a34_dsi_wr(SWEET_FB_DSI_CMDQ_CON, cmdqCon);
++	a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, type1);
+ 	a34_dsi_unlock();
+ 	return ok && closed;
+ }
+@@ -1439,7 +1509,7 @@ AppleCLCD::vsyncUS(void)
+ 		return SWEET_FB_VSYNC_US;
+ 	}
+ 	now = mach_absolute_time();
+-	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_LEAD_US * NSEC_PER_USEC, &lead);
++	nanoseconds_to_absolutetime((uint64_t)fVsyncLeadUS * NSEC_PER_USEC, &lead);
+ 	if (last == 0 || last > now) {
+ 		next = now + p;
+ 	} else {
+@@ -1520,9 +1590,23 @@ AppleCLCD::teWait(uint64_t *waited)
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_TE_MAX_MS * NSEC_PER_MSEC, &limit);
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_TE_WAKE_US * NSEC_PER_USEC, &wake);
+ 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+-	if (fTELast != 0 && fTEPeriod != 0 && t0 - fTELast < second) {
+-		uint64_t next = fTELast + ((t0 - fTELast) / fTEPeriod + 1) * fTEPeriod, ns;
++	if (fTELast != 0 && fTEPeriod != 0 && t0 > fTELast && t0 - fTELast < second) {
++		uint64_t next = fTELast + ((t0 - fTELast) / fTEPeriod + 1) * fTEPeriod, ns, since, late;
+ 
++		/*
++		 * A34 (0938): the TE of the grid point just passed, if it came at most
++		 * SWEET_FB_TE_LATE_US ago (TE_RDY is cleared after every start and
++		 * transfer, so set means "since then"): started on now instead of
++		 * one period later -- the panel's TE leads its scan by 130 us (B9).
++		 */
++		since = (t0 - fTELast) % fTEPeriod;
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_TE_LATE_US * NSEC_PER_USEC, &late);
++		if (since < late && (a34_dsi_rd(SWEET_FB_DSI_INTSTA) & SWEET_FB_TE_RDY) != 0) {
++			fTELast = t0 - since;
++			*waited = 0;
++			sweet_fb_flip_stats[11]++;
++			return true;
++		}
+ 		if (next - t0 > wake + wake) {
+ 			absolutetime_to_nanoseconds(next - t0 - wake, &ns);
+ 			IOSleep((unsigned)(ns / NSEC_PER_MSEC));
+@@ -1552,7 +1636,44 @@ AppleCLCD::teWait(uint64_t *waited)
+ void
+ AppleCLCD::kickFlip(void)
+ {
+-	uint64_t wait = 0, xfer = 0, tew = 0;
++	/*
++	 * A34 (0938): every TE counts. 0937 at 120 Hz sent 64 frames a second:
++	 * a 7.6 ms transfer leaves 0.7 ms to the next TE, and the next kick came
++	 * through the timer's thread call after it. Now the kick stays: after a
++	 * transfer, while a picture is queued or being drawn (present() wakes it),
++	 * it goes on to the next TE itself.
++	 */
++	if (!fKickBound && sweet_fb_kick_cpu < 8) {
++		fKickBound = true;
++		IOLog("A34 FB 120: the kick %s cpu%u (a34kickcpu)\n", a34_thread_bind_cpu((int)sweet_fb_kick_cpu) ?
++		    "is bound to" : "could not be bound to", sweet_fb_kick_cpu);
++	}
++	while (kickOne() && fTE) {
++		bool more;
++
++		IOLockLock(fFlipLock);
++		if (fQueued < 0 && fWriting >= 0) {
++			uint64_t deadline = mach_absolute_time() + fTEPeriod;
++
++			while (fQueued < 0 && fWriting >= 0) {
++				if (IOLockSleepDeadline(fFlipLock, &fQueued, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++					break;
++				}
++			}
++		}
++		more = fQueued >= 0;
++		IOLockUnlock(fFlipLock);
++		if (!more) {
++			break;
++		}
++	}
++}
++
++/* A34 (0930, 0938): one picture to the panel; false: none was queued, or it could not be sent. */
++bool
++AppleCLCD::kickOne(void)
++{
++	uint64_t wait = 0, xfer = 0, tew = 0, readyAt;
+ 	int32_t t;
+ 
+ 	if (!a34_dsi_wait_idle(&wait, fTEBit ? SWEET_FB_TE_XFER_MS : 1000)) {
+@@ -1572,10 +1693,11 @@ AppleCLCD::kickFlip(void)
+ 	t = fQueued;
+ 	if (t < 0 || t == fWriting) {
+ 		IOLockUnlock(fFlipLock);
+-		return;
++		return false;
+ 	}
+ 	fQueued = -1;
+ 	fTaken = t;
++	readyAt = fQueuedAt > fXferEnd ? fQueuedAt : fXferEnd;  /* A34 (0938): the first moment it could have gone */
+ 	IOLockUnlock(fFlipLock);
+ 	if (fTEBitWanted && !fTEBit && a34_dsi_lock()) {
+ 		/* A34 (0931): a34fbte=2, the TE seen only with EXT_TE_EN (teProbe()): set now, the DSI idle */
+@@ -1595,6 +1717,9 @@ AppleCLCD::kickFlip(void)
+ 			}
+ 		}
+ 		sweet_fb_flip_stats[8] += tew;
++		if (fTEPeriod != 0 && fTELast > readyAt) {
++			sweet_fb_flip_stats[10] += (fTELast - readyAt) / fTEPeriod;   /* A34 (0938): whole periods it waited */
++		}
+ 	}
+ 	if (!a34_dsi_lock()) {
+ 		a34_kick_stats[5]++;
+@@ -1606,7 +1731,7 @@ AppleCLCD::kickFlip(void)
+ 		}
+ 		IOLockWakeup(fFlipLock, &fTaken, false);
+ 		IOLockUnlock(fFlipLock);
+-		return;
++		return false;
+ 	}
+ 	uint64_t again = 0;
+ 	(void)a34_dsi_wait_idle(&again, fTEBit ? SWEET_FB_TE_XFER_MS : 1000);  /* (the console may have started one) */
+@@ -1626,6 +1751,9 @@ AppleCLCD::kickFlip(void)
+ 	}
+ 	sweet_fb_hs(true);              /* A34 (0937): a34dsihs */
+ 	a34_dsi_trigger();
++	if (fTE) {
++		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);      /* A34 (0938): set from here on: a later TE */
++	}
+ 	a34_dsi_unlock();
+ 	sweet_fb_flip_stats[6]++;
+ 	IODelay(50);
+@@ -1648,6 +1776,9 @@ AppleCLCD::kickFlip(void)
+ 	}
+ 	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
+ 	sweet_fb_hs_say(xfer);
++	if (fTE) {
++		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);      /* A34 (0938): see teWait() */
++	}
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+ 	a34_kick_stats[2] += xfer;
+@@ -1659,8 +1790,10 @@ AppleCLCD::kickFlip(void)
+ 	}
+ 	IOLockLock(fFlipLock);
+ 	fTaken = -1;
++	fXferEnd = mach_absolute_time();
+ 	IOLockWakeup(fFlipLock, &fTaken, false);
+ 	IOLockUnlock(fFlipLock);
++	return true;
+ }
+ 
+ /*
+@@ -1714,6 +1847,8 @@ AppleCLCD::drawDone(int32_t target)
+ 	IOLockLock(fFlipLock);
+ 	fWriting = -1;
+ 	fQueued = target;
++	fQueuedAt = mach_absolute_time();       /* A34 (0938) */
++	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
+ 	IOLockUnlock(fFlipLock);
+ }
+ 
