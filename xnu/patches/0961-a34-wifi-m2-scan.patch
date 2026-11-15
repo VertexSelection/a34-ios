@@ -1,0 +1,689 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 6ee0a93..9c63c2b 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -15,6 +15,8 @@
+  *   3  Wi-Fi's view of it: conn_infra woken for Wi-Fi (0x180601a4), a34_connsys_readable(),
+  *      the A-die's chip id, the radio status in sysram, the LDOs
+  *   4  and 5: see the Wi-Fi part below
++ *   6  and 7 (0961, milestone 2): the running firmware's command channel and one passive scan,
++ *      every network heard said in the log -- see milestone 2's part below
+  *
+  * A34 (0960): steps 2 and 3 were 0940's own conninfra power-up; they now use a34_connsys.c so
+  * that Wi-Fi and Bluetooth can run in one boot, and Wi-Fi uses CONNSYS's one memory region
+@@ -148,7 +150,7 @@ void a34_wifi_init(void);               /* bsd/dev/sweet_ufs.c, at boot */
+ 
+ /* ---- state, the log ---- */
+ 
+-#define A34W_STEPS              5u
++#define A34W_STEPS              7u
+ #define A34W_LOG_SIZE           12288u
+ 
+ static LCK_GRP_DECLARE(a34w_grp, "a34_wifi");
+@@ -161,6 +163,7 @@ static int a34w_want;                   /* the highest step asked for (boot-arg
+ static int a34w_done;                   /* the highest step done */
+ static int a34w_busy;
+ static int a34w_failed;                 /* the step that failed (no more steps after it) */
++static int a34w_rescan;                 /* (0961) the scan, step 7, asked for again */
+ static bool a34w_thread_started;
+ static int a34w_chan;
+ 
+@@ -248,19 +251,6 @@ a34w_clr(vm_offset_t base, uint32_t off, uint32_t bits)
+ 	a34w_wr(base, off, a34w_rd(base, off) & ~bits);
+ }
+ 
+-/* CONSYS_REG_BIT_POLLING: bit `bit` of the register to `want`, `tries` reads `us` apart. */
+-static bool
+-a34w_poll(vm_offset_t base, uint32_t off, uint32_t bit, uint32_t want, uint32_t tries, uint32_t us)
+-{
+-	for (uint32_t i = 0; i <= tries; i++) {
+-		if (((a34w_rd(base, off) >> bit) & 1u) == want) {
+-			return true;
+-		}
+-		delay((int)us);
+-	}
+-	return false;
+-}
+-
+ /* the CONN domain powered (both acks) and reachable (no bus protection): 0x18xxxxxx may be read */
+ static bool
+ a34w_conn_reachable(void)
+@@ -465,11 +455,12 @@ a34w_step3(void)
+  *      then INIT_CMD_ID_DYN_MEM_MAP_FW_FINISH {0, 0} answered by INIT_EVENT_ID_CMD_RESULT, and
+  *      the firmware's ready bits (0x180600f0 [1:0] = 3, polled 5 ms apart for 2.5 s).
+  *
+- * Not done (M2, docs/wifi-plan.md): PHY_ACTION (pre-calibration with the NVRAM's ePA/eLNA bytes
+- * and connfem's front-end id -- the firmware is expected to start without it, uncalibrated),
+- * LOG_TIME_SYNC, the front-end's GPIO modes, DMASHDL, the other rings, interrupts (everything
+- * here is polled), and the running firmware's commands, which on this chip go through a
+- * mailbox in the EMI ("SW WFDMA") rather than a DMA ring.
++ * Not done here: PHY_ACTION (pre-calibration with the NVRAM's ePA/eLNA bytes and connfem's
++ * front-end id -- the firmware is expected to start without it, uncalibrated), LOG_TIME_SYNC,
++ * the front-end's GPIO modes, DMASHDL, the data rings, interrupts (everything here is polled).
++ * The running firmware's commands, which on this chip go through a mailbox in the EMI ("SW
++ * WFDMA") rather than a DMA ring, are milestone 2's (0961, below); step 5 zeroes that mailbox
++ * before the RAM code starts, as Android does.
+  *
+  * INIT command (asicConnac2xFillInitCmdTxdInfo; nic_connac2x_tx.h, wsys_cmd_handler_fw.h): a
+  * 32-byte TXD -- DW0 the whole length and packet format 2 (command) at [24:23], DW1 header
+@@ -590,6 +581,7 @@ static uint64_t a34w_emi_pa;
+ static uint32_t a34w_emi_size;
+ static uint32_t a34w_tx_cidx, a34w_rx_cidx;
+ static uint8_t a34w_seq;
++static bool a34w_mbox_reset(void);       /* (0961) milestone 2's part, below: step 5 calls it */
+ 
+ static uint8_t *
+ a34w_file(const char *name, uint32_t *size)
+@@ -1148,6 +1140,9 @@ a34w_step5(void)
+ 	a34w_wr(a34w_conn, HOST_IRQ_ENA, 1u);
+ 	a34w_wr(a34w_conn, WFDMA_MCU2HOST_SW_INT_ENA, 0xffffu);
+ 	a34w_wfdma_init();
++	if (!a34w_mbox_reset()) {                       /* (0961) halHifSwInfoInit's halSwWfdmaInit */
++		return false;
++	}
+ 
+ 	/* the ROM over the INIT channel: does TX ring 17 / RX ring 0 work at all */
+ 	if (!a34w_access_reg(TOP_HVR, &hvr) || !a34w_access_reg(TOP_FVR, &fvr)) {
+@@ -1186,6 +1181,527 @@ a34w_step5(void)
+ 	return true;
+ }
+ 
++/* ---- what a scan heard: beacons and probe responses (802.11-2016 9.3.3.3, 9.4.2) ---- */
++
++#define SCAN_MOST                       64u
++
++struct a34w_bss {
++	uint8_t bssid[6];
++	uint8_t ssid_length;
++	char ssid[33];
++	uint8_t channel;                /* from the DS Parameter Set (or HT Operation) element, else the RX vector's */
++	int8_t rssi;                    /* dBm, the strongest frame heard */
++	uint16_t capability;
++	uint16_t beacon_interval;
++	uint16_t frames;
++	bool probe_response;
++	bool rsn, wpa;                  /* an RSN element, a WPA vendor element: WPA2/WPA3 or WPA, else open/WEP */
++};
++
++static struct a34w_bss a34w_heard[SCAN_MOST];
++static uint32_t a34w_heard_count, a34w_heard_dropped;
++
++/*
++ * A beacon or probe response (an 802.11 management frame without its FCS): who, its name, its
++ * channel, how loud. `frame` is the frame from its Frame Control field on.
++ */
++static void
++a34w_heard_frame(const uint8_t *frame, uint32_t length, int rssi, uint8_t rx_channel)
++{
++	struct a34w_bss *b = NULL;
++	const uint8_t *ie, *end;
++	uint8_t subtype;
++
++	if (length < 24 + 12 || (frame[0] & 0x0cu) != 0) {     /* not a management frame */
++		return;
++	}
++	subtype = (uint8_t)(frame[0] >> 4);
++	if (subtype != 8 && subtype != 5) {                     /* beacon, probe response */
++		return;
++	}
++	for (uint32_t i = 0; i < a34w_heard_count; i++) {
++		if (memcmp(a34w_heard[i].bssid, frame + 16, 6) == 0) {
++			b = &a34w_heard[i];
++			break;
++		}
++	}
++	if (b == NULL) {
++		if (a34w_heard_count >= SCAN_MOST) {
++			a34w_heard_dropped++;
++			return;
++		}
++		b = &a34w_heard[a34w_heard_count++];
++		bzero(b, sizeof(*b));
++		memcpy(b->bssid, frame + 16, 6);
++		b->rssi = -128;
++		b->channel = rx_channel;
++	}
++	b->frames++;
++	if (rssi > b->rssi) {
++		b->rssi = (int8_t)rssi;
++	}
++	b->probe_response |= subtype == 5;
++	b->beacon_interval = (uint16_t)(frame[32] | frame[33] << 8);
++	b->capability = (uint16_t)(frame[34] | frame[35] << 8);
++	for (ie = frame + 36, end = frame + length; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] == 0 && ie[1] <= 32 && (ie[1] > 0 || b->ssid_length == 0)) {   /* SSID (a hidden one is empty) */
++			memcpy(b->ssid, ie + 2, ie[1]);
++			b->ssid[ie[1]] = '\0';
++			b->ssid_length = ie[1];
++		} else if (ie[0] == 3 && ie[1] == 1) {                  /* DS Parameter Set: the channel */
++			b->channel = ie[2];
++		} else if (ie[0] == 61 && ie[1] >= 1 && b->channel == 0) {   /* HT Operation: the primary channel */
++			b->channel = ie[2];
++		} else if (ie[0] == 48) {                               /* RSN */
++			b->rsn = true;
++		} else if (ie[0] == 221 && ie[1] >= 4 && ie[2] == 0x00 && ie[3] == 0x50 && ie[4] == 0xf2 && ie[5] == 1) {
++			b->wpa = true;                                  /* Microsoft's WPA element */
++		}
++	}
++}
++
++/* the SSID for the log: printable ASCII, the rest as '?' */
++static void
++a34w_ssid_printable(const struct a34w_bss *b, char out[33])
++{
++	uint32_t n = b->ssid_length;
++
++	for (uint32_t i = 0; i < n; i++) {
++		char c = b->ssid[i];
++
++		out[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
++	}
++	out[n] = '\0';
++}
++
++static void
++a34w_heard_report(const char *what)
++{
++	char ssid[33];
++
++	a34w_say("%s: %u networks heard%s", what, a34w_heard_count, a34w_heard_dropped ? " (more not kept)" : "");
++	for (uint32_t i = 0; i < a34w_heard_count; i++) {
++		const struct a34w_bss *b = &a34w_heard[i];
++
++		a34w_ssid_printable(b, ssid);
++		a34w_say("  %02x:%02x:%02x:%02x:%02x:%02x ch %3u %4d dBm %s%s \"%s\"%s (%u frames)", b->bssid[0], b->bssid[1],
++		    b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5], b->channel, b->rssi,
++		    b->rsn ? "RSN" : b->wpa ? "WPA" : (b->capability & 0x10u) ? "WEP" : "open",
++		    b->probe_response ? ", answered a probe" : "", b->ssid_length ? ssid : "(hidden)", "", b->frames);
++	}
++}
++/*
++ * ---- milestone 2 (0961): the running firmware's commands, and a scan (steps 6 and 7) ----
++ *
++ * What wlanAdapterStart() and AIS's first scan do once the firmware is ready (gen4m_s1:
++ * common/wlan_lib.c, nic/nic.c, mgmt/ais_fsm.c, mgmt/scan_fsm.c), as far as one scan needs:
++ *
++ *   6  the firmware's command channel. On this chip the running firmware's commands do not go
++ *      through a DMA ring but through "SW WFDMA" (gen4m soc5_0.c fgIsEnSwWfdma, fgIsEnAfterFwdl =
++ *      false; os/linux/hif/common/sw_wfdma.c): a mailbox in CONNSYS's memory at the offset the ROM
++ *      leaves in 0x180537fc[23:0] (default 0x2bcc00), {u32 drv_idx (host), u32 fw_idx (firmware),
++ *      4 slots of 1600 bytes}, zeroed by the host before the RAM code starts (halSwWfdmaInit and
++ *      halSwWfdmaReset: step 5 does that now); a command is the same TXD + CONNAC2X_WIFI_CMD frame
++ *      as on a ring, copied into slot drv_idx, drv_idx advanced, then 3 written to the CCIF's
++ *      TCHNUM (0x1803d00c); the mailbox is full when (drv_idx + 1) % 4 == fw_idx. Answers come on
++ *      RX ring 0 (polled, as Android does until its interrupts are on): a 24-byte RXD, then
++ *      WIFI_EVENT (EID at +4, sequence at +5, payload at +12); RXD DW0[31:27] = 7 and
++ *      DW0[31:16] & 0x380f = 0x3800 is an event, 0x3801 an 802.11 frame the firmware forwards.
++ *      Then CMD_ID_GET_NIC_CAPABILITY_V2 (0x8a, a query) answered by event 0xec (u16 count, 2
++ *      reserved, TLVs {u32 tag, u32 length, body}: 5 HW version, 6 SW version, 7 MAC address,
++ *      0x14 A-die), and CMD_ID_BASIC_CONFIG (0x02, 12 zero bytes), as Android sends them.
++ *   7  one scan, as AIS does it: CMD_ID_BSS_ACTIVATE_CTRL (0x11: BSS 0, active, AIS, own MAC
++ *      slot 0, the MAC, broadcast WTBL entry 4), CMD_ID_SCAN_REQ_V2 (0x03, 1192 bytes; Android's
++ *      dmesg: LEN[1256]), then RX ring 0 drained until EVENT_ID_SCAN_DONE (0x0d, 476 bytes,
++ *      "size of ScanDone476"): beacons and probe responses come forwarded (0x3801) behind the RXD
++ *      and its groups (DW1[15:11]: in the buffer G4 16, G1 16, G2 8, G3 8, G5 72 bytes; then
++ *      DW2[15:14] x 2 bytes of padding; the channel in DW3[15:8]; RCPI in G3's second word,
++ *      dBm = min(RCPI, 220) / 2 - 110: nic_rxd_v2.c, scan.c); then the BSS deactivated. The scan
++ *      is PASSIVE (ucScanType 0): nothing is transmitted -- no probe requests from a radio that
++ *      has had neither its calibration (PHY_ACTION) nor its NVRAM -- over an explicit channel
++ *      list (ucChannelType 4: 2.4 GHz 1-13, 5 GHz 36-48 and 149-165), so that no country
++ *      setting is needed. kern.a34wifi.rescan=1 (a34wifi scan) scans again.
++ *
++ * Not sent, unlike Android: LOG_TIME_SYNC, PHY_ACTION (pre-calibration), the NVRAM fragments
++ * (0x48), the domain and power limits (0x0f, 0x49, 0x5d), the customer settings (0x70). If the
++ * scan ends with nothing heard, PHY_ACTION and the NVRAM are the next things to add.
++ * MAC address: the firmware's (tag 7, from the chip's efuse) if it has one, else a locally
++ * administered one, 02:41:33:34:57:46; nothing is read from or written to the phone's NVRAM.
++ */
++
++#define CMD_ID_BASIC_CONFIG             0x02u
++#define CMD_ID_SCAN_REQ_V2              0x03u
++#define CMD_ID_BSS_ACTIVATE_CTRL        0x11u
++#define CMD_ID_GET_NIC_CAPABILITY_V2    0x8au
++#define EVENT_ID_SCAN_DONE              0x0du
++#define EVENT_ID_NIC_CAPABILITY_V2      0xecu
++#define WIFI_EVENT_HEADER_SIZE          12u
++#define RXD_SIZE                        24u
++#define RXD_PKT_TYPE(dw0)               ((dw0) >> 27)
++#define RXD_SW_KIND(dw0)                (((dw0) >> 16) & 0x380fu)
++#define RX_PKT_TYPE_SW_DEFINED          7u
++#define SW_KIND_EVENT                   0x3800u
++#define SW_KIND_FRAME                   0x3801u
++#define CMD_SET                         true
++#define CMD_QUERY                       false
++#define CMD_FRAME_MOST                  1600u           /* SW_WFDMA_CMD_PKT_SIZE, cmd_max_pkt_size */
++#define SW_WFDMA_SLOTS                  4u
++#define SW_WFDMA_SIZE                   (8u + SW_WFDMA_SLOTS * CMD_FRAME_MOST)
++#define SW_WFDMA_DEFAULT_OFFSET         0x2bcc00u
++#define CCIF_TCHNUM                     0x3d00cu        /* in the conn_infra map: AP2WF PCCIF, channel to raise */
++#define CCIF_RCHNUM                     0x3d010u        /* WF2AP: bit 3 SW WFDMA, 0 FW log, 1/2 resets */
++#define CCIF_ACK                        0x3d014u
++#define CCIF_SW_WFDMA_CHANNEL           3u
++#define SCAN_REQ_V2_SIZE                1192u
++#define BSS_AIS                         0u
++#define BMC_WLAN_INDEX                  4u
++#define TAG_CAP_HW_VERSION              0x5u
++#define TAG_CAP_SW_VERSION              0x6u
++#define TAG_CAP_MAC_ADDR                0x7u
++#define TAG_CAP_HW_ADIE_VERSION         0x14u
++#define CMD_BAND_2G4                    1u
++#define CMD_BAND_5G                     2u
++
++static uint32_t a34w_mbox_offset;               /* the mailbox's offset in CONNSYS's memory */
++static bool a34w_mbox_ready;
++static uint8_t a34w_cmd_seq;
++static uint8_t a34w_mac[6] = { 0x02, 0x41, 0x33, 0x34, 0x57, 0x46 };   /* (locally administered: "A34WF") */
++static uint8_t a34w_scan_seq;
++static uint32_t a34w_rx_events, a34w_rx_frames, a34w_rx_other;
++static uint8_t a34w_rxbuf[SLOT_SIZE];
++
++/* step 5, before the RAM code: where the mailbox is, and zeroed (halSwWfdmaInit, halSwWfdmaReset) */
++static bool
++a34w_mbox_reset(void)
++{
++	uint32_t v = a34w_rd(a34w_conn, SYSRAM_SW_WFDMA_OFFSET) & EMI_ADDR_MASK;
++
++	a34w_mbox_offset = v != 0 ? v : SW_WFDMA_DEFAULT_OFFSET;
++	if (a34w_mbox_offset + SW_WFDMA_SIZE > a34w_emi_size) {
++		a34w_say("step 5: the command mailbox at EMI +0x%x is past CONNSYS's memory (0x%x)", a34w_mbox_offset,
++		    a34w_emi_size);
++		return false;
++	}
++	bzero((void *)(a34w_emi + a34w_mbox_offset), SW_WFDMA_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_mbox_ready = true;
++	a34w_say("step 5: the running firmware's command mailbox (SW WFDMA) at EMI +0x%x (%s), zeroed", a34w_mbox_offset,
++	    v != 0 ? "the ROM's 0x180537fc" : "0x180537fc empty: the driver's default");
++	return true;
++}
++
++static inline volatile uint32_t *
++a34w_mbox_word(uint32_t off)
++{
++	return (volatile uint32_t *)(a34w_emi + a34w_mbox_offset + off);
++}
++
++/* a command to the running firmware, through the mailbox; its sequence number (0: not sent) */
++static uint8_t
++a34w_cmd(uint8_t cid, bool set, const void *payload, uint32_t payload_length)
++{
++	static uint8_t frame[CMD_FRAME_MOST];
++	const uint32_t length = INIT_CMD_HEADER_SIZE + payload_length;
++	volatile uint32_t *drv = a34w_mbox_word(0), *fw = a34w_mbox_word(4);
++	uint32_t d, f = 0, dw;
++	uint64_t until = a34w_ms() + 1000u;
++
++	if (!a34w_mbox_ready || length > CMD_FRAME_MOST) {
++		return 0;
++	}
++	/* the mailbox has room when the slot after ours is not the firmware's next */
++	for (;;) {
++		d = *drv % SW_WFDMA_SLOTS;
++		f = *fw % SW_WFDMA_SLOTS;
++		if ((d + 1u) % SW_WFDMA_SLOTS != f) {
++			break;
++		}
++		if (a34w_ms() >= until) {
++			a34w_say("command 0x%02x: the mailbox stays full (drv %u fw %u)", cid, d, f);
++			return 0;
++		}
++		delay(100);
++	}
++	bzero(frame, INIT_CMD_HEADER_SIZE);
++	dw = (length & 0xffffu) | (2u << 23);           /* TXD DW0: byte count, packet format 2 (command) */
++	memcpy(frame + 0, &dw, 4);
++	dw = 1u << 16;                                  /* DW1: header format 1 (command) */
++	memcpy(frame + 4, &dw, 4);
++	frame[32] = (uint8_t)(length - TXD_SIZE);       /* CONNAC2X_WIFI_CMD: u2Length */
++	frame[33] = (uint8_t)((length - TXD_SIZE) >> 8);
++	frame[36] = cid;
++	frame[37] = INIT_CMD_PACKET_TYPE_ID;            /* 0xa0 */
++	frame[38] = set ? 1u : 0u;
++	if (++a34w_cmd_seq == 0) {
++		a34w_cmd_seq = 1;
++	}
++	frame[39] = a34w_cmd_seq;
++	if (payload_length != 0) {
++		memcpy(frame + INIT_CMD_HEADER_SIZE, payload, payload_length);
++	}
++	memcpy((void *)(a34w_emi + a34w_mbox_offset + 8u + d * CMD_FRAME_MOST), frame, length);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*drv = (d + 1u) % SW_WFDMA_SLOTS;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_wr(a34w_conn, CCIF_TCHNUM, CCIF_SW_WFDMA_CHANNEL);
++	return a34w_cmd_seq;
++}
++
++/* a forwarded 802.11 frame: its RXD and groups skipped (nic_rxd_v2.c), then the scan table's */
++static void
++a34w_rx_80211(const uint8_t *f, uint32_t got)
++{
++	uint32_t dw0, dw1, dw2, dw3, count, at = RXD_SIZE, vld, rcpi = 0, rv0 = 0, rv1 = 0;
++	int rssi = -128;
++
++	memcpy(&dw0, f, 4);
++	memcpy(&dw1, f + 4, 4);
++	memcpy(&dw2, f + 8, 4);
++	memcpy(&dw3, f + 12, 4);
++	count = dw0 & 0xffffu;
++	if (count > got) {
++		count = got;
++	}
++	vld = (dw1 >> 11) & 0x1fu;                      /* bit 0 G1, 1 G2, 2 G3, 3 G4, 4 G5 */
++	at += (vld & 8u) ? 16u : 0u;                    /* G4 */
++	at += (vld & 1u) ? 16u : 0u;                    /* G1 */
++	at += (vld & 2u) ? 8u : 0u;                     /* G2 */
++	if (vld & 4u) {                                 /* G3: the RX vector's first two words */
++		if (at + 8u <= count) {
++			memcpy(&rv0, f + at, 4);
++			memcpy(&rv1, f + at + 4, 4);
++			rcpi = ((rv0 >> 18) & 7u) == 0u ? ((rv1 & 0xffu) >= 255u ? (rv1 >> 8) & 0xffu : rv1 & 0xffu) :
++			    ((rv1 & 0xffu) > ((rv1 >> 8) & 0xffu) ? rv1 & 0xffu : (rv1 >> 8) & 0xffu);
++			rssi = (int)((rcpi > 220u ? 220u : rcpi) >> 1) - 110;
++		}
++		at += 8u;
++	}
++	at += (vld & 16u) ? 72u : 0u;                   /* G5 */
++	at += ((dw2 >> 14) & 3u) * 2u;                  /* padding before the header */
++	if (at + 24u > count) {
++		a34w_rx_other++;
++		return;
++	}
++	a34w_heard_frame(f + at, count - at, rssi, (uint8_t)((dw3 >> 8) & 0xffu));
++}
++
++/*
++ * RX ring 0 once: an event is copied out when it is the one waited for (eid, and seq when not 0),
++ * forwarded frames go to the scan table; the number of payload bytes copied, -1 when nothing came,
++ * -2 when something else came. The CCIF's WF-to-AP channels are acknowledged as Android does.
++ */
++static int
++a34w_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, uint8_t *got_eid)
++{
++	int got = a34w_rx(a34w_rxbuf, sizeof(a34w_rxbuf), 0);
++	uint32_t dw0, ccif;
++
++	ccif = a34w_rd(a34w_conn, CCIF_RCHNUM);
++	if (ccif != 0) {
++		a34w_wr(a34w_conn, CCIF_ACK, ccif);
++	}
++	if (got < (int)RXD_SIZE) {
++		return got < 0 ? -1 : -2;
++	}
++	memcpy(&dw0, a34w_rxbuf, 4);
++	if (RXD_PKT_TYPE(dw0) == RX_PKT_TYPE_SW_DEFINED && RXD_SW_KIND(dw0) == SW_KIND_FRAME) {
++		a34w_rx_frames++;
++		a34w_rx_80211(a34w_rxbuf, (uint32_t)got);
++		return -2;
++	}
++	if (RXD_PKT_TYPE(dw0) != RX_PKT_TYPE_SW_DEFINED || RXD_SW_KIND(dw0) != SW_KIND_EVENT ||
++	    got < (int)(RXD_SIZE + WIFI_EVENT_HEADER_SIZE)) {
++		a34w_rx_other++;
++		return -2;
++	}
++	a34w_rx_events++;
++	*got_eid = a34w_rxbuf[RXD_SIZE + 4];
++	if (a34w_rxbuf[RXD_SIZE + 4] != eid || (seq != 0 && a34w_rxbuf[RXD_SIZE + 5] != seq)) {
++		a34w_say("event 0x%02x (sequence %u, %d bytes) while waiting for 0x%02x", a34w_rxbuf[RXD_SIZE + 4],
++		    a34w_rxbuf[RXD_SIZE + 5], got, eid);
++		return -2;
++	}
++	got -= (int)(RXD_SIZE + WIFI_EVENT_HEADER_SIZE);
++	if ((uint32_t)got > room) {
++		got = (int)room;
++	}
++	memcpy(body, a34w_rxbuf + RXD_SIZE + WIFI_EVENT_HEADER_SIZE, (uint32_t)got);
++	return got;
++}
++
++/* the event (eid; seq if not 0) within wait_ms, everything else on the way handled; its length or -1 */
++static int
++a34w_wait_event(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, uint32_t wait_ms)
++{
++	uint64_t until = a34w_ms() + wait_ms;
++	uint8_t seen = 0;
++	int got;
++
++	do {
++		got = a34w_pump(eid, seq, body, room, &seen);
++		if (got >= 0) {
++			return got;
++		}
++		if (got == -1) {
++			delay(200);
++		}
++	} while (a34w_ms() < until);
++	return -1;
++}
++
++/* ---- step 6: the running firmware answers ---- */
++
++static bool
++a34w_step6(void)
++{
++	static uint8_t answer[2048];
++	uint8_t basic[12], seq;
++	uint32_t count, at = 4;
++	int got;
++	bool mac = false;
++
++	if (!a34w_conn_reachable()) {
++		a34w_say("step 6: the CONN domain is off or protected: not touched");
++		return false;
++	}
++	if (!a34w_mbox_ready || (a34w_rd(a34w_conn, HOST_SW_SYNC0) & 3u) != 3u) {
++		a34w_say("step 6: the firmware is not running (CONN_ON_MISC 0x%08x) or its mailbox is not set up",
++		    a34w_rd(a34w_conn, HOST_SW_SYNC0));
++		return false;
++	}
++	a34w_set(a34w_conn, HOST_WAKEPU_WF, 1u);        /* conn_infra awake for Wi-Fi from now on (the CCIF is in it) */
++	seq = a34w_cmd(CMD_ID_GET_NIC_CAPABILITY_V2, CMD_QUERY, NULL, 0);
++	got = seq != 0 ? a34w_wait_event(EVENT_ID_NIC_CAPABILITY_V2, seq, answer, sizeof(answer), 3000) : -1;
++	if (got < 4) {
++		a34w_say("step 6: NIC_CAPABILITY_V2 %s: mailbox drv %u fw %u, RX0 cidx/didx %u/%u, CCIF 0x%08x, %u events "
++		    "%u frames %u other", seq == 0 ? "NOT SENT" : "NOT ANSWERED", *a34w_mbox_word(0), *a34w_mbox_word(4),
++		    a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u),
++		    a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0xcu), a34w_rd(a34w_conn, CCIF_RCHNUM),
++		    a34w_rx_events, a34w_rx_frames, a34w_rx_other);
++		return false;
++	}
++	count = (uint32_t)(answer[0] | answer[1] << 8);
++	a34w_say("step 6: the firmware answers: NIC_CAPABILITY_V2, %u elements in %d bytes (mailbox fw %u)", count, got,
++	    *a34w_mbox_word(4));
++	for (uint32_t i = 0; i < count && at + 8u <= (uint32_t)got; i++) {
++		uint32_t tag = a34w_le32(answer + at), length = a34w_le32(answer + at + 4);
++		const uint8_t *b = answer + at + 8;
++
++		if (length > (uint32_t)got - at - 8u) {
++			break;
++		}
++		if (tag == TAG_CAP_HW_VERSION && length >= 4u) {
++			a34w_say("step 6: hardware 0x%04x, ECO %u", (unsigned)(b[0] | b[1] << 8), b[2]);
++		} else if (tag == TAG_CAP_SW_VERSION && length >= 24u) {
++			a34w_say("step 6: firmware %u.%u build %u, branch %.4s, date %.16s", b[1], b[0],
++			    (unsigned)(b[2] | b[3] << 8), (const char *)(b + 4), (const char *)(b + 8));
++		} else if (tag == TAG_CAP_MAC_ADDR && length >= 6u) {
++			bool none = (b[0] | b[1] | b[2] | b[3] | b[4] | b[5]) == 0 || (b[0] & 1u) != 0;
++
++			a34w_say("step 6: MAC address in the efuse: %02x:%02x:%02x:%02x:%02x:%02x%s", b[0], b[1], b[2], b[3],
++			    b[4], b[5], none ? " (none: a locally administered one is used)" : "");
++			if (!none) {
++				memcpy(a34w_mac, b, 6);
++				mac = true;
++			}
++		} else if (tag == TAG_CAP_HW_ADIE_VERSION && length >= 4u) {
++			a34w_say("step 6: A-die 0x%04x ECO %u", (unsigned)(b[0] | b[1] << 8), (unsigned)(b[2] | b[3] << 8));
++		}
++		at += 8u + length;
++	}
++	bzero(basic, sizeof(basic));                    /* CMD_BASIC_CONFIG: native 802.11 off, asserts and debug level 0 */
++	seq = a34w_cmd(CMD_ID_BASIC_CONFIG, CMD_SET, basic, sizeof(basic));
++	a34w_say("step 6: BASIC_CONFIG %s; MAC %02x:%02x:%02x:%02x:%02x:%02x (%s)", seq != 0 ? "sent" : "NOT SENT", a34w_mac[0],
++	    a34w_mac[1], a34w_mac[2], a34w_mac[3], a34w_mac[4], a34w_mac[5], mac ? "the chip's" : "locally administered");
++	return seq != 0;
++}
++
++/* ---- step 7: one passive scan ---- */
++
++static bool
++a34w_bss_activate(bool on)
++{
++	uint8_t c[12];
++
++	bzero(c, sizeof(c));
++	c[0] = BSS_AIS;                                 /* ucBssIndex */
++	c[1] = on ? 1u : 0u;                            /* ucActive */
++	c[2] = 0;                                       /* ucNetworkType: AIS */
++	c[3] = 0;                                       /* ucOwnMacAddrIndex */
++	memcpy(c + 4, a34w_mac, 6);                     /* aucBssMacAddr */
++	c[10] = BMC_WLAN_INDEX;                         /* ucBMCWlanIndex */
++	return a34w_cmd(CMD_ID_BSS_ACTIVATE_CTRL, CMD_SET, c, sizeof(c)) != 0;
++}
++
++static bool
++a34w_step7(void)
++{
++	static uint8_t scan[SCAN_REQ_V2_SIZE], done[476];
++	static const uint8_t channels_2g4[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++	static const uint8_t channels_5g[] = { 36, 40, 44, 48, 149, 153, 157, 161, 165 };
++	uint32_t n = 0, events0, frames0;
++	uint64_t t0;
++	uint8_t seq;
++	int got = -1;
++
++	if (!a34w_mbox_ready || !a34w_conn_reachable() || (a34w_rd(a34w_conn, HOST_SW_SYNC0) & 3u) != 3u) {
++		a34w_say("step 7: the firmware is not running (step 6 first)");
++		return false;
++	}
++	a34w_set(a34w_conn, HOST_WAKEPU_WF, 1u);
++	a34w_heard_count = 0;
++	a34w_heard_dropped = 0;
++	events0 = a34w_rx_events;
++	frames0 = a34w_rx_frames;
++	if (!a34w_bss_activate(true)) {
++		a34w_say("step 7: BSS_ACTIVATE_CTRL not sent");
++		return false;
++	}
++	bzero(scan, sizeof(scan));
++	if (++a34w_scan_seq == 0) {
++		a34w_scan_seq = 1;
++	}
++	scan[0] = a34w_scan_seq;                        /* ucSeqNum (SCAN_DONE says it back) */
++	scan[1] = BSS_AIS;                              /* ucBssIndex */
++	scan[2] = 0;                                    /* ucScanType: passive */
++	scan[3] = 0;                                    /* ucSSIDType: none (passive) */
++	scan[6] = 0x02u;                                /* ucScnFuncMask: DBDC scan off (wifi.cfg DbdcMode 0) */
++	scan[7] = 1;                                    /* auVersion */
++	scan[158] = 4;                                  /* ucChannelType: the list below */
++	for (uint32_t i = 0; i < sizeof(channels_2g4); i++, n++) {
++		scan[160u + 2u * n] = CMD_BAND_2G4;
++		scan[161u + 2u * n] = channels_2g4[i];
++	}
++	for (uint32_t i = 0; i < sizeof(channels_5g); i++, n++) {
++		scan[160u + 2u * n] = CMD_BAND_5G;
++		scan[161u + 2u * n] = channels_5g[i];
++	}
++	scan[159] = (uint8_t)n;                         /* ucChannelListNum (32 at most) */
++	memset(scan + 1112, 0xff, 6);                   /* aucBSSID: any */
++	scan[1162] = 1;                                 /* ucScnSourceMask */
++	t0 = a34w_ms();
++	seq = a34w_cmd(CMD_ID_SCAN_REQ_V2, CMD_SET, scan, sizeof(scan));
++	if (seq == 0) {
++		a34w_say("step 7: SCAN_REQ_V2 not sent");
++		return false;
++	}
++	a34w_say("step 7: passive scan %u of %u channels asked (command sequence %u)", a34w_scan_seq, n, seq);
++	sweet_log_flush();
++	got = a34w_wait_event(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 20000);
++	(void)a34w_bss_activate(false);
++	if (got < 8) {
++		a34w_say("step 7: no SCAN_DONE in 20 s (%u events, %u frames, %u other; mailbox drv %u fw %u)",
++		    a34w_rx_events - events0, a34w_rx_frames - frames0, a34w_rx_other, *a34w_mbox_word(0), *a34w_mbox_word(4));
++		a34w_heard_report("step 7: nonetheless");
++		return false;
++	}
++	a34w_say("step 7: SCAN_DONE in %llu ms: scan %u (asked %u), %u channels done, state %u, version %u, %u beacons "
++	    "counted by the firmware; %u frames forwarded", (unsigned long long)(a34w_ms() - t0), done[0], a34w_scan_seq,
++	    done[4], done[5], done[6], a34w_le32(done + 8), a34w_rx_frames - frames0);
++	a34w_heard_report("step 7");
++	return true;
++}
++
+ /* ---- the thread: steps up to what is asked, one at a time ---- */
+ 
+ static bool
+@@ -1202,6 +1718,10 @@ a34w_run_step(int step)
+ 		return a34w_step4();
+ 	case 5:
+ 		return a34w_step5();
++	case 6:
++		return a34w_step6();
++	case 7:
++		return a34w_step7();
+ 	default:
+ 		return false;
+ 	}
+@@ -1213,14 +1733,22 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 	for (;;) {
+ 		int step;
+ 
++		bool again;
++
+ 		lck_mtx_lock(&a34w_run_mtx);
+-		while (a34w_want <= a34w_done || a34w_failed != 0) {
++		while ((a34w_want <= a34w_done || a34w_failed != 0) && !a34w_rescan) {
+ 			a34w_busy = 0;
+ 			lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
+ 		}
+ 		a34w_busy = 1;
+-		step = a34w_done + 1;
++		again = a34w_rescan != 0 && (a34w_want <= a34w_done || a34w_failed != 0);
++		a34w_rescan = 0;
++		step = again ? (int)A34W_STEPS : a34w_done + 1;
+ 		lck_mtx_unlock(&a34w_run_mtx);
++		if (again) {
++			(void)a34w_step7();             /* a scan more: done and failed stay as they are */
++			continue;
++		}
+ 
+ 		if (!a34w_map()) {
+ 			lck_mtx_lock(&a34w_run_mtx);
+@@ -1298,8 +1826,37 @@ a34w_sysctl_want SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, want, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+-    a34w_sysctl_want, "I", "steps asked for (write N: 1..5)");
++    a34w_sysctl_want, "I", "steps asked for (write N: 1..7)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, done, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_done, 0, "steps done");
++
++/* (0961) write 1: the scan (step 7) once more, once step 7 is done */
++static int
++a34w_sysctl_rescan SYSCTL_HANDLER_ARGS
++{
++	int value = 0, changed = 0;
++	int error;
++
++	(void)arg1;
++	(void)arg2;
++	(void)oidp;
++	error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++	if (error != 0 || !changed || value == 0) {
++		return error;
++	}
++	lck_mtx_lock(&a34w_run_mtx);
++	if (a34w_done < (int)A34W_STEPS || a34w_busy) {
++		lck_mtx_unlock(&a34w_run_mtx);
++		return EBUSY;
++	}
++	a34w_rescan = 1;
++	a34w_busy = 1;
++	thread_wakeup((event_t)&a34w_chan);
++	lck_mtx_unlock(&a34w_run_mtx);
++	return 0;
++}
++
++SYSCTL_PROC(_kern_a34wifi, OID_AUTO, rescan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    a34w_sysctl_rescan, "I", "write 1: scan again (after step 7)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
+ 
