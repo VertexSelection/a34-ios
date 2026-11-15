@@ -1,0 +1,274 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 5d0ce6d..eade716 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -130,6 +130,18 @@
+  * 1004-120-a's "0 passed" lines were such stretches). The A2DP crash of that boot was Skywalk's user-pipe privilege,
+  * not the bridge: bsd/kern/sweet_amfi.c now grants Skywalk's privileges from their entitlements.
+  *
++ * A34 (0983): the ACL path accounted for. Boot 0981-120-a: the AirPods (the phone's pairing lost with the root's
++ * /var: bluetoothd started with no keys) paired again by SSP and encrypted (AES-CCM), but every L2CAP connection
++ * after that timed out (CONNECT_RSP/CONFIG_RSP, STATUS 559) and bluetoothd dropped the link; the bridge's trace had
++ * stopped at its 600 lines by then. (1) A synchronous command of the kernel's own (scan off/on around a parameter
++ * change, the address after an HCI_Reset) read and threw away whatever else came meanwhile -- ACL data and Number Of
++ * Completed Packets events included, which would cost bluetoothd L2CAP answers and ACL credits; those now go on to
++ * bluetoothd. (2) Every 10 s with ACL traffic: packets and bytes each way, packets the controller completed, how many
++ * are outstanding against its buffer count (Read_Buffer_Size), L2CAP signalling packets each way; a stall (credits
++ * all out, no completion for 2 s) is said once. (3) L2CAP signalling packets are always in the trace (the first
++ * 400), Apple's vendor answers and Number Of Completed Packets no longer use up its budget (now 1200), and on each
++ * Disconnection Complete the last 24 packets are said.
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -975,6 +987,11 @@ bt_receive(uint8_t *pkt, uint32_t wait_ms)
+  * A command of ours and its answer: the event `event` (0x0e Command Complete of this opcode, or 0xe4 for WMT)
+  * within ms; anything else that comes meanwhile is said. The answer's length, 0 if none came.
+  */
++static bool br_running;                         /* (0983) the bridge is up: what comes is bluetoothd's */
++static bool br_nested;                          /* (0983) passing on what came during a command of the kernel's */
++static void br_event_in(uint8_t *a, uint32_t n, bool nested);
++static void br_acl_count(const uint8_t *p, uint32_t n, bool out);
++
+ static uint32_t
+ bt_command(const uint8_t *cmd, uint32_t n, uint8_t event, uint8_t *answer, uint32_t ms)
+ {
+@@ -997,6 +1014,15 @@ bt_command(const uint8_t *cmd, uint32_t n, uint8_t event, uint8_t *answer, uint3
+ 			printf("A34 BT: command %04x: Command Status %#x\n", opcode, answer[3]);
+ 			return 0;
+ 		}
++		if (br_running && !br_nested) {
++			/* (0983) not ours: bluetoothd's (ACL data, completed packets, reports), passed on, not dropped */
++			static uint8_t other[BT_PKT_MAX];
++
++			memcpy(other, answer, got);
++			br_nested = true;
++			br_event_in(other, got, true);
++			br_nested = false;
++		}
+ 	}
+ 	printf("A34 BT: command %04x: no answer in %u ms (LSR %#x)\n", opcode, ms, rd(bt_btif, BTIF_LSR));
+ 	return 0;
+@@ -1478,7 +1504,15 @@ bt_ctl_register(void)
+ static LCK_MTX_DECLARE(br_lock, &bt_lck_grp);
+ static uint8_t br_txq[BR_TXQ];
+ static unsigned br_txq_count;
+-static uint32_t br_txq_dropped, br_log_max = 600, br_said;
++static uint32_t br_txq_dropped, br_log_max = 1200, br_said;
++
++/* (0983) the ACL path, every 10 s with traffic */
++static struct {
++	uint32_t out_pkts, out_bytes, in_pkts, in_bytes, completed, sig_out, sig_in, start_ms, last_done_ms;
++	int32_t outstanding;            /* sent minus completed, all connections */
++	uint16_t buffers;               /* the controller's ACL buffer count (Read_Buffer_Size) */
++	bool stall_said;
++} br_acl;
+ static kern_ctl_ref br_ctl_ref;
+ static bool br_waiting;                         /* (0974) a command of bluetoothd's went to the controller ... */
+ static uint16_t br_wait_op;                     /* ... this one, br_wait_n bytes, at br_wait_ms: not answered yet */
+@@ -1543,10 +1577,24 @@ br_dump(const char *dir, const uint8_t *b, uint32_t n)
+ 	static uint32_t data_said;
+ 	uint32_t i = br_ring_at++ % BR_RING;
+ 
++	static uint32_t sig_said, vsc_said;
++
++	if (n >= 2 && b[0] == 0x04 && b[1] == 0x13) {
++		return;                                         /* (0983) Number Of Completed Packets: counted, not said */
++	}
+ 	strlcpy(br_ring[i].dir, dir, sizeof(br_ring[i].dir));
+ 	br_ring[i].n = (uint16_t)(n < 0xffff ? n : 0xffff);
+ 	memcpy(br_ring[i].b, b, n < sizeof(br_ring[i].b) ? n : sizeof(br_ring[i].b));
+ 	br_ring[i].ms = bt_ms();
++	if (n >= 9 && b[0] == 0x02 && (b[2] & 0x30) != 0x10 && b[7] == 0x01 && b[8] == 0x00) {
++		if (sig_said++ < 400) {                         /* (0983) L2CAP signalling: always in the trace */
++			bt_dump(dir, b, n, &(uint32_t){ 0 });
++		}
++		return;
++	}
++	if (dir[2] == '=' && n >= 6 && b[0] == 0x04 && (b[5] >> 2) == 0x3f && vsc_said++ >= 40) {
++		return;                                         /* (0983) Apple's vendor answers: the first 40 */
++	}
+ 
+ 	if (b[0] == 2 || b[0] == 3 || b[0] == 5) {             /* data: only the first few */
+ 		if (data_said++ >= 32) {
+@@ -2012,7 +2060,7 @@ br_xl_event(uint8_t *p, uint32_t n)
+ 		p[4] = (uint8_t)br_xl_from;
+ 		p[5] = (uint8_t)(br_xl_from >> 8);
+ 		br_xl_to = 0;
+-	} else if (op == 0x200b && p[6] == 0x0c && !br_xl && !br_scan.on && br_xl_start()) {
++	} else if (op == 0x200b && p[6] == 0x0c && !br_xl && !br_scan.on && !br_nested && br_xl_start()) {
+ 		br_xl = true;
+ 		p[6] = 0;
+ 	} else if (op == 0x0c03 && p[6] == 0) {                 /* HCI_Reset: legacy again */
+@@ -2166,6 +2214,7 @@ br_drain(void)
+ 			}
+ 		}
+ 		br_scan_command(pkt, n);                               /* (0975) scanning off around it, if need be */
++		br_acl_count(pkt, n, true);                            /* (0983) */
+ 		br_dump("br>", pkt, n);
+ 		if (bt_btif_write(pkt, n) == 0 && pkt[0] == 0x01) {
+ 			br_waiting = true;
+@@ -2512,6 +2561,7 @@ br_start(void)
+ 		bt_sleep_ms(250);
+ 	}
+ 	printf("A34 BT: br: bridge to bluetoothd %s\n", node ? "up: waiting for bluetoothd" : "up, but the registry's service could not be made");
++	br_running = true;                                      /* (0983) */
+ }
+ 
+ static void
+@@ -2524,6 +2574,109 @@ bt_idle(uint32_t ms)
+ 	(void)thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* (0983) the ACL path: what went each way, completed, outstanding; said every 10 s with traffic */
++static void
++br_acl_count(const uint8_t *p, uint32_t n, bool out)
++{
++	if (p[0] == 0x02 && n >= 5) {
++		bool sig = n >= 9 && (p[2] & 0x30) != 0x10 && p[7] == 0x01 && p[8] == 0x00;
++
++		if (br_acl.start_ms == 0) {
++			br_acl.start_ms = bt_ms();
++			br_acl.last_done_ms = bt_ms();
++		}
++		if (out) {
++			br_acl.out_pkts++;
++			br_acl.out_bytes += n;
++			br_acl.sig_out += sig ? 1u : 0u;
++			br_acl.outstanding++;
++		} else {
++			br_acl.in_pkts++;
++			br_acl.in_bytes += n;
++			br_acl.sig_in += sig ? 1u : 0u;
++		}
++	} else if (!out && n >= 4 && p[0] == 0x04 && p[1] == 0x13) {    /* Number Of Completed Packets */
++		uint32_t handles = p[3], done = 0;
++
++		for (uint32_t k = 0; k < handles && 4 + 4 * k + 3 < n; k++) {
++			done += (uint32_t)(p[4 + 4 * k + 2] | (p[4 + 4 * k + 3] << 8));
++		}
++		br_acl.completed += done;
++		br_acl.outstanding -= (int32_t)done;
++		br_acl.last_done_ms = bt_ms();
++		br_acl.stall_said = false;
++	} else if (!out && n >= 13 && p[0] == 0x04 && p[1] == 0x0e && p[4] == 0x05 && p[5] == 0x10 && p[6] == 0) {
++		br_acl.buffers = (uint16_t)(p[10] | (p[11] << 8));        /* Read_Buffer_Size: Total_Num_ACL_Data_Packets */
++	} else if (!out && n >= 7 && p[0] == 0x04 && p[1] == 0x05) {     /* Disconnection Complete */
++		printf("A34 BT: br: Disconnection Complete: status %#x, handle %#x, reason %#x; ACL outstanding %d\n", p[3],
++		    (unsigned)(p[4] | ((p[5] & 0x0f) << 8)), p[6], br_acl.outstanding);
++		br_acl.outstanding = 0;                         /* (its packets are the controller's to forget) */
++		br_ring_pending = true;
++	}
++}
++
++static void
++br_acl_say(void)
++{
++	uint32_t now = bt_ms();
++
++	if (br_acl.start_ms == 0) {
++		return;
++	}
++	if (!br_acl.stall_said && br_acl.buffers != 0 && br_acl.outstanding >= (int32_t)br_acl.buffers &&
++	    now - br_acl.last_done_ms > 2000) {
++		br_acl.stall_said = true;
++		printf("A34 BT: br: ACL stalled: all %u of the controller's buffers out, none completed for %u ms\n",
++		    br_acl.buffers, now - br_acl.last_done_ms);
++	}
++	if (now - br_acl.start_ms < 10000) {
++		return;
++	}
++	printf("A34 BT: br: ACL in %u s: out %u packets (%u bytes, %u L2CAP signalling), in %u (%u bytes, %u signalling); "
++	    "the controller completed %u, %d outstanding of %u buffers\n", (now - br_acl.start_ms) / 1000, br_acl.out_pkts,
++	    br_acl.out_bytes, br_acl.sig_out, br_acl.in_pkts, br_acl.in_bytes, br_acl.sig_in, br_acl.completed,
++	    br_acl.outstanding, br_acl.buffers);
++	br_acl.out_pkts = br_acl.out_bytes = br_acl.in_pkts = br_acl.in_bytes = br_acl.completed = 0;
++	br_acl.sig_out = br_acl.sig_in = 0;
++	br_acl.start_ms = (br_acl.outstanding != 0) ? now : 0;
++}
++
++/*
++ * (0983) one packet from the controller on its way to bluetoothd: counted, logged, fixed up, delivered. nested: it
++ * came while the kernel waited for an answer of its own (bt_command), so nothing here sends a command again.
++ */
++static void
++br_event_in(uint8_t *a, uint32_t n, bool nested)
++{
++	br_answered(a, n);
++	br_acl_count(a, n, false);
++	if (n >= 4 && a[0] == 0x04 && a[1] == 0x3e && (a[3] == 0x02 || a[3] == 0x0d)) {
++		br_le_heard(a, n);                              /* (counted every 10 s, not each in the log) */
++	} else {
++		br_dump("br<", a, n);
++	}
++	if (!nested && n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
++		/* HCI_Reset done: the phone's address again before whoever reset it is told (0970) */
++		uint8_t reset[BT_PKT_MAX];
++
++		memcpy(reset, a, n);
++		(void)bt_addr_apply("after an HCI_Reset");
++		memcpy(a, reset, n);
++	}
++	if (!nested) {
++		br_scan_event(a, n);                            /* (0975) */
++	}
++	n = br_xl_event(a, n);                                  /* (0976) */
++	if (n != 0) {
++		n = br_dup_report(a, n);                        /* (0979) */
++	}
++	if (n != 0) {
++		br_quirks(a, n);
++		a34_btsk_deliver(a, n);
++		bt_deliver(a, n);
++	}
++}
++
+ /* ---- the thread ---- */
+ 
+ static bool
+@@ -2647,41 +2800,19 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 
+ 		if ((n = bt_receive(a, bt_level >= 2 ? 0 : 1000)) != 0) {
+ 			busy = true;
+-			br_answered(a, n);
+ 			if (bt_level >= 2) {
+-				if (n >= 4 && a[0] == 0x04 && a[1] == 0x3e && (a[3] == 0x02 || a[3] == 0x0d)) {
+-					br_le_heard(a, n);              /* (counted every 10 s, not each in the log) */
+-				} else {
+-					br_dump("br<", a, n);
+-				}
++				br_event_in(a, n, false);
+ 			} else {
+ 				bt_dump("in ", a, n, &bt_said_in);
+-			}
+-			if (n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
+-				/* HCI_Reset done: the phone's address again before whoever reset it is told (0970) */
+-				uint8_t reset[BT_PKT_MAX];
+-
+-				memcpy(reset, a, n);
+-				(void)bt_addr_apply("after an HCI_Reset");
+-				memcpy(a, reset, n);
+-			}
+-			if (bt_level >= 2) {
+-				br_scan_event(a, n);                    /* (0975) */
+-				n = br_xl_event(a, n);                  /* (0976) */
+-				if (n != 0) {
+-					n = br_dup_report(a, n);        /* (0979) */
+-				}
+-				if (n != 0) {
+-					br_quirks(a, n);
+-					a34_btsk_deliver(a, n);
++				if (n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
++					(void)bt_addr_apply("after an HCI_Reset");      /* (0970) */
+ 				}
+-			}
+-			if (n != 0) {
+ 				bt_deliver(a, n);
+ 			}
+ 		}
+ 		if (bt_level >= 2) {
+ 			br_le_say();
++			br_acl_say();
+ 			br_watch();
+ 			if (br_ring_pending) {                          /* (0975) bluetoothd left */
+ 				br_ring_pending = false;
