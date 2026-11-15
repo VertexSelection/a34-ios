@@ -1,0 +1,235 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5872703..0fdab55 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -63,6 +63,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSString.h>
++#include <libkern/c++/OSData.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -224,6 +225,9 @@ public:
+ 	void publishRefresh(uint32_t hz);
+ 	void publishModes(uint32_t hz);
+ 	bool          fModes;                   /* A34 (1000): a34fbmodes=1: TimingElements/ColorElements published */
++	uint32_t      fBLLevel;                 /* A34 (1002): the last IOMFBBrightnessLevel (nits, 16.16) */
++	uint32_t      fBLLevels;                /* ... how many were set */
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void kickFlip(void);
+ 	bool kickOne(void);
+ 	int32_t drawTarget(bool full, bool *seed);
+@@ -248,6 +252,34 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * A34 (1002): the display's backlight, as iOS looks for it. CoreBrightness
++ * (backboardd, CBDisplayContaineriOS) only makes its display module for a
++ * service matching IOPropertyMatch { backlight-control = true } that conforms
++ * to AppleARMBacklight; QuartzCore (CADeviceHasBacklight) asks for the same
++ * service. Without it nobody ever commits a brightness to CoreAnimation
++ * (-[CAWindowServerDisplay commitBrightness:]), so its display's SDR nits stay
++ * 0 -- and below CA_LUMA_BOOST_NITS_MAX (20 nits) QuartzCore draws every frame
++ * once more through its luma boost pipeline (..._TlubA2Xhf_Isrc), on the
++ * iPhone X at full strength below 2 nits. A real iPhone at a normal brightness
++ * (above 20 nits) skips it. After the y2sios/z3sios ports (MIT,
++ * MiniIOMobileFramebuffer.cpp AppleARMBacklight). The panel's own brightness
++ * is not changed (yet): what iOS sets here and as IOMFBBrightnessLevel on the
++ * framebuffer is kept and logged ("A34 BL:"). Boot-arg a34fbbl=0: not published.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	uint32_t fValue;                        /* IODisplayParameters brightness value, 0..SWEET_FB_BL_MAX */
++	uint32_t fRequests;
++	void publishParameters(void);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static void sweet_fb_backlight_publish(AppleCLCD *fb);
++
+ /*
+  * A34 (0907, from ios-topaz 0138, MakrSas/ios-topaz): the graphics
+  * accelerator's service class. QuartzCore (CAMetalContextCreate, once per
+@@ -1048,6 +1080,11 @@ AppleCLCD::start(IOService *provider)
+ 		    fPanelHz, fFlipEvery);
+ 	}
+ 	registerService();
++	uint32_t blOn = 1;
++	(void)PE_parse_boot_argn("a34fbbl", &blOn, sizeof(blOn));    /* A34 (1002) */
++	if (blOn != 0) {
++		sweet_fb_backlight_publish(this);
++	}
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+@@ -2059,6 +2096,165 @@ AppleCLCD::publishRefresh(uint32_t hz)
+ 	OSSafeReleaseNULL(refresh);
+ }
+ 
++/*
++ * A34 (1002): AppleARMBacklight (above). IODisplayParameters = { brightness =
++ * { min 0, max SWEET_FB_BL_MAX, value } }, which CoreBrightness reads, and
++ * backlight-marketing-table, the nits (16.16) at each slider step 0..100 % that
++ * it reads off the same service on the iPhone X: here our own curve,
++ * 2 nits + (SWEET_FB_BL_NITS - 2) * step^2. Halfway is about 126 nits.
++ */
++#define SWEET_FB_BL_MAX         65536u
++#define SWEET_FB_BL_NITS        500u
++#define SWEET_FB_BL_STEPS       101u
++#define SWEET_FB_BL_SAY         24u     /* requests logged one by one, then every 64th */
++
++void
++AppleARMBacklight::publishParameters(void)
++{
++	OSDictionary *parameters = OSDictionary::withCapacity(1), *brightness = OSDictionary::withCapacity(3);
++
++	if (parameters != NULL && brightness != NULL) {
++		sweet_fb_set_number(brightness, "min", 0);
++		sweet_fb_set_number(brightness, "max", SWEET_FB_BL_MAX);
++		sweet_fb_set_number(brightness, "value", fValue);
++		parameters->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", parameters);
++	}
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(parameters);
++}
++
++/*
++ * What CoreBrightness sets here: brightness / backlight-level (0..max, or
++ * { value = N }), IODisplayParameters.brightness, brightness-nits and the like.
++ * Numbers under those names are kept (read back as set); anything else is
++ * logged and refused.
++ */
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	static const char * const kept[] = { "brightness", "backlight-level", "brightness-nits", "brightness-nits-cap",
++		                             "DisplayBrightness" };
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *keys;
++	OSObject *next;
++	bool refused = false;
++	char who[32] = "?";
++
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	proc_selfname(who, sizeof(who));
++	fRequests++;
++	keys = OSCollectionIterator::withCollection(dict);
++	if (keys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol *key = OSDynamicCast(OSSymbol, next);
++		OSObject *value = key != NULL ? dict->getObject(key) : NULL;
++		OSNumber *number = OSDynamicCast(OSNumber, value);
++		OSDictionary *inner = OSDynamicCast(OSDictionary, value);
++		bool level = false, known = false;
++
++		if (key == NULL) {
++			continue;
++		}
++		if (key->isEqualTo("IODisplayParameters") && inner != NULL) {
++			inner = OSDynamicCast(OSDictionary, inner->getObject("brightness"));
++			number = inner != NULL ? OSDynamicCast(OSNumber, inner->getObject("value")) : NULL;
++			level = known = number != NULL;
++		} else {
++			if (number == NULL && inner != NULL) {
++				number = OSDynamicCast(OSNumber, inner->getObject("value"));
++			}
++			for (unsigned i = 0; i < sizeof(kept) / sizeof(kept[0]) && number != NULL; i++) {
++				if (key->isEqualTo(kept[i])) {
++					known = true;
++					level = i < 2;
++					setProperty(key, number);
++				}
++			}
++		}
++		if (level) {
++			uint64_t v = number->unsigned64BitValue();
++
++			fValue = v > SWEET_FB_BL_MAX ? SWEET_FB_BL_MAX : (uint32_t)v;
++			publishParameters();
++		}
++		refused |= !known;
++		if (fRequests <= SWEET_FB_BL_SAY || (fRequests % 64) == 0) {
++			IOLog("A34 BL: backlight request %u from %s: %s = %s%llu%s\n", fRequests, who, key->getCStringNoCopy(),
++			    number != NULL ? "" : "(not a number) ", number != NULL ? number->unsigned64BitValue() : 0ULL,
++			    known ? (level ? " (the level, of 65536)" : "") : ", refused");
++		}
++	}
++	keys->release();
++	return refused ? kIOReturnUnsupported : kIOReturnSuccess;
++}
++
++static void
++sweet_fb_backlight_publish(AppleCLCD *fb)
++{
++	AppleARMBacklight *backlight = OSTypeAlloc(AppleARMBacklight);
++	uint32_t table[SWEET_FB_BL_STEPS];
++	OSData *marketing;
++
++	for (uint32_t i = 0; i < SWEET_FB_BL_STEPS; i++) {
++		table[i] = (uint32_t)((2ULL << 16) + (uint64_t)(SWEET_FB_BL_NITS - 2) * 65536ULL * i * i /
++		    ((SWEET_FB_BL_STEPS - 1) * (SWEET_FB_BL_STEPS - 1)));
++	}
++	marketing = OSData::withBytes(table, sizeof(table));
++	if (backlight != NULL && marketing != NULL && backlight->init()) {
++		backlight->fValue = SWEET_FB_BL_MAX / 2;
++		backlight->setName("backlight");
++		backlight->setProperty("backlight-control", kOSBooleanTrue);
++		backlight->setProperty("backlight-marketing-table", marketing);
++		backlight->publishParameters();
++		if (backlight->attach(fb)) {
++			backlight->registerService();
++			IOLog("A34 BL: AppleARMBacklight published (IODisplayParameters 0..%u, marketing table 2..%u nits); "
++			    "CA's luma boost needs a brightness under 20 nits now (a34fbbl=0: off)\n", SWEET_FB_BL_MAX,
++			    SWEET_FB_BL_NITS);
++		}
++	}
++	OSSafeReleaseNULL(marketing);
++	OSSafeReleaseNULL(backlight);
++}
++
++/*
++ * A34 (1002): CoreBrightness sets IORegistryEntrySetCFProperty(the
++ * framebuffer, "IOMFBBrightnessLevel", nits in 16.16) once it has the
++ * backlight. Kept (and readable) and logged; anything else is refused as
++ * before (IOService's answer).
++ */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *level = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
++	char who[32] = "?";
++
++	proc_selfname(who, sizeof(who));
++	if (level == NULL || dict->getCount() != 1) {
++		static unsigned said;
++
++		if (said++ < 4) {
++			IOLog("A34 BL: framebuffer properties from %s refused (%u keys; only IOMFBBrightnessLevel is taken)\n", who,
++			    dict != NULL ? dict->getCount() : 0);
++		}
++		return kIOReturnUnsupported;
++	}
++	fBLLevel = level->unsigned32BitValue();
++	fBLLevels++;
++	setProperty("IOMFBBrightnessLevel", level);
++	if (fBLLevels <= SWEET_FB_BL_SAY || (fBLLevels % 64) == 0) {
++		IOLog("A34 BL: IOMFBBrightnessLevel %u from %s: %u.%03u nits (the panel is not changed)\n", fBLLevels, who,
++		    fBLLevel >> 16, (uint32_t)(((uint64_t)(fBLLevel & 0xffffu) * 1000) >> 16));
++	}
++	return kIOReturnSuccess;
++}
++
+ /*
+  * A34 (0931): the kick's: EXT_TE_EN, set by us (a34fbte=2), cleared again
+  * because a transfer did not end with it (no TE: the frame waits for one);
