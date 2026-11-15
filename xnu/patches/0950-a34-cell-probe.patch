@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..42823b6
+index 0000000..782174e
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1728 @@
+@@ -0,0 +1,1870 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -1006,6 +1006,29 @@ index 0000000..42823b6
 +		adc_val = auxadc_raw(ch);       /* Android reads it once at probe, too */
 +	}
 +	printf("A34 CELL: RPC: modem ADC channel %d, raw %d\n", adc_num, adc_val);
++	/*
++	 * Android's raw value is calibrated: mt6577_auxadc.c (mt6765 compatible: sample_data_cali)
++	 * with the devinfo efuse word at 0x1c4 (auxadc node: cali-efuse-reg-offset, en bit 20,
++	 * ge bits 10-19, oe bits 0-9, each - 512), which Android's devinfo takes from LK's /chosen
++	 * atag,devinfo (word 1 + 0x1c4 / 4). Only that word is read; only ge/oe are logged.
++	 */
++	const uint8_t *dv;
++	uint32_t dvl = 0;
++	if (adc_val >= 0 && a34_cell_fdt_prop("chosen", NULL, "atag,devinfo", &dv, &dvl) &&
++	    dvl >= 4u * (2u + 0x1c4u / 4u)) {
++		uint32_t w = le32(dv + 4u * (1u + 0x1c4u / 4u));
++		if ((w >> 20) & 1u) {
++			int ge = (int)((w >> 10) & 0x3ffu) - 512, oe = (int)(w & 0x3ffu) - 512;
++			int cal = (4096 * (adc_val - oe)) / (4096 + ge);
++			printf("A34 CELL: RPC: ADC calibration as Android's AUXADC driver (devinfo ge %d, oe %d): "
++			    "raw %d -> %d\n", ge, oe, adc_val, cal);
++			adc_val = cal;
++		} else {
++			printf("A34 CELL: RPC: ADC calibration not enabled in devinfo: raw value as is\n");
++		}
++	} else if (adc_val >= 0) {
++		printf("A34 CELL: RPC: no atag,devinfo in LK's device tree: ADC raw value as is\n");
++	}
 +}
 +
 +/* EINT attribute of SIM n's hot-plug interrupt (port_rpc.c get_eint_attr_val), < 0 if none. */
@@ -1249,6 +1272,7 @@ index 0000000..42823b6
 +	    le32(in + 272));
 +	printf("A34 CELL: modem exception: as fatal: code1 0x%x code2 0x%x code3 0x%x\n", le32(in),
 +	    le32(in + 4), le32(in + 8));
++	a34_ccci_md_pmic("at the exception", false);
 +	ccb_ctrl_show("at the exception", 0, 3);
 +	ccb_ctrl_show("at the exception", 18, 2);
 +	ccb_data_show("at the exception");
@@ -1437,6 +1461,124 @@ index 0000000..42823b6
 +	}
 +	printf("A34 CELL: shared memory cleared as Android's first boot: %u regions, %u KiB "
 +	    "(rings, DRDI, PHY_CAP, AMMS, CONSYS, USIP kept)\n", n, kib);
++}
++
++/* ---- the modem's PMIC rails (md_sys1_platform.c md1_pmic_setting_on) ---- */
++
++extern int ruby_pwrap_read(uintptr_t pwrap, uint16_t reg, uint16_t *val);
++extern void a34_pmic_lock(void);
++extern void a34_pmic_unlock(void);
++#define PW_PA           0x10026000u
++#define PW_ACC          0x880u
++#define PW_WDATA        0x884u
++#define PW_STA          0x8a8u
++#define PW_INIT_DONE    (1u << 15)
++/* MT6359P (include/linux/mfd/mt6359p/registers.h): buck VPU = the device tree's md-vdigrf */
++#define PM_VPU_CON0     0x1488u         /* RG_BUCK_VPU_EN bit 0 */
++#define PM_VPU_DBG0     0x14a6u         /* DA_VPU_VOSEL bits 0-6 */
++#define PM_VPU_DBG1     0x14a8u         /* DA_VPU_EN */
++#define PM_VPU_ELR0     0x14acu         /* RG_BUCK_VPU_VOSEL bits 0-6: 400 mV + 6.25 mV steps */
++#define PM_VPU_700MV    48u             /* (700000 - 400000) / 6250 */
++static vm_offset_t pw;
++
++static bool
++pm_idle(void)
++{
++	for (uint32_t i = 0; i < 100000u; i++)
++		if (((rd32(pw, PW_STA) >> 1) & 7u) == 0)
++			return true;
++	return false;
++}
++
++static bool
++pm_read(uint16_t reg, uint16_t *v)
++{
++	a34_pmic_lock();
++	int err = ruby_pwrap_read(pw, reg, v);
++	a34_pmic_unlock();
++	return err == 0;
++}
++
++static bool
++pm_write(uint16_t reg, uint16_t v)
++{
++	bool ok = false;
++	a34_pmic_lock();
++	if ((rd32(pw, PW_STA) & PW_INIT_DONE) && pm_idle()) {
++		wr32(pw, PW_WDATA, v);
++		wr32(pw, PW_ACC, (1u << 29) | reg);
++		ok = pm_idle();
++	}
++	a34_pmic_unlock();
++	return ok;
++}
++
++/*
++ * Android's md_cd_power_on, step 1 (power-flow-config 0x2: no DPSW): md1_pmic_setting_on sets
++ * md-vmodem 825 mV, md-vsram 825 mV (MT6315 #3 bucks 1 and 4) and md-vdigrf 700 mV (MT6359P
++ * buck VPU: the RF transceiver's digital supply). With set, VPU is set to 700 mV here as there
++ * (boot-arg a34cellpmic=0: read only); the MT6315 bucks sit on SPMI, which this kernel does not
++ * drive, and are left as the boot loader set them. The RF LDOs (VFE28, VRF18, VRF12, VRFCK,
++ * VBBCK: no consumer in the device tree, run by the modem) are only read.
++ */
++void
++a34_ccci_md_pmic(const char *when, bool set)
++{
++	static const struct { const char *nm; uint16_t con0, mon; } ldo[] = {
++		{ "VFE28", 0x1b88, 0x1b8c }, { "VRF18", 0x1bac, 0x1bb0 }, { "VRF12", 0x1bbe, 0x1bc2 },
++		{ "VRFCK", 0x1d1c, 0x1d20 }, { "VBBCK", 0x1d2e, 0x1d32 },
++	};
++	uint32_t pmic = 1;
++	uint16_t con0 = 0, dbg0 = 0, dbg1 = 0, elr0 = 0;
++
++	if (!pw)
++		pw = ml_io_map(PW_PA, PAGE_SIZE);
++	if (!pw || !(rd32(pw, PW_STA) & PW_INIT_DONE)) {
++		printf("A34 CELL: PMIC %s: the wrapper is not ready; modem rails not read\n", when);
++		return;
++	}
++	(void)PE_parse_boot_argn("a34cellpmic", &pmic, (int)sizeof(pmic));
++	if (!pm_read(PM_VPU_CON0, &con0) || !pm_read(PM_VPU_DBG0, &dbg0) || !pm_read(PM_VPU_DBG1, &dbg1) ||
++	    !pm_read(PM_VPU_ELR0, &elr0)) {
++		printf("A34 CELL: PMIC %s: VPU (md-vdigrf) not readable\n", when);
++		return;
++	}
++	printf("A34 CELL: PMIC %s: md-vdigrf (MT6359P VPU) en %u/%u, %u uV now, %u uV set "
++	    "(CON0 0x%04x DBG1 0x%04x)\n", when, con0 & 1u, dbg1 & 1u, 400000u + 6250u * (dbg0 & 0x7fu),
++	    400000u + 6250u * (elr0 & 0x7fu), con0, dbg1);
++	for (size_t i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
++		uint16_t c = 0, m = 0;
++		if (pm_read(ldo[i].con0, &c) && pm_read(ldo[i].mon, &m))
++			printf("A34 CELL: PMIC %s: %s CON0 0x%04x MON 0x%04x (on: %u)\n", when, ldo[i].nm, c, m,
++			    m & 1u);
++	}
++	/* The RF power-enable pin the device tree gives the modem (gpio_usage_mapping): its state only. */
++	uint32_t rfpin;
++	if (dt_cell(NULL, "mediatek,gpio_usage_mapping", "GPIO_RF_PWREN_RST_PIN", 1, &rfpin) && rfpin < 256) {
++		if (!gpio_base)
++			gpio_base = ml_io_map(0x10005000, PAGE_SIZE);
++		if (gpio_base)
++			printf("A34 CELL: %s: GPIO_RF_PWREN_RST_PIN = GPIO %u: mode %u, dir %u, out %u, in %u\n", when,
++			    rfpin, (rd32(gpio_base, 0x300 + (rfpin / 8) * 0x10) >> ((rfpin % 8) * 4)) & 7u,
++			    (rd32(gpio_base, 0x000 + (rfpin / 32) * 0x10) >> (rfpin % 32)) & 1u,
++			    (rd32(gpio_base, 0x100 + (rfpin / 32) * 0x10) >> (rfpin % 32)) & 1u,
++			    (rd32(gpio_base, 0x200 + (rfpin / 32) * 0x10) >> (rfpin % 32)) & 1u);
++	}
++	if (!set)
++		return;
++	if (!pmic) {
++		printf("A34 CELL: PMIC: a34cellpmic=0: md-vdigrf left as it is\n");
++	} else if ((elr0 & 0x7fu) != PM_VPU_700MV) {
++		bool ok = pm_write(PM_VPU_ELR0, (uint16_t)((elr0 & ~0x7fu) | PM_VPU_700MV));
++		delay(200);
++		uint16_t now = 0;
++		(void)pm_read(PM_VPU_DBG0, &now);
++		printf("A34 CELL: PMIC: md-vdigrf set to 700 mV as Android%s: %u uV now\n", ok ? "" : " (write FAILED)",
++		    400000u + 6250u * (now & 0x7fu));
++	} else {
++		printf("A34 CELL: PMIC: md-vdigrf already 700 mV\n");
++	}
++	printf("A34 CELL: PMIC: md-vmodem/md-vsram (MT6315 on SPMI, 825 mV on Android) left as the boot loader set them\n");
 +}
 +
 +bool
@@ -1749,10 +1891,10 @@ index 0000000..42823b6
 +#endif
 diff --git a/bsd/dev/a34_ccci.h b/bsd/dev/a34_ccci.h
 new file mode 100644
-index 0000000..c4d51a4
+index 0000000..0e1aaf3
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,45 @@
 +/*
 + * A34 (0951): the modem's control path (CCCI over CCIF) and its file server, shared declarations.
 + * bsd/dev/a34_ccci.c (shared memory, rings, handshake, ports), bsd/dev/a34_cellfs.c (the modem's
@@ -1787,6 +1929,9 @@ index 0000000..c4d51a4
 +/* Sends one packet: hdr (16 bytes, channel/seq set here) + payload. true if queued. */
 +bool a34_ccci_send(uint16_t channel, const struct ccci_hdr *hdr, const void *payload, uint32_t len);
 +
++/* The modem's PMIC rails (Android's md1_pmic_setting_on): read, and with set md-vdigrf to 700 mV. */
++void a34_ccci_md_pmic(const char *when, bool set);
++
 +/* a34_cellfs.c: one packet from CCCI_FS_RX (header included), and the session's counters. */
 +void a34_cellfs_rx(const uint8_t *pkt, uint32_t len);
 +void a34_cellfs_report(void);
@@ -1797,10 +1942,10 @@ index 0000000..c4d51a4
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..f971be5
+index 0000000..751cca3
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1007 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -2071,6 +2216,7 @@ index 0000000..f971be5
 + */
 +bool a34_cell_lk_tag(const char *name, const uint8_t **data, uint32_t *len);
 +bool a34_ccci_prepare(vm_offset_t ap_ccif, vm_offset_t md_ccif);
++void a34_ccci_md_pmic(const char *when, bool set);
 +void a34_ccci_hs1(vm_offset_t ap_ccif, vm_offset_t md_ccif, const uint32_t feature_query[56]);
 +bool
 +a34_cell_lk_tag(const char *name, const uint8_t **data, uint32_t *len)
@@ -2586,7 +2732,8 @@ index 0000000..f971be5
 +	    off ? "" : " (status bit still set)", ac_rd32(spm, AC_SPM_MD1_PWR_CON), ac_rd32(spm, AC_SPM_PWR_STATUS),
 +	    ac_rd32(spm, AC_SPM_PWR_STATUS_2ND), ac_rd32(spm, AC_SPM_MD_BUCK_ISO), ac_rd32(top, 0));
 +
-+	/* 3. on */
++	/* 3. on: step 1 PMIC (md1_pmic_setting_on), then the clocks and the power domain */
++	a34_ccci_md_pmic("before power on", true);
 +	ac_wr32(top, 0, ac_rd32(top, 0) & ~((1u << 8) | (1u << 9)));
 +	ac_wr32(spm, AC_SPM_POWERON_CONFIG, AC_SPM_PROJECT_CODE);
 +	ac_wr32(spm, AC_SPM_POWER_ON_VAL1, ac_rd32(spm, AC_SPM_POWER_ON_VAL1) | 0x8000u);
