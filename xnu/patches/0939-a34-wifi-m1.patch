@@ -12,10 +12,10 @@ index 4c12ac2..7cc87a1 100644
  bsd/dev/ruby_irq.c			standard
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
 new file mode 100644
-index 0000000..a9b896c
+index 0000000..bc404f0
 --- /dev/null
 +++ b/bsd/dev/a34_wifi.c
-@@ -0,0 +1,1957 @@
+@@ -0,0 +1,1962 @@
 +/*
 + * A34 (0939): Wi-Fi, milestone 1 (docs/wifi-plan.md) -- the MT6877's CONNSYS powered, the
 + * MT6635 A-die found, the Wi-Fi subsystem started and its firmware loaded, all said in the
@@ -24,7 +24,8 @@ index 0000000..a9b896c
 + *
 + *   1  read only: SPM (CONN_PWR_CON, PWR_STATUS), the bus protection, TOPRGU's software
 + *      resets, SRCLKEN_RC's mode, the MT6359P's VCN13/VCN18/VCN33_1/VCN33_2; conn_infra's
-+ *      IP version only if the domain is on and unprotected
++ *      IP version only if the domain is already on and unprotected (then after a wake-up
++ *      request, the one write step 1 may make: conn_infra asleep is not to be read)
 + *   2  conn_infra on, as conninfra.ko's consys_hw_pwr_on() part 1 and 2 (first power-on):
 + *      VCN18 and VCN13 (RC mode or legacy, as the PMIC is set up), the D-die/A-die pins,
 + *      the CONN MTCMOS (clk-mt6877-pg.c: PWR_ON, PWR_ON_2ND, both acks, CLK_DIS, ISO, RST_B),
@@ -122,6 +123,9 @@ index 0000000..a9b896c
 +#define INFRA_PROTECTEN_CLR     0x12a4u
 +#define CONN_PROT_STEP1         ((1u << 13) | (1u << 18))       /* clk-mt6877-pg.c */
 +#define CONN_PROT_STEP2         ((1u << 14) | (1u << 19))
++/* AP to CONNSYS (AHB RX 19, TX 13): what must be off before the AP reads CONNSYS; Android's manual flow
++ * polls only these after a release ("DRV access connsys CR will get 0"), not CONN to AP's 14 and 18 */
++#define CONN_PROT_AP2CONN       ((1u << 13) | (1u << 19))
 +#define GPIO_DIR6_SET           0x5064u
 +#define GPIO_DOUT6_SET          0x5164u
 +#define GPIO_MODE24             0x5480u
@@ -417,7 +421,7 @@ index 0000000..a9b896c
 +	return (a34w_rd(a34w_ap, SPM_PWR_STATUS) & CONN_PWR_STA) != 0 &&
 +	       (a34w_rd(a34w_ap, SPM_PWR_STATUS_2ND) & CONN_PWR_STA) != 0 &&
 +	       (a34w_rd(a34w_ap, SPM_CONN_PWR_CON) & (PWR_ISO | PWR_CLK_DIS | PWR_RST_B)) == PWR_RST_B &&
-+	       (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)) == 0;
++	       (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & CONN_PROT_AP2CONN) == 0;
 +}
 +
 +static bool
@@ -753,12 +757,13 @@ index 0000000..a9b896c
 +	/* bus protection released (spm_mtcmos_ctrl_conn_bus_prot(STA_RELEASE_BUS)): step 2, then step 1 */
 +	a34w_wr(a34w_ap, INFRA_PROTECTEN_CLR, CONN_PROT_STEP2);
 +	a34w_wr(a34w_ap, INFRA_PROTECTEN_CLR, CONN_PROT_STEP1);
-+	for (uint32_t i = 0; i < 100u && (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)); i++) {
++	for (uint32_t i = 0; i < 100u && (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & CONN_PROT_AP2CONN); i++) {
 +		delay(500);
 +	}
-+	if (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)) {
-+		a34w_say("step 2: CONN bus protection still on: PROTECTEN 0x%08x STA1 0x%08x",
-+		    a34w_rd(a34w_ap, INFRA_PROTECTEN), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++	a34w_say("step 2: bus protection released: PROTECTEN 0x%08x STA1 0x%08x", a34w_rd(a34w_ap, INFRA_PROTECTEN),
++	    a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++	if (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & CONN_PROT_AP2CONN) {
++		a34w_say("step 2: AP-to-CONNSYS protection still on (STA1 bits 13/19): CONNSYS not read");
 +		return false;
 +	}
 +	delay(5000);            /* "Wait 5ms (apply this for CONNSYS XO clock ready)" */
