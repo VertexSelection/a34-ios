@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 93f200c..8127e09 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1191,6 +1191,10 @@ IOService::startDeferredMatches(void)
+ #endif /* !NO_KEXTD */
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern bool gA34IOKitDaemonHold;                /* (A34 0996) IOStartIOKit.cpp */
++#endif
++
+ void
+ IOService::iokitDaemonLaunched(void)
+ {
+@@ -1200,7 +1204,14 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (gA34IOKitDaemonHold) {              /* (A34 0996) only the hold StartIOKitMatching took */
++		gA34IOKitDaemonHold = false;
++		getServiceRoot()->adjustBusy(-1);
++	}
++#else
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..732cec8 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -177,6 +177,13 @@ ConfigureIOKit(void)
+ 	gRootNub->configureDefaults();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>                    /* (A34 0996) PE_parse_boot_argn */
++/* (A34 0996) whether StartIOKitMatching took the IOKit daemon's hold (IOService::iokitDaemonLaunched gives it back) */
++extern bool gA34IOKitDaemonHold;
++bool gA34IOKitDaemonHold;
++#endif
++
+ void
+ StartIOKitMatching(void)
+ {
+@@ -188,7 +195,24 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A34 (0996): the IOKit daemon (kernelmanagerd) whose "launched" message takes this hold
++	 * back is not in our root, so the registry root stayed busy for good: IOKit never went
++	 * quiet, configd's interface namer never said so, and wifid -- and SpringBoard behind it,
++	 * in WiFiManagerClientCreate -- waited for that at boot (log 0995-wifi-a: "the registry's
++	 * busy state is 1"). On this board the hold is taken only with boot-arg a34iokithold=1.
++	 */
++	{
++		int a34_hold = 0;
++
++		(void)PE_parse_boot_argn("a34iokithold", &a34_hold, sizeof(a34_hold));
++		gA34IOKitDaemonHold = a34_hold != 0 && OSKext::iokitDaemonAvailable();
++	}
++	if (gA34IOKitDaemonHold) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been

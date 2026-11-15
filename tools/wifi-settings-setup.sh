@@ -3,6 +3,11 @@
 # 0995; docs/wifi-plan.md, "0969" and "0995"). Idempotent: run it again and it changes nothing.
 #
 #   sudo tools/wifi-settings-setup.sh ROOT
+#   sudo tools/wifi-settings-setup.sh --undo ROOT     wifid's job as it was (stock _LimitLoadToDeviceTree:
+#                                                    ["wlan", "marconi-wifi"]); nothing else is touched
+#
+# wifid needs kernel 0996 too (the registry going quiet): without it wifid waits for configd's
+# interface namer at boot, and SpringBoard waits for wifid (log 0995-wifi-a: stuck at the logo).
 #
 # ROOT is the iOS root, mounted read-write. What it does:
 #
@@ -23,7 +28,12 @@
 #      printed here: the passphrase comes from that file or from Settings, and goes into no log.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=${1:?usage: sudo tools/wifi-settings-setup.sh ROOT}
+if [ "${1:-}" = "--undo" ]; then
+	ROOT=${2:?usage: sudo tools/wifi-settings-setup.sh --undo ROOT}
+	python3 "$HERE/root-add-job.py" --relimit "$ROOT" com.apple.wifid | head -n 1
+	exit 0
+fi
+ROOT=${1:?usage: sudo tools/wifi-settings-setup.sh [--undo] ROOT}
 PLIST="$ROOT/System/Library/xpc/launchd.plist"
 [ -f "$PLIST" ] || { echo "error: $PLIST not found (is ROOT the mounted iOS root?)" >&2; exit 1; }
 [ -w "$PLIST" ] || { echo "error: $PLIST is not writable (mounted read-write? run as root?)" >&2; exit 1; }
