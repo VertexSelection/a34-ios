@@ -58,7 +58,10 @@ tools/root-add-job.py --env /mnt com.a34.metaldrvtest REDWOOD_DRM_ASYNC=0
 
 The second line also copies `a34/` into `/a34`: Mesa's four dylibs (the same Mesa as a34gl's, plus
 patches 0006/0007, which also turn panfrost's CRC off for GL), `mali-tri`, `metal-probe`,
-`metal_drv_test`, `metal_props`. Boot-args as today (`a34mali=1`, no `a34metal`).
+`metal_drv_test`, `metal_props`. Boot-args as today (`a34mali=1`, no `a34metal`), plus
+`sweetnull=backboardd,SpringBoard,metal-probe,metal_drv_test`: the kernel then copies what the
+tests write to `/dev/null` into its log as `|metal-probe| ...`, a second copy of every line that
+no console state can lose (boot 54 lost everything the tests wrote after their first lines).
 `REDWOOD_DRM_ASYNC=0` keeps the tests' GPU jobs synchronous, as HackiOS's known-good runs were.
 
 What a good run puts in the kernel log (stdout of both jobs goes to the console):
@@ -75,9 +78,12 @@ What a good run puts in the kernel log (stdout of both jobs goes to the console)
   kernels of `/System/Library/VideoDecoders/AV1SW.metallib` compiled for the Mali (`drvtest: of 11
   functions, N compiled and M were refused`) and dispatched. Other modes (`--draw`, `--draw-all`,
   `--time`): the top of `metal_drv_test.m`.
-- Both: `a34watch: PROGRAM[PID] T s: alive; main thread: ...` every 5 s and `exit()` at the end,
-  on the program's own console descriptor (boot 31's metal-probe went silent for 30 s inside
-  `MTLCreateSystemDefaultDevice()` and then printed nothing more).
+- Both (`a34_watch.c`): every line of stdout and stderr -- theirs, the plug-in's, redwood-drm's --
+  prefixed `+SECONDS`, written through `/dev/console` opened anew for that line and to `/dev/null`;
+  `a34watch: PROGRAM[PID] T s: alive; fd 1 ..., N lines out, M lost` and `main thread: c:0x18...
+  < ...` every 5 s (`c:` addresses are unslid dyld-cache addresses, others image+offset); `exit()`
+  or `signal N` at the end. Boot 31 and 54: silent for 30-40 s inside or right after
+  `MTLCreateSystemDefaultDevice()`; the backtraces say where.
 
 ## Credits and licence
 
