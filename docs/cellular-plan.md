@@ -269,6 +269,14 @@ and the UPDATE_MD_SEC_SMEM SMC after let-go. Not done: the SBP code ccci_mdinit 
 nvdata APCFG/APRDCL/MD_SBP (unknown format; Samsung sets no project SBP), the AMMS interrupt
 (DRDI/POS free requests), MT6315 rails.
 
+Ninth run (`1001-cell3b`, log build/logs/1001-cell3b-a): UPDATE_MD_SEC_SMEM answered 0x10000;
+no assert and no exception bits, but no HS2. The modem's file-server and RPC traffic is the
+same, request for request, as in the asserting run, up to the point where that one asserted;
+then it waits. Next: AMMS requests polled and acknowledged as Android's amms driver does
+(SIP 0xC2000250-0x258), every CCIF doorbell logged, and a stall report at 30/120 s (CCIF of both
+sides, boot status, the exception record as it stands). An a34celldbg=2 twin shows whether the
+debug level only turned the eLNA assert into a silent stop.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
