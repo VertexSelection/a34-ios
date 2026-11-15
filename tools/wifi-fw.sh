@@ -14,7 +14,7 @@
 # wifi node has no flavor, so the "1_1" files are the ones.
 #
 # Then, with a34wifi from the a34wifi workflow's artifact copied into OUT_DIR as well:
-#   sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi OUT_DIR a34wifi up 5
+#   sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi OUT_DIR a34wifi up 7
 set -euo pipefail
 
 SUPER=${1:?usage: tools/wifi-fw.sh SUPER_IMG OUT_DIR}

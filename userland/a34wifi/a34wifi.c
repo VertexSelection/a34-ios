@@ -16,11 +16,16 @@
  *   5  driver own, the host DMA's command and event rings, the ROM asked for its versions,
  *      /a34/wifi/WIFI_RAM_CODE_soc5_0_1_1.bin loaded, FW_FINISH answered, the firmware's ready
  *      bits (0x180600f0 = 3): "THE WI-FI FIRMWARE IS READY"
+ *   6  (M2, 0961) the running firmware's command channel (the SW-WFDMA mailbox in CONNSYS's
+ *      memory): its capabilities, its MAC address and version
+ *   7  (M2) one scan: the station's BSS activated, a scan request, beacons and probe responses
+ *      collected until SCAN_DONE: one line per network heard (BSSID, channel, RSSI, SSID)
  *
  * Usage (as root):
  *   a34wifi                 the state and the kernel's Wi-Fi log
  *   a34wifi up N [SECONDS]  ask for steps up to N, then follow the log until the kernel is
  *                           done (or SECONDS, default 120, have passed)
+ *   a34wifi scan            once step 7 is done: scan again (kern.a34wifi.rescan), and follow
  *   a34wifi log             the kernel's Wi-Fi log only
  *   a34wifi files           the firmware files in /a34/wifi: present, sizes, what they say
  *
@@ -113,23 +118,39 @@ follow(size_t *printed)
 	}
 }
 
+static int ask(const char *name, int value, int step, int seconds);
+
 static int
 up(int step, int seconds)
 {
-	int want = step, done = 0, busy = 0;
-	size_t printed = 0;
-	time_t until = time(NULL) + seconds;
-
 	if (step < 1 || step > 9) {
 		fprintf(stderr, "a34wifi: step %d: 1 to 9\n", step);
 		return 2;
 	}
+	return ask("kern.a34wifi.want", step, step, seconds);
+}
+
+/* kern.a34wifi.rescan: the scan (step 7) once more */
+static int
+rescan(int seconds)
+{
+	return ask("kern.a34wifi.rescan", 1, 7, seconds);
+}
+
+/* writes `value` into sysctl `name`, then follows the log until the kernel is no longer busy */
+static int
+ask(const char *name, int value, int step, int seconds)
+{
+	int want = value, done = 0, busy = 0;
+	size_t printed = 0;
+	time_t until = time(NULL) + seconds;
+
 	follow(&printed);
-	if (sysctlbyname("kern.a34wifi.want", NULL, NULL, &want, sizeof(want)) != 0) {
-		printf("a34wifi: kern.a34wifi.want=%d: %s\n", want, strerror(errno));
+	if (sysctlbyname(name, NULL, NULL, &want, sizeof(want)) != 0) {
+		printf("a34wifi: %s=%d: %s\n", name, want, strerror(errno));
 		return 1;
 	}
-	printf("a34wifi: asked for step %d\n", step);
+	printf("a34wifi: %s=%d\n", name, want);
 	fflush(stdout);
 	for (;;) {
 		sleep(1);
@@ -250,12 +271,15 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "up") == 0 && argc >= 3) {
 		return up(atoi(argv[2]), argc >= 4 ? atoi(argv[3]) : 120);
 	}
+	if (strcmp(argv[1], "scan") == 0) {
+		return rescan(argc >= 3 ? atoi(argv[2]) : 60);
+	}
 	if (strcmp(argv[1], "log") == 0) {
 		return print_log();
 	}
 	if (strcmp(argv[1], "files") == 0) {
 		return files();
 	}
-	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | log | files]\n");
+	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files]\n");
 	return 2;
 }

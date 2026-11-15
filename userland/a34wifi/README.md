@@ -15,12 +15,15 @@ The kernel does nothing for Wi-Fi until it is asked, by boot-arg `a34wifi=N` or 
 | 3 | `conn_infra` set up as Android's `conninfra.ko` does; the MT6635 A-die; VCN33 for Wi-Fi | `A-die chip id 0x66358a10: MT6635 E2` (the firmware is built for 0x8a10) |
 | 4 | the Wi-Fi subsystem powered, the MCU's image (`soc5_0_ram_wmmcu_1_1_hdr.bin`) in CONNSYS's memory, the MCU's ROM done | `WFSYS on: version 0x02050002`, `WM MCU ROM done (mailbox 0x00001d1e)` |
 | 5 | driver own, the command/event DMA rings, the ROM's versions, `WIFI_RAM_CODE_soc5_0_1_1.bin` loaded, FW_FINISH | `the ROM answers: TOP_HVR ...`, `THE WI-FI FIRMWARE IS READY` |
+| 6 | (M2, 0961) the running firmware's command mailbox: NIC capability (versions, MAC), BASIC_CONFIG | `the firmware answers: NIC_CAPABILITY_V2`, `MAC ...` |
+| 7 | (M2) one **passive** scan (nothing transmitted) of 2.4 GHz 1-13 and 5 GHz 36-48, 149-165 | `SCAN_DONE in N ms`, then one line per network: BSSID, channel, dBm, security, SSID |
 
 ## Use
 
 ```sh
 a34wifi                 # the state and the kernel's Wi-Fi log
-a34wifi up 5 [SECONDS]  # steps up to 5, following the log until the kernel is done (default 120 s)
+a34wifi up 7 [SECONDS]  # steps up to 7, following the log until the kernel is done (default 120 s)
+a34wifi scan [SECONDS]  # once step 7 is done: one scan more (kern.a34wifi.rescan)
 a34wifi log             # the log only
 a34wifi files           # the firmware files in /a34/wifi
 ```
@@ -34,7 +37,7 @@ mounted at `/mnt` and the a34wifi artifact unpacked:
 ```sh
 tools/wifi-fw.sh .../A346EXXSADYG1/super.img /tmp/a34wifi
 cp a34wifi-artifact/a34/wifi/a34wifi /tmp/a34wifi/
-sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi /tmp/a34wifi a34wifi up 5
+sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi /tmp/a34wifi a34wifi up 7
 ```
 
 The job runs once at boot with its output on `/dev/console`, so it lands in the kernel's

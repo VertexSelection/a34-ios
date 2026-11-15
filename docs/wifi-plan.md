@@ -294,8 +294,63 @@ boot, or one run of the job's command by hand. What to read in `tools/pull-log.s
 - step 5: `driver own in N ms` (Android: ~3 ms), `the ROM answers: TOP_HVR 0x...`, five region
   lines, `FW_FINISH answered`, **`THE WI-FI FIRMWARE IS READY`** = milestone 1.
 
+### Milestone 2 (0961): the firmware's commands and one scan -- built, not yet run
+
+`xnu/patches/0961-a34-wifi-m2-scan.patch` (on top of 0960) adds steps 6 and 7 to `a34_wifi.c`
+(same switches: `a34wifi=7` or `a34wifi up 7`; `a34wifi scan` = `kern.a34wifi.rescan=1` scans
+again). Read from `gen4m_s1` and checked against Android's dmesg where it shows the same thing:
+
+- **Command channel** ("SW WFDMA", `os/linux/hif/common/sw_wfdma.c`; soc5_0's `fgIsEnSwWfdma = true`,
+  `fgIsEnAfterFwdl = false`): a mailbox in CONNSYS's memory at `0x180537fc[23:0]` (the ROM's;
+  0x713400 on the running phone per `iomem.txt`'s `WIFI-SW-WFDMA`, default 0x2bcc00): `u32 drv_idx`
+  (host), `u32 fw_idx` (firmware), 4 slots of 1600 bytes. Step 5 now zeroes it before the RAM code,
+  as `halHifSwInfoInit` -> `halSwWfdmaInit`/`halSwWfdmaReset` do. A command (the same 32-byte TXD +
+  `CONNAC2X_WIFI_CMD` frame as on a ring: CID +36, 0xa0, set/query +38, sequence +39, payload +64)
+  is copied into slot `drv_idx`, `drv_idx` advanced, then 3 written to the CCIF's TCHNUM
+  (`0x1803d00c`); full when `(drv_idx + 1) % 4 == fw_idx`. INIT commands (M1) stay on HW TX ring 17
+  (`asicCapInit`: `u2TxInitCmdPort = TX_RING_CMD_IDX_3`, `gl_init.c:5307`, before the download).
+- **Answers** on RX ring 0, polled (Android polls too until its interrupts are on): a 24-byte RXD,
+  then `WIFI_EVENT` (EID +4, sequence +5, payload +12); RXD `DW0[31:27] = 7` with
+  `DW0[31:16] & 0x380f` = 0x3800 for an event, 0x3801 for an 802.11 frame the firmware forwards.
+  The CCIF's WF-to-AP channels (`0x1803d010`) are acknowledged (`0x1803d014`) as Android does.
+- **Step 6**: `GET_NIC_CAPABILITY_V2` (0x8a, query) -> event 0xec (TLVs: hardware, firmware version,
+  MAC in the chip's efuse (tag 7), A-die), then `BASIC_CONFIG` (0x02, 12 zero bytes). MAC: the
+  efuse's if it has one, else `02:41:33:34:57:46` (locally administered); the phone's NVRAM is
+  neither read nor written.
+- **Step 7**: `BSS_ACTIVATE_CTRL` (0x11: BSS 0, AIS, own-MAC slot 0, broadcast WTBL 4), then
+  `SCAN_REQ_V2` (0x03, 1192 bytes: Android's dmesg shows `LEN[1256]` = 64 + 1192) **passive** --
+  nothing is transmitted by an uncalibrated radio -- over an explicit list (`ucChannelType` 4:
+  2.4 GHz 1-13, 5 GHz 36-48 and 149-165, so no country setting is needed), `ucScnFuncMask` 0x02
+  (DBDC off, `wifi.cfg DbdcMode 0`); RX ring 0 drained for up to 20 s until `SCAN_DONE` (0x0d, 476
+  bytes; dmesg: "size of ScanDone476"); then the BSS deactivated. Beacons and probe responses come
+  **forwarded on RX ring 0** (0x3801; the dmesg's counters moved on the event ring, not the data
+  rings, during scans): RXD, then its groups (`DW1[15:11]`: G4 16, G1 16, G2 8, G3 8, G5 72 bytes in
+  that order), `DW2[15:14]` x 2 bytes of padding, the 802.11 frame; channel `DW3[15:8]`; RCPI in
+  G3's second word, dBm = min(RCPI, 220) / 2 - 110 (`nic_rxd_v2.c`, `scan.c`). Each network heard is
+  one log line: BSSID, channel, dBm, RSN/WPA/WEP/open, SSID.
+- **Structures**: copied field by field into a host program from `include/wsys_cmd_handler_fw.h`
+  and `nic_cmd_event.h` (none is packed) and their offsets printed; `tools/wifi-host-check` then runs
+  the code on synthetic RX entries (a forwarded beacon with an RX vector, a SCAN_DONE) and checks the
+  mailbox frame byte for byte.
+
+**First M2 test** (after M1 has passed; Wi-Fi only, without `a34bt`): kernel with 0939, 0940, 0960
+and 0961; the `com.a34.wifi` job running `a34wifi up 7`; then `grep 'A34 WIFI\|A34 CONNSYS'`:
+
+- `step 5: the running firmware's command mailbox (SW WFDMA) at EMI +0x713400 (the ROM's ...)`
+  (another offset is fine if it is the ROM's), then `THE WI-FI FIRMWARE IS READY`;
+- `step 6: the firmware answers: NIC_CAPABILITY_V2, N elements`, the firmware's version and date
+  (Android's tailer says `20250122153052`), the MAC line;
+- `step 7: passive scan 1 of 22 channels asked`, `SCAN_DONE in N ms` (a few seconds), and one line
+  per access point near the phone. `a34wifi scan` repeats it.
+- If step 6 says `NOT ANSWERED` with `mailbox drv 1 fw 0`: the firmware never took the command
+  (the doorbell or the mailbox offset); with `fw 1` and no event: the answer path (RX ring 0).
+  If `SCAN_DONE` comes with nothing heard: PHY_ACTION/NVRAM (below) are next.
+
 ### Biggest unknowns
 
+0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
+   before its first scan; M2 sends neither (passive, so nothing is transmitted). The firmware
+   should still receive; if not, they are the next patch.
 1. **Whether the firmware starts without PHY_ACTION** (pre-calibration with NVRAM front-end
    data and connfem's id). Android always sends it before the download; M1 does not. If
    FW_FINISH is refused or the ready bits never come, PHY_ACTION (with the default `WIFI`
@@ -320,7 +375,7 @@ user-space piece; each is held against what Android's driver does on this phone.
 | | Goal | Kernel | User space | Size (new lines) | Main risks |
 | --- | --- | --- | --- | --- | --- |
 | **M1** | CONNSYS powered, A-die found, the Wi-Fi MCU running Samsung's firmware (its ready bits), all in the log | 0940, 0960 (`a34_wifi.c` steps 1-5) | `a34wifi` (sysctl), `tools/wifi-fw.sh` | ~1 900 (built) | see section 3 |
-| **M2** | scan results in the kernel log | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
+| **M2** | scan results in the kernel log -- **built (0961), not yet run** | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
 | **M3** | join an open network, then WPA2-PSK; an IP by DHCP; apps reach the internet | steps 8-9: BSS/STA records, channel privilege, auth/assoc frames, EAPOL through the command ring, keys (`ADD_REMOVE_KEY`), data TX/RX descriptors (connac2x TXD/RXD), an Ethernet `ifnet` (HackiOS `redwood_net.c`), WPA2 four-way/group handshake in the kernel (`redwood_wpa.c`) | `a34wifi join SSID [PASS]`, then the IPConfiguration `setservice` call (HackiOS `net_test.m`, MIT) | ~2 000 + ~900 ported | MediaTek firmware quirks HackiOS hit (runs 448-459) on a different firmware generation; the WPA2 offload settings of this firmware; MAC address source (eFuse may be empty: a fixed locally administered address, never NVRAM writes) |
 | **M4** | Settings' Wi-Fi: networks listed, password typed, joined | the wifid layer (section 2): `IO80211Controller`/`IONetworkInterface`, Apple80211 ioctls and events, `IONetworkStack`; ADT `wlan` node with `local-mac-address` | wifid, configd, mDNSResponder, trustd, securityd, nsurlsessiond, CFNetworkAgent enabled in the root | ~1 100 ported + ~200 | boot stalls if IOKit never quiesces (ios-topaz 0128) or InterfaceNamer never reports quiet; wifid holding SpringBoard (ios-sapphire); the 16.7.16 structure layouts (sizes match, field offsets to confirm from the log) |
 

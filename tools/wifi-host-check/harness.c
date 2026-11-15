@@ -118,6 +118,51 @@ int main(int argc, char **argv)
 	    (f[32] | f[33] << 8) != 40 || d[0] != 0x58010000u || d[1] != ((72u << 16) | (1u << 30));
 	bad |= a34w_rd(a34w_conn, WFDMA_GLO_CFG) != 0x50209075u;
 	printf("frame and rings: %s\n", bad ? "WRONG" : "ok");
+
+	/* ---- milestone 2 (0961): the mailbox, a command in it, RX ring 0's events and forwarded frames ---- */
+	*(volatile uint32_t *)(a34w_conn + SYSRAM_SW_WFDMA_OFFSET) = 0x00713400u;   /* what the ROM left on the phone */
+	bad |= !a34w_mbox_reset() || a34w_mbox_offset != 0x713400u;
+	bad |= !a34w_bss_activate(true);
+	{
+		uint8_t *m = (uint8_t *)a34w_emi + 0x713400u, *c = m + 8;       /* slot 0 */
+		printf("BSS_ACTIVATE in mailbox slot 0: DW0 0x%08x len %u cid 0x%02x type 0x%02x set %u seq %u | active %u "
+		    "mac %02x:..:%02x bmc %u | drv %u, CCIF TCHNUM %u\n", a34w_le32(c), c[32] | c[33] << 8, c[36], c[37], c[38],
+		    c[39], c[65], c[68], c[73], c[74], a34w_le32(m), a34w_rd(a34w_conn, CCIF_TCHNUM));
+		bad |= a34w_le32(c) != (0x01000000u | 76u) || (c[32] | c[33] << 8) != 44 || c[36] != 0x11 || c[37] != 0xa0 ||
+		    c[38] != 1 || c[65] != 1 || memcmp(c + 68, a34w_mac, 6) != 0 || c[74] != 4 || a34w_le32(m) != 1 ||
+		    a34w_rd(a34w_conn, CCIF_TCHNUM) != 3;
+	}
+	/* RX ring 0: a forwarded beacon (SW kind 0x3801, group 3 with RCPI 120 = -50 dBm, channel 6), then an event */
+	{
+		uint32_t slot = (a34w_rx_cidx + 1u) % RING_SLOTS;
+		uint8_t *buf = (uint8_t *)a34w_dma + DMA_RX0_BUFS + slot * SLOT_SIZE, *bc;
+		volatile uint32_t *dsc = a34w_desc(DMA_RX0_DESC, slot);
+		uint32_t len = 24 + 8 + 24 + 12 + 2 + 5 + 3, w;
+		memset(buf, 0, SLOT_SIZE);
+		w = 0x38010000u | len; memcpy(buf, &w, 4);
+		w = 1u << 13; memcpy(buf + 4, &w, 4);                   /* G3 only */
+		w = 6u << 8; memcpy(buf + 12, &w, 4);                   /* channel 6 */
+		w = 0; memcpy(buf + 24, &w, 4); w = 120; memcpy(buf + 28, &w, 4);
+		bc = buf + 32;
+		bc[0] = 0x80; memset(bc + 4, 0xff, 6); memcpy(bc + 10, "\x0a\x0b\x0c\x0d\x0e\x0f", 6); memcpy(bc + 16, "\x0a\x0b\x0c\x0d\x0e\x0f", 6);
+		bc[32] = 100; bc[34] = 0x01;
+		bc[36] = 0; bc[37] = 5; memcpy(bc + 38, "hello", 5); bc[43] = 3; bc[44] = 1; bc[45] = 6;
+		dsc[1] = (1u << 31) | (len << 16);
+		slot = (slot + 1u) % RING_SLOTS;
+		buf = (uint8_t *)a34w_dma + DMA_RX0_BUFS + slot * SLOT_SIZE; dsc = a34w_desc(DMA_RX0_DESC, slot);
+		len = 24 + 12 + 476;
+		memset(buf, 0, SLOT_SIZE);
+		w = 0x38000000u | len; memcpy(buf, &w, 4);
+		buf[24 + 4] = EVENT_ID_SCAN_DONE; buf[24 + 5] = 77; buf[36] = 9; buf[40] = 22;
+		dsc[1] = (1u << 31) | (len << 16);
+		uint8_t done[476]; int got = a34w_wait_event(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 100);
+		printf("RX ring 0: SCAN_DONE %d bytes (scan %u, %u channels); %u networks: %02x:..:%02x ch %u %d dBm \"%s\"\n", got,
+		    done[0], done[4], a34w_heard_count, a34w_heard[0].bssid[0], a34w_heard[0].bssid[5], a34w_heard[0].channel,
+		    a34w_heard[0].rssi, a34w_heard[0].ssid);
+		bad |= got != 476 || done[0] != 9 || done[4] != 22 || a34w_heard_count != 1 || a34w_heard[0].rssi != -50 ||
+		    a34w_heard[0].channel != 6 || strcmp(a34w_heard[0].ssid, "hello") != 0;
+	}
+	printf("milestone 2 paths: %s\n", bad ? "WRONG" : "ok");
 	printf("log:\n%s", a34w_log);
 	return bad;
 }
