@@ -190,6 +190,8 @@ main(int argc, char **argv)
 {
 	const char *port = "/dev/a34at0";
 	bool radio = false, once = false;
+	const char *fake_oper = NULL;
+	int fake_bars = 0;
 	int trace = 0;
 	struct at_chan ch;
 	struct at_resp r;
@@ -207,8 +209,13 @@ main(int argc, char **argv)
 			trace = 1;
 		else if (strcmp(argv[i], "-once") == 0)
 			once = true;
+		else if (strcmp(argv[i], "-fake") == 0 && i + 2 < argc) {
+			fake_oper = argv[++i];
+			fake_bars = atoi(argv[++i]);
+		}
 		else {
-			fprintf(stderr, "usage: a34cell [-port DEV] [-state PLIST] [-inbox DIR] [-radio] [-trace] [-once]\n");
+			fprintf(stderr, "usage: a34cell [-port DEV] [-state PLIST] [-inbox DIR] [-radio] [-trace] [-once]\n"
+			    "       a34cell -fake OPERATOR BARS   (status bar test: publishes a made-up state, no modem)\n");
 			return 2;
 		}
 	}
@@ -217,6 +224,20 @@ main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 	model_init(&st);
+	if (fake_oper) {
+		/* Nothing is said to any modem: a state for liba34cell-sb.dylib to show. */
+		static const int rssi_for_bars[] = { 0, 3, 6, 10, 20 };
+		st.fake = true;
+		st.sim = SIM_READY;
+		st.creg.stat = st.cereg.stat = 1;
+		st.cereg.act = 7;
+		st.rssi = rssi_for_bars[fake_bars < 0 ? 0 : fake_bars > 4 ? 4 : fake_bars];
+		snprintf(st.oper, sizeof(st.oper), "%s", fake_oper);
+		fprintf(stderr, "a34cell: FAKE state for the status bar test (no modem involved): \"%s\", %d bars\n",
+		    st.oper, model_bars(&st));
+		publish();
+		return 0;
+	}
 	fprintf(stderr, "a34cell: start (port %s, radio %s)\n", port, radio ? "wanted" : "off");
 	kernel_state();
 

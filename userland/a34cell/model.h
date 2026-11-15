@@ -41,6 +41,7 @@ struct cell_state {
 	char clip[32];          /* last +CLIP number */
 	unsigned sms_received;
 	bool radio_gate;
+	bool fake;              /* a34cell -fake: a made-up state for testing the status bar */
 };
 
 void model_init(struct cell_state *s);

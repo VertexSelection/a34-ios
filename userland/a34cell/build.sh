@@ -37,6 +37,9 @@ CLANG=$(xcrun -f clang)
 echo "clang: $("$CLANG" --version | head -n 1); iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
 (cd "$HERE" && "$CLANG" -target "arm64-apple-ios$IOS_MIN" -isysroot "$IOS_SDK" -std=c11 -O2 -g \
 	"${WARN[@]}" -o "$OUT/a34/a34cell" a34cell.c "${SRC[@]}")
+(cd "$HERE" && "$CLANG" -target "arm64-apple-ios$IOS_MIN" -isysroot "$IOS_SDK" -std=c11 -O2 -g \
+	"${WARN[@]}" -dynamiclib -install_name /a34/liba34cell-sb.dylib -framework CoreFoundation -lobjc \
+	-o "$OUT/a34/liba34cell-sb.dylib" sb.c)
 # System libraries only, no rpath: nothing for dyld to look for outside /usr/lib.
 if otool -L "$OUT/a34/a34cell" | tail -n +2 | grep -v -E '^\s+/usr/lib/'; then
 	echo "error: a34cell links something outside /usr/lib"
@@ -49,10 +52,19 @@ fi
 rm -rf "$WORK/a34cell.dSYM"
 dsymutil -o "$WORK/a34cell.dSYM" "$OUT/a34/a34cell" >/dev/null 2>&1 || true
 rm -rf "$OUT/a34/a34cell.dSYM"     # only the binary goes to the phone
-strip -S "$OUT/a34/a34cell"
-codesign -f -s - "$OUT/a34/a34cell"     # last: nothing changes the file after this
-codesign -v "$OUT/a34/a34cell"
-lipo -info "$OUT/a34/a34cell"
+if otool -L "$OUT/a34/liba34cell-sb.dylib" | tail -n +2 |
+	grep -v -E '^\s+(/usr/lib/|/System/Library/Frameworks/CoreFoundation.framework/|/a34/liba34cell-sb.dylib)'; then
+	echo "error: liba34cell-sb.dylib links something unexpected"
+	exit 1
+fi
+otool -D "$OUT/a34/liba34cell-sb.dylib" | grep -q '^/a34/liba34cell-sb.dylib$'
+rm -rf "$OUT/a34/liba34cell-sb.dylib.dSYM"
+for f in a34cell liba34cell-sb.dylib; do
+	strip -S "$OUT/a34/$f"
+	codesign -f -s - "$OUT/a34/$f"  # last: nothing changes the file after this
+	codesign -v "$OUT/a34/$f"
+	lipo -info "$OUT/a34/$f"
+done
 
 cat >"$OUT/INSTALL.txt" <<'EOF'
 a34cell -- cellular daemon for the A34 port (docs/cellular-plan.md on branch "cellular").
@@ -68,6 +80,13 @@ else is touched. The transmitter stays off unless "-radio" is added to the job's
 the modem reports a well-formed identity of its own; the identity is never printed or stored.
 
   a34cell [-port /dev/a34at0] [-state /var/run/a34cell.plist] [-inbox DIR] [-radio] [-trace] [-once]
+
+The status bar: liba34cell-sb.dylib, loaded into SpringBoard through the kernel's a34inject
+(several libraries separated by ':'), e.g. boot-arg
+  a34inject=/a34/liba34gl-inject.dylib:/a34/liba34cell-sb.dylib,backboardd,SpringBoard,mediaserverd
+shows the bars and the operator while a34cell's state says registered. To test it without a
+modem: a job that runs "/a34/a34cell -fake Turkcell 3" (publishes a made-up state, says so,
+touches no modem).
 
 To remove: delete the job com.a34.cell from System/Library/xpc/launchd.plist (or reinstall the
 root image) and /a34/a34cell.
