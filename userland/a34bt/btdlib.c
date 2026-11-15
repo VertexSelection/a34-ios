@@ -48,19 +48,14 @@
 #include <string.h>
 #include <unistd.h>
 
-typedef void *xpc_object_t;
-typedef xpc_object_t xpc_connection_t;
-typedef void (^xpc_handler_t)(xpc_object_t object);
-extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags);
-extern xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_connection_t connection, xpc_object_t message);
-extern void xpc_connection_send_message_with_reply(xpc_connection_t connection, xpc_object_t message,
-    dispatch_queue_t replyq, xpc_handler_t handler);
-extern void xpc_connection_send_message(xpc_connection_t connection, xpc_object_t message);
-extern xpc_object_t xpc_dictionary_create(const char *const *keys, const xpc_object_t *values, size_t count);
-extern void xpc_dictionary_set_int64(xpc_object_t xdict, const char *key, int64_t value);
-extern void xpc_dictionary_set_string(xpc_object_t xdict, const char *key, const char *string);
-extern char *xpc_copy_description(xpc_object_t object);
-extern void xpc_release(xpc_object_t object);
+#include <xpc/xpc.h>
+
+/*
+ * The SDK marks the Mach-service connection unavailable on iOS; libxpc in the system has it (bluetoothd calls it).
+ * Reached by its symbol name, for the call and for the interposer table.
+ */
+extern xpc_connection_t a34_xpc_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags)
+    __asm__("_xpc_connection_create_mach_service");
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -122,7 +117,7 @@ static xpc_connection_t
 my_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags)
 {
 	static unsigned said;
-	xpc_connection_t c = xpc_connection_create_mach_service(name, targetq, flags);
+	xpc_connection_t c = a34_xpc_create_mach_service(name, targetq, flags);
 
 	if (said++ < 40) {
 		say("connects to %s (flags %#llx)", name != NULL ? name : "(null)", (unsigned long long)flags);
@@ -743,7 +738,7 @@ __attribute__((used)) static const struct {
 	const void *replacement;
 	const void *replacee;
 } interposers[] __attribute__((section("__DATA,__interpose"))) = {
-	{ (const void *)my_create_mach_service, (const void *)xpc_connection_create_mach_service },
+	{ (const void *)my_create_mach_service, (const void *)a34_xpc_create_mach_service },
 	{ (const void *)my_send_sync, (const void *)xpc_connection_send_message_with_reply_sync },
 	{ (const void *)my_send_async, (const void *)xpc_connection_send_message_with_reply },
 	{ (const void *)my_send, (const void *)xpc_connection_send_message },
