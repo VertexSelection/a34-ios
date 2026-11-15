@@ -631,6 +631,16 @@ load_store_actions_on(void)
    return on;
 }
 
+/* a span of work sent: panfrost told (re-entries are counted within one), and the pass trace of
+ * the span that recorded something ended (rwa_pan_profile) */
+static void
+span_ended(void)
+{
+   redwood_pan_span = rwa_bind_span;
+   if (redwood_pan_trace_on && redwood_pan_trace_n)
+      redwood_pan_trace_on = false;
+}
+
 static void
 pass_store_actions(struct pipe_context *pipe)
 {
@@ -4055,6 +4065,7 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
    pass_store_actions(device->pipe);
    device->pipe->flush(device->pipe, &fence, 0);
    rwa_bind_span++;
+   span_ended();
    if (!fence) {
       if (!required)
          return 0;
@@ -5171,6 +5182,8 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
    static uint64_t reason_count[RWP_REASONS];
    static struct rwa_drm_stats now, before;
    static bool have_before;
+   static struct redwood_pan_pass trace[RWP_TRACE];
+   static unsigned ntrace;
 
    if (!line || !size)
       return 0;
@@ -5185,6 +5198,11 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
          before = now;
          redwood_drm_stats(&now);
       }
+      /* the passes of the span traced since the last call, and the next span traced */
+      ntrace = redwood_pan_trace_on ? 0 : MIN2(redwood_pan_trace_n, (unsigned)RWP_TRACE);
+      memcpy(trace, redwood_pan_trace, ntrace * sizeof(trace[0]));
+      redwood_pan_trace_n = 0;
+      redwood_pan_trace_on = true;
    }
    uint64_t draws = p[RWP_DRAWS] ? p[RWP_DRAWS] : 1;
 #define RWP_US(i) ((unsigned long long)(p[i] / 1000 / draws))
@@ -5238,14 +5256,18 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
          spans = 1;
       snprintf(line, size, "rwm pan tiles: per work sent (%llu): %.1f passes, %.1f MB preloaded, %.1f MB written "
                "back; in all %llu passes (%llu screen-sized); preloads %llu colour + %llu depth/stencil "
-               "= %.1f MB; write-backs %llu colour + %llu depth/stencil = %.1f MB; %llu colour clears in the tiles",
+               "= %.1f MB; write-backs %llu colour + %llu depth/stencil = %.1f MB; %llu colour clears in the tiles; "
+               "re-entries (preloads of a target written back earlier in the same work) %llu = %.1f MB; colour "
+               "traffic of IOSurfaces %.1f MB, of AFBC targets %.1f MB, of linear ones %.1f MB",
                (unsigned long long)spans, (double)p[RWP_PASSES] / spans, p[RWP_PRELOAD_KB] / 1024.0 / spans,
                p[RWP_WRITEBACK_KB] / 1024.0 / spans,
                (unsigned long long)p[RWP_PASSES], (unsigned long long)p[RWP_FULL_PASSES],
                (unsigned long long)p[RWP_PRELOADS], (unsigned long long)p[RWP_ZS_PRELOADS],
                p[RWP_PRELOAD_KB] / 1024.0, (unsigned long long)p[RWP_WRITEBACKS],
                (unsigned long long)p[RWP_ZS_WRITEBACKS], p[RWP_WRITEBACK_KB] / 1024.0,
-               (unsigned long long)p[RWP_CLEARS]);
+               (unsigned long long)p[RWP_CLEARS], (unsigned long long)p[RWP_REENTRY_PRELOADS],
+               p[RWP_REENTRY_KB] / 1024.0, p[RWP_SHARED_KB] / 1024.0, p[RWP_AFBC_KB] / 1024.0,
+               p[RWP_LINEAR_KB] / 1024.0);
       return 1;
    }
    case 3: {
@@ -5288,8 +5310,25 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                   (unsigned long long)(now.local_madvises - before.local_madvises));
       return 1;
    }
-   default:
-      return 0;
+   default: {
+      /* 5, 6, ...: the passes of one span of work, in the order they were submitted */
+      unsigned k = which - 5;
+      if (which < 5 || k >= ntrace)
+         return 0;
+      const struct redwood_pan_pass *r = &trace[k];
+      static const char *const kinds[] = { "linear", "16x16 tiled", "AFBC", "other" };
+      snprintf(line, size, "rwm pass %u of %u: %ux%u %s %s%s level %u (framebuffer %ux%u, drawn %ux%u), "
+               "%u draws, %u colour attachments; colour 0 %s%s%s, %s; depth/stencil %s%s%s; sent for: %s; "
+               "GPU job %llu",
+               k + 1, ntrace, r->res_w, r->res_h, util_format_short_name((enum pipe_format)r->format),
+               kinds[r->kind & 3], r->shared ? " IOSurface" : "", r->level, r->width, r->height, r->extent_w,
+               r->extent_h, r->draws, r->nr_cbufs, r->clear ? "cleared" : r->preload ? "preloaded" : "not loaded",
+               r->reentry ? " (re-entry)" : "", "", r->writeback ? "written back" : "not written back",
+               !r->zs ? "none" : r->zs_preload ? "preloaded" : "not loaded",
+               r->zs ? (r->zs_writeback ? ", written back" : ", not written back") : "", "", r->why,
+               (unsigned long long)r->seq);
+      return 1;
+   }
    }
 #undef RWP_US
 #undef RWP_EACH
@@ -5304,6 +5343,7 @@ rwa_flush_seq(struct rwa_device *device)
    pass_store_actions(device->pipe);
    device->pipe->flush(device->pipe, NULL, 0);
    rwa_bind_span++;
+   span_ended();
    return redwood_drm_last_seq();
 }
 

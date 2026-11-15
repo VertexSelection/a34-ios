@@ -57,6 +57,12 @@ enum redwood_pan_prof_index {
    RWP_ZS_WRITEBACKS,   /* depth/stencil attachments written out */
    RWP_WRITEBACK_KB,
    RWP_CLEARS,          /* colour attachments cleared in the tiles */
+   /* (patch 0019) where that traffic is: */
+   RWP_REENTRY_PRELOADS,   /* colour preloads of a target written back earlier in the same work */
+   RWP_REENTRY_KB,
+   RWP_SHARED_KB,          /* preload + write-back KB of IOSurface (shared) targets */
+   RWP_AFBC_KB,            /* ... of AFBC targets */
+   RWP_LINEAR_KB,          /* ... of linear targets (the rest: 16x16 tiled) */
    RWP_SLOTS
 };
 
@@ -76,6 +82,30 @@ enum redwood_pan_memtest_index {
    RWP_MEM_SLOTS
 };
 extern uint64_t redwood_pan_memtest[RWP_MEM_SLOTS];
+
+/*
+ * (patch 0019) The passes of one command buffer's work, in the order submitted, for the profile:
+ * redwood_pan_trace_on is set by air_metal.c for one span of work (rwa_pan_profile), and every
+ * batch submitted meanwhile is recorded (at most RWP_TRACE). redwood_pan_span is air_metal.c's
+ * count of works sent (a re-entry is a preload of a target written back in the same span).
+ */
+#define RWP_TRACE 40
+struct redwood_pan_pass {
+   uint16_t width, height;            /* the framebuffer */
+   uint16_t extent_w, extent_h;       /* the drawn area */
+   uint16_t res_w, res_h;             /* colour attachment 0's resource (or the depth one's) */
+   uint16_t format;                   /* its pipe_format */
+   uint8_t level, nr_cbufs;
+   uint8_t kind;                      /* 0 linear, 1 16x16 tiled, 2 AFBC, 3 other */
+   bool shared, preload, writeback, clear, reentry, zs, zs_preload, zs_writeback;
+   uint32_t draws;
+   const char *why;
+   uint64_t seq;                      /* its last GPU job's number (redwood-drm), 0: not known */
+};
+extern bool redwood_pan_trace_on;
+extern unsigned redwood_pan_trace_n;
+extern struct redwood_pan_pass redwood_pan_trace[RWP_TRACE];
+extern uint64_t redwood_pan_span;
 
 /* why batches with work were submitted: panfrost's own reason strings, counted */
 #define RWP_REASONS 12
