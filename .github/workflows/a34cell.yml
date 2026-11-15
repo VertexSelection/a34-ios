@@ -1,0 +1,51 @@
+name: a34cell
+
+# The cellular daemon (userland/a34cell, docs/cellular-plan.md): host tests of its AT channel,
+# command policy, identity check, SMS PDUs and modem model against a scripted fake modem, then
+# the iOS 16 arm64 binary, ad-hoc signed. The artifact "a34cell" holds a34/a34cell (for /a34 on
+# the phone) and INSTALL.txt.
+
+on:
+  push:
+    branches: [main, cellular]
+    paths:
+      - userland/a34cell/**
+      - .github/workflows/a34cell.yml
+  workflow_dispatch:
+
+concurrency:
+  group: a34cell-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_MIN: "16.0"
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Host tests and the iOS binary (userland/a34cell/build.sh)
+        run: |
+          A34CELL_OUT="$WORK/out" userland/a34cell/build.sh
+          echo "commit=$GITHUB_SHA" > "$WORK/out/BUILD_INFO.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: a34cell
+          path: ${{ env.WORK }}/out
+          if-no-files-found: error
