@@ -61,6 +61,22 @@ struct rwm_perf {
 extern struct rwm_perf rwm_perf;
 /* A34: set on the driver's completion queue while it waits for a buffer's GPU work (redwoodmetal.m) */
 extern __thread bool rwm_on_completion_queue;
+/*
+ * A34: one command buffer's run in parts -- its works by kind (rwm_run_works), the slowest of them, the submit at
+ * its end, and what the library did meanwhile (rwa_cb_counters, the difference over the run) -- and the slowest
+ * buffer's of each profile period printed with it ("rwm worst cb", perf.cpp).
+ */
+struct rwm_cb_parts {
+	uint64_t took_ns;
+	uint64_t draws, draw_ns, blits, blit_ns, dispatches, dispatch_ns, copyins, copyin_ns, submit_ns;
+	uint64_t slowest_ns;
+	unsigned slowest_index, slowest_kind, works;
+	uint64_t lib[RWA_CB_SLOTS];
+};
+extern __thread struct rwm_cb_parts rwm_cb_now;
+void rwm_cb_parts_note(const struct rwm_cb_parts *parts);
+/* one of the compiler library's calls that are not part of the contract (profiles), or NULL */
+void *rwm_profile_call(const char *name);
 /* A34: a line HackiOS kept with their kernel's sysctl kern.redwood.say (which ours has not): written to
  * stdout as "redwoodmetal kept: ...", which in backboardd reaches the kernel log through the devnull tee */
 void rwm_keep(const char *line);

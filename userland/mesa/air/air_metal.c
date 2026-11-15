@@ -1342,9 +1342,27 @@ struct rwa_surface_import {
    unsigned offset, row_bytes;
 };
 
+/* textures made (cumulative; rwa_cb_counters), on whichever thread made them */
+static uint64_t rwa_textures_made, rwa_textures_made_ns;
+
+static struct rwa_texture *
+texture_of_shape_timed(struct rwa_device *device, const struct rwa_texture_shape *shape,
+                       const struct rwa_surface_import *import, char *why, size_t why_size);
+
 static struct rwa_texture *
 texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shape,
                  const struct rwa_surface_import *import, char *why, size_t why_size)
+{
+   uint64_t began = os_time_get_nano();
+   struct rwa_texture *texture = texture_of_shape_timed(device, shape, import, why, why_size);
+   __atomic_fetch_add(&rwa_textures_made, 1, __ATOMIC_RELAXED);
+   __atomic_fetch_add(&rwa_textures_made_ns, os_time_get_nano() - began, __ATOMIC_RELAXED);
+   return texture;
+}
+
+static struct rwa_texture *
+texture_of_shape_timed(struct rwa_device *device, const struct rwa_texture_shape *shape,
+                       const struct rwa_surface_import *import, char *why, size_t why_size)
 {
    if (!shape) {
       say(why, why_size, "a texture with no descriptor");
@@ -4956,6 +4974,56 @@ ticks_ns(uint64_t ticks)
 #else
    return ticks;
 #endif
+}
+
+/*
+ * What the library and panfrost have done so far, for the plug-in to take the difference over one
+ * command buffer ("rwm worst cb"): out[RWA_CB_*] (air_metal.h), as many as `room`; the number
+ * filled. panfrost's counters are cleared by the profile (rwa_pan_profile, rwa_submit_profile),
+ * which the plug-in calls only between command buffers; the kernel calls and the textures made
+ * are the whole process's, other threads' included.
+ */
+unsigned
+rwa_cb_counters(uint64_t *out, unsigned room)
+{
+   RWA_GUARD();
+   uint64_t v[RWA_CB_SLOTS] = { 0 };
+
+   v[RWA_CB_BATCHES] = redwood_pan_prof[RWP_JOB_SUBMITS];
+   v[RWA_CB_BATCH_NS] = redwood_pan_prof[RWP_JOB_SUBMIT_NS];
+   v[RWA_CB_DEP_FLUSHES] = redwood_pan_prof[RWP_DEP_FLUSHES];
+   v[RWA_CB_BO_MADE] = redwood_pan_prof[RWP_BO_CREATES];
+   v[RWA_CB_BO_MADE_NS] = redwood_pan_prof[RWP_BO_CREATE_NS];
+   v[RWA_CB_BO_FRESH] = redwood_pan_prof[RWP_BO_FRESH];
+   v[RWA_CB_BO_FRESH_NS] = redwood_pan_prof[RWP_BO_FRESH_NS];
+   v[RWA_CB_VARIANTS] = &redwood_pan_variant_compiles ? redwood_pan_variant_compiles : 0;
+   v[RWA_CB_VARIANT_NS] = &redwood_pan_variant_ns ? redwood_pan_variant_ns : 0;
+   v[RWA_CB_PIPELINES] = rwa_pipelines_made;
+   v[RWA_CB_PIPELINE_NS] = rwa_pipelines_translate_ns + rwa_pipelines_compile_ns;
+   v[RWA_CB_TEXTURES] = __atomic_load_n(&rwa_textures_made, __ATOMIC_RELAXED);
+   v[RWA_CB_TEXTURE_NS] = __atomic_load_n(&rwa_textures_made_ns, __ATOMIC_RELAXED);
+   for (unsigned i = 0; i < RWP_REASONS && redwood_pan_reason[i]; i++) {
+      if (strstr(redwood_pan_reason[i], "staging") || strstr(redwood_pan_reason[i], "AFBC"))
+         v[RWA_CB_STAGING] += redwood_pan_reason_count[i];
+   }
+   if (redwood_drm_stats) {
+      static struct rwa_drm_stats st;
+      static const struct { unsigned slot, selector; } calls[] = {
+         { RWA_CB_K_CREATE, 0x42 }, { RWA_CB_K_SURFACE, 0x7e }, { RWA_CB_K_SUBMIT, 0x40 },
+         { RWA_CB_K_WAIT_BO, 0x41 }, { RWA_CB_K_CLOSE, 0x09 },
+      };
+      redwood_drm_stats(&st);
+      for (unsigned i = 0; i < ARRAY_SIZE(calls); i++) {
+         v[calls[i].slot] = st.calls[calls[i].selector];
+         v[calls[i].slot + 1] = ticks_ns(st.ticks[calls[i].selector]);
+      }
+      v[RWA_CB_K_MAPS] = st.maps;
+      v[RWA_CB_K_MAPS + 1] = ticks_ns(st.map_ticks);
+   }
+   unsigned n = MIN2(room, (unsigned)RWA_CB_SLOTS);
+   if (out)
+      memcpy(out, v, n * sizeof(uint64_t));
+   return n;
 }
 
 /*
