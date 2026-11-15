@@ -24,6 +24,9 @@
  *    /var/mobile/Library/Bluetooth/com.a34.keychain.plist (a binary plist, bluetoothd's own user: NOT encrypted --
  *    the pairing keys of this research port are readable by root); every other keychain call goes to securityd as
  *    before. A34BT_KEYCHAIN=securityd leaves bluetoothd's to securityd too.
+ * 6. A crash said: SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT print the faulting pc, lr, address and the frame-pointer
+ *    chain as image+offset ("crash: SIGSEGV at 0x... pc bluetoothd+0x... lr ... frames ..."), then the signal is let
+ *    through as before (the kernel's CRASH line still comes).
  * 5. Its os_log on the console (OS_ACTIVITY_DT_MODE did not show it): _os_log_impl, _os_log_error_impl and
  *    _os_log_fault_impl formatted here (format string and arguments, privacy ignored: this is the phone's own log),
  *    the first 3000 lines of each run, debug ones left out; "bt: " ahead of each.
@@ -37,7 +40,9 @@
 #include <dlfcn.h>
 #include <os/log.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/ucontext.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -725,6 +730,72 @@ my_os_log_fault_impl(void *dso, os_log_t log, os_log_type_t type, const char *fo
 	_os_log_fault_impl(dso, log, type, format, buf, size);
 }
 
+/* ---- 6. crashes ---- */
+
+static void
+crash_where(uintptr_t a, char *out, size_t room)
+{
+	Dl_info info;
+
+	if (a != 0 && dladdr((void *)a, &info) != 0 && info.dli_fname != NULL) {
+		const char *image = strrchr(info.dli_fname, '/') != NULL ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+
+		snprintf(out, room, "%s+%#lx", image, (unsigned long)(a - (uintptr_t)info.dli_fbase));
+	} else {
+		snprintf(out, room, "%#lx", (unsigned long)a);
+	}
+}
+
+static void
+crash_handler(int sig, siginfo_t *si, void *context)
+{
+	ucontext_t *uc = context;
+	char pc[96], lr[96], frames[900], one[96];
+	size_t used = 0;
+	uintptr_t fp = 0;
+
+	frames[0] = 0;
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		crash_where((uintptr_t)uc->uc_mcontext->__ss.__pc, pc, sizeof(pc));
+		crash_where((uintptr_t)uc->uc_mcontext->__ss.__lr, lr, sizeof(lr));
+		fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+	} else {
+		snprintf(pc, sizeof(pc), "?");
+		snprintf(lr, sizeof(lr), "?");
+	}
+	for (int i = 0; i < 14 && fp >= 0x100000000ull && (fp & 7) == 0 && used < sizeof(frames) - 100; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		crash_where(ret, one, sizeof(one));
+		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %s", one);
+		if (next <= fp) {
+			break;
+		}
+		fp = next;
+	}
+	say("crash: signal %d at %#lx: pc %s lr %s frames%s", sig, si != NULL ? (unsigned long)(uintptr_t)si->si_addr : 0UL,
+	    pc, lr, frames);
+	signal(sig, SIG_DFL);                   /* returning re-runs the faulting instruction: the system's crash, as before */
+	if (sig == SIGABRT || sig == SIGTRAP) {
+		raise(sig);
+	}
+}
+
+static void
+crash_handlers(void)
+{
+	static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT };
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crash_handler;
+	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+	for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+		(void)sigaction(sigs[i], &sa, NULL);
+	}
+}
+
 /* ---- exits ---- */
 
 static void
@@ -796,6 +867,7 @@ btd_init(void)
 	bluetool_local = !(mode != NULL && strcmp(mode, "launchd") == 0);
 	kc_local = !(kc != NULL && strcmp(kc, "securityd") == 0);
 	unsetenv("DYLD_INSERT_LIBRARIES");     /* (not into what bluetoothd starts) */
-	say("liba34bt-btd loaded: BlueTool %s, keychain (MobileBluetooth) %s, os_log on the console, exits said",
+	crash_handlers();
+	say("liba34bt-btd loaded: BlueTool %s, keychain (MobileBluetooth) %s, os_log on the console, exits and crashes said",
 	    bluetool_local ? "answered here" : "left to launchd", kc_local ? "kept in " KC_FILE : "left to securityd");
 }
