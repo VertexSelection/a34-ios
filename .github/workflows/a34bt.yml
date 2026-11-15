@@ -1,0 +1,54 @@
+name: a34bt
+
+# Bluetooth on the Galaxy A34 (MT6877 CONNSYS) under iOS 16.7.16, milestone 1 (docs/bluetooth-plan.md):
+# the user-space test tool a34bt (userland/a34bt/build.sh), which talks to the kernel's raw HCI channel
+# (xnu/patches/0939-a34-bt-m1.patch, boot-arg a34bt=1). The artifact "a34bt" holds a34/ (for /a34 on the
+# phone, ad-hoc signed), INSTALL.md and install-firmware.sh. No firmware is built or shipped: the user
+# copies MediaTek's Bluetooth patches from their own phone's vendor partition (install-firmware.sh).
+
+on:
+  push:
+    branches: [bluetooth]
+    paths:
+      - userland/a34bt/**
+      - .github/workflows/a34bt.yml
+  workflow_dispatch:
+
+concurrency:
+  group: a34bt-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_MIN: "16.0"
+  INSTALL_DIR: /a34
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: install-firmware.sh (shell syntax)
+        run: bash -n userland/a34bt/install-firmware.sh
+
+      - name: a34bt (userland/a34bt/build.sh)
+        run: A34BT_OUT="$WORK/a34bt-out" userland/a34bt/build.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: a34bt
+          path: ${{ env.WORK }}/a34bt-out
+          if-no-files-found: error

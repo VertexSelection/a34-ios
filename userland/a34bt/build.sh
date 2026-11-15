@@ -1,0 +1,76 @@
+#!/bin/bash
+# a34bt for the iOS 16 user space (docs/bluetooth-plan.md, milestone 1), built on a Mac with
+# Xcode. Used by .github/workflows/a34bt.yml.
+#
+#   userland/a34bt/build.sh
+#
+# Makes $A34BT_OUT (default $WORK/a34bt-out):
+#   a34/          what goes into /a34 on the phone: a34bt (ad-hoc signed, arm64, iOS $IOS_MIN)
+#   INSTALL.md    how to put it and the firmware there, and the first test
+#   install-firmware.sh
+#   BUILD_INFO.txt, dSYM/ (debug symbols, not for the phone)
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+IOS_MIN=${IOS_MIN:-16.0}
+INSTALL_DIR=${INSTALL_DIR:-/a34}
+WORK=${WORK:-$HERE/work}
+OUT=${A34BT_OUT:-$WORK/a34bt-out}
+BUILD=$WORK/a34bt-build
+A=$OUT/a34
+
+IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+CLANG=$(xcrun -f clang)
+CC=("$CLANG" -target "arm64-apple-ios$IOS_MIN" -isysroot "$IOS_SDK" -std=gnu11 -O2 -g -Wall -Wextra -Werror)
+
+log() { printf '\n=== %s\n' "$*"; }
+
+rm -rf "$BUILD" "$OUT"
+mkdir -p "$BUILD" "$A" "$OUT/dSYM"
+echo "clang: $("$CLANG" --version | head -n 1)"
+echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $IOS_SDK"
+
+log "a34bt (a34bt.c)"
+"${CC[@]}" -o "$A/a34bt" "$HERE/a34bt.c"
+
+log "package"
+mv "$A"/*.dSYM "$OUT/dSYM/" 2>/dev/null || true
+cp "$HERE/INSTALL.md" "$HERE/install-firmware.sh" "$OUT/"
+codesign -f -s - "$A/a34bt"         # (last: nothing changes a load command after this)
+
+log "check"
+bad=0
+f=$A/a34bt
+if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
+	echo "error: a34bt refers to a library outside $INSTALL_DIR and the system"
+	bad=1
+fi
+if otool -l "$f" | grep -E '^ *cmd LC_RPATH$' >/dev/null; then
+	echo "error: a34bt has an LC_RPATH"
+	bad=1
+fi
+[ "$(lipo -archs "$f")" = arm64 ] || { echo "error: a34bt is $(lipo -archs "$f"), not arm64"; bad=1; }
+codesign -v "$f" || { echo "error: a34bt: signature"; bad=1; }
+for s in com.a34.bt.hci kern.a34bt; do
+	strings "$f" | grep -x "$s" >/dev/null || { echo "error: a34bt does not name $s"; bad=1; }
+done
+otool -L "$f"
+[ "$bad" = 0 ] && echo ok
+[ "$bad" = 0 ]
+
+{
+	echo "a34bt: the Galaxy A34's Bluetooth controller from user space (milestone 1), iOS 16.7.16"
+	echo
+	echo "repository:    ${GITHUB_REPOSITORY:-local} ${GITHUB_SHA:-$(git -C "$HERE" rev-parse HEAD 2>/dev/null || echo '?')}"
+	echo "run:           ${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-local}"
+	echo "built:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	echo "install dir:   $INSTALL_DIR (ad-hoc signed)"
+	echo "iPhoneOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version); target arm64-apple-ios$IOS_MIN"
+	echo "kernel:        xnu/patches/0939-a34-bt-m1.patch, boot-arg a34bt=1"
+	echo
+	echo "files (into $INSTALL_DIR):"
+	(cd "$A" && for f in *; do
+		printf '  %-12s %9s  %s\n' "$f" "$(stat -f %z "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)"
+	done)
+} >"$OUT/BUILD_INFO.txt"
+cat "$OUT/BUILD_INFO.txt"
