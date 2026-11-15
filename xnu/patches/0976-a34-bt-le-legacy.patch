@@ -1,0 +1,213 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index bdf2fc7..88e31d4 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -83,6 +83,20 @@
+  * is in that state is answered as done. Also: every status other than 0 the controller gives is said (the first 64),
+  * and when bluetoothd leaves, the last 24 packets of the bridge are said (the full trace stops at a34btbrlog).
+  *
++ * A34 (0976): legacy and extended LE commands. Boot 0975-modes120-a (TX through the AP DMA: "long frames (AP DMA):
++ * ... whole"): 712 again, and 0975's new lines name it: bluetoothd's first LE_Set_Scan_Parameters of each run
++ * (01 0b 20 07 00 e0 01 30 00 01 00) answered 0x0C, with nothing scanning (a34bt's scan ended at bluetoothd's
++ * HCI_Reset; no enable after it). The one LE command between that reset and the refusal that the Core specification
++ * counts among the extended advertising commands is bluetoothd's LE_Read_Periodic_Advertiser_List_Size (0x204A) in
++ * its HCI init; a controller that has seen one (since the last reset) refuses the legacy advertising, scanning and
++ * connection commands with Command Disallowed (Vol 4 Part E 3.1.1). a34bt's own LE_Set_Scan_Parameters, with no
++ * 0x204A before it, was taken. So 0x204A is answered here (16 entries, the MT6635's own answer in boots 0994 and
++ * 0975) and never reaches the controller, which stays in legacy mode -- LE_Create_Connection, needed to pair, is a
++ * legacy command too. Should 0x200B be refused all the same (and not scanning), bluetoothd's scanning is carried by
++ * the extended commands from then on: LE_Set_Scan_Parameters and LE_Set_Scan_Enable sent as their extended forms
++ * (1M PHY), their answers given back under the legacy opcodes, and extended advertising reports of legacy PDUs
++ * given to bluetoothd as legacy reports.
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1621,11 +1635,17 @@ br_standard_here(const uint8_t *cmd, uint32_t n)
+ 	if (op == 0x0c5a) {
+ 		ev[2] = 5;                                      /* Read_Default_Erroneous_Data_Reporting: mode 0 (off) */
+ 		len = 8;
++	} else if (op == 0x204a) {
++		ev[2] = 5;                                      /* (0976) LE_Read_Periodic_Advertiser_List_Size: 16 */
++		ev[7] = 16;
++		len = 8;
+ 	} else if (op != 0x0c5b && op != 0x0c84) {
+ 		return false;
+ 	}
+ 	if (said++ < 16) {
+-		printf("A34 BT: br: command %04x (%u bytes) answered here: the controller does not have it\n", op, n - 4);
++		printf("A34 BT: br: command %04x (%u bytes) answered here: %s\n", op, n - 4, op == 0x204a ?
++		    "an extended command, which would make the controller refuse legacy LE commands" :
++		    "the controller does not have it");
+ 	}
+ 	br_dump("br=", ev, len);
+ 	bt_deliver(ev, len);
+@@ -1732,6 +1752,128 @@ br_scan_event(uint8_t *p, uint32_t n)
+ 	}
+ }
+ 
++/*
++ * (0976) bluetoothd's legacy scanning carried by the extended commands, once the controller has refused
++ * LE_Set_Scan_Parameters while not scanning: the commands rewritten on the way out, their answers and the
++ * advertising reports on the way back.
++ */
++static bool br_xl;                              /* scanning goes through the extended commands */
++static uint16_t br_xl_from, br_xl_to;           /* a rewritten command in flight: its legacy and extended opcodes */
++static uint8_t br_xl_params[7];                 /* bluetoothd's last LE_Set_Scan_Parameters */
++
++/* pkt (a legacy scan command) as its extended form into out; its length, or 0 when it is not one */
++static uint32_t
++br_xl_command(const uint8_t *pkt, uint32_t n, uint8_t *out)
++{
++	uint16_t op = (uint16_t)(pkt[1] | (pkt[2] << 8));
++
++	if (op == 0x200b && n >= 11) {          /* type, interval, window, own address type, filter policy */
++		const uint8_t o[12] = { 0x01, 0x41, 0x20, 8, pkt[9], pkt[10], 0x01, pkt[4], pkt[5], pkt[6], pkt[7], pkt[8] };
++
++		memcpy(out, o, sizeof(o));
++		return sizeof(o);
++	}
++	if (op == 0x200c && n >= 6) {           /* enable, filter duplicates; no duration, no period */
++		const uint8_t o[10] = { 0x01, 0x42, 0x20, 6, pkt[4], pkt[5], 0, 0, 0, 0 };
++
++		memcpy(out, o, sizeof(o));
++		return sizeof(o);
++	}
++	return 0;
++}
++
++/* LE_Set_Scan_Parameters refused while not scanning: the same through LE_Set_Extended_Scan_Parameters */
++static bool
++br_xl_start(void)
++{
++	static uint8_t ans[BT_PKT_MAX];
++	uint8_t legacy[11] = { 0x01, 0x0b, 0x20, 7 }, ext[12];
++	uint32_t got;
++
++	memcpy(legacy + 4, br_xl_params, sizeof(br_xl_params));
++	(void)br_xl_command(legacy, sizeof(legacy), ext);
++	got = bt_command(ext, sizeof(ext), 0x0e, ans, 500);
++	printf("A34 BT: br: LE_Set_Scan_Parameters refused while not scanning; LE_Set_Extended_Scan_Parameters %s\n",
++	    got >= 7 && ans[6] == 0 ? "taken: bluetoothd's scanning goes through the extended commands from now on" :
++	    "refused too");
++	return got >= 7 && ans[6] == 0;
++}
++
++/* an LE Extended Advertising Report as a legacy one (its legacy PDUs only); the new length, 0 if none is left */
++static uint32_t
++br_xl_report(uint8_t *p, uint32_t n)
++{
++	static uint8_t out[BT_PKT_MAX];
++	uint32_t at = 5, o = 5, kept = 0, count = n > 4 ? p[4] : 0;
++
++	for (uint32_t i = 0; i < count && at + 24 <= n; i++) {
++		uint32_t type = (uint32_t)(p[at] | (p[at + 1] << 8)), dl = p[at + 23];
++		int legacy = -1;
++
++		if (at + 24 + dl > n) {
++			break;
++		}
++		switch (type & 0x7f) {
++		case 0x13: legacy = 0; break;   /* ADV_IND */
++		case 0x15: legacy = 1; break;   /* ADV_DIRECT_IND */
++		case 0x12: legacy = 2; break;   /* ADV_SCAN_IND */
++		case 0x10: legacy = 3; break;   /* ADV_NONCONN_IND */
++		case 0x1b:                      /* SCAN_RSP to ADV_IND */
++		case 0x1a: legacy = 4; break;   /* SCAN_RSP to ADV_SCAN_IND */
++		default: break;
++		}
++		if (legacy >= 0 && dl <= 31 && o + 10 + dl <= 3 + 255) {
++			out[o++] = (uint8_t)legacy;
++			out[o++] = p[at + 2];                           /* address type */
++			memcpy(out + o, p + at + 3, 6);                 /* address */
++			o += 6;
++			out[o++] = (uint8_t)dl;
++			memcpy(out + o, p + at + 24, dl);
++			o += dl;
++			out[o++] = p[at + 13];                          /* RSSI */
++			kept++;
++		}
++		at += 24 + dl;
++	}
++	if (kept == 0) {
++		return 0;
++	}
++	out[0] = 0x04;
++	out[1] = 0x3e;
++	out[2] = (uint8_t)(o - 3);
++	out[3] = 0x02;
++	out[4] = (uint8_t)kept;
++	memcpy(p, out, o);
++	return o;
++}
++
++/* (0976) an event before bluetoothd sees it: the translation's side. The length to deliver, 0 to drop it. */
++static uint32_t
++br_xl_event(uint8_t *p, uint32_t n)
++{
++	uint16_t op;
++
++	if (n >= 5 && p[0] == 0x04 && p[1] == 0x3e && p[3] == 0x0d) {
++		return br_xl ? br_xl_report(p, n) : n;
++	}
++	if (n < 7 || p[0] != 0x04 || p[1] != 0x0e) {
++		return n;
++	}
++	op = (uint16_t)(p[4] | (p[5] << 8));
++	if (br_xl_to != 0 && op == br_xl_to) {                  /* the answer under bluetoothd's opcode */
++		p[4] = (uint8_t)br_xl_from;
++		p[5] = (uint8_t)(br_xl_from >> 8);
++		br_xl_to = 0;
++	} else if (op == 0x200b && p[6] == 0x0c && !br_xl && !br_scan.on && br_xl_start()) {
++		br_xl = true;
++		p[6] = 0;
++	} else if (op == 0x0c03 && p[6] == 0) {                 /* HCI_Reset: legacy again */
++		br_xl = false;
++		br_xl_to = 0;
++	}
++	return n;
++}
++
+ /*
+  * (0974) When long frames do not get through (bt_long_setup): a command over 16 bytes answered here, Command
+  * Complete with status 0 (and LE_Set_Extended_Advertising_Parameters' selected TX power, 0 dBm); data dropped.
+@@ -1841,6 +1983,20 @@ br_drain(void)
+ 			br_long_here(pkt, n);
+ 			continue;
+ 		}
++		if (pkt[0] == 0x01 && n >= 11 && pkt[1] == 0x0b && pkt[2] == 0x20) {
++			memcpy(br_xl_params, pkt + 4, sizeof(br_xl_params));   /* (0976) for br_xl_start */
++		}
++		if (br_xl && pkt[0] == 0x01) {                         /* (0976) legacy scanning as extended */
++			uint8_t ext[12];
++			uint32_t m = br_xl_command(pkt, n, ext);
++
++			if (m != 0) {
++				br_xl_from = (uint16_t)(pkt[1] | (pkt[2] << 8));
++				br_xl_to = (uint16_t)(ext[1] | (ext[2] << 8));
++				memcpy(pkt, ext, m);
++				n = m;
++			}
++		}
+ 		br_scan_command(pkt, n);                               /* (0975) scanning off around it, if need be */
+ 		br_dump("br>", pkt, n);
+ 		if (bt_btif_write(pkt, n) == 0 && pkt[0] == 0x01) {
+@@ -2337,10 +2493,15 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 			}
+ 			if (bt_level >= 2) {
+ 				br_scan_event(a, n);                    /* (0975) */
+-				br_quirks(a, n);
+-				a34_btsk_deliver(a, n);
++				n = br_xl_event(a, n);                  /* (0976) */
++				if (n != 0) {
++					br_quirks(a, n);
++					a34_btsk_deliver(a, n);
++				}
++			}
++			if (n != 0) {
++				bt_deliver(a, n);
+ 			}
+-			bt_deliver(a, n);
+ 		}
+ 		if (bt_level >= 2) {
+ 			br_le_say();
