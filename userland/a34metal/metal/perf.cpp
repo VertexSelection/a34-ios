@@ -281,9 +281,11 @@ rwm_perf_report(uint64_t now)
 					 b->trace_answer == 0 ? "asked" : b->trace_answer < 0 ? "not asked" : "refused");
 				say(wide);
 			}
-			snprintf(line, sizeof(line), "rwm burst: %u buffers in %.1f ms; %u commits more than 8.4 ms after the one "
-				 "before; %u whose GPU work ended more than 8.33 ms after their commit", rwm_burst_n,
-				 rwm_burst_n ? (rwm_burst[rwm_burst_n - 1].run_end - t0) / 1e6 : 0.0, over, gpu_over);
+			snprintf(line, sizeof(line), "rwm burst: %u buffers in %.1f ms from %llu us (mach_absolute_time, the "
+				 "kernel's clock); %u commits more than 8.4 ms after the one before; %u whose GPU work ended more "
+				 "than 8.33 ms after their commit", rwm_burst_n,
+				 rwm_burst_n ? (rwm_burst[rwm_burst_n - 1].run_end - t0) / 1e6 : 0.0, (unsigned long long)(t0 / 1000),
+				 over, gpu_over);
 			say(line);
 			rwm_burst_ready = false;
 			armed = false;
