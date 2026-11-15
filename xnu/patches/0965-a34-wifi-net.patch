@@ -11,7 +11,7 @@ index a939ee2..79c5c35 100644
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_goodix_spi.c		standard
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
-index 0fba26b..5698910 100644
+index d87cdb4..398efc0 100644
 --- a/bsd/dev/a34_wifi.c
 +++ b/bsd/dev/a34_wifi.c
 @@ -21,6 +21,8 @@

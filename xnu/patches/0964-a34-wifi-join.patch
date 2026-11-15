@@ -11,7 +11,7 @@ index 70c2540..a939ee2 100644
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_goodix_spi.c		standard
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
-index 076e5c5..0fba26b 100644
+index 076e5c5..d87cdb4 100644
 --- a/bsd/dev/a34_wifi.c
 +++ b/bsd/dev/a34_wifi.c
 @@ -17,6 +17,10 @@
@@ -921,18 +921,18 @@ index 076e5c5..0fba26b 100644
 +static void
 +a34w_report_in(const uint8_t *r, uint32_t count)
 +{
-+	uint32_t dw0, dw1, version, tokens, done = 0;
++	uint32_t dw0, dw1, form, tokens, done = 0;
 +
 +	if (count < 8u) {
 +		return;
 +	}
 +	memcpy(&dw0, r, 4);
 +	memcpy(&dw1, r + 4, 4);
-+	version = (dw1 >> 16) & 7u;
-+	tokens = version == 3u ? (dw0 >> 16) & 0x3ffu : (dw0 >> 16) & 0x7fu;
-+	if (a34w_report_version != version) {
-+		a34w_report_version = version;
-+		a34w_say("TX ring 0: the first token report: version %u, %u tokens, words 0x%08x 0x%08x 0x%08x", version,
++	form = (dw1 >> 16) & 7u;                        /* the report's version (TFD_EVT_VER_*) */
++	tokens = form == 3u ? (dw0 >> 16) & 0x3ffu : (dw0 >> 16) & 0x7fu;
++	if (a34w_report_version != form) {
++		a34w_report_version = form;
++		a34w_say("TX ring 0: the first token report: version %u, %u tokens, words 0x%08x 0x%08x 0x%08x", form,
 +		    tokens, dw0, dw1, count >= 12u ? a34w_le32(r + 8) : 0u);
 +	}
 +	a34w_reports++;
@@ -940,11 +940,11 @@ index 076e5c5..0fba26b 100644
 +	for (uint32_t i = 0; done < tokens && 8u + 4u * i + 4u <= count; i++) {
 +		uint32_t w = a34w_le32(r + 8u + 4u * i), token;
 +
-+		if (version == 0u) {
++		if (form == 0u) {
 +			token = (a34w_le32(r + 8u + 4u * (i >> 1)) >> (16u * (i & 1u))) & 0xffffu;
-+		} else if (version == 1u) {
++		} else if (form == 1u) {
 +			token = w & 0xffffu;
-+		} else if (version == 2u) {
++		} else if (form == 2u) {
 +			token = w & 0x7fffu;
 +		} else if ((w & (1u << 31)) != 0) {
 +			continue;                       /* (a rate word, not a token) */
@@ -1640,18 +1640,18 @@ index 076e5c5..0fba26b 100644
 +static void
 +a34w_service(void)
 +{
-+	static uint64_t said_at, said_total;
++	static uint64_t said_at, said_moved;
 +	uint8_t body[16], seen = 0;
-+	uint64_t total;
++	uint64_t moved;
 +
 +	for (uint32_t i = 0; i < 16u && a34w_pump(EVENT_NONE, 0, body, sizeof(body), &seen) != -1; i++) {
 +	}
 +	for (uint32_t i = 0; i < 8u && a34w_data_poll(); i++) {
 +	}
-+	total = a34w_data_frames_in + a34w_data_frames_out + a34w_data_dropped_in + a34w_data_dropped_out;
-+	if (a34w_ms() - said_at >= 30000u && total != said_total) {
++	moved = a34w_data_frames_in + a34w_data_frames_out + a34w_data_dropped_in + a34w_data_dropped_out;
++	if (a34w_ms() - said_at >= 30000u && moved != said_moved) {
 +		said_at = a34w_ms();
-+		said_total = total;
++		said_moved = moved;
 +		a34w_say("carried: %llu frames out (%llu bytes), %llu in (%llu bytes); dropped %llu out, %llu in; tokens back %u",
 +		    (unsigned long long)a34w_data_frames_out, (unsigned long long)a34w_data_bytes_out,
 +		    (unsigned long long)a34w_data_frames_in, (unsigned long long)a34w_data_bytes_in,

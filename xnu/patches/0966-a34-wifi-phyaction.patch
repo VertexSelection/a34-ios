@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
-index 5698910..cb70e99 100644
+index 398efc0..78ba13d 100644
 --- a/bsd/dev/a34_wifi.c
 +++ b/bsd/dev/a34_wifi.c
 @@ -23,6 +23,8 @@
