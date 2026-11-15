@@ -3220,10 +3220,10 @@ index 0000000..8c9615f
 +#endif
 diff --git a/bsd/dev/a34_cellfs.c b/bsd/dev/a34_cellfs.c
 new file mode 100644
-index 0000000..afbc021
+index 0000000..8910512
 --- /dev/null
 +++ b/bsd/dev/a34_cellfs.c
-@@ -0,0 +1,1347 @@
+@@ -0,0 +1,1368 @@
 +/*
 + * A34 (0951): the modem's file server, in the kernel and read only.
 + *
@@ -3634,12 +3634,16 @@ index 0000000..afbc021
 +} cnt;
 +static uint32_t verbose_left = 400;
 +
++static uint32_t mdtrace_on, mdtrace_fsop;      /* defined with the trace code below */
++
 +void
 +a34_cellfs_report(void)
 +{
 +	printf("A34 CELL FS: %u requests: %u opens (%u not found), %u reads (%llu bytes), %llu bytes written to RAM in %u files, %u refused, %u errors; overlay %u KiB\n",
 +	    cnt.ops, cnt.opens, cnt.open_missing, cnt.reads, cnt.read_bytes, cnt.write_bytes, cnt.written_files,
 +	    cnt.refused, cnt.errors, ov_bytes >> 10);
++	if (mdtrace_on == 1)
++		printf("A34 CELL MDTRACE: %u file-operation lines skipped so far\n", mdtrace_fsop);
 +}
 +
 +/* ---- operations ---- */
@@ -3725,7 +3729,8 @@ index 0000000..afbc021
 +/* ---- the modem's own boot trace text (a34cellmdtrace=1) ---- */
 +
 +static uint32_t mdtrace_on = 2;         /* 2: boot-arg not read yet */
-+static uint32_t mdtrace_left = 48u << 10;
++static uint32_t mdtrace_left = 128u << 10;
++/* mdtrace_fsop: the modem's own FS_OP trace lines, counted, not logged */
 +
 +static bool
 +is_hexch(char c)
@@ -3760,6 +3765,17 @@ index 0000000..afbc021
 +	}
 +}
 +
++static bool
++has_fsop(const char *s, uint32_t n)
++{
++	static const char pat[] = "[OP:FS_OP_";
++	const uint32_t m = sizeof(pat) - 1;
++	for (uint32_t i = 0; i + m <= n; i++)
++		if (memcmp(s + i, pat, m) == 0)
++			return true;
++	return false;
++}
++
 +static void
 +mdtrace(const char *key, const uint8_t *d, uint32_t len)
 +{
@@ -3780,17 +3796,22 @@ index 0000000..afbc021
 +			continue;
 +		}
 +		if (n >= 4) {
-+			mdtrace_mask(line, n);
 +			line[n] = 0;
-+			printf("A34 CELL MDTRACE: %c %s\n", key[0], line);
-+			mdtrace_left = mdtrace_left > n ? mdtrace_left - n : 0;
++			if (has_fsop(line, n)) {
++				mdtrace_fsop++;
++			} else {
++				mdtrace_mask(line, n);
++				printf("A34 CELL MDTRACE: %c %s\n", key[0], line);
++				mdtrace_left = mdtrace_left > n ? mdtrace_left - n : 0;
++			}
 +		}
 +		n = 0;
 +		if (pr)
 +			line[n++] = (char)d[i];
 +	}
 +	if (!mdtrace_left)
-+		printf("A34 CELL MDTRACE: (48 KiB logged; the rest is not)\n");
++		printf("A34 CELL MDTRACE: (128 KiB logged, %u file-operation lines skipped; the rest is not)\n",
++		    mdtrace_fsop);
 +}
 +
 +static int32_t
