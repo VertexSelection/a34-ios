@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..c4aaa87
+index 0000000..2dfdad2
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1581 @@
+@@ -0,0 +1,1624 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -63,6 +63,17 @@ index 0000000..c4aaa87
 +#include "a34_ccci.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/*
++ * Shared memory is mapped out of kernel_map (ml_io_map_unmappable), never the 8 MiB io_submap
++ * ml_io_map uses: io_map() allocates with KMA_NOFAIL, so a region that does not fit there panics
++ * (0996-cell3: a 7 MiB region). Regions kept mapped are at most CC_MAP_MAX; larger ones are only
++ * ever touched through CC_WIN windows, unmapped again (ml_io_unmap) right after.
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++#define CC_WIMG_IO      0x7u            /* VM_WIMG_IO: device memory, as ml_io_map */
++#define CC_MAP_MAX      (1u << 20)
++#define CC_WIN          (1u << 20)
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
 +extern bool a34_cell_lk_tag(const char *name, const uint8_t **data, uint32_t *len);
@@ -379,9 +390,39 @@ index 0000000..c4aaa87
 +static vm_offset_t
 +rva(int id)
 +{
-+	if (!rg[id].va && rg[id].size && rg[id].ap)
-+		rg[id].va = ml_io_map((vm_offset_t)rg[id].ap, ((vm_size_t)rg[id].size + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++	if (!rg[id].va && rg[id].size && rg[id].ap) {
++		uint64_t page = rg[id].ap & ~(uint64_t)PAGE_MASK;
++		vm_size_t len = ((vm_size_t)(rg[id].ap - page) + rg[id].size + PAGE_MASK) & ~(vm_size_t)PAGE_MASK;
++		if (len > CC_MAP_MAX) {
++			printf("A34 CELL: smem %d (%u bytes) is too large to keep mapped; not mapped\n", id,
++			    rg[id].size);
++			return 0;
++		}
++		vm_offset_t m = ml_io_map_unmappable((vm_offset_t)page, len, CC_WIMG_IO);
++		if (m)
++			rg[id].va = m + (vm_offset_t)(rg[id].ap - page);
++	}
 +	return rg[id].va;
++}
++
++/* Zero physical [pa, pa + len) through CC_WIN windows, each unmapped after use. */
++static bool
++pa_zero(uint64_t pa, uint32_t len)
++{
++	while (len >= 4) {
++		uint64_t page = pa & ~(uint64_t)PAGE_MASK;
++		uint32_t off = (uint32_t)(pa - page);
++		uint32_t n = len < CC_WIN - off ? len : CC_WIN - off;
++		vm_size_t mlen = ((vm_size_t)off + n + PAGE_MASK) & ~(vm_size_t)PAGE_MASK;
++		vm_offset_t m = ml_io_map_unmappable((vm_offset_t)page, mlen, CC_WIMG_IO);
++		if (!m)
++			return false;
++		dm_zero(m, off, n & ~3u);
++		ml_io_unmap(m, mlen);
++		pa += n;
++		len -= n;
++	}
++	return true;
 +}
 +
 +/* ---- rings ---- */
@@ -1285,10 +1326,12 @@ index 0000000..c4aaa87
 +		for (size_t j = 0; j < i; j++)
 +			if (rg[clear_first[j]].ap == rg[id].ap && rg[clear_first[j]].size == rg[id].size)
 +				dup = true;
-+		vm_offset_t va = dup ? 0 : rva(id);
-+		if (!va)
++		if (dup)
 +			continue;
-+		dm_zero(va, 0, rg[id].size & ~3u);
++		if (!pa_zero(rg[id].ap, rg[id].size)) {
++			printf("A34 CELL: smem %d: no mapping to clear it; clearing stopped\n", id);
++			break;
++		}
 +		n++;
 +		kib += rg[id].size >> 10;
 +	}
@@ -1650,10 +1693,10 @@ index 0000000..c4d51a4
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..22c93f7
+index 0000000..f971be5
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,973 @@
+@@ -0,0 +1,1005 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -1706,6 +1749,10 @@ index 0000000..22c93f7
 +#include <libkern/libkern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* LK's tag table and device tree are read through temporary kernel_map mappings (not the
++ * 8 MiB io_submap, where a failed allocation panics), unmapped once copied. */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
 +/* bsd/dev/sweet_ufs.c (A34 0950) */
@@ -1846,6 +1893,23 @@ index 0000000..22c93f7
 + * shared-memory layout (smem_layout, nc/c_smem_layout*, md_mpu_inf, ...) that the kernel's
 + * start sequence needs. Small values are printed in hex; nothing in them is an identity.
 + */
++/* Map [pa, pa + len) temporarily: *base/*mlen are what ac_unmap_tmp takes back. */
++static vm_offset_t
++ac_map_tmp(uint64_t pa, uint32_t len, vm_offset_t *base, vm_size_t *mlen)
++{
++	uint64_t page = pa & ~(uint64_t)PAGE_MASK;
++	*mlen = ((vm_size_t)(pa - page) + len + PAGE_MASK) & ~(vm_size_t)PAGE_MASK;
++	*base = ml_io_map_unmappable((vm_offset_t)page, *mlen, 0x7u /* VM_WIMG_IO */);
++	return *base ? *base + (vm_offset_t)(pa - page) : 0;
++}
++
++static void
++ac_unmap_tmp(vm_offset_t base, vm_size_t mlen)
++{
++	if (base)
++		ml_io_unmap(base, mlen);
++}
++
 +static void
 +ac_lk_tags(void)
 +{
@@ -1853,17 +1917,21 @@ index 0000000..22c93f7
 +
 +	if (ac_tag_base == 0 || size == 0 || size > 0x10000 || ac_tag_count > 256)
 +		return;
-+	vm_offset_t m = ml_io_map((vm_offset_t)ac_tag_base, ((vm_size_t)size + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++	vm_offset_t mb = 0;
++	vm_size_t ml = 0;
++	vm_offset_t m = ac_map_tmp(ac_tag_base, size, &mb, &ml);
 +	uint8_t *t = kalloc_data(size + 4, Z_WAITOK | Z_ZERO);
 +	if (!m || !t) {
 +		if (t)
 +			kfree_data(t, size + 4);
++		ac_unmap_tmp(mb, ml);
 +		return;
 +	}
 +	for (uint32_t o = 0; o + 4 <= size; o += 4) {
 +		uint32_t w = ac_rd32(m, o);
 +		memcpy(t + o, &w, 4);
 +	}
++	ac_unmap_tmp(mb, ml);
 +	uint32_t namelen = ac_tag_version >= 2 ? 64 : 16, cur = 0;
 +	for (uint32_t i = 0; i < ac_tag_count && cur + namelen + 12 <= size; i++) {
 +		char name[68];
@@ -1941,7 +2009,9 @@ index 0000000..22c93f7
 +				memcpy(&ac_xnu_size, pv, 8);
 +		}
 +	}
-+	vm_offset_t m = ml_io_map((vm_offset_t)pa, PAGE_SIZE);
++	vm_offset_t hb = 0;
++	vm_size_t hl = 0;
++	vm_offset_t m = ac_map_tmp(pa, 40, &hb, &hl);
 +	if (!m) {
 +		printf("A34 CELL: LK FDT 0x%llx: no mapping\n", pa);
 +		return;
@@ -1950,6 +2020,7 @@ index 0000000..22c93f7
 +		uint32_t w = ac_rd32(m, (uint32_t)(4 * i));
 +		memcpy(hdr + 4 * i, &w, 4);
 +	}
++	ac_unmap_tmp(hb, hl);
 +	uint32_t magic = be32(hdr), total = be32(hdr + 4), off_struct = be32(hdr + 8);
 +	uint32_t off_strings = be32(hdr + 12), size_strings = be32(hdr + 32), size_struct = be32(hdr + 36);
 +	if (magic != 0xd00dfeedu || total < 64 || total > AC_FDT_MAX ||
@@ -1959,18 +2030,22 @@ index 0000000..22c93f7
 +		AC_NOTE("lkfdt=none");
 +		return;
 +	}
-+	vm_offset_t all = ml_io_map((vm_offset_t)pa, ((vm_size_t)total + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++	vm_offset_t ab = 0;
++	vm_size_t al = 0;
++	vm_offset_t all = ac_map_tmp(pa, total, &ab, &al);
 +	uint8_t *f = kalloc_data(total, Z_WAITOK);
 +	if (!all || !f) {
 +		printf("A34 CELL: LK FDT: no memory for %u bytes\n", total);
 +		if (f)
 +			kfree_data(f, total);
++		ac_unmap_tmp(ab, al);
 +		return;
 +	}
 +	for (uint32_t o = 0; o + 4 <= total; o += 4) {
 +		uint32_t w = ac_rd32(all, o);   /* aligned 32-bit reads only: it is mapped as device */
 +		memcpy(f + o, &w, 4);
 +	}
++	ac_unmap_tmp(ab, al);
 +	printf("A34 CELL: LK device tree at 0x%llx, %u bytes\n", pa, total);
 +
 +	/* Walk the structure block: /chosen props, /reserved-memory children, and any node's
