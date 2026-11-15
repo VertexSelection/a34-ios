@@ -1005,8 +1005,12 @@ rw_trace_install(Class cls)
 					BOOL answer = ((BOOL(*)(id, SEL, uint64_t, uint64_t, uint64_t))orig)(me, sel, a, b, c);
 
 					if (!rw_trace_said(keep, args ? a : 0)) {
-						rw_print("caps: -[device %s%s%llu] = %s\n", keep, args ? " " : "",
-							 args ? (unsigned long long)a : 0ull, answer ? "YES" : "NO");
+						if (args) {
+							rw_print("caps: -[device %s %llu] = %s\n", keep, (unsigned long long)a,
+								 answer ? "YES" : "NO");
+						} else {
+							rw_print("caps: -[device %s] = %s\n", keep, answer ? "YES" : "NO");
+						}
 					}
 					return answer;
 				};
@@ -1016,8 +1020,12 @@ rw_trace_install(Class cls)
 														     c);
 
 					if (!rw_trace_said(keep, args ? a : 0)) {
-						rw_print("caps: -[device %s%s%llu] = %llu\n", keep, args ? " " : "",
-							 args ? (unsigned long long)a : 0ull, (unsigned long long)answer);
+						if (args) {
+							rw_print("caps: -[device %s %llu] = %llu\n", keep, (unsigned long long)a,
+								 (unsigned long long)answer);
+						} else {
+							rw_print("caps: -[device %s] = %llu\n", keep, (unsigned long long)answer);
+						}
 					}
 					return answer;
 				};
