@@ -1,0 +1,488 @@
+Darwin: where panfrost's processor time goes, in a process that draws through Metal.
+
+A34 (local to this port; nothing here goes upstream). Counters and timers in panfrost's draw
+path, batch handling and buffer allocation, kept only when redwood_pan_metal is set (air_metal.c
+sets it when it opens its device); a process that only uses OpenGL ES times and counts nothing.
+The slots are named in src/compiler/air/redwood_pan_prof.h (userland/mesa/air), read and
+cleared by air_metal.c (rwa_pan_profile) for the plug-in's camprof ("rwm pan" lines):
+
+- the parts of a draw: prepare_draw, the vertex count and index buffer, update_state_3d
+  (depth/stencil, blend, vertex), update_shader_state (textures, samplers, shader and varying
+  descriptors, uniform buffers and push constants, images and storage buffers), launch_draw;
+  draws that found no current batch (all state dirty);
+- batches begun, pools' new backing buffers, panfrost_bo_create and those of them not from
+  Mesa's cache, batches submitted from inside a draw for an access to what they use;
+- batches submitted with work and empty, and why each with work was submitted (panfrost's own
+  reason strings, set around the submission by whoever asked for it).
+- once, at the first batch: what 4 KB of stores, a memcpy and loads cost in a batch pool's
+  memory against malloc's (redwood_pan_memtest) -- every descriptor of a draw is written there.
+
+One change of behaviour, in a Metal process only: panfrost_flush_all_batches submits the batches
+there are, and no longer begins the compute batch and the current framebuffer's render batch
+when there are none only to submit them empty (two of the three batches of every flush on a pass
+switch were such in boot 68).
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -18,10 +18,63 @@
+ #include "pan_trace.h"
+ #include "pan_util.h"
+ #include "util/os_time.h"
++#include <string.h>
++#include "compiler/air/redwood_pan_prof.h"
+ 
+ #define foreach_batch(ctx, idx)                                                \
+    BITSET_FOREACH_SET(idx, ctx->batches.active, PAN_MAX_BATCHES)
+ 
++/* A34 (patch 0011): what stores and loads cost in a batch pool's memory against malloc's, once
++ * per Metal process, at its first batch (redwood_pan_prof.h, redwood_pan_memtest). The pool's
++ * buffer is fresh: nothing has been allocated from it yet, and what is written here is written
++ * over by the descriptors that will be. */
++uint64_t redwood_pan_memtest[RWP_MEM_SLOTS];
++static volatile uint32_t redwood_pan_memtest_sink;
++
++static void
++redwood_pan_measure_memory(struct panfrost_pool *pool)
++{
++   static bool done;
++
++   if (done || !redwood_pan_metal || !pool->transient_bo || !pool->transient_bo->ptr.cpu ||
++       panfrost_bo_size(pool->transient_bo) < 8192)
++      return;
++   done = true;
++
++   uint32_t *ram = malloc(8192), *src = malloc(4096);
++   if (!ram || !src) {
++      free(ram);
++      free(src);
++      return;
++   }
++   memset(ram, 0, 8192);
++   memset(src, 0x5a, 4096);
++   volatile uint32_t *where[2] = { (volatile uint32_t *)pool->transient_bo->ptr.cpu,
++                                   (volatile uint32_t *)ram };
++   for (unsigned m = 0; m < 2; m++) {
++      volatile uint32_t *w = where[m];
++      uint32_t sum = 0;
++
++      for (unsigned i = 0; i < 2048; i++)   /* first touch, not timed */
++         w[i] = 0;
++      uint64_t t0 = os_time_get_nano();
++      for (unsigned i = 0; i < 1024; i++)
++         w[i] = i * 2654435761u;
++      uint64_t t1 = os_time_get_nano();
++      memcpy((void *)(w + 1024), src, 4096);
++      uint64_t t2 = os_time_get_nano();
++      for (unsigned i = 0; i < 1024; i++)
++         sum += w[i];
++      uint64_t t3 = os_time_get_nano();
++      redwood_pan_memtest_sink = sum;
++      redwood_pan_memtest[m ? RWP_MEM_RAM_STORE : RWP_MEM_POOL_STORE] = t1 - t0;
++      redwood_pan_memtest[m ? RWP_MEM_RAM_COPY : RWP_MEM_POOL_COPY] = t2 - t1;
++      redwood_pan_memtest[m ? RWP_MEM_RAM_LOAD : RWP_MEM_POOL_LOAD] = t3 - t2;
++   }
++   free(ram);
++   free(src);
++}
++
+ #define foreach_render_batch(ctx, idx)                                         \
+    BITSET_FOREACH_SET(idx, ctx->batches.active, PAN_MAX_RENDER_BATCHES)
+ 
+@@ -65,6 +118,7 @@
+    struct pipe_screen *pscreen = ctx->base.screen;
+    struct panfrost_screen *screen = pan_screen(pscreen);
+    struct panfrost_device *dev = &screen->dev;
++   uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
+ 
+    batch->type = type;
+    batch->ctx = ctx;
+@@ -75,6 +129,7 @@
+    if (panfrost_pool_init(&batch->pool, NULL, dev, 0, 65536, "Batch pool",
+                           true, true))
+       return -1;
++   redwood_pan_measure_memory(&batch->pool);
+ 
+    /* Don't preallocate the invisible pool, since not every batch will use
+     * the pre-allocation, particularly if the varyings are larger than the
+@@ -101,7 +156,10 @@
+ 
+    BITSET_SET(ctx->batches.active, panfrost_batch_idx(batch));
+ 
+-   return screen->vtbl.init_batch(batch);
++   int ret = screen->vtbl.init_batch(batch);
++   rwp_count(RWP_BATCH_INITS);
++   rwp_lap(RWP_BATCH_INIT_NS, &rwp_t);
++   return ret;
+ }
+ 
+ static void
+@@ -178,7 +236,10 @@
+    /* The selected slot is used, we need to flush the batch */
+    if (batch->seqnum) {
+       perf_debug(ctx, "Flushing batch due to seqnum overflow");
++      const char *rwp_why = redwood_pan_why;
++      redwood_pan_why = "all batch slots in use";
+       panfrost_batch_submit(ctx, batch);
++      redwood_pan_why = rwp_why;
+    }
+ 
+    if (panfrost_batch_init(ctx, batch, PANFROST_BATCH_RENDER)) {
+@@ -215,6 +276,7 @@
+    /* Make the batch current. */
+    ctx->batch[PANFROST_BATCH_RENDER] = batch;
+    panfrost_dirty_state_all(ctx);
++   rwp_count(RWP_REBINDS);
+    return batch;
+ }
+ 
+@@ -235,7 +297,10 @@
+ 
+    if (batch->draw_count + batch->compute_count > 0) {
+       perf_debug(ctx, "Flushing the current FBO due to: %s", reason);
++      const char *rwp_why = redwood_pan_why;
++      redwood_pan_why = reason;
+       panfrost_batch_submit(ctx, batch);
++      redwood_pan_why = rwp_why;
+       batch = find_best_render_batch(ctx);
+       if (!batch)
+          return NULL;
+@@ -293,8 +358,14 @@
+    struct panfrost_batch *writer = entry ? entry->data : NULL;
+ 
+    /* Both reads and writes flush the existing writer */
+-   if (writer != NULL && writer != batch)
++   const char *rwp_why = redwood_pan_why;
++   if (writer != NULL && writer != batch) {
++      uint64_t rwp_t = rwp_now();
++      redwood_pan_why = "an access to what another batch writes";
+       panfrost_batch_submit(ctx, writer);
++      rwp_count(RWP_DEP_FLUSHES);
++      rwp_lap(RWP_DEP_FLUSH_NS, &rwp_t);
++   }
+ 
+    /* Writes (only) flush readers too */
+    if (writes) {
+@@ -307,10 +378,16 @@
+          struct panfrost_batch *other_batch = &ctx->batches.slots[i];
+ 
+          /* Submit if it's a user */
+-         if (panfrost_batch_uses_resource(other_batch, rsrc))
++         if (panfrost_batch_uses_resource(other_batch, rsrc)) {
++            uint64_t rwp_t = rwp_now();
++            redwood_pan_why = "a write to what another batch uses";
+             panfrost_batch_submit(ctx, other_batch);
++            rwp_count(RWP_DEP_FLUSHES);
++            rwp_lap(RWP_DEP_FLUSH_NS, &rwp_t);
++         }
+       }
+    }
++   redwood_pan_why = rwp_why;
+ }
+ 
+ static pan_bo_access *
+@@ -728,8 +805,10 @@
+    int ret;
+ 
+    /* Nothing to do! */
+-   if (!has_frag && batch->compute_count == 0 && !batch->has_time_query)
++   if (!has_frag && batch->compute_count == 0 && !batch->has_time_query) {
++      rwp_count(RWP_EMPTY_SUBMITS);
+       goto out;
++   }
+ 
+    if (batch->key.zsbuf.texture && has_frag) {
+       struct pipe_surface *surf = &batch->key.zsbuf;
+@@ -763,6 +842,23 @@
+    ret = screen->vtbl.submit_batch(batch, &fb);
+    if (ret)
+       mesa_loge("panfrost_batch_submit failed: %d\n", ret);
++   if (redwood_pan_metal) {
++      /* A34 (patch 0011): a batch with work, and why it went */
++      redwood_pan_prof[RWP_JOB_SUBMITS]++;
++      redwood_pan_prof[RWP_JOB_SUBMIT_NS] += os_time_get_nano() - redwood_began;
++      const char *why = redwood_pan_why ? redwood_pan_why : "(no reason given)";
++      for (unsigned i = 0; i < RWP_REASONS; i++) {
++         if (redwood_pan_reason[i] == NULL) {
++            redwood_pan_reason[i] = why;
++            redwood_pan_reason_count[i] = 1;
++            break;
++         }
++         if (redwood_pan_reason[i] == why || strcmp(redwood_pan_reason[i], why) == 0) {
++            redwood_pan_reason_count[i]++;
++            break;
++         }
++      }
++   }
+ 
+    if (pan_device(ctx->base.screen)->arch >= 10)
+       u_trace_flush(&batch->trace, NULL, U_TRACE_FRAME_UNKNOWN, false);
+@@ -800,6 +896,14 @@
+  * is upstream. */
+ bool redwood_pan_metal;
+ 
++/* A34 (patch 0011): where panfrost's time goes in a process drawing through Metal, and why its
++ * batches were submitted (compiler/air/redwood_pan_prof.h; read by air_metal.c,
++ * rwa_pan_profile). redwood_pan_why is set around a submission by whoever asks for it. */
++uint64_t redwood_pan_prof[RWP_SLOTS];
++const char *redwood_pan_reason[RWP_REASONS];
++uint64_t redwood_pan_reason_count[RWP_REASONS];
++const char *redwood_pan_why;
++
+ void
+ panfrost_flush_batch(struct panfrost_batch *batch, const char *reason)
+ {
+@@ -809,7 +913,10 @@
+    struct panfrost_context *ctx = batch->ctx;
+ 
+    perf_debug(ctx, "Flushing batch due to: %s", reason);
++   const char *rwp_why = redwood_pan_why;
++   redwood_pan_why = reason;
+    panfrost_batch_submit(ctx, batch);
++   redwood_pan_why = rwp_why;
+ }
+ 
+ /* Submit all batches */
+@@ -820,21 +927,32 @@
+    assert(reason);
+    PAN_TRACE_SCOPE(PAN_TRACE_GL_JOB, "%s reason=\"%s\"", __func__, reason);
+    perf_debug(ctx, "Flushing everything due to: %s", reason);
++   const char *rwp_why = redwood_pan_why;
++   redwood_pan_why = reason;
+ 
+-   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
++   /* A34 (patch 0011): in a process drawing through Metal, only the batches there are. Upstream
++    * gets the compute batch and the current framebuffer's render batch -- beginning each when
++    * there is none (a pool's buffer from the cache and its descriptors) -- only to submit it
++    * empty: two of the three batches of every flush on a pass switch were such (boot 68). */
++   struct panfrost_batch *batch =
++      redwood_pan_metal ? ctx->batch[PANFROST_BATCH_COMPUTE] : panfrost_get_compute_batch(ctx);
+    if (batch)
+       panfrost_batch_submit(ctx, batch);
+ 
+-   batch = panfrost_get_render_batch(ctx);
+-   if (!batch)
++   batch = redwood_pan_metal ? ctx->batch[PANFROST_BATCH_RENDER] : panfrost_get_render_batch(ctx);
++   if (!batch && !redwood_pan_metal) {
++      redwood_pan_why = rwp_why;
+       return;
++   }
+ 
+-   panfrost_batch_submit(ctx, batch);
++   if (batch)
++      panfrost_batch_submit(ctx, batch);
+ 
+    for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
+       if (ctx->batches.slots[i].seqnum)
+          panfrost_batch_submit(ctx, &ctx->batches.slots[i]);
+    }
++   redwood_pan_why = rwp_why;
+ 
+    if (pan_device(ctx->base.screen)->arch >= 10)
+       u_trace_context_process(&ctx->trace_context, false);
+@@ -851,7 +969,10 @@
+ 
+    if (entry) {
+       perf_debug(ctx, "Flushing writer due to: %s", reason);
++      const char *rwp_why = redwood_pan_why;
++      redwood_pan_why = reason;
+       panfrost_batch_submit(ctx, entry->data);
++      redwood_pan_why = rwp_why;
+       if (pan_device(ctx->base.screen)->arch >= 10)
+          u_trace_context_process(&ctx->trace_context, false);
+    }
+@@ -873,7 +994,10 @@
+          continue;
+ 
+       perf_debug(ctx, "Flushing user due to: %s", reason);
++      const char *rwp_why = redwood_pan_why;
++      redwood_pan_why = reason;
+       panfrost_batch_submit(ctx, batch);
++      redwood_pan_why = rwp_why;
+    }
+    if (pan_device(ctx->base.screen)->arch >= 10)
+       u_trace_context_process(&ctx->trace_context, false);
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -47,6 +47,7 @@
+ #include "pan_trace.h"
+ #include "panfrost_tracepoints.h"
+ #include "panfrost_perfetto.h"
++#include "compiler/air/redwood_pan_prof.h"
+ 
+ #if PAN_ARCH >= 6
+ #include "pan_precomp.h"
+@@ -3175,13 +3176,18 @@
+    if (ss->info.has_shader_clk_instr)
+       batch->need_job_req_cycle_count = true;
+ 
++   /* A34 (patch 0011): each part timed, for the Metal driver's profile */
++   uint64_t rwp_t = rwp_now();
++
+    if (dirty & (PAN_DIRTY_STAGE_TEXTURE | PAN_DIRTY_STAGE_SHADER)) {
+       batch->textures[st] = panfrost_emit_texture_descriptors(batch, st);
+    }
++   rwp_lap(RWP_TEX, &rwp_t);
+ 
+    if (dirty & PAN_DIRTY_STAGE_SAMPLER) {
+       batch->samplers[st] = panfrost_emit_sampler_descriptors(batch, st);
+    }
++   rwp_lap(RWP_SAMP, &rwp_t);
+ 
+    /* On Bifrost and older, the fragment shader descriptor is fused
+     * together with the renderer state; the combined renderer state
+@@ -3191,10 +3197,12 @@
+    if ((dirty & PAN_DIRTY_STAGE_SHADER) && !((PAN_ARCH <= 7) && frag)) {
+       batch->rsd[st] = panfrost_emit_compute_shader_meta(batch, st);
+    }
++   rwp_lap(RWP_SHADER, &rwp_t);
+ 
+ #if PAN_ARCH >= 9
+    if ((dirty & PAN_DIRTY_STAGE_SHADER) && frag)
+       batch->attribs[st] = panfrost_val_emit_varying_descriptors(batch);
++   rwp_lap(RWP_SHADER, &rwp_t);
+ 
+    if (dirty & PAN_DIRTY_STAGE_IMAGE) {
+       batch->images[st] =
+@@ -3203,6 +3211,7 @@
+ 
+    if (dirty & PAN_DIRTY_STAGE_SSBO)
+       batch->ssbos[st] = panfrost_emit_ssbos(batch, st);
++   rwp_lap(RWP_IMG, &rwp_t);
+ #endif
+ 
+    if ((dirty & ss->dirty_shader) || (dirty_3d & ss->dirty_3d)) {
+@@ -3210,6 +3219,7 @@
+          batch, st, &batch->nr_uniform_buffers[st], &batch->push_uniforms[st],
+          &batch->nr_push_uniforms[st]);
+    }
++   rwp_lap(RWP_UBO, &rwp_t);
+ 
+ #if PAN_ARCH <= 7
+    /* On Bifrost and older, if the fragment shader changes OR any renderer
+@@ -3256,12 +3266,15 @@
+       panfrost_set_batch_masks_zs(batch);
+ 
+ #if PAN_ARCH >= 9
++   uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
+    if ((dirty & (PAN_DIRTY_ZS | PAN_DIRTY_RASTERIZER)) ||
+        (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & PAN_DIRTY_STAGE_SHADER))
+       batch->depth_stencil = panfrost_emit_depth_stencil(batch);
++   rwp_lap(RWP_ZS, &rwp_t);
+ 
+    if (dirty & PAN_DIRTY_BLEND)
+       batch->blend = panfrost_emit_blend_valhall(batch);
++   rwp_lap(RWP_BLEND, &rwp_t);
+ 
+    if (dirty & PAN_DIRTY_VERTEX) {
+       batch->attribs[MESA_SHADER_VERTEX] = panfrost_emit_vertex_data(batch);
+@@ -3269,6 +3282,7 @@
+       batch->attrib_bufs[MESA_SHADER_VERTEX] =
+          panfrost_emit_vertex_buffers(batch);
+    }
++   rwp_lap(RWP_VERTEX, &rwp_t);
+ #else
+    /* Always re-emit vertex attributes, in midgard and bifrost they depend on
+     * per-draw parameters (e.g. vertex_count, instancing, images and textures),
+@@ -3432,6 +3446,8 @@
+       return;
+ 
+    struct panfrost_context *ctx = batch->ctx;
++   uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
++   rwp_count(RWP_DRAWS);
+ 
+    panfrost_update_active_prim(ctx, info->mode);
+ 
+@@ -3450,11 +3466,14 @@
+       panfrost_draw_get_vertex_count(batch, info, draw, idvs);
+ 
+    panfrost_statistics_record(ctx, info, draw);
++   rwp_lap(RWP_VCOUNT, &rwp_t);
+ 
+    panfrost_update_state_3d(batch);
++   rwp_lap(RWP_STATE3D, &rwp_t);
+    panfrost_update_shader_state(batch, MESA_SHADER_VERTEX);
+    panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
+    panfrost_clean_state_3d(ctx);
++   rwp_lap(RWP_STAGES, &rwp_t);
+ 
+    if (ctx->uncompiled[MESA_SHADER_VERTEX]->xfb) {
+       panfrost_launch_xfb(batch, info, draw->count);
+@@ -3482,9 +3501,11 @@
+                                &(struct panfrost_trace_cs_info){ .batch = batch });
+ #endif
+ 
++   rwp_t = rwp_now();
+    if (vertex_count > 0)
+       JOBX(launch_draw)(batch, info, drawid_offset, draw, vertex_count);
+    batch->draw_count++;
++   rwp_lap(RWP_LAUNCH, &rwp_t);
+ }
+ 
+ static bool
+@@ -3635,7 +3656,9 @@
+                            unsigned num_draws)
+ {
+    struct panfrost_context *ctx = pan_context(pipe);
++   uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
+    struct panfrost_batch *batch = prepare_draw(pipe, info->mode);
++   rwp_lap(RWP_PREPARE, &rwp_t);
+    if (!batch) {
+       mesa_loge("prepare_draw failed");
+       return;
+--- a/src/gallium/drivers/panfrost/pan_mempool.c
++++ b/src/gallium/drivers/panfrost/pan_mempool.c
+@@ -11,6 +11,7 @@
+ #include "pan_device.h"
+ #include "pan_mempool.h"
+ #include "pan_trace.h"
++#include "compiler/air/redwood_pan_prof.h"
+ 
+ /* Knockoff u_upload_mgr. Uploads wherever we left off, allocating new entries
+  * when needed.
+@@ -37,8 +38,11 @@
+     * flags to this function and keep the read/write,
+     * fragment/vertex+tiler pools separate.
+     */
++   uint64_t rwp_t = rwp_now();   /* A34: patch 0011 */
+    struct panfrost_bo *bo =
+       panfrost_bo_create(pool->dev, bo_sz, pool->create_flags, pool->label);
++   rwp_count(RWP_POOL_ALLOCS);
++   rwp_lap(RWP_POOL_ALLOC_NS, &rwp_t);
+    if (!bo)
+       return NULL;
+ 
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -17,6 +17,7 @@
+ #include "pan_trace.h"
+ #include "pan_util.h"
+ #include "wrap.h"
++#include "compiler/air/redwood_pan_prof.h"
+ 
+ #include "util/os_mman.h"
+ 
+@@ -386,9 +387,14 @@
+     * cache. But if there's no nothing suitable, we should flush the cache
+     * to make space for the new allocation.
+     */
++   uint64_t rwp_t = rwp_now(), rwp_f = rwp_t;   /* A34: patch 0011 */
+    bo = panfrost_bo_cache_fetch(dev, size, flags, label, true);
+-   if (!bo)
++   if (!bo) {
++      rwp_f = rwp_now();
+       bo = panfrost_bo_alloc(dev, size, flags, label);
++      rwp_count(RWP_BO_FRESH);
++      rwp_lap(RWP_BO_FRESH_NS, &rwp_f);
++   }
+    if (!bo)
+       bo = panfrost_bo_cache_fetch(dev, size, flags, label, false);
+    if (!bo) {
+@@ -411,6 +417,8 @@
+    }
+ 
+    p_atomic_set(&bo->refcnt, 1);
++   rwp_count(RWP_BO_CREATES);
++   rwp_lap(RWP_BO_CREATE_NS, &rwp_t);
+ 
+    if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+       if (flags & PAN_BO_INVISIBLE)
