@@ -487,15 +487,15 @@ int main(int argc, char **argv)
 			    "to %02x:..:%02x type %02x%02x key info %02x%02x\n", a34w_eapol_tx, a34w_rd(a34w_conn, WFDMA_TX_RING(0) + 8),
 			    w0, w1, tok[33], tok[32], a34w_le32(tok + 40), tok[44] | tok[45] << 8, e[0], e[5], e[12], e[13], e[14 + 5], e[14 + 6]);
 			failed |= a34w_eapol_tx != 1 || a34w_rd(a34w_conn, WFDMA_TX_RING(0) + 8) != 1 || (w0 & 0xffff0000u) != 0x020a0000u ||
-			    w1 != 0x80008405u || tok[33] != 0x80 || a34w_le32(tok + 40) != 0x58050040u || e[12] != 0x88 || e[13] != 0x8e ||
-			    memcmp(e, a34w_target.bssid, 6) != 0 || e[14 + 5] != 0x01 || e[14 + 6] != 0x0a || (a34w_tokens_busy & 1u) == 0;
+			    w1 != 0x80008405u || tok[33] != 0x80 || a34w_le32(tok + 40) != 0x58140040u || e[12] != 0x88 || e[13] != 0x8e ||
+			    memcmp(e, a34w_target.bssid, 6) != 0 || e[14 + 5] != 0x01 || e[14 + 6] != 0x0a || (a34w_tokens_busy[0] & 1u) == 0;
 		}
 		/* the token's report on RX ring 4 (version 3: one word, token 0 in bits 30:16) */
 		bzero(f, sizeof(f));
 		put32(f, (6u << 27) | (1u << 16) | 12u); put32(f + 4, 3u << 16); put32(f + 8, (0u << 16) | 1u);
 		rx_put(4, f, 12);
 		(void)a34w_data_poll();
-		failed |= (a34w_tokens_busy & 1u) != 0 || a34w_tokens_back != 1;
+		failed |= (a34w_tokens_busy[0] & 1u) != 0 || a34w_tokens_back != 1;
 		printf("0964 data path (EAPOL out on TX ring 0, the token back on ring 4): %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
@@ -750,6 +750,111 @@ int main(int argc, char **argv)
 		/* the link events: SSID (2), BSSID (3), LINK (4) changed, then ASSOC_DONE (9) */
 		failed |= kev_count < 4 || kev_codes[kev_count - 1] != 9;
 		printf("0969 iOS's Wi-Fi side (registry, Apple80211 scan and join): %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 1010: every token in flight, one report waiting on ring 4: the frame waits, takes it back, goes ---- */
+	{
+		uint8_t f[64], e[60];
+		int failed = 0;
+		uint64_t drops0 = a34w_data_dropped_out;
+		bool sent;
+
+		a34w_joined = true;
+		memset(a34w_tokens_busy, 0xff, sizeof(a34w_tokens_busy));
+		bzero(f, sizeof(f));
+		put32(f, (6u << 27) | (1u << 16) | 12u); put32(f + 4, 3u << 16); put32(f + 8, (77u << 16) | 1u);   /* token 77 back */
+		rx_put(4, f, 12);
+		bzero(e, sizeof(e)); memcpy(e, a34w_target.bssid, 6); memcpy(e + 6, a34w_mac, 6); e[12] = 0x08; e[14] = 0x45;
+		sent = a34w_data_tx(e, sizeof(e), false, true, false);
+		printf("1010 TX with every token busy: %s, token 77 %s, %llu waited, dropped %llu\n", sent ? "sent" : "NOT SENT",
+		    (a34w_tokens_busy[1] >> 13) & 1u ? "taken again" : "free", (unsigned long long)a34w_tx_waits,
+		    (unsigned long long)(a34w_data_dropped_out - drops0));
+		failed |= !sent || ((a34w_tokens_busy[1] >> 13) & 1u) == 0 || a34w_data_dropped_out != drops0;
+		/* and with none coming back: dropped after 5 ms, counted as "no token" */
+		sent = a34w_data_tx(e, sizeof(e), false, true, false);
+		failed |= sent || a34w_drop_no_token != 1;
+		bzero(a34w_tokens_busy, sizeof(a34w_tokens_busy));
+		printf("1010 TX waits for tokens: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 1010: a scan for a name (hidden networks), and Settings' Wi-Fi switch ---- */
+	{
+		static struct apple80211_scan_request scan;
+		struct apple80211req rq;
+		struct { uint32_t version, radios, state[4]; } power;
+		int failed = 0, e;
+		uint32_t at = 0;
+
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1; sim_ap = 1;
+		bzero(&scan, sizeof(scan)); scan.scan_type = 1; scan.ssid_length = 6; memcpy(scan.ssid, "Hidden", 6);
+		bzero(&rq, sizeof(rq)); rq.req_type = 10; rq.req_len = sizeof(scan); rq.req_data = (user_addr_t)(uintptr_t)&scan;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_scan != 1 || a34w_sta_scan_ssid_length != 6;
+		a34w_sta_scan = 0;
+		a34w_sta_do(false, NULL, true);
+		firmware_sim();
+		for (uint32_t i = 0; i < nsent; i++) if (sent[i][36] == 0x03) at = i;
+		printf("1010 named scan: type %u, SSID type %u, %u name(s): \"%.*s\"\n", sent[at][64 + 2], sent[at][64 + 3],
+		    sent[at][64 + 4], sent[at][64 + 8], (const char *)sent[at] + 64 + 12);
+		failed |= sent[at][64 + 2] != 1 || sent[at][64 + 3] != 4 || sent[at][64 + 4] != 1 || sent[at][64 + 8] != 6 ||
+		    memcmp(sent[at] + 64 + 12, "Hidden", 6) != 0;
+		/* the switch off: the network left, no rejoin, scans refused; on: told, scans again */
+		a34w_joined = true;
+		kev_count = 0;
+		power.version = 1; power.radios = 1; power.state[0] = 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 19; rq.req_len = sizeof(power); rq.req_data = (user_addr_t)(uintptr_t)&power;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_leave != 1 || !a34_sta_switched_off();
+		a34w_sta_leave = 0;
+		a34w_sta_do(true, NULL, false);
+		failed |= a34w_joined || a34w_auto_rejoin_at != 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 10; rq.req_len = sizeof(scan); rq.req_data = (user_addr_t)(uintptr_t)&scan;
+		failed |= a34_apple80211_ioctl(SIOCSA80211, &rq) != ENETDOWN;
+		power.state[0] = 1;
+		bzero(&rq, sizeof(rq)); rq.req_type = 19; rq.req_len = sizeof(power); rq.req_data = (user_addr_t)(uintptr_t)&power;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34_sta_switched_off() || kev_count == 0 || kev_codes[kev_count - 1] != 1;
+		bzero(&rq, sizeof(rq)); rq.req_type = 10; rq.req_len = sizeof(scan); rq.req_data = (user_addr_t)(uintptr_t)&scan;
+		failed |= a34_apple80211_ioctl(SIOCSA80211, &rq) != 0;
+		a34w_sta_scan = 0;
+		sim_on = 0; sim_ap = 0;
+		printf("1010 named scan, the Wi-Fi switch off and on: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 1010: BSS transition: taken when the AP says it will let us go, refused for one we never heard ---- */
+	{
+		uint8_t f[96];
+		static const uint8_t other[6] = { 0xc4, 0x9a, 0x31, 0x2a, 0xc8, 0x59 };
+		int failed = 0;
+
+		a34w_joined = true; a34w_roam_pending = false; a34w_link_rssi = -80;
+		for (int imminent = 1; imminent >= 0; imminent--) {
+			bzero(f, sizeof(f));
+			f[0] = 0xd0; memcpy(f + 4, a34w_mac, 6); memcpy(f + 10, a34w_target.bssid, 6); memcpy(f + 16, a34w_target.bssid, 6);
+			f[24] = 10; f[25] = 7; f[26] = 9; f[27] = (uint8_t)(0x01 | (imminent ? 0x04 : 0)); f[28] = 10; f[30] = 100;
+			f[31] = 52; f[32] = 16; memcpy(f + 33, other, 6); f[43] = 81; f[44] = 5; f[45] = 7;   /* neighbor report: channel 5 */
+			f[46] = 3; f[47] = 1; f[48] = 200;                                                         /* preference 200 */
+			*a34w_mbox_word(4) = *a34w_mbox_word(0);
+			nsent = 0; sim_on = 1;
+			a34w_mgmt_in(f, 49, -60, 48);
+			firmware_sim();
+			sim_on = 0;
+			printf("1010 BSS transition (%s): status %u, %u bytes%s, move %s\n", imminent ? "disassociation imminent" : "a candidate never heard",
+			    sent[0][32 + 27], sent_len[0] - 32, sent_len[0] - 32 == 35 && memcmp(sent[0] + 32 + 29, other, 6) == 0 ? " with the target" : "",
+			    a34w_roam_pending ? "scheduled" : "not");
+			if (imminent) {
+				failed |= nsent != 1 || sent[0][32 + 27] != 0 || memcmp(sent[0] + 32 + 29, other, 6) != 0 || !a34w_roam_pending ||
+				    memcmp(a34w_roam_to, other, 6) != 0;
+			} else {
+				failed |= nsent != 1 || sent[0][32 + 27] != 7 || a34w_roam_pending;
+			}
+			a34w_roam_pending = false;
+		}
+		printf("1010 BSS transition taken or refused: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 

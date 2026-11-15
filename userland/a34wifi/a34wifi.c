@@ -61,6 +61,8 @@
  *                           on the interface, and wait (default 60 s) for its IPv4 address
  *   a34wifi tcp HOST [PORT] connect to HOST (a name or an address; port 80), send an HTTP HEAD
  *                           request, print the first line of the answer
+ *   a34wifi get [URL] [SECONDS]  (1010) an HTTP GET timed: bytes, seconds, Mbit/s (default
+ *                           http://speedtest.tele2.net/10MB.zip, at most 60 s); plain HTTP only
  *   a34wifi connect [HOST [PORT]]  all of it, for a boot job: "up 9", "dhcp", then "tcp" to
  *                           HOST (default 1.1.1.1, port 80: no name server needed)
  *                           ("up" does that too, before it asks the kernel for anything)
@@ -81,6 +83,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -697,6 +700,123 @@ tcp(const char *host, const char *port)
 	return n > 0 ? 0 : 1;
 }
 
+/* (1010) an HTTP GET of URL, timed: what the link carries */
+#define GET_DEFAULT_URL "http://speedtest.tele2.net/10MB.zip"
+
+static double
+now_seconds(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static int
+get(const char *url, int seconds)
+{
+	char host[256], port[8] = "80", request[512], line[128] = "";
+	const char *path, *h = url;
+	struct addrinfo hints, *list = NULL;
+	static char buf[65536];
+	struct timeval timeout = { .tv_sec = 10 };
+	double t0, t1 = 0, last = 0;
+	long long total = 0, body = -1;
+	size_t n;
+	int s, error;
+
+	if (strncmp(h, "http://", 7) != 0) {
+		printf("a34wifi: get: only http:// URLs (%s)\n", url);
+		return 2;
+	}
+	h += 7;
+	path = strchr(h, '/');
+	n = path != NULL ? (size_t)(path - h) : strlen(h);
+	if (n == 0 || n >= sizeof(host)) {
+		printf("a34wifi: get: no host in %s\n", url);
+		return 2;
+	}
+	memcpy(host, h, n);
+	host[n] = '\0';
+	if (strchr(host, ':') != NULL) {
+		snprintf(port, sizeof(port), "%s", strchr(host, ':') + 1);
+		*strchr(host, ':') = '\0';
+	}
+	if (path == NULL) {
+		path = "/";
+	}
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	t0 = now_seconds();
+	if ((error = getaddrinfo(host, port, &hints, &list)) != 0) {
+		printf("a34wifi: get %s: %s\n", host, gai_strerror(error));
+		return 1;
+	}
+	s = socket(list->ai_family, SOCK_STREAM, 0);
+	if (s < 0 || connect(s, list->ai_addr, list->ai_addrlen) != 0) {
+		printf("a34wifi: get %s: %s\n", host, strerror(errno));
+		if (s >= 0) {
+			close(s);
+		}
+		freeaddrinfo(list);
+		return 1;
+	}
+	freeaddrinfo(list);
+	(void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: a34wifi\r\nConnection: close\r\n\r\n",
+	    path, host);
+	if (write(s, request, strlen(request)) < 0) {
+		printf("a34wifi: get: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	printf("a34wifi: get %s: connected in %.2f s\n", url, now_seconds() - t0);
+	fflush(stdout);
+	t0 = now_seconds();
+	last = t0;
+	for (;;) {
+		ssize_t got = read(s, buf, sizeof(buf));
+
+		if (got <= 0) {
+			break;
+		}
+		if (total == 0) {               /* the status line and where the body begins */
+			char *end = memchr(buf, '\n', (size_t)got), *sep;
+
+			if (end != NULL) {
+				size_t k = (size_t)(end - buf) < sizeof(line) - 1 ? (size_t)(end - buf) : sizeof(line) - 1;
+
+				memcpy(line, buf, k);
+				line[k] = '\0';
+				if ((sep = strchr(line, '\r')) != NULL) {
+					*sep = '\0';
+				}
+			}
+			buf[got < (ssize_t)sizeof(buf) ? got : got - 1] = '\0';
+			if ((sep = strstr(buf, "\r\n\r\n")) != NULL) {
+				body = -(long long)(sep + 4 - buf);
+			}
+		}
+		total += got;
+		t1 = now_seconds();
+		if (t1 - last >= 1.0) {
+			last = t1;
+			printf("a34wifi: get: %.1f MB in %.1f s: %.1f Mbit/s\n", (double)total / 1e6, t1 - t0,
+			    (double)total * 8.0 / 1e6 / (t1 - t0 > 0 ? t1 - t0 : 1));
+			fflush(stdout);
+		}
+		if (t1 - t0 >= seconds) {
+			break;
+		}
+	}
+	close(s);
+	body = body < 0 ? total + body : total;
+	printf("a34wifi: get: \"%s\": %lld bytes (body %lld) in %.2f s: %.1f Mbit/s\n", line, total, body, t1 - t0,
+	    t1 > t0 ? (double)total * 8.0 / 1e6 / (t1 - t0) : 0.0);
+	return total > 0 ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -724,6 +844,9 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "join") == 0) {
 		return join(argc >= 3 ? atoi(argv[2]) : 180);
 	}
+	if (strcmp(argv[1], "get") == 0) {
+		return get(argc >= 3 ? argv[2] : GET_DEFAULT_URL, argc >= 4 ? atoi(argv[3]) : 60);
+	}
 	if (strcmp(argv[1], "tcp") == 0 && argc >= 3) {
 		return tcp(argv[2], argc >= 4 ? argv[3] : "80");
 	}
@@ -743,6 +866,6 @@ main(int argc, char **argv)
 		return dhcp(argc >= 3 ? atoi(argv[2]) : 60);
 	}
 	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files | mac | join [SECONDS] | "
-	    "dhcp [SECONDS] | tcp HOST [PORT] | connect [HOST [PORT]]]\n");
+	    "dhcp [SECONDS] | tcp HOST [PORT] | get [URL] [SECONDS] | connect [HOST [PORT]]]\n");
 	return 2;
 }

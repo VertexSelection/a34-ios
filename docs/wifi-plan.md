@@ -650,6 +650,47 @@ shows wifid's own threads if it still waits on something. Undo for the root:
 `sudo tools/wifi-settings-setup.sh --undo ROOT` (`root-add-job.py --relimit ROOT
 com.apple.wifid`: `_LimitLoadToDeviceTree` back to its stock `["wlan", "marconi-wifi"]`).
 
+### Settings works (kernel main with 0995 + 0999; `build/logs/0999-wifi-a`)
+
+Wi-Fi in Settings, and Safari (YouTube's page) over it. What is left of the log (bluetoothd
+flooded it) shows ~97 MB received, 3.4 MB sent, every token given back -- and **4264 of ~27 000
+frames dropped on the way out**: with 64 tokens in flight (a token comes back only when the
+firmware reports the frame sent) a burst from the stack found none free and was dropped. One
+BSS transition request was answered (we stay). The system never sleeps on this port (only "SWEET
+FB: display off"), so "sleep/wake" is the display turning off with the link kept.
+
+### 1010: robustness (built as one patch; numbers 1010-1019 are Wi-Fi's)
+
+- **TX without drops**: 256 tokens and ring slots (Android's 256), their buffers after RX ring 5's;
+  with none free the sender takes in the token reports itself (rings 4/5 under their own lock) and
+  waits up to 5 ms before dropping; drops are counted by cause in the `carried:` line.
+- **Coming back**: after the AP lets us go or the beacons stop, joining again never gives up while
+  the network is wanted -- 3, 10, 30 s, then every 60 s -- and stops when iOS asks to leave or
+  switches Wi-Fi off. (wifid also rejoins known networks by itself.)
+- **Roaming by BSS transition**: the AP's candidates (Neighbor Report elements, preference
+  subelement) are read; we go -- BTM Response status 0 with the target BSSID, then leave and join
+  again preferring that BSS -- when the AP says it will disassociate us (mode bit 2), or when a
+  candidate we heard in the last two minutes is 8 dB louder than the AP is now and above -75 dBm;
+  otherwise status 7, as Android answered this AP (accepting every steer would move us between the
+  bands every minute, each move a few seconds without a link). How loud the AP is now comes from
+  the RX vector (group 3) of its data frames, averaged; wifid's RSSI and the status bar get that.
+- **Hidden networks**: a join whose name two passive scans did not hear probes for it (an active
+  scan for that name: ucScanType 1, SSID type 4, the name in arSSID[0]); a scan wifid asks for with
+  a name is that active scan too.
+- **Power save**: the firmware does 802.11 power save itself (PS-Poll, the PM bit, DTIM wake-ups,
+  keep-alive, ARP offload: the RAM code's strings) once it has the DTIM and our AID
+  (INDICATE_PM_BSS_CONNECTED, sent at the join). We join in CAM and go to FAST_PSP (Android's: dozes,
+  awake while traffic flows) 15 s later, after the handshake and DHCP; an AP without a TIM element
+  keeps us in CAM, as gen4m does. `kern.a34wifi.powersave` / boot-arg `a34wifips`: -1 automatic,
+  0 CAM, 1 MAX_PSP, 2 FAST_PSP. (The ~80 s stall another MediaTek port saw in PS came from the
+  firmware dozing without a correct DTIM/AID; we send both before leaving CAM.)
+- **The Wi-Fi switch**: off leaves the network, stops rejoining and refuses scans/joins; on tells
+  wifid (power event) and lets it scan and join again. The firmware stays up (no re-run of steps
+  4-5).
+
+`a34wifi get [URL] [SECONDS]` times an HTTP GET (default `http://speedtest.tele2.net/10MB.zip`) and
+prints Mbit/s, for the throughput work.
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
