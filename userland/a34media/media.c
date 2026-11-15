@@ -5,11 +5,22 @@
  * userland/a34gl/inject.c).
  *
  * The crash it is about (README.md): whenever a program starts playing a movie -- the keyboard's
- * "slide to type" introduction, Setup's "hello" -- mediaserverd aborts on an Objective-C exception
- * that nobody catches, thrown in a block on one of its serial dispatch queues. The kernel's crash
- * line cannot say which: by the time std::terminate runs, the stack has been unwound to libdispatch.
- * Here:
+ * "slide to type" introduction, Setup's "hello" -- mediaserverd aborted on an Objective-C exception
+ * that nobody caught, thrown in a block on one of its serial dispatch queues (its player server's,
+ * "com.apple.coremedia.player.item.P/AV"). The kernel's crash line cannot say which: by the time
+ * std::terminate runs, the stack has been unwound to libdispatch. Here:
  *
+ *   the display's alignments  VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService(), asked
+ *                             by MediaToolbox how the frames of a movie that goes to the display are to
+ *                             be laid out, reads AppleCLCD's DisplayPipePlaneBaseAlignment as a
+ *                             dictionary { PlaneBaseAlignmentLinear = N } (QuartzCore reads it so too,
+ *                             but checks the type). Our kernel publishes a number (ios-sweet 0046:
+ *                             64), and -[__NSCFNumber objectForKey:] is the exception (boot 54). The
+ *                             function keeps both answers in statics of its own; they are given here,
+ *                             before anybody asks, with the kernel's number (the function's own default
+ *                             is the same 64). Left alone when the kernel's is a dictionary. This one
+ *                             is done in every program the library is loaded into (A34_LOAD), the rest
+ *                             only in mediaserverd.
  *   every exception thrown    is said on the console, with the dispatch queue it was thrown on, its
  *                             name and reason and the stack at the throw: shared-cache addresses
  *                             unslid (research/metal/tools/ipsw-dl/ipsw dyld a2s CACHE ADDRESS names
@@ -55,8 +66,17 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+/* IOKit's (no header in the iOS SDK) */
+typedef mach_port_t io_object_t;
+extern CFMutableDictionaryRef IOServiceMatching(const char *name);
+extern io_object_t IOServiceGetMatchingService(mach_port_t main_port, CFDictionaryRef matching);
+extern CFTypeRef IORegistryEntrySearchCFProperty(io_object_t entry, const char *plane, CFStringRef key, CFAllocatorRef allocator,
+    uint32_t options);
+extern kern_return_t IOObjectRelease(io_object_t object);
 
 /* libobjc's (objc/objc-exception.h; declared here, the header hides them from some SDKs) */
 typedef id (*a34_exception_preprocessor)(id exception);
@@ -72,6 +92,7 @@ extern a34_uncaught_handler objc_setUncaughtExceptionHandler(a34_uncaught_handle
 static uintptr_t slide, cache_start, cache_end;
 static int pid;
 static unsigned lines;
+static const char *program = "?";
 
 /* One line for the kernel's log, whatever the daemon's stderr is (launchd's /dev/null): the console. */
 static void __attribute__((format(printf, 1, 2)))
@@ -84,7 +105,7 @@ say(const char *format, ...)
 	if (__atomic_fetch_add(&lines, 1, __ATOMIC_RELAXED) >= LINES_MAX) {
 		return;
 	}
-	n = snprintf(line, sizeof(line), "a34media: mediaserverd[%d]: ", pid);
+	n = snprintf(line, sizeof(line), "a34media: %s[%d]: ", program, pid);
 	va_start(ap, format);
 	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
 	va_end(ap);
@@ -105,6 +126,114 @@ static uintptr_t
 unslid(uintptr_t address)
 {
 	return address >= cache_start && address < cache_end ? address - slide : address;
+}
+
+/* ---- the display's alignments (VideoToolbox) ---------------------------------------------------- */
+
+/*
+ * FigGetAlignmentForIOSurfaceOutputToDisplayService(&plane_base, &stride), unslid (our 16.7.16 cache): for
+ * each answer a "checked" byte and a 32-bit "requirement" in VideoToolbox's data. The instructions that
+ * read them are checked before anything is written (they do not move with the slide).
+ */
+#define FN_DISPLAY_ALIGNMENT    0x194f3b410UL
+#define PLANE_BASE_CHECKED      0x1dd2bd853UL   /* _planeBaseRequirement.checked (__bss) */
+#define PLANE_BASE_REQUIREMENT  0x1dd2bd42cUL   /* _planeBaseRequirement.requirement (__data) */
+#define STRIDE_CHECKED          0x1dd2bd854UL   /* _strideRequirement.checked */
+#define STRIDE_REQUIREMENT      0x1dd2bd430UL   /* _strideRequirement.requirement */
+
+static const struct {
+	uintptr_t address;
+	uint32_t word;
+} alignment_code[] = {
+	{ 0x194f3b438UL, 0xd0241c19 },  /* adrp x25, _planeBaseRequirement.checked@PAGE */
+	{ 0x194f3b43cUL, 0x39614f28 },  /* ldrb w8, [x25, #0x853] */
+	{ 0x194f3b440UL, 0xd0241c1a },  /* adrp x26, _planeBaseRequirement.requirement@PAGE */
+	{ 0x194f3b448UL, 0x94000637 },  /* bl _getH3clcdService */
+	{ 0x194f3b4d8UL, 0xb9442f48 },  /* ldr w8, [x26, #0x42c] */
+	{ 0x194f3b4e4UL, 0xd0241c18 },  /* adrp x24, _strideRequirement.checked@PAGE */
+	{ 0x194f3b4e8UL, 0x39615308 },  /* ldrb w8, [x24, #0x854] */
+	{ 0x194f3b4ecUL, 0xd0241c19 },  /* adrp x25, _strideRequirement.requirement@PAGE */
+	{ 0x194f3b584UL, 0xb9443328 },  /* ldr w8, [x25, #0x430] */
+};
+
+/* AppleCLCD's property `key`: 1 a dictionary, 0 a number (in *number), -1 neither or no display. */
+static int
+display_property(const char *key, uint32_t *number)
+{
+	io_object_t display = IOServiceGetMatchingService(0, IOServiceMatching("AppleCLCD"));
+	CFStringRef name = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+	CFTypeRef value = display != 0 && name != NULL ? IORegistryEntrySearchCFProperty(display, "IOService", name, NULL, 0) : NULL;
+	int kind = -1;
+
+	if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+		kind = 1;
+	} else if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID() &&
+	    CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, number)) {
+		kind = 0;
+	}
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	if (name != NULL) {
+		CFRelease(name);
+	}
+	if (display != 0) {
+		IOObjectRelease(display);
+	}
+	return kind;
+}
+
+/* One answer: the requirement, then the byte that says it is there. */
+static bool
+give_answer(const char *key, uintptr_t checked, uintptr_t requirement)
+{
+	volatile uint8_t *done = (volatile uint8_t *)(checked + slide);
+	volatile uint32_t *value = (volatile uint32_t *)(requirement + slide);
+	uint32_t number = 64;           /* (the function's own default, and the kernel's) */
+	int kind = display_property(key, &number);
+
+	if (kind == 1) {
+		say("display alignment: AppleCLCD's %s is a dictionary: VideoToolbox reads it itself", key);
+		return false;
+	}
+	if (*done != 0) {
+		say("display alignment: VideoToolbox has its %s already (%u)", key, (unsigned)*value);
+		return false;
+	}
+	if (number == 0 || (number & (number - 1)) != 0 || number > 4096) {
+		number = 64;
+	}
+	*value = number;
+	__atomic_store_n(done, 1, __ATOMIC_RELEASE);
+	say("display alignment: VideoToolbox's %s set to %u (AppleCLCD's is %s)", key, (unsigned)number,
+	    kind == 0 ? "a number, where it reads a dictionary" : "not there");
+	return true;
+}
+
+static void
+display_alignment(void)
+{
+	void *function = dlsym(RTLD_DEFAULT, "FigGetAlignmentForIOSurfaceOutputToDisplayService");
+
+	if (slide == 0 && cache_start == 0) {
+		return;
+	}
+	if (function != NULL && (uintptr_t)function != FN_DISPLAY_ALIGNMENT + slide) {
+		say("display alignment: FigGetAlignmentForIOSurfaceOutputToDisplayService at %#lx, expected %#lx: left alone",
+		    (unsigned long)unslid((uintptr_t)function), (unsigned long)FN_DISPLAY_ALIGNMENT);
+		return;
+	}
+	for (size_t i = 0; i < sizeof(alignment_code) / sizeof(alignment_code[0]); i++) {
+		uint32_t word = *(const uint32_t *)(alignment_code[i].address + slide);
+
+		if (word != alignment_code[i].word) {
+			say("display alignment: VideoToolbox's code at %#lx is %#x, expected %#x: left alone",
+			    (unsigned long)alignment_code[i].address, word, alignment_code[i].word);
+			return;
+		}
+	}
+	give_answer("DisplayPipePlaneBaseAlignment", PLANE_BASE_CHECKED, PLANE_BASE_REQUIREMENT);
+	give_answer("DisplayPipeStrideRequirements", STRIDE_CHECKED, STRIDE_REQUIREMENT);
 }
 
 /* ---- the portrait prewarm (HackiOS) --------------------------------------------------------------- */
@@ -391,9 +520,7 @@ a34media_init(void)
 	size_t size = sizeof(args) - 1, length = 0;
 	const void *cache;
 
-	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
-		return;
-	}
+	program = name != NULL ? name : "?";
 	pid = getpid();
 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "a34media=0") != NULL) {
 		say("loaded, off (boot-arg a34media=0)");
@@ -404,8 +531,14 @@ a34media_init(void)
 		cache_end = cache_start + length;
 		slide = cache_start - CACHE_BASE;
 	}
-	say("loaded (cache slide %#lx, mediaserverd at %p): exceptions said, the portrait prewarm skipped",
-	    (unsigned long)slide, (const void *)_dyld_get_image_header(0));
+	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
+		say("loaded (cache slide %#lx): the display's alignments only", (unsigned long)slide);
+		display_alignment();
+		return;
+	}
+	say("loaded (cache slide %#lx, mediaserverd at %p): exceptions said, the display's alignments, the portrait "
+	    "prewarm skipped", (unsigned long)slide, (const void *)_dyld_get_image_header(0));
+	display_alignment();
 	install_preprocessor();
 	install_uncaught();
 	_dyld_register_func_for_add_image(image_added);         /* (also called for every image already there) */

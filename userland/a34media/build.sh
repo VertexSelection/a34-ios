@@ -37,7 +37,7 @@ mkdir -p "$BUILD" "$A" "$DRIVER" "$A34MEDIA_OUT/dSYM"
 
 log "liba34media.dylib (inside mediaserverd: media.c)"
 "${CC[@]}" -Werror -dynamiclib -install_name "$INSTALL_DIR/liba34media.dylib" \
-	-o "$BUILD/liba34media.dylib" "$HERE/media.c" -framework CoreFoundation -lobjc
+	-o "$BUILD/liba34media.dylib" "$HERE/media.c" -framework CoreFoundation -framework IOKit -lobjc
 
 log "RedwoodAudio.driver (the HAL's null devices: audio_plugin.c)"
 "${CC[@]}" -bundle -o "$BUILD/RedwoodAudio" "$HERE/audio_plugin.c" -framework CoreFoundation 2>&1 | tee "$BUILD/RedwoodAudio.log"
