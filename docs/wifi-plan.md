@@ -639,7 +639,8 @@ is why every boot before reached the home screen.
 
 0997 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
 baseline's 0021/0022/0083): on this board the hold is not taken (boot-arg `a34iokithold=1` takes
-it as XNU does), and `iokitDaemonLaunched` gives back only a hold that was taken. Expected in the
+it as XNU does), and `iokitDaemonLaunched` gives back only a hold that was taken (built in CI with
+every patch of main: [43733929245](https://github.com/VertexSelection/a34-ios/actions/runs/43733929245)). Expected in the
 log: `the registry's busy state is 0` when configd opens IONetworkStack. Next boot with wifid:
 boot-arg `sweetsample=SpringBoard,backboardd,wifid` (the sampler's list: first sample at 90 s)
 shows wifid's own threads if it still waits on something. Undo for the root:
