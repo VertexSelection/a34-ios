@@ -178,6 +178,18 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
 					     unsigned row_bytes, char *why, size_t why_size);
 
 /*
+ * A34 (rwm_afbcscan=1): rwa_texture_from_surface for a surface of the display's scan-out pool,
+ * drawn compressed (AFBC 32x8 sparse split YTR) when the kernel scans it out so (a34fbafbc=1,
+ * GET_PARAM 0x1002 and request 0x78): imported, and the kernel told panfrost's layout of it. NULL and
+ * a sentence otherwise, the surface then laid out as rows for the display again -- the caller imports
+ * it as rows. On success `why` holds the layout (not an error).
+ */
+struct rwa_texture *rwa_texture_from_surface_afbc(struct rwa_device *device,
+                                                  const struct rwa_texture_shape *shape,
+                                                  int surface_id, unsigned offset, char *why,
+                                                  size_t why_size);
+
+/*
  * A34 (from y2sios's air_metal.c, MIT): a texture over a buffer's memory,
  * -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a linear 2D image of `shape` from byte
  * `offset` with `row_bytes` a row, the same GPU buffer object as the buffer (not a copy). Refused by

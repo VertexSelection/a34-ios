@@ -303,7 +303,7 @@ check() {
 	done
 	for sym in drmIoctl drmGetDevices2 drmGetVersion drmSyncobjWait drmPrimeFDToHandle redwood_drm_mmap redwood_drm_munmap \
 		redwood_drm_surface redwood_drm_stats redwood_drm_queued redwood_drm_last_seq redwood_drm_wait_seq \
-		redwood_drm_surface_seq redwood_drm_submit_batch redwood_drm_trace_jobs; do
+		redwood_drm_surface_seq redwood_drm_submit_batch redwood_drm_trace_jobs redwood_drm_afbc_scanout redwood_drm_surface_layout; do
 		nm -gU "$OUT/libdrm.2.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libdrm lacks $sym"; bad=1; }
 	done
 	# panfrost maps BOs through the user client (patch 0002) and sizes IOSurface imports by it (0003)
@@ -313,7 +313,7 @@ check() {
 	# the Metal driver's library in libgallium (0006, userland/a34metal looks these up) and its
 	# counters in panfrost (0007)
 	for sym in rwa_device_open rwa_render_create rwa_render_draw rwa_texture_from_surface rwa_finish \
-		rwa_wait_seq rwa_bind_profile rwa_pan_profile; do
+		rwa_wait_seq rwa_bind_profile rwa_pan_profile rwa_texture_from_surface_afbc; do
 		nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep " _$sym\$" >/dev/null || { echo "error: libgallium lacks $sym (0006)"; bad=1; }
 	done
 	nm -gU "$OUT/libgallium-$MESA_VERSION.dylib" | grep -E ' _redwood_pan_submits$' >/dev/null ||

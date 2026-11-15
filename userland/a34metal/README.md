@@ -143,6 +143,20 @@ write its pipelines' recipes into the log three minutes into the boot (`rwr ...`
 `tools/rwm-recipes.py LOG` makes `build/rwm-recipes.txt` of them; as `/a34/rwm-recipes.txt` the
 driver builds those pipelines on a thread of its own at its next start (`rwm_warm=0`: not).
 
+## The display's surfaces compressed (boot-arg rwm_afbcscan=1, with the kernel's a34fbafbc=1)
+
+backboardd's drawables are surfaces of the kernel's scan-out pool, which MT6877's OVL scans out
+as they are. As rows (1125x2436, 11 MB) every pass of CoreAnimation's into one reads and writes
+them: 2.4-3.4 ms of GPU time each full-screen pass, 3-4 of them in a Control Center or app-zoom
+frame (boot 1006-120-a). The OVL also reads AFBC (AFBC_V1_2_MTK_1), which is panfrost's AFBC
+32x8 | SPARSE | SPLIT | YTR. With `rwm_afbcscan=1` a 'BGRA' surface the kernel says is of its pool
+(request 0x78 laying it out as rows answers that, changing nothing) is imported as that AFBC, and
+the kernel is told panfrost's own layout of the import (Mesa 0025: headers at +0, 576 bytes a row,
+payloads from +176256, 1 KB a superblock) before anything is drawn into it; a refusal is said once
+per surface ("redwooddrawable: surface N: ...") and the surface is drawn as rows as before.
+GET_PARAM 0x1002 says whether the kernel scans AFBC out at all. The driver's own reads of such a
+texture (-getBytes:) go through panfrost's linear staging copy; nothing else of ours reads one.
+
 ## CoreAnimation's effects on Metal (metal-fx)
 
 Boots 63 and 65 (`camtl=1`) drew blurs black or not at all. QuartzCore's Metal renderer asks the

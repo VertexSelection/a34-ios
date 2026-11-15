@@ -1,0 +1,57 @@
+Darwin: an imported AFBC resource's layout for the display's scan-out (redwood_pan_afbc_layout).
+
+A34 (local to this port; nothing here goes upstream). The scan-out pool's drawables can be drawn
+compressed and scanned out so by MT6877's OVL (rwm_afbcscan=1 with the kernel's a34fbafbc=1). The
+kernel has to be told where panfrost put the headers and the payloads (request 0x78), and panfrost's
+own layout of the import is the one to tell it: air_metal.c's rwa_texture_from_surface_afbc reads it
+here -- the first header's offset, a row of headers, the header area, the first payload's offset
+from the first header, the image's size -- with the buffer's size, so that an image larger than the
+buffer the kernel gave is never drawn.
+
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -35,6 +35,7 @@
+ #include "pan_tiling.h"
+ #include "pan_trace.h"
+ #include "pan_util.h"
++#include "compiler/air/redwood_pan_prof.h"
+ 
+ static uint64_t
+ panfrost_max_res_size_b(unsigned arch)
+@@ -399,6 +400,36 @@
+    return prsc;
+ }
+ 
++/*
++ * A34 (patch 0025): an imported AFBC resource's layout, for the display's scan-out (air_metal.c's
++ * rwa_texture_from_surface_afbc tells the kernel with request 0x78): the first header's offset in
++ * the buffer, a row of headers, their size, the first payload's offset from the first header, the
++ * whole image, and the buffer's own size. 1, or 0 for a resource that is not untiled AFBC.
++ */
++int
++redwood_pan_afbc_layout(struct pipe_resource *prsc, struct redwood_pan_afbc *out)
++{
++   struct panfrost_resource *rsrc = pan_resource(prsc);
++   struct panfrost_device *dev = pan_device(prsc->screen);
++
++   memset(out, 0, sizeof(*out));
++   if (!rsrc->bo || !drm_is_afbc(rsrc->modifier) || (rsrc->modifier & AFBC_FORMAT_MOD_TILED))
++      return 0;
++
++   const struct pan_image_slice_layout *slice = &rsrc->plane.layout.slices[0];
++
++   out->modifier = rsrc->modifier;
++   out->offset = slice->offset_B;
++   out->header_row_bytes = slice->afbc.header.row_stride_B;
++   out->header_size = slice->afbc.header.surface_size_B;
++   out->body_offset =
++      pan_afbc_body_offset(dev->arch, rsrc->modifier, slice->afbc.header.surface_size_B);
++   out->size = slice->afbc.surface_stride_B;
++   out->rows = out->header_row_bytes ? out->header_size / out->header_row_bytes : 0;
++   out->bo_size = panfrost_bo_size(rsrc->bo);
++   return 1;
++}
++
+ static void
+ panfrost_set_resource_label(UNUSED struct pipe_screen *pscreen,
+                             struct pipe_resource *presource,

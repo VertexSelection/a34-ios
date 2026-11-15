@@ -898,6 +898,55 @@ redwood_drm_wait_seq(uint64_t seq, int64_t relative_ns)
 	return wait_seq(seq, relative_ns < 0 ? INT64_MAX : (int64_t)monotonic_ns() + relative_ns);
 }
 
+/* AFBC scan-out (kernel 1007, redwood_drm.h): GET_PARAM 0x1002, asked once */
+EXPORT int
+redwood_drm_afbc_scanout(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		struct drm_panfrost_get_param param = { .param = REDWOOD_DRM_PARAM_AFBC };
+		size_t size = sizeof(param);
+
+		on = connected() && IOConnectCallStructMethod(connection, DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param,
+		    sizeof(param), &param, &size) == kIOReturnSuccess && param.value == 1;
+	}
+	return on;
+}
+
+/* SURFACE_LAYOUT (0x78, redwood_drm.h): the request comes back with `size` filled in */
+EXPORT int
+redwood_drm_surface_layout(struct redwood_drm_surface_layout *request)
+{
+	_Static_assert(sizeof(struct redwood_drm_surface_layout) == 24, "SURFACE_LAYOUT is 24 bytes");
+	struct redwood_drm_surface_layout answer;
+	size_t size = sizeof(answer);
+	kern_return_t result;
+	uint64_t began;
+
+	if (request == NULL || request->surface == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!connected()) {
+		errno = ENODEV;
+		return -1;
+	}
+	answer = *request;
+	began = mach_absolute_time();
+	result = IOConnectCallStructMethod(connection, REDWOOD_DRM_SURFACE_LAYOUT, request, sizeof(*request), &answer, &size);
+	count(&stats.calls[REDWOOD_DRM_SURFACE_LAYOUT], &stats.ticks[REDWOOD_DRM_SURFACE_LAYOUT], began);
+	if (result != kIOReturnSuccess) {
+		errno = result == kIOReturnUnsupported ? ENOTSUP : result == kIOReturnBadArgument ? EINVAL :
+		    result == kIOReturnNoSpace ? ENOSPC : errno_of(result);
+		return -1;
+	}
+	if (size == sizeof(answer)) {
+		request->size = answer.size;
+	}
+	return 0;
+}
+
 EXPORT int
 redwood_drm_surface_seq(uint32_t surface, uint64_t seq)
 {

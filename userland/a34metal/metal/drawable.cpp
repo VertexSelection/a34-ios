@@ -69,6 +69,7 @@
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "drawable.h"
@@ -534,6 +535,43 @@ rwd_import_available(void)
 	return rwd_import() != NULL;
 }
 
+/*
+ * A34 (boot-arg rwm_afbcscan=1, backboardd only): a surface of the display's scan-out pool drawn
+ * compressed, which MT6877's OVL scans out as it is (the kernel's a34fbafbc=1, request 0x78):
+ * rwa_texture_from_surface_afbc asks the kernel, imports it as AFBC 32x8 sparse split YTR and tells
+ * the kernel panfrost's layout; NULL, and the surface is imported as rows as before. Every pass of
+ * CoreAnimation's into its drawable reads and writes the drawable, 11 MB as rows.
+ */
+typedef struct rwa_texture *(*rwd_import_afbc_call)(struct rwa_device *device,
+						    const struct rwd_texture_shape *shape,
+						    int surface_id, unsigned offset, char *why,
+						    size_t why_size);
+
+extern "C" bool rwm_boot_arg(const char *text);
+
+static rwd_import_afbc_call
+rwd_import_afbc(void)
+{
+	static rwd_import_afbc_call import;
+	static int on = -1;
+
+	if (on < 0) {
+		on = rwm_boot_arg("rwm_afbcscan=1") && strcmp(getprogname(), "backboardd") == 0;
+		if (on) {
+			void *library = dlopen("/a34/libgallium-26.3.0.dylib", RTLD_NOW | RTLD_NOLOAD);
+
+			if (library != NULL) {
+				*(void **)&import = dlsym(library, "rwa_texture_from_surface_afbc");
+			}
+			printf("redwooddrawable: rwm_afbcscan=1: the display's surfaces drawn compressed, %s\n",
+			    import != NULL ? "if the kernel takes them (a34fbafbc=1)" :
+			    "NOT: the compiler library has no rwa_texture_from_surface_afbc");
+			fflush(stdout);
+		}
+	}
+	return on ? import : NULL;
+}
+
 struct rwa_texture *
 rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigned long plane,
 			const struct rwd_texture_shape *want, struct rwd_surface *took,
@@ -632,8 +670,39 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	 * per user client -- and then there would be two owners of one surface and only one
 	 * release.
 	 */
-	texture = import(mesa_device, want, (int)id, surface.offset, surface.rowBytes, why,
-	    why_size);
+	texture = NULL;
+	if (surface.pixelFormat == 0x42475241u && bytes_per_pixel == 4 && rwd_import_afbc() != NULL) {
+		/*
+		 * 'BGRA': the scan-out pool's, which the kernel answers for. A surface it refused once is
+		 * not asked about again (other programs' windows come through here too, and an ID is not
+		 * given twice), so that a refusal costs one kernel call and one line per surface.
+		 */
+		static uint32_t refused[128];
+		static unsigned refused_n, said;
+		bool known = false;
+		char line[512];
+
+		for (unsigned i = 0; i < 128 && !known; i++) {
+			known = refused[i] == id;
+		}
+		if (!known) {
+			texture = rwd_import_afbc()(mesa_device, want, (int)id, surface.offset, line,
+			    sizeof(line));
+			if (texture == NULL) {
+				refused[refused_n++ % 128] = id;
+			}
+			if (said < 48) {
+				said++;
+				printf("redwooddrawable: surface %u: %s%s\n", id, line,
+				    texture != NULL ? "" : " -- drawn as rows");
+				fflush(stdout);
+			}
+		}
+	}
+	if (texture == NULL) {
+		texture = import(mesa_device, want, (int)id, surface.offset, surface.rowBytes, why,
+		    why_size);
+	}
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */
 	}

@@ -1450,6 +1450,7 @@ pixel_format_refusal(unsigned f)
 struct rwa_surface_import {
    int id;
    unsigned offset, row_bytes;
+   uint64_t modifier;   /* (A34) 0: rows of pixels; else the layout drawn (rwa_texture_from_surface_afbc) */
 };
 
 /* textures made (cumulative; rwa_cb_counters), on whichever thread made them */
@@ -1844,7 +1845,7 @@ texture_of_shape_timed(struct rwa_device *device, const struct rwa_texture_shape
          .handle = (unsigned) import->id,
          .stride = import->row_bytes,
          .offset = import->offset,
-         .modifier = DRM_FORMAT_MOD_LINEAR,
+         .modifier = import->modifier ? import->modifier : DRM_FORMAT_MOD_LINEAR,
       };
 
       /*
@@ -2015,6 +2016,146 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
       .id = surface_id, .offset = offset, .row_bytes = row_bytes };
 
    return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/*
+ * A34 (rwm_afbcscan=1): a surface of the display's scan-out pool drawn compressed. MT6877's OVL
+ * scans out AFBC_V1_2_MTK_1, which is panfrost's AFBC(32x8 | SPARSE | SPLIT | YTR), so a drawable
+ * drawn that way is read and written by every pass at a fraction of its 11 MB of rows -- each
+ * full-screen pass of CoreAnimation's into the drawable cost the GPU 2.4-3.4 ms as rows (boot
+ * 1006-120-a). The kernel's side (1007/1008, a34fbafbc=1; redwood_drm.h, laid out again here, this
+ * tree having no redwood_drm.h): GET_PARAM 0x1002 says whether it scans AFBC out at all, and request
+ * 0x78 (SURFACE_LAYOUT) how a surface of its pool is laid out. A surface this process has not marked
+ * yet is first set to rows, as made -- which changes nothing and answers whether it is a pool
+ * surface at all, so that no other program's surface is ever imported compressed -- then imported,
+ * and the kernel told panfrost's own layout of the import (patch 0025), which has to fit the buffer.
+ */
+#define RWA_LAYOUT_ROWS 0u
+#define RWA_LAYOUT_AFBC 1u
+struct rwa_drm_surface_layout {
+   uint32_t surface, layout, header, body, header_row, size;
+};
+static_assert(sizeof(struct rwa_drm_surface_layout) == 24, "redwood_drm.h's SURFACE_LAYOUT is 24 bytes");
+extern int redwood_drm_afbc_scanout(void) __attribute__((weak_import));
+extern int redwood_drm_surface_layout(struct rwa_drm_surface_layout *request) __attribute__((weak_import));
+
+/* the surfaces this process marked AFBC (IOSurface IDs, which the kernel does not give twice) */
+static pthread_mutex_t rwa_afbc_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t rwa_afbc_marked[64];
+
+static bool
+afbc_marked(uint32_t id, int set)
+{
+   bool found = false;
+   pthread_mutex_lock(&rwa_afbc_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(rwa_afbc_marked) && !found; i++) {
+      if (rwa_afbc_marked[i] == id) {
+         found = true;
+         if (set == 0)
+            rwa_afbc_marked[i] = 0;
+      }
+   }
+   if (!found && set == 1) {
+      static unsigned next;
+      rwa_afbc_marked[next++ % ARRAY_SIZE(rwa_afbc_marked)] = id;
+   }
+   pthread_mutex_unlock(&rwa_afbc_mtx);
+   return found;
+}
+
+/* the surface back to rows, for the display, before anything draws it so */
+static void
+afbc_unmark(uint32_t id)
+{
+   struct rwa_drm_surface_layout rows = { .surface = id, .layout = RWA_LAYOUT_ROWS };
+   (void)redwood_drm_surface_layout(&rows);
+   afbc_marked(id, 0);
+}
+
+struct rwa_texture *
+rwa_texture_from_surface_afbc(struct rwa_device *device, const struct rwa_texture_shape *shape,
+                              int surface_id, unsigned offset, char *why, size_t why_size)
+{
+   /* (no lock, as rwa_texture_from_surface) */
+   if (surface_id <= 0 || !shape || shape->width == 0) {
+      say(why, why_size, "IOSurface %d is not a surface to draw compressed", surface_id);
+      return NULL;
+   }
+   if (!redwood_drm_afbc_scanout || !redwood_drm_surface_layout) {
+      say(why, why_size, "this libdrm has no SURFACE_LAYOUT (request 0x78): built before it");
+      return NULL;
+   }
+   if (!redwood_drm_afbc_scanout()) {
+      say(why, why_size, "the kernel does not scan AFBC out (GET_PARAM 0x1002: boot-arg a34fbafbc=1 "
+                         "and the display's scan-out pool are needed)");
+      return NULL;
+   }
+   const uint32_t id = (uint32_t)surface_id;
+   const bool was_marked = afbc_marked(id, -1);
+   uint32_t room = 0;
+   if (!was_marked) {
+      struct rwa_drm_surface_layout ask = { .surface = id, .layout = RWA_LAYOUT_ROWS };
+      if (redwood_drm_surface_layout(&ask) != 0) {
+         say(why, why_size, "IOSurface %d is not a surface of the display's scan-out pool (errno %d)",
+             surface_id, errno);
+         return NULL;
+      }
+      room = ask.size;
+   }
+   const struct rwa_surface_import import = {
+      .id = surface_id, .offset = offset,
+      /* the pitch an AFBC import is described by: a row of superblocks' payloads over their 8 lines */
+      .row_bytes = ALIGN_POT(shape->width, 32) * 4,
+      .modifier = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 | AFBC_FORMAT_MOD_SPARSE |
+                                          AFBC_FORMAT_MOD_SPLIT | AFBC_FORMAT_MOD_YTR),
+   };
+   struct rwa_texture *texture = texture_of_shape(device, shape, &import, why, why_size);
+   if (!texture) {
+      if (was_marked)
+         afbc_unmark(id);
+      return NULL;
+   }
+   struct redwood_pan_afbc layout;
+   if (util_format_get_blocksize(texture->res->format) != 4 ||
+       !redwood_pan_afbc_layout(texture->res, &layout) || layout.offset < offset) {
+      say(why, why_size, "IOSurface %d imported as %s is not 4-byte AFBC as asked", surface_id,
+          util_format_short_name(texture->res->format));
+      rwa_texture_destroy(texture);
+      if (was_marked)
+         afbc_unmark(id);
+      return NULL;
+   }
+   /* bytes from the first pixel: the headers, the first payload and the image's end (panfrost lays
+    * out ALIGN(height, 16) / 8 rows of superblocks, the GPU writing 16-line blocks) */
+   const uint64_t header = layout.offset - offset;
+   const uint64_t body = header + layout.body_offset;
+   const uint64_t end = header + layout.size;
+   struct rwa_drm_surface_layout mark = {
+      .surface = id, .layout = RWA_LAYOUT_AFBC, .header = (uint32_t)header, .body = (uint32_t)body,
+      .header_row = layout.header_row_bytes,
+   };
+   const bool fits = end <= UINT32_MAX && layout.offset + layout.size <= layout.bo_size &&
+                     (was_marked || end <= room);
+   if (!fits || redwood_drm_surface_layout(&mark) != 0 || end > mark.size) {
+      int error = errno;
+      say(why, why_size, "the kernel would not take IOSurface %d compressed%s (errno %d): headers at "
+                         "+%llu, %u bytes a row of them, %u rows, payloads from +%llu to +%llu of a "
+                         "buffer of %u bytes from the first pixel (%llu in all)", surface_id,
+          fits ? "" : ", or it does not fit", fits ? error : 0, (unsigned long long)header,
+          layout.header_row_bytes, layout.rows, (unsigned long long)body, (unsigned long long)end,
+          mark.size ? mark.size : room, (unsigned long long)layout.bo_size);
+      rwa_texture_destroy(texture);
+      afbc_unmark(id);
+      return NULL;
+   }
+   afbc_marked(id, 1);
+   /* the layout, for the caller's log (a sentence that is not a refusal) */
+   say(why, why_size, "IOSurface %d drawn compressed for the display: AFBC 32x8 sparse split YTR, "
+                      "headers at +%llu, %u bytes a row of them, %u rows, payloads from +%llu to "
+                      "+%llu of %u bytes", surface_id, (unsigned long long)header,
+       layout.header_row_bytes, layout.rows, (unsigned long long)body, (unsigned long long)end,
+       mark.size);
+   return texture;
 }
 
 /*
@@ -5162,6 +5303,8 @@ drm_selector_name(unsigned selector)
    case 0x09: return "GEM_CLOSE";
    case 0x7a: return "SET_MODE";
    case 0x7b: return "WAIT_SEQ";
+   case 0x78: return "SURFACE_AFBC";
+   case 0x79: return "TRACE_JOBS";
    case 0x7c: return "PENDING";
    case 0x7d: return "SUBMIT_BATCH";
    case 0x7e: return "SURFACE";

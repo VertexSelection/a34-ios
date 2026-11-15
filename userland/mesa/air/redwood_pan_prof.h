@@ -158,6 +158,22 @@ int redwood_pan_shader_stats(void *cso, char *buf, size_t size);
 int redwood_pan_pass_discard(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
                              const struct pipe_surface *zs, unsigned color_mask, unsigned zs_mask);
 
+/*
+ * (patch 0025) an imported AFBC resource's layout, for the display's scan-out (request 0x78,
+ * rwa_texture_from_surface_afbc): offsets and sizes in bytes; 1, or 0 when it is not untiled AFBC.
+ */
+struct redwood_pan_afbc {
+   uint64_t modifier;
+   uint64_t offset;              /* the first header, in the buffer */
+   uint32_t header_row_bytes;    /* from a row of headers to the next */
+   uint32_t rows;                /* rows of superblocks */
+   uint64_t header_size;
+   uint64_t body_offset;         /* the first payload, from the first header */
+   uint64_t size;                /* from the first header to the end of the last payload */
+   uint64_t bo_size;             /* the buffer's */
+};
+int redwood_pan_afbc_layout(struct pipe_resource *prsc, struct redwood_pan_afbc *out);
+
 static inline uint64_t
 rwp_now(void)
 {
