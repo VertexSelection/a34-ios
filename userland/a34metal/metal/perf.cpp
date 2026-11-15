@@ -254,6 +254,24 @@ rwm_perf_report(uint64_t now)
 		}
 	}
 	say_worst_cb();
+	/* A34: the traced command buffer's passes by pipeline (rwm_pass_draws), and the next one traced */
+	for (unsigned k = 0; !rwm_pass_draws_on && k < rwm_pass_draws_n; k++) {
+		const struct rwm_pass_draws *d = &rwm_pass_draws[k];
+		char wide[900];
+		size_t at = (size_t)snprintf(wide, sizeof(wide), "rwm pass draws %u of %u: %ux%u level %u, %u draws:", k + 1,
+					     rwm_pass_draws_n, d->width, d->height, d->level, d->draws);
+
+		for (unsigned i = 0; i < d->nshaders && at < sizeof(wide); i++) {
+			at += (size_t)snprintf(wide + at, sizeof(wide) - at, "%s %s x%u (%.2f Mpx)", i ? "," : "",
+					       d->shaders[i].label, d->shaders[i].draws, d->shaders[i].pixels / 1e6);
+		}
+		if (d->other_draws != 0 && at < sizeof(wide)) {
+			snprintf(wide + at, sizeof(wide) - at, ", others x%u (%.2f Mpx)", d->other_draws, d->other_pixels / 1e6);
+		}
+		say(wide);
+	}
+	rwm_pass_draws_n = 0;
+	rwm_pass_draws_on = true;
 	for (unsigned which = 0; pan != nullptr && which < 47; which++) {    /* (4: tiles; 5: one span's jobs; 6 and on: its passes) */
 		char wide[1000];
 

@@ -4,6 +4,7 @@
  */
 #include "rwm.h"
 
+#include <stdio.h>
 #include <string.h>
 
 namespace {
@@ -78,6 +79,79 @@ rwm_works_copy_in(struct rwm_work *const *works, unsigned count)
 	}
 }
 
+/* A34: one draw into the traced command buffer's passes, by pipeline (rwm_pass_draws) */
+static void
+note_pass_draw(const struct rwm_work *w)
+{
+	static const struct rwa_texture *last_target;
+	static unsigned last_level;
+	const struct rwm_draw *d = &w->draw;
+	const struct rwa_texture *target = d->color_count != 0 ? d->color[0] : nullptr;
+	const unsigned level = d->color_count != 0 ? d->color_level[0] : 0;
+
+	if (rwm_pass_draws_n == 0 || target != last_target || level != last_level) {
+		if (rwm_pass_draws_n == RWM_PASS_DRAWS) {
+			return;
+		}
+		struct rwm_pass_draws *p = &rwm_pass_draws[rwm_pass_draws_n++];
+
+		memset(p, 0, sizeof(*p));
+		if (w->target_count != 0 && w->targets[0] != nullptr) {
+			const struct rwa_texture_shape *shape = rwm_texture_shape(w->targets[0]);
+
+			p->width = shape->width >> level;
+			p->height = shape->height >> level;
+		}
+		p->level = level;
+		last_target = target;
+		last_level = level;
+	}
+	struct rwm_pass_draws *p = &rwm_pass_draws[rwm_pass_draws_n - 1];
+	/* the pixels it may cover: its viewport (or the target), within its scissor */
+	double x0 = 0, y0 = 0, x1 = p->width, y1 = p->height;
+
+	if (d->viewport != nullptr) {
+		x0 = d->viewport[0];
+		y0 = d->viewport[1];
+		x1 = x0 + d->viewport[2];
+		y1 = y0 + d->viewport[3];
+	}
+	if (d->scissor != nullptr) {
+		x0 = x0 > d->scissor[0] ? x0 : d->scissor[0];
+		y0 = y0 > d->scissor[1] ? y0 : d->scissor[1];
+		x1 = x1 < d->scissor[0] + d->scissor[2] ? x1 : d->scissor[0] + d->scissor[2];
+		y1 = y1 < d->scissor[1] + d->scissor[3] ? y1 : d->scissor[1] + d->scissor[3];
+	}
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > p->width ? p->width : x1;
+	y1 = y1 > p->height ? p->height : y1;
+	const uint64_t pixels = x1 > x0 && y1 > y0 ? (uint64_t)((x1 - x0) * (y1 - y0)) : 0;
+	const char *label = rwm_label_of(w->pipeline);
+	unsigned k;
+
+	if (label == nullptr) {
+		label = "?";
+	}
+	if (strstr(label, "coreanimation.") != nullptr) {
+		label = strstr(label, "coreanimation.") + 14;
+	}
+	p->draws++;
+	for (k = 0; k < p->nshaders && strncmp(p->shaders[k].label, label, sizeof(p->shaders[k].label) - 1) != 0; k++) {
+	}
+	if (k == p->nshaders && p->nshaders < RWM_PASS_SHADERS) {
+		snprintf(p->shaders[k].label, sizeof(p->shaders[k].label), "%s", label);
+		p->nshaders++;
+	}
+	if (k < p->nshaders) {
+		p->shaders[k].draws++;
+		p->shaders[k].pixels += pixels;
+	} else {
+		p->other_draws++;
+		p->other_pixels += pixels;
+	}
+}
+
 extern "C" int
 rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned count, bool copy, bool finish,
 	      uint64_t *seq, uint64_t *waited_ns, char *why, size_t why_size)
@@ -147,6 +221,9 @@ rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned
 			int failed;
 
 			rwm_perf.draws++;
+			if (rwm_pass_draws_on) {
+				note_pass_draw(w);
+			}
 			failed = rwm_run_draw(&w->draw, why, why_size);
 			if (failed == -2) {
 				rwm_print("the draw failed: %s\n", why);

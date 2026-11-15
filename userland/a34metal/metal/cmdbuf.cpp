@@ -111,6 +111,16 @@ __thread bool rwm_on_completion_queue;
 /* A34: the last buffer committed (its last GPU job) and when the completion queue saw a buffer's GPU work end */
 static uint64_t last_committed_seq, last_done_ns;
 __thread struct rwm_cb_parts rwm_cb_now;
+bool rwm_pass_draws_on;
+unsigned rwm_pass_draws_n;
+struct rwm_pass_draws rwm_pass_draws[RWM_PASS_DRAWS];
+static const char *(*commit_label)(void *pipeline);
+
+extern "C" const char *
+rwm_label_of(void *pipeline)
+{
+	return commit_label != nullptr && pipeline != nullptr ? commit_label(pipeline) : nullptr;
+}
 
 extern "C" bool
 rwm_copyin_late(void)
@@ -173,6 +183,9 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 		if (!rwm_worker_on()) {
 			rwm_bind_big(1);
 		}
+	}
+	if (label != nullptr) {
+		commit_label = label;
 	}
 	if (inuse_wanted()) {
 		rwm_works_sampled(works, count, &c->sampled);
@@ -239,6 +252,9 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 	}
 	rwm_cb_now.took_ns = took;
 	rwm_cb_parts_note(&rwm_cb_now);
+	if (rwm_pass_draws_on && rwm_pass_draws_n != 0) {
+		rwm_pass_draws_on = false;      /* (one command buffer's, said with the next report) */
+	}
 	if (c->seq != 0) {
 		__atomic_store_n(&last_committed_seq, c->seq, __ATOMIC_RELAXED);
 	}

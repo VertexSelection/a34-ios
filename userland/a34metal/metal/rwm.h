@@ -81,6 +81,30 @@ struct rwm_cb_parts {
 };
 extern __thread struct rwm_cb_parts rwm_cb_now;
 void rwm_cb_parts_note(const struct rwm_cb_parts *parts);
+/*
+ * A34: the draws of one command buffer's passes, by pipeline -- the one the library traces after each profile
+ * report ("rwm pass k of n", whose GPU jobs the kernel times): which pipelines a pass that costs milliseconds on the
+ * GPU ran, how often, and over how many pixels (viewport and scissor). Kept by rwm_run_works while
+ * rwm_pass_draws_on, said with the next report.
+ */
+#define RWM_PASS_DRAWS 40
+#define RWM_PASS_SHADERS 6
+struct rwm_pass_draws {
+	unsigned width, height, level, draws;
+	unsigned nshaders;
+	struct {
+		char label[48];
+		unsigned draws;
+		uint64_t pixels;
+	} shaders[RWM_PASS_SHADERS];
+	unsigned other_draws;
+	uint64_t other_pixels;
+};
+extern bool rwm_pass_draws_on;
+extern unsigned rwm_pass_draws_n;
+extern struct rwm_pass_draws rwm_pass_draws[RWM_PASS_DRAWS];
+/* a pipeline's label (the plug-in's, set at -commit), or NULL */
+const char *rwm_label_of(void *pipeline);
 /* one of the compiler library's calls that are not part of the contract (profiles), or NULL */
 void *rwm_profile_call(const char *name);
 /* A34: a line HackiOS kept with their kernel's sysctl kern.redwood.say (which ours has not): written to
