@@ -1,0 +1,258 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 363e0d1..a0c6c1e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -199,6 +199,9 @@ public:
+ 	uint64_t      fScanSwapNo[6];
+ 	uint8_t       fScanState[6];
+ 	uint64_t      fScanSwaps;
++	uint32_t      fScanSwapID[6];           /* A34 (0998): the swap (CoreAnimation's id) of scan-out frame k */
++	uint32_t      fFlipEvery;               /* A34 (0998): TEs a frame shows for at least (panel Hz / a34iomfbhz) */
++	uint64_t      fLastFlipTE;              /* A34 (0998): the TE the last transfer started at */
+ 	uint64_t      fOvlPA;
+ 	uint32_t      fOvlPitch;
+ 	SweetSurface *fScanLast;
+@@ -236,7 +239,8 @@ public:
+ 	void present(const uint8_t *rec);
+ 	uint8_t *takePending(SweetSurface *presenting[SWEET_FB_LAYERS]);
+ 	void presentTaken(uint8_t *rec, SweetSurface *presenting[SWEET_FB_LAYERS]);
+-	IOReturn swapWait(uint32_t id, uint32_t options);
++	IOReturn swapWait(uint32_t id, uint32_t options, uint32_t timeoutMs);
++	bool scanSwapBusy(uint32_t id);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -1030,6 +1034,11 @@ AppleCLCD::start(IOService *provider)
+ 	if (iomfbHz != 0) {
+ 		publishRefresh(iomfbHz);
+ 	}
++	if (iomfbHz != 0 && fPanelHz > iomfbHz && fPanelHz % iomfbHz == 0) {
++		fFlipEvery = fPanelHz / iomfbHz;        /* A34 (0998) */
++		IOLog("A34 FB 120: a34iomfbhz=%u with the panel at %u Hz: a frame shows for %u TEs at least\n", iomfbHz,
++		    fPanelHz, fFlipEvery);
++	}
+ 	registerService();
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
+@@ -1455,16 +1464,29 @@ AppleCLCD::swap(const uint8_t *rec)
+ /*
+  * A34 (0927): SwapWait(id, options): done when the display no longer needs
+  * that swap (see the top of the file). Options bit 0: only asked.
++ *
++ * A34 (0998): as Apple's swap_wait (ios-viva 0133, from their reverse
++ * engineering of IOMFBDisplay::can_update_): [swap, options, timeout ms],
++ * options bit 31 only asks (kIOReturnBusy while not done), the low bits say
++ * what is waited for (0 retired, 1 displayed, 2 idle). CoreAnimation asks
++ * (0x80000000) before it draws into a framebuffer page again. Here all three
++ * are "the display no longer needs the swap's surfaces": copied, or for a
++ * scan-out frame sent (its transfer over) or dropped. Until 0997 a scan-out
++ * frame's swap was done as soon as it was queued, CoreAnimation drew into
++ * the surface the panel was still to be sent, and its GPU jobs waited for
++ * the display (boot 0996: 709 ms of GPU idle in 10 s). Bit 0 alone (0927's
++ * "only asked") is op 1, displayed, and waits.
+  */
+ IOReturn
+-AppleCLCD::swapWait(uint32_t id, uint32_t options)
++AppleCLCD::swapWait(uint32_t id, uint32_t options, uint32_t timeoutMs)
+ {
+ 	uint64_t deadline, t0;
+ 	IOReturn ret = kIOReturnSuccess;
++	bool ask = (options & 0x80000000u) != 0;
+ 
+ 	IOLockLock(fLock);
+ 	bool busy = id != 0 && (id == fPendingSwapID || id == fPresentingSwapID);
+-	if ((options & 1u) != 0) {
++	if (ask) {
+ 		sweet_fb_hold_stats[3]++;
+ 		if (busy) {
+ 			sweet_fb_hold_stats[4]++;
+@@ -1473,7 +1495,8 @@ AppleCLCD::swapWait(uint32_t id, uint32_t options)
+ 	} else if (busy) {
+ 		sweet_fb_hold_stats[5]++;
+ 		t0 = mach_absolute_time();
+-		clock_interval_to_deadline(SWEET_FB_SWAP_WAIT_MS, kMillisecondScale, &deadline);
++		clock_interval_to_deadline(timeoutMs != 0 && timeoutMs < SWEET_FB_SWAP_WAIT_MS ? timeoutMs : SWEET_FB_SWAP_WAIT_MS,
++		    kMillisecondScale, &deadline);
+ 		while (id == fPendingSwapID || id == fPresentingSwapID) {
+ 			int res = IOLockSleepDeadline(fLock, &fPendingSwapID, deadline, THREAD_ABORTSAFE);
+ 
+@@ -1490,6 +1513,34 @@ AppleCLCD::swapWait(uint32_t id, uint32_t options)
+ 		}
+ 	}
+ 	IOLockUnlock(fLock);
++	if (ret != kIOReturnSuccess || id == 0 || !fScanOn || fFlipLock == NULL) {
++		return ret;
++	}
++	/* A34 (0998): a scan-out frame of the swap still pending, the kick's or being sent */
++	IOLockLock(fFlipLock);
++	if (scanSwapBusy(id)) {
++		if (ask) {
++			sweet_fb_hold_stats[4]++;
++			ret = kIOReturnBusy;
++		} else {
++			t0 = mach_absolute_time();
++			clock_interval_to_deadline(timeoutMs != 0 && timeoutMs < SWEET_FB_SWAP_WAIT_MS ? timeoutMs :
++			    SWEET_FB_SWAP_WAIT_MS, kMillisecondScale, &deadline);
++			while (scanSwapBusy(id)) {
++				int res = IOLockSleepDeadline(fFlipLock, &fScanSwapID, deadline, THREAD_ABORTSAFE);
++
++				if (res != THREAD_AWAKENED && scanSwapBusy(id)) {
++					ret = res == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
++					break;
++				}
++			}
++			sweet_fb_hold_stats[5]++;
++			if (mach_absolute_time() - t0 > sweet_fb_hold_stats[7]) {
++				sweet_fb_hold_stats[7] = mach_absolute_time() - t0;
++			}
++		}
++	}
++	IOLockUnlock(fFlipLock);
+ 	return ret;
+ }
+ 
+@@ -2260,19 +2311,26 @@ AppleCLCD::kickOne(void)
+ 			sweet_fb_flip_stats[10] += (fTELast - readyAt) / fTEPeriod;   /* A34 (0938): whole periods it waited */
+ 		}
+ 	}
++	if (fTE && fFlipEvery > 1 && fLastFlipTE != 0 && fTEPeriod != 0) {
++		/*
++		 * A34 (0998): a34iomfbhz below the panel's rate (CoreAnimation told 60,
++		 * the panel at 120): a frame shows for fFlipEvery TEs at least, so 60
++		 * frames a second go out evenly, one every other TE.
++		 */
++		uint64_t more = 0;
++
++		for (uint32_t n = 0; n < fFlipEvery && fTELast - fLastFlipTE < fFlipEvery * fTEPeriod - fTEPeriod / 2; n++) {
++			if (!teWait(&more)) {
++				break;
++			}
++			tew += more;
++		}
++	}
+ 	if (t >= 2) {
+-		/* A34 (0996): a newer frame done by this TE goes instead; from here until its end the surface is held */
++		/* A34 (0996, 0998): sent as taken (in order); from here until its end the surface is held */
+ 		SweetSurface *instead = NULL;
+ 
+ 		IOLockLock(fFlipLock);
+-		int32_t newer = scanPick(fScanSwapNo[t], skip, &nd);
+-
+-		if (newer >= 0) {
+-			instead = scanRelease(t);
+-			sweet_fb_scan_stats[6]++;
+-			t = newer;
+-			fTaken = t;
+-		}
+ 		fScanState[t] = SWEET_FB_SCAN_SENDING;
+ 		if (fScanSurf[t] != NULL) {
+ 			scanHoldMin(fScanSurf[t]);
+@@ -2354,6 +2412,7 @@ AppleCLCD::kickOne(void)
+ 		sweet_fb_path_stats[11] += started - readyAt;
+ 	}
+ 	a34_dsi_trigger();
++	fLastFlipTE = fTELast;                  /* A34 (0998) */
+ 	if (fTE) {
+ 		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);      /* A34 (0938): set from here on: a later TE */
+ 	}
+@@ -2423,6 +2482,8 @@ AppleCLCD::scanRelease(int32_t k)
+ 	fScanSurf[k] = NULL;
+ 	fScanState[k] = SWEET_FB_SCAN_FREE;
+ 	fScanSwapNo[k] = 0;
++	fScanSwapID[k] = 0;
++	IOLockWakeup(fFlipLock, &fScanSwapID, false);   /* A34 (0998): SwapWait */
+ 	if (s != NULL && sending) {
+ 		scanHoldMin(s);         /* A34 (0993): before scanHeld drops */
+ 		OSDecrementAtomic(&s->scanHeld);
+@@ -2432,34 +2493,56 @@ AppleCLCD::scanRelease(int32_t k)
+ }
+ 
+ /*
+- * A34 (0996), with fFlipLock: the newest pending scan-out frame swapped after
+- * `after` whose GPU jobs are done (~0 as `after`: the newest pending, done
+- * or not); the pending ones older than it dropped, their surfaces into
+- * dropped[] for the caller to release without the lock. -1: none.
++ * A34 (0996, 0998), with fFlipLock: the scan-out frame to send. 0998: in the
++ * order they were swapped, each once -- the oldest pending frame, when its
++ * GPU jobs are done (`after` ~0: done or not); -1: none, or not done yet.
++ * 0996 took the newest done one and dropped the older ones (boot 0996: 133-247
++ * of ~990 frames a 10 s never shown, and every drop is a jump in
++ * CoreAnimation's animation: judder). Only a backlog is cut: of more than
++ * SWEET_FB_SCAN_BACKLOG pending frames the oldest go (into dropped[] for the
++ * caller to release without the lock).
+  */
++#define SWEET_FB_SCAN_BACKLOG   2u
+ int32_t
+ AppleCLCD::scanPick(uint64_t after, SweetSurface *dropped[4], uint32_t *nd)
+ {
+-	int32_t best = -1;
+-	bool any = after == ~0ull;
++	int32_t oldest;
+ 
+-	for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
+-		if (fScanState[k] == SWEET_FB_SCAN_PENDING && (any || fScanSwapNo[k] > after) &&
+-		    (best < 0 || fScanSwapNo[k] > fScanSwapNo[best]) &&
+-		    (any || fScanSurf[k] == NULL || a34_mali_surface_done(fScanSurf[k]))) {
+-			best = k;
++	for (;;) {
++		oldest = -1;
++		for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
++			if (fScanState[k] == SWEET_FB_SCAN_PENDING && (oldest < 0 || fScanSwapNo[k] < fScanSwapNo[oldest])) {
++				oldest = k;
++			}
+ 		}
++		if (oldest < 0 || scanPending() <= SWEET_FB_SCAN_BACKLOG || *nd >= 4) {
++			break;
++		}
++		dropped[(*nd)++] = scanRelease(oldest);
++		sweet_fb_scan_stats[6]++;               /* (the display fell behind) */
+ 	}
+-	if (best < 0) {
++	if (oldest < 0) {
+ 		return -1;
+ 	}
+-	for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
+-		if (k != best && fScanState[k] == SWEET_FB_SCAN_PENDING && fScanSwapNo[k] < fScanSwapNo[best] && *nd < 4) {
+-			dropped[(*nd)++] = scanRelease(k);
+-			sweet_fb_scan_stats[6]++;       /* (a newer one is done first) */
++	if (after != ~0ull && fScanSurf[oldest] != NULL && !a34_mali_surface_done(fScanSurf[oldest])) {
++		return -1;
++	}
++	return oldest;
++}
++
++/*
++ * A34 (0998), with fFlipLock: whether the display still needs swap `id`'s
++ * surface: one of its scan-out frames is pending, the kick's, or being sent.
++ */
++bool
++AppleCLCD::scanSwapBusy(uint32_t id)
++{
++	for (uint32_t k = 2; k < SWEET_FB_FRAMES; k++) {
++		if (fScanSwapID[k] == id && fScanState[k] != SWEET_FB_SCAN_FREE) {
++			return true;
+ 		}
+ 	}
+-	return best;
++	return false;
+ }
+ 
+ /* A34 (0996), with fFlipLock: scan-out frames waiting for the kick. */
+@@ -2619,6 +2702,7 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 	fScanSurf[k] = s;                       /* (sweet_surface_copy()'s reference) */
+ 	fScanSwapNo[k] = ++fScanSwaps;
+ 	fScanState[k] = SWEET_FB_SCAN_PENDING;
++	fScanSwapID[k] = get32(rec, 0x50);      /* A34 (0998) */
+ 	fBufPA[k] = addr;
+ 	fPitch[k] = s->bytesPerRow;
+ 	queuedAt(now);
+@@ -3142,7 +3226,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBSwapWait:
+ 		/* A34 (0927): scalars [swap id, options, timeout] (kern_SwapWait, kern_SwapWaitWithTimeout) */
+ 		if (fFB->fHold && args->scalarInputCount >= 2) {
+-			ret = fFB->swapWait((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1]);
++			ret = fFB->swapWait((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
++			    args->scalarInputCount >= 3 ? (uint32_t)args->scalarInput[2] : 0);
+ 		}
+ 		break;
+ 	default:

@@ -36,6 +36,11 @@
       "wlan"/"marconi-wifi", which ours does not have; the Wi-Fi it finds is in
       the registry instead (iokit/Kernel/arm/A34WLAN.cpp, xnu/patches/0969).
 
+  root-add-job.py --relimit ROOT LABEL [NODE...]
+      Undoes --unlimit: sets _LimitLoadToDeviceTree to NODE..., by default for
+      com.apple.wifid its stock value, ["wlan", "marconi-wifi"] (iOS 16.7.16's
+      launchd.plist).
+
 For CoreAnimation on the GPU (userland/a34gl/README.md):
   root-add-job.py --copy  /mnt /a34 a34gl/a34
   root-add-job.py --wrap  /mnt com.apple.backboardd /a34/a34gl-bbd
@@ -143,6 +148,20 @@ def unlimit(job):
     return job.pop('_LimitLoadToDeviceTree', None) is not None
 
 
+STOCK_LIMITS = {'com.apple.wifid': ['wlan', 'marconi-wifi']}
+
+
+def relimit(job, nodes):
+    if not nodes:
+        nodes = STOCK_LIMITS.get(job.get('Label'))
+        if nodes is None:
+            sys.exit('no stock _LimitLoadToDeviceTree known for %s: name the nodes' % job.get('Label'))
+    if job.get('_LimitLoadToDeviceTree') == list(nodes):
+        return False
+    job['_LimitLoadToDeviceTree'] = list(nodes)
+    return True
+
+
 def show(key, job):
     print(key)
     for name, value in sorted(job.items()):
@@ -214,6 +233,8 @@ def main():
         change_job(argv[1], argv[2], unwrap)
     elif mode == '--unlimit' and len(argv) == 3:
         change_job(argv[1], argv[2], unlimit)
+    elif mode == '--relimit' and len(argv) >= 3:
+        change_job(argv[1], argv[2], lambda job: relimit(job, argv[3:]))
     elif mode == '--show' and len(argv) == 3:
         _path, plist = load_launchd(argv[1])
         show(*find_job(plist, argv[2]))

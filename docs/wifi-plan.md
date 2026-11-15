@@ -620,6 +620,33 @@ type is one to answer next), MobileGestalt's `IONameMatch wlan -> ` the service.
 Wi-Fi: the switch, the networks around (wifid's scans: `scan for iOS`), the joined network ticked;
 joining another network with a typed passphrase (`iOS asks us to join "..."`, then JOINED).
 
+### 0997: the registry goes quiet (stuck at the logo with wifid: `build/logs/0995-wifi-a`)
+
+With wifid started (0995 and the setup script) the phone stayed at the Apple logo. The kernel's
+sampler (baseline patch 0054, `SMP` lines; symbolized with `ipsw dyld a2s` against
+`research/metal/dsc` and the cache slide it prints) shows SpringBoard's main thread, and a second
+one from `SBWiFiManager`, in `wifi_manager_open` < `WiFiManagerClientCreate` (MobileWiFi): a
+synchronous request to wifid, never answered. wifid had made its first Apple80211 requests
+(capabilities, power, channels) and then nothing; and the log already said why it would wait:
+`IONetworkStack opened by configd; the registry's busy state is 1`. XNU's `StartIOKitMatching`
+takes a busy count on the registry root for the IOKit daemon, given back only when
+kernelmanagerd says it has launched (`IOService::iokitDaemonLaunched`); our root has no
+kernelmanagerd (no job), and `OSKext::iokitDaemonAvailable()` says yes unless `-restore`. So the
+registry never went quiet, configd's interface namer never said "quiet", wifid waited for that
+(SCNetworkInterfaceCopyAll), and SpringBoard for wifid. (ios-topaz's notes record the same:
+"IOKit never quiesced, wifid hung boot".) Without wifid, MobileWiFi's open failed at once, which
+is why every boot before reached the home screen.
+
+0997 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
+baseline's 0021/0022/0083): on this board the hold is not taken (boot-arg `a34iokithold=1` takes
+it as XNU does), and `iokitDaemonLaunched` gives back only a hold that was taken (built in CI with
+every patch of main: [43733929245](https://github.com/VertexSelection/a34-ios/actions/runs/43733929245)). Expected in the
+log: `the registry's busy state is 0` when configd opens IONetworkStack. Next boot with wifid:
+boot-arg `sweetsample=SpringBoard,backboardd,wifid` (the sampler's list: first sample at 90 s)
+shows wifid's own threads if it still waits on something. Undo for the root:
+`sudo tools/wifi-settings-setup.sh --undo ROOT` (`root-add-job.py --relimit ROOT
+com.apple.wifid`: `_LimitLoadToDeviceTree` back to its stock `["wlan", "marconi-wifi"]`).
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
