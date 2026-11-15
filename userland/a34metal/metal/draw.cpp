@@ -779,16 +779,30 @@ glyph_after(const struct rwm_draw *d, glyph_probe &p)
 		}
 		unsigned long lit = 0;
 		unsigned top = 0;
+		char first[48] = "";
 
 		for (size_t k = 0; k < (size_t)tw * th * tb; k++) {
 			lit += all[k] != 0;
 			top = all[k] > top ? all[k] : top;
 		}
+		/* a small texture (a gradient's ramp, a look-up table): its first texel and its middle one, raw */
+		if ((size_t)tw * th <= 4096 && tb <= 16) {
+			size_t f = 0;
+			const size_t mid = ((size_t)tw * th / 2) * tb;
+
+			for (unsigned k = 0; k < tb && f < sizeof(first) - 3; k++) {
+				f += (size_t)snprintf(first + f, sizeof(first) - f, "%02x", all[k]);
+			}
+			f += (size_t)snprintf(first + f, sizeof(first) - f, "/");
+			for (unsigned k = 0; k < tb && f < sizeof(first) - 3; k++) {
+				f += (size_t)snprintf(first + f, sizeof(first) - f, "%02x", all[mid + k]);
+			}
+		}
 		free(all);
 		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s t%u #%04x %ux%u %ub: %lu of %lu bytes not "
-					 "zero, top %02x", n++ ? ";" : "", i,
+					 "zero, top %02x%s%s", n++ ? ";" : "", i,
 					 (unsigned)((uintptr_t)d->textures[i] >> 4 & 0xffff), tw, th, tb, lit,
-					 (unsigned long)tw * th * tb, top);
+					 (unsigned long)tw * th * tb, top, first[0] ? " " : "", first);
 		if (d->texture_surface[i] != 0) {
 			used += (size_t)snprintf(line + used, sizeof(line) - used, " (%s %u)",
 						 d->texture_surface[i] & 0x80000000u ? "copied" : "surface",
@@ -797,10 +811,11 @@ glyph_after(const struct rwm_draw *d, glyph_probe &p)
 	}
 	rwm_print("%s\n", line);
 
-	/* CoreAnimation's per-draw words: fragment buffers 0 (config) and 1 (uniforms), as far as 64 and 176 bytes */
+	/* CoreAnimation's per-draw words: every bound fragment buffer of 0 to 5 (0 config, 1 uniforms -- 176 bytes, the
+	 * colour matrix of the vibrant blends at 128 -- 4 colorP), eight words a line (a log line holds about 22) */
 	const struct rwm_air *air = rwm_air();
 
-	for (unsigned b = 0; b < 2 && b < d->fragment_count_bound && air->buffer_map != nullptr; b++) {
+	for (unsigned b = 0; b < 6 && b < d->fragment_count_bound && air->buffer_map != nullptr; b++) {
 		const uint8_t *base = d->fragment[b] != nullptr ? (const uint8_t *)air->buffer_map(d->fragment[b]) : nullptr;
 		const size_t size = d->fragment[b] != nullptr && air->buffer_size != nullptr ? air->buffer_size(d->fragment[b])
 											   : 0;
@@ -808,17 +823,19 @@ glyph_after(const struct rwm_draw *d, glyph_probe &p)
 		if (base == nullptr || d->fragment_offset[b] >= size) {
 			continue;
 		}
-		const size_t n = size - d->fragment_offset[b] < (b == 0 ? 64u : 176u) ? size - d->fragment_offset[b]
-										      : (b == 0 ? 64u : 176u);
+		const size_t most = b == 1 ? 176u : 64u;
+		const size_t n = size - d->fragment_offset[b] < most ? size - d->fragment_offset[b] : most;
 
-		used = (size_t)snprintf(line, sizeof(line), "glyph:   b%u+%zu:", b, d->fragment_offset[b]);
-		for (size_t k = 0; k < n && used < sizeof(line) - 4; k += 4) {
-			uint32_t word;
+		for (size_t at = 0; at < n; at += 32) {
+			used = (size_t)snprintf(line, sizeof(line), "glyph:   b%u+%zu @%zu:", b, d->fragment_offset[b], at);
+			for (size_t k = at; k < n && k < at + 32; k += 4) {
+				uint32_t word = 0;
 
-			memcpy(&word, base + d->fragment_offset[b] + k, 4);
-			used += (size_t)snprintf(line + used, sizeof(line) - used, " %08x", word);
+				memcpy(&word, base + d->fragment_offset[b] + k, n - k >= 4 ? 4 : n - k);
+				used += (size_t)snprintf(line + used, sizeof(line) - used, " %08x", word);
+			}
+			rwm_print("%s\n", line);
 		}
-		rwm_print("%s\n", line);
 	}
 }
 
