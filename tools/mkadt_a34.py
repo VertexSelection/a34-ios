@@ -63,10 +63,13 @@ cstr = lambda s: s.encode() + b'\0'
 
 COMMAND_LINE_MAX = 607         # boot_args.CommandLine: BOOT_LINE_LENGTH 608, with its NUL
 BOOT_ARGS_MAX = 4095            # 0990: the kernel's whole line (KERNEL_BOOT_INFO_MAX 4096, with its NUL)
-# What the kernel parses first (arm_init: serial, cpus, debug; the root's rd/ufs*): kept in
-# CommandLine, which is there even without the device tree's part.
-EARLY_ARGS = ('debug', 'serial', 'cpus', 'keepsyms', '-noprogress', 'rd', 'maxmem', 'wdt', 'wdt_test', 'rootrw')
-EARLY_PREFIXES = ('ufs',)
+# Kept in CommandLine, which is there even without the device tree's part: what the kernel
+# parses first (arm_init: serial, cpus, debug; the root's rd/ufs*), and what launchd, its
+# cache loader and AMFI read (launchd_unsecure_cache: without it launchd_cache_loader wants
+# AMFI's handshake and the boot panics).
+EARLY_ARGS = ('debug', 'serial', 'cpus', 'keepsyms', '-noprogress', 'rd', 'maxmem', 'wdt', 'wdt_test', 'rootrw',
+              'launchd_unsecure_cache', 'unentitled_ios_sim_launch', 'ignition_level')
+EARLY_PREFIXES = ('ufs', 'launchd', 'amfi', 'cs_')
 
 
 def arg_name(arg):

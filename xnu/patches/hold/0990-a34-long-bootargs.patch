@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
-index 9ba4ffb..a41a5e3 100644
+index 9ba4ffb..d17f74c 100644
 --- a/bsd/kern/kern_sysctl.c
 +++ b/bsd/kern/kern_sysctl.c
-@@ -2163,12 +2163,15 @@ STATIC int
+@@ -2163,12 +2163,17 @@ STATIC int
  sysctl_sysctl_bootargs
  (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
  {
@@ -15,12 +15,14 @@ index 9ba4ffb..a41a5e3 100644
 +	/*
 +	 * A34 (0990): the whole line PE_boot_args() gives (CommandLine and
 +	 * /chosen/a34-bootargs, pexpert/arm/pe_bootargs.c), no longer cut at
-+	 * BOOT_LINE_LENGTH. A caller whose buffer is too small for it gets as
-+	 * much as fits, terminated (trunc), as from a shorter line before;
-+	 * one that asks for the size first gets it all. Not writable
-+	 * (valueSize 0: EPERM).
++	 * BOOT_LINE_LENGTH. A buffer too small for it gets ENOMEM, as before
++	 * (trunc 0), and that matters: launchd_cache_loader (and libxpc's
++	 * reader) try a 128-byte buffer first and ask for the size only on
++	 * ENOMEM; a truncated "success" hid launchd_unsecure_cache=1 from it
++	 * ("Unable to find AMFI handshake", panic). Not writable (valueSize 0:
++	 * EPERM).
 +	 */
-+	return sysctl_io_string(req, PE_boot_args(), 0, 1, NULL);
++	return sysctl_io_string(req, PE_boot_args(), 0, 0, NULL);
  }
  
  SYSCTL_PROC(_kern, OID_AUTO, bootargs,
