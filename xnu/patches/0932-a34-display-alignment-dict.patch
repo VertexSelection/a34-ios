@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a533de6..8442719 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -460,7 +460,25 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * A34 (0932): a dictionary, not a number. VideoToolbox's
++	 * FigGetAlignmentForIOSurfaceOutputToDisplayService reads
++	 * DisplayPipePlaneBaseAlignment as {PlaneBaseAlignmentLinear: N}
++	 * without checking its type; the number (ios-sweet 0046) made every
++	 * movie set up for the display throw -[__NSCFNumber objectForKey:]
++	 * and abort its process (mediaserverd, assetsd). QuartzCore reads
++	 * the same key and checks for a dictionary.
++	 */
++	{
++		OSDictionary *alignment = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (alignment != NULL && linear != NULL) {
++			alignment->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", alignment);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(alignment);
++	}
+ 	registerService();
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
