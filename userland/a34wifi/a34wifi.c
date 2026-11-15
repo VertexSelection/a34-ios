@@ -627,6 +627,10 @@ dhcp(int seconds)
 		return 1;
 	}
 	interface[sizeof(interface) - 1] = '\0';
+	/* (0969) with the interface in the registry configd may give it a service of its own and run DHCP itself */
+	for (int i = 0; i < 10 && !ipv4_of(interface, address, sizeof(address)); i++) {
+		sleep(1);
+	}
 	if (ipv4_of(interface, address, sizeof(address))) {
 		printf("a34wifi: %s has %s already\n", interface, address);
 		return 0;

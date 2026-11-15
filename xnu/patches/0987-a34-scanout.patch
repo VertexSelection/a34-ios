@@ -1,0 +1,877 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index ae1a0a9..ad1e9a2 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -420,6 +420,7 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_FOREVER             (~0ull)
+ #define A34_STALL_NS            (250ull * NSEC_PER_MSEC)       /* A34 (0935): a queued job slower than this is told of */
+ #define A34_STALL_SAY_NS        (10ull * NSEC_PER_SEC)         /* ... once per this at most */
++#define A34_SCAN_WAIT_MS        50u             /* A34 (0983): a job waits so long at most for the display (scanWait()) */
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+@@ -449,6 +450,8 @@ static uint32_t gA34MaliCPU = 5;                /* boot-arg a34malicpu: the job
+ static int gA34MaliLastSlot = -1;               /* the worker's: slot of the queued job run last */
+ static uint32_t gA34MaliSkip = 1;               /* A34 (0985): boot-arg a34maliskip=0: every clean before a job done */
+ static uint32_t gA34MaliPair = 1;               /* A34 (0985): boot-arg a34malipair=0: every flush after a job done */
++static uint32_t gA34MaliScanWaits, gA34MaliScanLate;    /* A34 (0983): the worker's, scanWait() */
++static uint64_t gA34MaliScanTicks;
+ 
+ /*
+  * A34 (0919): queued jobs.
+@@ -903,6 +906,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	IOReturn runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q);
+ 	void runQueued(struct a34_qjob *j);
+ 	IOReturn queueSubmit(struct a34_submit *req);
++	void scanWait(const struct a34_qjob *j);
+ 	IOReturn setMode(struct a34_set_mode *req);
+ 	IOReturn waitSeq(struct a34_wait_seq *req);
+ 	IOReturn requestQueued(uint32_t selector, union a34_request *r);
+@@ -1102,8 +1106,8 @@ RedwoodMaliUserClient::upkeep(bool before, bool all, const struct a34_qjob *q)
+ 			if (!before) {
+ 				OSIncrementAtomic(&b->surface->gpuWrites);
+ 			}
+-			if (!b->surface->wrapped && (b->state & A34_BO_MAPPED) == 0) {
+-				continue;
++			if ((!b->surface->wrapped && (b->state & A34_BO_MAPPED) == 0) || b->surface->scanPA != 0) {
++				continue;       /* A34 (0983): a scan-out pool surface is write-combined in every mapping */
+ 			}
+ 			va = b->kva;
+ 		} else {
+@@ -1243,6 +1247,15 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 			    (unsigned long long)(waitNs / NSEC_PER_MSEC), fWinSkips, (unsigned long long)(fWinSkipBytes >> 20),
+ 			    fWinPairs, (unsigned long long)(fWinPairBytes >> 20));
+ 		}
++		if (gA34MaliScanWaits != 0) {
++			uint64_t scanNs;
++
++			absolutetime_to_nanoseconds(gA34MaliScanTicks, &scanNs);
++			IOLog("A34 MALI UC: %u jobs (anyone's) waited %llu ms in all for the display to send a surface they name "
++			    "(a34fbscanout)\n", gA34MaliScanWaits, (unsigned long long)(scanNs / NSEC_PER_MSEC));
++			gA34MaliScanWaits = 0;
++			gA34MaliScanTicks = 0;
++		}
+ 		fWinSkips = fWinPairs = 0;
+ 		fWinSkipBytes = fWinPairBytes = 0;
+ 		fWinJobs = 0;
+@@ -1397,6 +1410,9 @@ RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
+ 			IODelay(10);
+ 		}
+ 		c = j->client;
++		if (sweet_surface_scan_total > 0) {
++			c->scanWait(j);         /* A34 (0983) */
++		}
+ 		c->runQueued(j);
+ 		IOLockLock(gA34MaliQLock);
+ 		if (!j->held) {
+@@ -1422,6 +1438,57 @@ a34_mali_worker(void *arg, wait_result_t result)
+ 	RedwoodMaliUserClient::worker(arg, result);
+ }
+ 
++/*
++ * A34 (0983), the worker's, without the GPU's lock: a job that names a surface
++ * the display has queued or is sending as it is (a34fbscanout,
++ * SweetFramebuffer.cpp scanOut(): scanHeld) waits for that transfer to end,
++ * A34_SCAN_WAIT_MS at most, or it would draw into what the panel is sent.
++ * The handles are read with the queue's lock (closeBo() clears one with it).
++ */
++void
++RedwoodMaliUserClient::scanWait(const struct a34_qjob *j)
++{
++	uint64_t t0 = mach_absolute_time(), limit;
++	bool waited = false;
++
++	nanoseconds_to_absolutetime(A34_SCAN_WAIT_MS * NSEC_PER_MSEC, &limit);
++	for (;;) {
++		SweetSurface *s = NULL;
++		uint32_t n = j->all ? A34_BOS : j->nhandles;
++
++		IOLockLock(gA34MaliQLock);
++		for (uint32_t i = 0; fBos != NULL && !fClosing && s == NULL && i < n; i++) {
++			uint32_t h = j->all ? i + 1 : j->handles[i];
++
++			if (h != 0 && h <= A34_BOS && fBos[h - 1].surface != NULL && fBos[h - 1].surface->scanHeld > 0) {
++				s = fBos[h - 1].surface;
++				s->retain();
++			}
++		}
++		IOLockUnlock(gA34MaliQLock);
++		if (s == NULL) {
++			break;
++		}
++		waited = true;
++		while (s->scanHeld > 0 && mach_absolute_time() - t0 < limit) {
++			IODelay(50);
++		}
++		bool late = s->scanHeld > 0;
++		s->release();
++		if (late) {
++			if (gA34MaliScanLate++ < 8) {
++				IOLog("A34 MALI UC: %s: a job waited %u ms for the display to send a surface it names; it runs now\n", fName,
++				    (unsigned)A34_SCAN_WAIT_MS);
++			}
++			break;
++		}
++	}
++	if (waited) {
++		gA34MaliScanWaits++;
++		gA34MaliScanTicks += mach_absolute_time() - t0;
++	}
++}
++
+ /*
+  * A34 (0919): SUBMIT of a client that queues. The request is checked and
+  * bo_handles copied in here, in the caller's thread; the job runs later, in
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 271d2bb..592f191 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -153,8 +153,8 @@ public:
+ 	bool          fFlip;
+ 	bool          fTE;
+ 	bool          fNewPath;                 /* fFlip or fTE: present() and the kick go by the state below */
+-	uintptr_t     fBufVA[2];
+-	uint64_t      fBufPA[2];
++	uintptr_t     fBufVA[4];                /* A34 (0983): 2 and 3 are scan-out frames (fScanSurf): no kernel address */
++	uint64_t      fBufPA[4];                /* ... their first pixel's physical address */
+ 	IOMemoryDescriptor *fMem1;              /* A34 (0933): picture 1, mapped write-combined into kernel_map */
+ 	IOMemoryMap  *fMap1;
+ 	uintptr_t     fDraw;                    /* where present() draws the frame it is drawing */
+@@ -184,6 +184,22 @@ public:
+ 	bool          fSleepWaits;              /* a34fbsleep=1: TE and transfer waited for asleep, polled only at the end */
+ 	uint32_t      fStageEvery, fStageN;     /* a34fbstage=N: one transfer in N watched stage by stage */
+ 	volatile uint32_t *fRdma;               /* RDMA0, for a34fbstage */
++	/*
++	 * A34 (0983): a34fbscanout (scanOut()). With fFlipLock: fPitch, each
++	 * frame's row bytes; fScanSurf, the surface of scan-out frame 2 or 3
++	 * (held: scanHeld) while it is queued or sent. The OVL layers' address
++	 * and pitch as last written (the kick's). fScanLast: the latest
++	 * scanned-out surface, retained, and its window, for a partial frame
++	 * after it (drawn over a copy of it).
++	 */
++	bool          fScanOn;
++	uint32_t      fPitch[4];
++	SweetSurface *fScanSurf[4];
++	uint64_t      fOvlPA;
++	uint32_t      fOvlPitch;
++	SweetSurface *fScanLast;
++	uintptr_t     fScanLastVA;
++	uint32_t      fScanLastPitch;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	bool xferWait(uint64_t started, uint64_t *xfer);
+@@ -200,7 +216,10 @@ public:
+ 	void publishRefresh(uint32_t hz);
+ 	void kickFlip(void);
+ 	bool kickOne(void);
+-	int32_t drawTarget(bool full);
++	int32_t drawTarget(bool full, bool *seed);
++	bool scanOut(const uint8_t *rec, uint32_t mask);
++	SweetSurface *scanRelease(int32_t k);
++	void queuedAt(uint64_t now);
+ 	void drawDone(int32_t target);
+ 	void layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6]);
+ 	bool fullFrame(const uint8_t *rec, uint32_t mask);
+@@ -357,6 +376,17 @@ static uint64_t sweet_fb_flip_last[12];
+  */
+ static uint64_t sweet_fb_path_stats[16];
+ static uint64_t sweet_fb_path_last[16];
++/*
++ * A34 (0983), the 10 s SCAN line: [0] frames scanned out, [1] copied with
++ * a34fbscanout on, of those [2] not a pool surface, [3] not one layer
++ * covering the panel, [4] unaligned or outside the buffer; [5] OVL switches
++ * to a surface, [6] scanned-out frames replaced before being sent, [7]
++ * partial frames drawn over a copy of a scanned-out one.
++ */
++static uint64_t sweet_fb_scan_stats[8];
++static uint64_t sweet_fb_scan_last[8];
++static uint32_t sweet_fb_scan_said;
++static uint64_t sweet_fb_scan_align = 4;        /* a34fbscanalign: the window's address a multiple of this (4..4096) */
+ 
+ /* A34 (0930): the display engine (MT6877; mt6877.dts, MediaTek's mtk_disp_ovl.c and mtk_dsi.c) */
+ #define SWEET_FB_OVL0_2L        0x14006000u
+@@ -393,6 +423,10 @@ static uint64_t sweet_fb_path_last[16];
+ #define SWEET_FB_MUTEX_MOD0(n)  (0x30u + 0x20u * (n))   /* MT6877_DISP_MUTEX0_MOD0 (mtk_drm_ddp.c), per mutex */
+ #define SWEET_FB_MOD_RDMA0      (1u << 2)       /* MT6877_MUTEX_MOD_DISP_RDMA0 */
+ #define SWEET_FB_MOD_DSI0       (1u << 14)      /* MT6877_MUTEX_MOD_DISP_DSI0 */
++/* A34 (0983): a layer's row bytes (mtk_disp_ovl.c DISP_REG_OVL_PITCH: [15:0]; PITCH_MSB [3:0]: bits 19:16) */
++#define SWEET_FB_OVL_PITCH(n)   (0x044u + 0x20u * (n))
++#define SWEET_FB_OVL_PITCH_MSB(n) (0x040u + 0x20u * (n))
++#define SWEET_FB_SCAN_POOL      4u              /* a34fbscanpool: buffers in the scan-out pool */
+ 
+ static bool
+ a34_dsi_wait_idle(uint64_t *ticks, uint32_t ms)
+@@ -779,6 +813,26 @@ AppleCLCD::start(IOService *provider)
+ 	(void)PE_parse_boot_argn("a34fbflush", &flushCopy, sizeof(flushCopy));
+ 	fFlushCopy = flushCopy != 0 || fSurface->wrapped || fSurface->mapCache != kIOMapWriteCombineCache;
+ 	flipStart();                    /* A34 (0930), before the first vsync */
++	/* A34 (0983): a34fbscanout=1 (scanOut()): the pool for display-sized surfaces, made now while memory is whole */
++	uint32_t scan = 0, scanPool = SWEET_FB_SCAN_POOL;
++	(void)PE_parse_boot_argn("a34fbscanout", &scan, sizeof(scan));
++	(void)PE_parse_boot_argn("a34fbscanpool", &scanPool, sizeof(scanPool));
++	if (scan != 0) {
++		uint32_t made = 0, align = 0;
++
++		if (PE_parse_boot_argn("a34fbscanalign", &align, sizeof(align)) && align >= 4 && align <= 4096 &&
++		    (align & (align - 1)) == 0) {
++			sweet_fb_scan_align = align;
++		}
++
++		if (fFlip && (fOvlFlip[0] | fOvlFlip[1]) != 0 && scanPool >= 2) {
++			made = sweet_surface_scan_pool(fLogicalW, fLogicalH, scanPool);
++		}
++		fScanOn = made >= 2;
++		IOLog("A34 FB SCAN: a34fbscanout: %s (%u pool buffers, windows %llu-byte aligned; other frames copied)\n", fScanOn ?
++		    "full-panel frames of a pool surface go to the OVL as they are" : "off: it needs a34fbflip=1 and 2 pool buffers",
++		    made, (unsigned long long)sweet_fb_scan_align);
++	}
+ 	uint32_t presentNow = 0;
+ 	(void)PE_parse_boot_argn("a34fbnow", &presentNow, sizeof(presentNow));     /* A34 (0935) */
+ 	if (presentNow != 0) {
+@@ -1131,6 +1185,22 @@ sweet_fb_flip_log(void)
+ 	IOLog("A34 FB PATH: 10 s: queued at TE+%llu us (by quarter %llu/%llu/%llu/%llu), to start %llu us; %llu ms polled\n",
+ 	    (unsigned long long)(u[5] / fr), (unsigned long long)p[6], (unsigned long long)p[7], (unsigned long long)p[8],
+ 	    (unsigned long long)p[9], (unsigned long long)(u[11] / st), (unsigned long long)(u[12] / 1000));
++
++	/* A34 (0983): a34fbscanout */
++	uint64_t c[8];
++	bool scanned = false;
++
++	for (unsigned i = 0; i < 8; i++) {
++		c[i] = sweet_fb_scan_stats[i] - sweet_fb_scan_last[i];
++		sweet_fb_scan_last[i] = sweet_fb_scan_stats[i];
++		scanned = scanned || c[i] != 0;
++	}
++	if (scanned) {
++		IOLog("A34 FB SCAN: 10 s: %llu scanned out, %llu copied (no pool surface %llu, not one full layer %llu, unaligned %llu); "
++		    "%llu OVL switches, %llu replaced unsent, %llu seeded\n", (unsigned long long)c[0], (unsigned long long)c[1],
++		    (unsigned long long)c[2], (unsigned long long)c[3], (unsigned long long)c[4], (unsigned long long)c[5],
++		    (unsigned long long)c[6], (unsigned long long)c[7]);
++	}
+ }
+ 
+ 
+@@ -1178,10 +1248,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		sweet_fb_unhold(dropped);
+-		if (step <= 6) {
++		/* A34 (0983): a scanned-out frame (2, 3) is a program's surface: not faded */
++		uintptr_t fade = fb->fNewPath ? fb->fBufVA[fb->fShown] : fb->fPixels;
++		if (step <= 6 && fade != 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)((fb->fNewPath ? fb->fBufVA[fb->fShown] : fb->fPixels) +
+-				    (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)(fade + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+@@ -1448,6 +1519,9 @@ AppleCLCD::flipStart(void)
+ 	fQueued = fTaken = fWriting = -1;
+ 	fBufVA[0] = fPixels;
+ 	fBufPA[0] = fPhys;
++	fPitch[0] = fPitch[1] = fRowBytes;      /* A34 (0983) */
++	fOvlPA = fPhys;
++	fOvlPitch = fRowBytes;
+ 	fDraw = fPixels;
+ 	fDrawPA = fPhys;
+ 	(void)PE_parse_boot_argn("a34fbflip", &flip, sizeof(flip));
+@@ -1485,6 +1559,13 @@ AppleCLCD::flipStart(void)
+ 				}
+ 			}
+ 			IOLog("A34 FB FLIP: %s SRC_CON 0x%08x: layers 0x%x read picture 0\n", ovlName[o], en, fOvlFlip[o]);
++			for (unsigned n = 0; n < ovlLayers[o]; n++) {
++				if ((fOvlFlip[o] & (1u << n)) != 0 && (fOvl[o][SWEET_FB_OVL_PITCH(n) / 4] & 0xffffu) != fRowBytes) {
++					/* A34 (0983): the kick writes the pitch only when it changes from fRowBytes */
++					IOLog("A34 FB FLIP: %s layer %u pitch 0x%08x/0x%08x, not %u bytes\n", ovlName[o], n,
++					    fOvl[o][SWEET_FB_OVL_PITCH_MSB(n) / 4], fOvl[o][SWEET_FB_OVL_PITCH(n) / 4], fRowBytes);
++				}
++			}
+ 		}
+ 		if (fPhys != SWEET_FB_LK_FB || SWEET_FB_SECOND + size > SWEET_FB_LK_FB_END || (fOvlFlip[0] | fOvlFlip[1]) == 0) {
+ 			IOLog("A34 FB FLIP: not flipping: picture 0 at 0x%llx, %u bytes, no OVL layer reads it or picture 1 "
+@@ -2097,31 +2178,56 @@ AppleCLCD::kickOne(void)
+ 	if (!a34_dsi_lock()) {
+ 		a34_kick_stats[5]++;
+ 		IOLog("A34 FB FLIP: the display lock not got: picture %d stays queued\n", t);
++		SweetSurface *dropped = NULL;
++
+ 		IOLockLock(fFlipLock);
+ 		fTaken = -1;
+ 		if (fQueued < 0) {
+ 			fQueued = t;            /* (sent by the next kick) */
++		} else if (t >= 2) {
++			dropped = scanRelease(t);       /* A34 (0983): a newer frame is queued */
+ 		}
+ 		IOLockWakeup(fFlipLock, &fTaken, false);
+ 		IOLockUnlock(fFlipLock);
++		OSSafeReleaseNULL(dropped);
+ 		return false;
+ 	}
+ 	uint64_t again = 0;
+ 	(void)a34_dsi_wait_idle(&again, fTEBit ? SWEET_FB_TE_XFER_MS : 1000);  /* (the console may have started one) */
+-	if (t != fShown) {
++	/* A34 (0983): by address and pitch (a scan-out frame 2 or 3 is a new surface each time) */
++	if (fBufPA[t] != fOvlPA || fPitch[t] != fOvlPitch) {
+ 		for (unsigned o = 0; o < 2; o++) {
+ 			for (unsigned n = 0; n < 4; n++) {
+ 				if ((fOvlFlip[o] & (1u << n)) != 0) {
+ 					fOvl[o][SWEET_FB_OVL_ADDR(n) / 4] = (uint32_t)fBufPA[t];
++					if (fPitch[t] != fOvlPitch) {
++						volatile uint32_t *pitch = &fOvl[o][SWEET_FB_OVL_PITCH(n) / 4];
++						volatile uint32_t *msb = &fOvl[o][SWEET_FB_OVL_PITCH_MSB(n) / 4];
++
++						*pitch = (*pitch & ~0xffffu) | (fPitch[t] & 0xffffu);
++						if (((fPitch[t] ^ fOvlPitch) >> 16) != 0) {
++							*msb = (*msb & ~0xfu) | ((fPitch[t] >> 16) & 0xfu);
++						}
++					}
+ 				}
+ 			}
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		sweet_fb_flip_stats[5]++;
+-		IOLockLock(fFlipLock);
+-		fShown = t;
+-		IOLockUnlock(fFlipLock);
++		if (t >= 2) {
++			sweet_fb_scan_stats[5]++;
++			if (sweet_fb_scan_said < 8) {
++				sweet_fb_scan_said++;
++				IOLog("A34 FB SCAN: the OVL layers read 0x%llx, %u bytes a row, now (were 0x%llx, %u): a surface\n",
++				    (unsigned long long)fBufPA[t], fPitch[t], (unsigned long long)fOvlPA, fOvlPitch);
++			}
++		}
++		fOvlPA = fBufPA[t];
++		fOvlPitch = fPitch[t];
+ 	}
++	IOLockLock(fFlipLock);
++	fShown = t;
++	IOLockUnlock(fFlipLock);
+ 	sweet_fb_hs(true);              /* A34 (0937): a34dsihs */
+ 	uint64_t started = mach_absolute_time();       /* A34 (0982) */
+ 	sweet_fb_path_stats[10]++;
+@@ -2169,11 +2275,149 @@ AppleCLCD::kickOne(void)
+ 	if (xfer > a34_kick_stats[4]) {
+ 		a34_kick_stats[4] = xfer;
+ 	}
++	SweetSurface *sent = NULL;
++
+ 	IOLockLock(fFlipLock);
+ 	fTaken = -1;
+ 	fXferEnd = mach_absolute_time();
++	if (t >= 2) {
++		sent = scanRelease(t);  /* A34 (0983): the panel has it: the GPU may draw into the surface again */
++	}
+ 	IOLockWakeup(fFlipLock, &fTaken, false);
+ 	IOLockUnlock(fFlipLock);
++	OSSafeReleaseNULL(sent);
++	return true;
++}
++
++/*
++ * A34 (0983), with fFlipLock: scan-out frame k's surface let go of (sent, or
++ * replaced before it was). Returned for the caller to release after it let
++ * go of the lock.
++ */
++SweetSurface *
++AppleCLCD::scanRelease(int32_t k)
++{
++	SweetSurface *s = fScanSurf[k];
++
++	fScanSurf[k] = NULL;
++	if (s != NULL) {
++		OSDecrementAtomic(&s->scanHeld);
++		OSDecrementAtomic(&sweet_surface_scan_total);
++	}
++	return s;
++}
++
++/* A34 (0982, 0983), with fFlipLock: a frame queued now, for the PATH line. */
++void
++AppleCLCD::queuedAt(uint64_t now)
++{
++	sweet_fb_path_stats[0]++;
++	if (fTELast != 0 && fTEPeriod != 0 && now > fTELast) {
++		uint64_t phase = (now - fTELast) % fTEPeriod;
++
++		sweet_fb_path_stats[5] += phase;
++		sweet_fb_path_stats[6 + (phase * 4 / fTEPeriod < 3 ? phase * 4 / fTEPeriod : 3)]++;
++	}
++	fQueuedAt = now;
++}
++
++/*
++ * A34 (0983): a34fbscanout=1, Stage 5 of research/120hz/plan.md. A swap whose
++ * one layer covers the panel with a surface of the scan-out pool
++ * (SweetSurface.h: physically contiguous below 4 GB, write-combined in every
++ * mapping) is not copied: once the GPU's jobs that draw it are done, it is
++ * queued as frame 2 or 3, the one not being sent, and the kick points the
++ * OVL layers that read picture 0 at its window (address + top * row bytes +
++ * left * 4, its row bytes as the pitch: the crop from the presented size to
++ * the panel's is free, as Android's mtk_plane_atomic_update() does it) and
++ * sends it at the TE. From the queue to the transfer's end the surface is
++ * held (scanHeld): a GPU job that names it waits (A34Mali.cpp worker()), so
++ * no frame is drawn into it while the panel is sent it; SwapWait is done
++ * now, as after a copy. Anything else is copied as before. No cache upkeep:
++ * no cache holds a line of the pool's pages.
++ */
++bool
++AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
++{
++	uint32_t id = get32(rec, 0x54);
++	SweetSurface *s, *gone = NULL, *stale = NULL;
++	int32_t r[6], k;
++	uint64_t addr, end, t0, now;
++
++	if ((mask & 1u) == 0 || id == 0) {
++		sweet_fb_scan_stats[3]++;
++		return false;
++	}
++	for (uint32_t l = 1; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) != 0 && get32(rec, 0x54 + 4 * l) != 0) {
++			sweet_fb_scan_stats[3]++;
++			return false;
++		}
++	}
++	s = sweet_surface_copy(id);
++	if (s == NULL || s == fSurface || s->scanPA == 0 || s->memory == NULL) {
++		sweet_fb_scan_stats[2]++;
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	layerRect(rec, 0, s, r);
++	addr = s->scanPA + s->offset + (uint64_t)r[1] * s->bytesPerRow + (uint64_t)r[0] * 4;
++	end = s->scanPA + s->offset + (uint64_t)(r[1] + r[5] - 1) * s->bytesPerRow + (uint64_t)(r[0] + r[4]) * 4;
++	if (r[2] != 0 || r[3] != 0 || r[4] != (int32_t)fWidth || r[5] != (int32_t)fHeight) {
++		sweet_fb_scan_stats[3]++;
++		s->release();
++		return false;
++	}
++	if ((addr & (sweet_fb_scan_align - 1)) != 0 || (s->bytesPerRow & 3u) != 0 || s->bytesPerRow > 0xfffffu ||
++	    end > s->scanPA + s->memory->getLength() || end > (1ull << 32)) {
++		sweet_fb_scan_stats[4]++;
++		s->release();
++		return false;
++	}
++	/* the GPU's jobs that draw it done first, as before a copy (no cache to clean: see above) */
++	t0 = mach_absolute_time();
++	if (s->gpuShared > 0) {
++		(void)a34_mali_surface_idle(s, 500);
++	}
++	now = mach_absolute_time();
++	sweet_fb_path_stats[2] += now - t0;
++	IOLockLock(fFlipLock);
++	k = fTaken == 2 ? 3 : 2;                /* the scan-out frame not being sent */
++	if (fQueued >= 2) {
++		gone = scanRelease(fQueued);    /* replaced before it was sent */
++		sweet_fb_scan_stats[6]++;
++	}
++	if (fScanSurf[k] != NULL) {
++		stale = scanRelease(k);
++	}
++	OSIncrementAtomic(&s->scanHeld);
++	OSIncrementAtomic(&sweet_surface_scan_total);
++	fScanSurf[k] = s;                       /* (sweet_surface_copy()'s reference) */
++	fBufPA[k] = addr;
++	fPitch[k] = s->bytesPerRow;
++	fQueued = k;
++	queuedAt(now);
++	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
++	IOLockUnlock(fFlipLock);
++	OSSafeReleaseNULL(gone);
++	OSSafeReleaseNULL(stale);
++	/* for a partial frame after it: its window, the surface kept */
++	if (fScanLast != s) {
++		OSSafeReleaseNULL(fScanLast);
++		s->retain();
++		fScanLast = s;
++	}
++	fScanLastVA = s->kernelAddress();
++	if (fScanLastVA != 0) {
++		fScanLastVA += s->offset + (uint64_t)r[1] * s->bytesPerRow + (uint64_t)r[0] * 4;
++	}
++	fScanLastPitch = s->bytesPerRow;
++	sweet_fb_scan_stats[0]++;
++	if (sweet_fb_scan_stats[0] <= 8) {
++		IOLog("A34 FB SCAN: swap %u: surface %u (%ux%u, %u bytes a row) at 0x%llx, window at 0x%llx: frame %d\n",
++		    get32(rec, 0x50), s->id, s->width, s->height, s->bytesPerRow, (unsigned long long)s->scanPA,
++		    (unsigned long long)addr, k);
++	}
+ 	return true;
+ }
+ 
+@@ -2183,16 +2427,31 @@ AppleCLCD::kickOne(void)
+  * pictures: the one neither being sent nor about to be (a queued one is
+  * drawn over, replaced). Otherwise the latest picture (the queued one, else
+  * the one sent last), after its transfer.
++ *
++ * A34 (0983): frames 2 and 3 (scanned-out surfaces) are never drawn into: a
++ * full frame goes to a picture neither sent nor queued; a partial one whose
++ * latest frame is 2 or 3 to such a picture too, *seed set: present() first
++ * copies the scanned-out surface's window into it (fScanLast).
+  */
++static inline bool
++sweet_fb_picture(int32_t t)
++{
++	return t == 0 || t == 1;
++}
++
+ int32_t
+-AppleCLCD::drawTarget(bool full)
++AppleCLCD::drawTarget(bool full, bool *seed)
+ {
+-	int32_t t;
++	int32_t t, latest;
+ 
++	*seed = false;
+ 	IOLockLock(fFlipLock);
+-	if (full) {
+-		t = fTaken >= 0 ? (fTaken ^ 1) : (fQueued >= 0 ? fQueued : (fShown ^ 1));
+-		sweet_fb_flip_stats[0]++;
++	latest = fQueued >= 0 ? fQueued : (fTaken >= 0 ? fTaken : fShown);
++	if (full || !sweet_fb_picture(latest)) {
++		t = sweet_fb_picture(fTaken) ? (fTaken ^ 1) : (sweet_fb_picture(fQueued) ? fQueued :
++		    (sweet_fb_picture(fShown) ? (fShown ^ 1) : 0));
++		*seed = !full;
++		sweet_fb_flip_stats[full ? 0 : 1]++;
+ 	} else {
+ 		if (fTaken >= 0 && fQueued < 0) {
+ 			uint64_t t0 = mach_absolute_time(), deadline, waited;
+@@ -2212,6 +2471,9 @@ AppleCLCD::drawTarget(bool full)
+ 		t = fQueued >= 0 ? fQueued : (fTaken >= 0 ? fTaken : fShown);
+ 		sweet_fb_flip_stats[1]++;
+ 	}
++	if (!sweet_fb_picture(t)) {
++		t = 0;                          /* (cannot be: a partial frame over a frame 2 or 3 went above) */
++	}
+ 	if (fQueued == t) {
+ 		fQueued = -1;                   /* (drawn over: not to be taken while it is) */
+ 		sweet_fb_flip_stats[2]++;
+@@ -2226,21 +2488,19 @@ void
+ AppleCLCD::drawDone(int32_t target)
+ {
+ 	uint64_t now = mach_absolute_time();
++	SweetSurface *gone = NULL;
+ 
+-	/* A34 (0982): where in the TE period the frame is ready (the kick starts it at the next TE) */
+-	sweet_fb_path_stats[0]++;
+-	if (fTELast != 0 && fTEPeriod != 0 && now > fTELast) {
+-		uint64_t phase = (now - fTELast) % fTEPeriod;
+-
+-		sweet_fb_path_stats[5] += phase;
+-		sweet_fb_path_stats[6 + (phase * 4 / fTEPeriod < 3 ? phase * 4 / fTEPeriod : 3)]++;
+-	}
+ 	IOLockLock(fFlipLock);
++	if (fQueued >= 2) {
++		gone = scanRelease(fQueued);    /* A34 (0983): a scanned-out frame replaced before it was sent */
++		sweet_fb_scan_stats[6]++;
++	}
+ 	fWriting = -1;
+ 	fQueued = target;
+-	fQueuedAt = now;                        /* A34 (0938) */
++	queuedAt(now);                          /* A34 (0938, 0982): fQueuedAt, where in the TE period */
+ 	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
+ 	IOLockUnlock(fFlipLock);
++	OSSafeReleaseNULL(gone);
+ }
+ 
+ /*
+@@ -2331,6 +2591,24 @@ extern "C" void a34_display_kick(void);
+ /* A34 (0914): bsd/dev/a34_mali.c, dc civac over a kernel range (no state: no lock needed) */
+ extern "C" void a34_mali_cpu_flush(uintptr_t va, uint64_t size);
+ 
++/* The kick asked for after a frame (A34 (0983): moved here from present(), shared with the scan-out). */
++static void
++sweet_fb_present_kick(void)
++{
++	uint64_t t_kick = mach_absolute_time();
++	if (a34_kick_timer != NULL) {
++		a34_kick_timer->setTimeoutUS(1);        /* coalesces while a kick runs */
++	} else {
++		a34_display_kick();
++	}
++	t_kick = mach_absolute_time() - t_kick;
++	a34_fb_stats[0]++;
++	a34_fb_stats[3] += t_kick;
++	if (t_kick > a34_fb_stats[4]) {
++		a34_fb_stats[4] = t_kick;
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -2341,16 +2619,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fPresentingAt != 0 && began > fPresentingAt) {
+ 		sweet_fb_path_stats[1] += began - fPresentingAt;        /* A34 (0982): the swap waited so long for its copy */
+ 	}
+-	/* A34 (0930): which picture this frame is drawn into (a34fbflip, a34fbte) */
+-	fDraw = fPixels;
+-	fDrawPA = fPhys;
+-	if (fNewPath) {
+-		target = drawTarget(fFlip && fullFrame(rec, mask));
+-		fDraw = fBufVA[target];
+-		fDrawPA = fBufPA[target];
+-	}
+-
+-
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -2360,6 +2628,34 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++	/* A34 (0983): a34fbscanout: a frame of one pool surface is not copied */
++	if (fScanOn) {
++		if (scanOut(rec, mask)) {
++			sweet_fb_present_kick();
++			return;
++		}
++		sweet_fb_scan_stats[1]++;
++	}
++	/* A34 (0930): which picture this frame is drawn into (a34fbflip, a34fbte) */
++	fDraw = fPixels;
++	fDrawPA = fPhys;
++	if (fNewPath) {
++		bool seed = false, full = fFlip && fullFrame(rec, mask);
++
++		target = drawTarget(full, &seed);
++		fDraw = fBufVA[target];
++		fDrawPA = fBufPA[target];
++		if (full) {
++			OSSafeReleaseNULL(fScanLast);   /* A34 (0983): the latest frame is a picture again */
++		} else if (seed && fScanLast != NULL && fScanLastVA != 0) {
++			/* A34 (0983): drawn over what the panel shows: the scanned-out surface's window first */
++			for (uint32_t y = 0; y < fHeight; y++) {
++				memcpy((void *)(fDraw + (uint64_t)y * fRowBytes), (const void *)(fScanLastVA + (uint64_t)y * fScanLastPitch),
++				    (size_t)fWidth * 4);
++			}
++			sweet_fb_scan_stats[7]++;
++		}
++	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -2469,18 +2765,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		drawDone(target);       /* A34 (0930): drawn, for the kick to send */
+ 	}
+ 	/* A34: no ruby debug markers (magenta corner, green centre, per-frame log). */
+-	uint64_t t_kick = mach_absolute_time();
+-	if (a34_kick_timer != NULL) {
+-		a34_kick_timer->setTimeoutUS(1);        /* coalesces while a kick runs */
+-	} else {
+-		a34_display_kick();
+-	}
+-	t_kick = mach_absolute_time() - t_kick;
+-	a34_fb_stats[0]++;
+-	a34_fb_stats[3] += t_kick;
+-	if (t_kick > a34_fb_stats[4]) {
+-		a34_fb_stats[4] = t_kick;
+-	}
++	sweet_fb_present_kick();
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9a2b51f..8812354 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -515,11 +515,10 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + sweet_surface_row_align - 1) & ~(uint64_t)(sweet_surface_row_align - 1));
+ }
+ 
+-/* A34 (0934): `name` is in a34surfrowfixnames ("*": every name). */
++/* A34 (0934): `name` is in a34surfrowfixnames ("*": every name). A34 (0983): any such list. */
+ static bool
+-sweet_surface_row_fix_for(const char *name)
++sweet_name_in(const char *p, const char *name)
+ {
+-	const char *p = sweet_surface_row_fix_names;
+ 
+ 	if (p[0] == '*' && p[1] == '\0') {
+ 		return true;
+@@ -543,6 +542,130 @@ sweet_surface_row_fix_for(const char *name)
+ 	return false;
+ }
+ 
++static bool
++sweet_surface_row_fix_for(const char *name)
++{
++	return sweet_name_in(sweet_surface_row_fix_names, name);
++}
++
++/*
++ * A34 (0983): the scan-out pool (SweetSurface.h). Each buffer an
++ * IOBufferMemoryDescriptor, physically contiguous below 4 GB (MT6877's OVL
++ * takes 32-bit addresses and reads physical memory: its larbs bypass the
++ * M4U), with the write-combine cache mode: IOKit gives every mapping of its
++ * pages that mode, the kernel's and the physical aperture's too (as 0918's
++ * GPU buffers), so no processor's cache ever holds a line of it: neither the
++ * GPU's jobs (A34Mali.cpp upkeep()) nor the display need cache upkeep for
++ * it, whoever maps it. Made at AppleCLCD's start, before memory is cut up.
++ * A buffer is free when only the pool holds it (its retain count as made):
++ * a surface, each mapping of it and the GPU's buffer of it hold it.
++ */
++#define SWEET_SCAN_MAX          6u
++static IOBufferMemoryDescriptor *sweet_scan_buf[SWEET_SCAN_MAX];
++static uint64_t      sweet_scan_pa[SWEET_SCAN_MAX];
++static int           sweet_scan_base[SWEET_SCAN_MAX];        /* retain count as made */
++static uint32_t      sweet_scan_n, sweet_scan_w, sweet_scan_h, sweet_scan_size;
++static IOLock       *sweet_scan_lock;
++static char          sweet_scan_names[SWEET_SURFACE_ROW_FIX_NAMES] = "backboardd";
++static uint32_t      sweet_scan_taken, sweet_scan_full;
++SInt32               sweet_surface_scan_total;
++
++uint32_t
++sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count)
++{
++	uint32_t row = (width * 4u + 1023u) & ~1023u;   /* (room for any row alignment up to 1 KB) */
++
++	if (sweet_scan_n != 0 || width == 0 || height == 0 || width > 4096 || height > 4096) {
++		return sweet_scan_n;
++	}
++	sweet_scan_lock = IOLockAlloc();
++	if (sweet_scan_lock == NULL) {
++		return 0;
++	}
++	(void)PE_parse_boot_arg_str("a34fbscannames", sweet_scan_names, (int)sizeof(sweet_scan_names));
++	sweet_scan_size = (uint32_t)round_page((uint64_t)row * height);
++	for (uint32_t i = 0; i < count && i < SWEET_SCAN_MAX; i++) {
++		IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache | kIOMemoryPhysicallyContiguous |
++		    kIOMemoryMapperNone, sweet_scan_size, 0x00000000ffffc000ULL);
++		IOByteCount len = 0;
++		addr64_t pa = b != NULL ? b->getPhysicalSegment(0, &len, kIOMemoryMapperNone) : 0;
++
++		if (b == NULL || pa == 0 || len < sweet_scan_size || pa + sweet_scan_size > (1ull << 32) ||
++		    b->getBytesNoCopy() == NULL) {
++			IOLog("SWEET SURF: scan-out buffer %u of %u KB: %s (pa 0x%llx, %llu bytes contiguous)\n", i,
++			    sweet_scan_size >> 10, b == NULL ? "no contiguous memory below 4 GB" : "not usable",
++			    (unsigned long long)pa, (unsigned long long)len);
++			OSSafeReleaseNULL(b);
++			break;
++		}
++		bzero(b->getBytesNoCopy(), sweet_scan_size);
++		sweet_scan_buf[i] = b;
++		sweet_scan_pa[i] = pa;
++		sweet_scan_base[i] = b->getRetainCount();
++		sweet_scan_n = i + 1;
++	}
++	sweet_scan_w = width;
++	sweet_scan_h = height;
++	IOLog("SWEET SURF: scan-out pool: %u of %u buffers of %u KB for %ux%u surfaces of %s, first at 0x%llx (a34fbscanout)\n",
++	    sweet_scan_n, count, sweet_scan_size >> 10, width, height, sweet_scan_names,
++	    (unsigned long long)sweet_scan_pa[0]);
++	return sweet_scan_n;
++}
++
++/*
++ * A34 (0983): a new surface of the kernel's own memory gets a pool buffer if
++ * it is display-sized, one plane of 4-byte pixels (BGRA), made by a program
++ * of a34fbscannames, and a buffer is free. True: s->memory is it.
++ */
++static bool
++sweet_surface_scan_take(SweetSurface *s, const char *name)
++{
++	IOBufferMemoryDescriptor *b = NULL;
++	uint32_t i;
++
++	if (sweet_scan_n == 0 || s->width != sweet_scan_w || s->height != sweet_scan_h || s->pixelFormat != 0x42475241u ||
++	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount > 1 ||
++	    s->allocSize > sweet_scan_size || (s->bytesPerRow & 3u) != 0 || !sweet_name_in(sweet_scan_names, name)) {
++		return false;
++	}
++	IOLockLock(sweet_scan_lock);
++	for (i = 0; i < sweet_scan_n; i++) {
++		if (sweet_scan_buf[i]->getRetainCount() == sweet_scan_base[i]) {
++			b = sweet_scan_buf[i];
++			b->retain();            /* the surface's */
++			break;
++		}
++	}
++	IOLockUnlock(sweet_scan_lock);
++	if (b == NULL) {
++		if (sweet_scan_full++ < 8) {
++			IOLog("SWEET SURF: %s: a %ux%u surface not from the scan-out pool: all %u buffers in use\n", name, s->width,
++			    s->height, sweet_scan_n);
++		}
++		return false;
++	}
++	bzero(b->getBytesNoCopy(), s->allocSize);
++	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);  /* (free() takes it off: an IOBMD) */
++	s->memory = b;
++	s->mapCache = kIOMapWriteCombineCache;
++	s->scanPA = sweet_scan_pa[i];
++	if (sweet_scan_taken++ < 16) {
++		IOLog("SWEET SURF: %s: surface %ux%u bpr %u offset %u from scan-out buffer %u at 0x%llx\n", name, s->width,
++		    s->height, s->bytesPerRow, s->offset, i, (unsigned long long)s->scanPA);
++	}
++	return true;
++}
++
++static bool
++sweet_surface_scan_take_named(SweetSurface *s)
++{
++	char name[32];
++
++	proc_selfname(name, sizeof(name));
++	return sweet_surface_scan_take(s, name);
++}
++
+ /* A34 (0934): once per program: its rows rounded or kept. */
+ static void
+ sweet_surface_row_fix_say(const char *name, bool fix, uint32_t asked, uint32_t row)
+@@ -1095,6 +1218,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			IOLog("SWEET SURF: create around client memory %#llx (%llu bytes) %ux%u fmt 0x%x -> 0x%x\n",
+ 			    client_address->unsigned64BitValue(), (unsigned long long)used, s->width, s->height, s->pixelFormat, ret);
+ 		}
++	} else if (ret == kIOReturnSuccess && sweet_scan_n != 0 && sweet_surface_scan_take_named(s)) {
++		/* A34 (0983): from the scan-out pool */
++		if (!sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8fab825..6c2a5fd 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -68,8 +68,18 @@ public:
+ 	 * the mark to go as it waits for gpuBusySeq. mach time of the mark | 1, 0: none.
+ 	 */
+ 	uint64_t                  gpuPendingSince;
++	/*
++	 * A34 (0983): a34fbscanout. scanPA: the physical address of the memory's
++	 * first byte when it is a buffer of the scan-out pool (physically
++	 * contiguous, below 4 GB, write-combined in every mapping), else 0.
++	 * scanHeld: frames of it the display has queued or is sending
++	 * (SweetFramebuffer.cpp; OSIncrementAtomic): GPU jobs that name it wait
++	 * (A34Mali.cpp).
++	 */
++	uint64_t                  scanPA;
++	SInt32                    scanHeld;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; scanPA = 0; scanHeld = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -125,5 +135,15 @@ bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
+  */
+ extern SInt32 sweet_surface_held_touch[2];
+ 
++/*
++ * A34 (0983): the scan-out pool (a34fbscanout=1, SweetFramebuffer.cpp, at its
++ * start): `count` physically contiguous write-combined buffers below 4 GB
++ * for surfaces of width x height, 4 bytes a pixel, that the programs of
++ * a34fbscannames make (default backboardd). The number made.
++ * sweet_surface_scan_total: scanHeld of all surfaces together.
++ */
++uint32_t sweet_surface_scan_pool(uint32_t width, uint32_t height, uint32_t count);
++extern SInt32 sweet_surface_scan_total;
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */

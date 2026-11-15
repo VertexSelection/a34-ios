@@ -649,6 +649,26 @@ int rwa_bind_profile(char *line, size_t size);
 /* panfrost's profile (patch 0011) and the kernel calls since the last call, line `which` (0 first,
  * which takes the snapshot the others report) as one line; 0 when there is no such line */
 int rwa_pan_profile(unsigned which, char *line, size_t size);
+/* What the library has done so far, for a difference over one command buffer: out[RWA_CB_*], as many
+ * as `room`; the number filled. Each "_NS" slot is the time of the one before it. */
+enum rwa_cb_counter {
+   RWA_CB_BATCHES, RWA_CB_BATCH_NS,          /* batches with work submitted */
+   RWA_CB_DEP_FLUSHES,                       /* ... of them from inside a draw, for an access */
+   RWA_CB_BO_MADE, RWA_CB_BO_MADE_NS,        /* panfrost_bo_create */
+   RWA_CB_BO_FRESH, RWA_CB_BO_FRESH_NS,      /* ... not from the cache: from the kernel */
+   RWA_CB_VARIANTS, RWA_CB_VARIANT_NS,       /* shader variants compiled while drawing */
+   RWA_CB_PIPELINES, RWA_CB_PIPELINE_NS,     /* pipelines made */
+   RWA_CB_TEXTURES, RWA_CB_TEXTURE_NS,       /* textures made (any thread) */
+   RWA_CB_STAGING,                           /* batches sent for an AFBC/staging copy */
+   RWA_CB_K_CREATE, RWA_CB_K_CREATE_NS,      /* kernel calls (the process's): CREATE_BO */
+   RWA_CB_K_SURFACE, RWA_CB_K_SURFACE_NS,    /* an IOSurface imported */
+   RWA_CB_K_SUBMIT, RWA_CB_K_SUBMIT_NS,
+   RWA_CB_K_WAIT_BO, RWA_CB_K_WAIT_BO_NS,
+   RWA_CB_K_CLOSE, RWA_CB_K_CLOSE_NS,        /* GEM_CLOSE */
+   RWA_CB_K_MAPS, RWA_CB_K_MAPS_NS,          /* CPU mappings made */
+   RWA_CB_SLOTS
+};
+unsigned rwa_cb_counters(uint64_t *out, unsigned room);
 
 /* The work so far sent off without waiting, and the number of its last job; a wait for it. */
 uint64_t rwa_flush_seq(struct rwa_device *device);
@@ -1412,7 +1432,18 @@ struct rwa_draw {
 	const unsigned *color_slice;
 	unsigned clear_color_mask;
 	const float *clear_colors;
+
+	/* A34, appended 16 November: Metal's DontCare actions, as masks -- bit i colour attachment
+	 * i, RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL. `load_dontcare_mask` is read on a pass's first
+	 * draw (the one that carries its clears): those attachments' old contents are not read back
+	 * into the tiles (MTLLoadActionDontCare). `store_dontcare_mask` of a pass's last draw
+	 * applies when the pass ends: those attachments are not written back
+	 * (MTLStoreActionDontCare). 0 and 0: everything loaded and stored, as before. */
+	unsigned load_dontcare_mask;
+	unsigned store_dontcare_mask;
 };
+#define RWA_ATTACH_DEPTH   (1u << 8)
+#define RWA_ATTACH_STENCIL (1u << 9)
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);

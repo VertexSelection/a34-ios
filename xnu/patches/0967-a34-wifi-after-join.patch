@@ -1,0 +1,391 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 8d745de..8ff10b1 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -2114,6 +2114,10 @@ a34w_step7(void)
+ #define CMD_ID_CH_PRIVILEGE             0x1cu
+ #define EVENT_ID_TX_DONE                0x0fu
+ #define EVENT_ID_CH_PRIVILEGE           0x10u
++#define EVENT_ID_RX_ADDBA               0x0au           /* (0967) */
++#define EVENT_ID_RX_DELBA               0x0bu
++#define EVENT_ID_BSS_BEACON_TIMEOUT     0x13u
++#define EVENT_ID_TX_ADDBA               0x2eu
+ #define STA_REC_SIZE                    168u
+ #define BSS_INFO_SIZE                   116u
+ #define KEY_CMD_SIZE                    64u
+@@ -2145,6 +2149,7 @@ struct a34w_network {
+ 
+ struct a34w_target {
+ 	bool found;
++	int score;                      /* (0967) rssi, less 20 for a BSS that let us go in the last 5 minutes */
+ 	uint8_t bssid[6];
+ 	uint8_t channel;
+ 	int8_t rssi;
+@@ -2171,6 +2176,14 @@ static uint64_t a34w_data_frames_in, a34w_data_bytes_in, a34w_data_frames_out, a
+ static uint64_t a34w_data_dropped_in, a34w_data_dropped_out;
+ static LCK_MTX_DECLARE(a34w_tx_mtx, &a34w_grp);
+ static void (*a34w_eth_input)(const uint8_t *frame, uint32_t length);   /* (0965: the network interface) */
++/* (0967) what the AP does after the join, said; leaving and coming back */
++static uint32_t a34w_actions_said, a34w_trace_left = 48u;
++static uint8_t a34w_kicked[6];                  /* the BSS that last let us go ... */
++static uint64_t a34w_kicked_at;                 /* ... and when (ms): it scores 20 dB less for 5 minutes */
++static uint64_t a34w_auto_rejoin_at;            /* when to join again by itself (0: not) */
++static uint32_t a34w_auto_rejoins;              /* how many times so far (5 at most a boot) */
++static void a34w_lost(const char *why);
++static void a34w_unjoin(bool deauth);
+ static void (*a34w_link_change)(bool up);
+ 
+ /* ---- the network the owner wants joined: /a34/wifi/network ---- */
+@@ -2318,6 +2331,7 @@ a34w_target_heard(const uint8_t *frame, uint32_t length, int rssi, uint8_t chann
+ {
+ 	const uint8_t *ie, *end = frame + length, *ssid = NULL;
+ 	uint8_t ds = 0;
++	int score;
+ 
+ 	if (!a34w_joining || length < 36u) {
+ 		return;
+@@ -2330,13 +2344,16 @@ a34w_target_heard(const uint8_t *frame, uint32_t length, int rssi, uint8_t chann
+ 		}
+ 	}
+ 	channel = ds != 0 ? ds : channel;
++	score = rssi - (a34w_kicked_at != 0 && a34w_ms() - a34w_kicked_at < 300000u && memcmp(frame + 16, a34w_kicked, 6) == 0 ?
++	    20 : 0);
+ 	if (ssid == NULL || ssid[1] != a34w_net.ssid_length || memcmp(ssid + 2, a34w_net.ssid, ssid[1]) != 0 ||
+ 	    (a34w_net.bssid_given && memcmp(frame + 16, a34w_net.bssid, 6) != 0) || channel == 0 ||
+-	    (a34w_target.found && rssi <= a34w_target.rssi && memcmp(frame + 16, a34w_target.bssid, 6) != 0)) {
++	    (a34w_target.found && score <= a34w_target.score && memcmp(frame + 16, a34w_target.bssid, 6) != 0)) {
+ 		return;
+ 	}
+ 	if (!a34w_target.found || memcmp(frame + 16, a34w_target.bssid, 6) != 0 || rssi > a34w_target.rssi) {
+ 		a34w_target.rssi = (int8_t)rssi;
++		a34w_target.score = score;
+ 	}
+ 	a34w_target.found = true;
+ 	memcpy(a34w_target.bssid, frame + 16, 6);
+@@ -2603,13 +2620,13 @@ a34w_report_in(const uint8_t *r, uint32_t count)
+  * DMA reads the first 64 bytes, the MAC the frame. The token is the DMA's until its report.
+  */
+ static bool
+-a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect)
++a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect, bool status)
+ {
+ 	uint32_t token, slot, next, didx;
+ 	uint8_t *buf;
+ 	uint64_t pa;
+ 	volatile uint32_t *d;
+-	uint8_t pid = eapol ? a34w_next_pid() : 0;
++	uint8_t pid = eapol || status ? a34w_next_pid() : 0;
+ 
+ 	if (!a34w_data_rings || length < 14u || length > FRAME_MOST) {
+ 		return false;
+@@ -2653,6 +2670,112 @@ a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect)
+ 	return true;
+ }
+ 
++/* ---- (0967) a line for each of the first frames either way: what it is, never what it says ---- */
++
++static void
++a34w_trace(const char *way, const uint8_t *e, uint32_t length, const char *how)
++{
++	uint32_t type, at = 14, l4;
++	const uint8_t *ip = e + 14;
++	char what[96] = "";
++
++	if (a34w_trace_left == 0 || length < 14u) {
++		return;
++	}
++	a34w_trace_left--;
++	type = (uint32_t)(e[12] << 8 | e[13]);
++	if (type == 0x0800u && length >= at + 20u) {
++		l4 = 14u + 4u * (ip[0] & 0xfu);
++		if ((ip[9] == 17u || ip[9] == 6u) && length >= l4 + 4u) {
++			uint32_t sport = (uint32_t)(e[l4] << 8 | e[l4 + 1u]), dport = (uint32_t)(e[l4 + 2u] << 8 | e[l4 + 3u]);
++			const char *dhcp = "";
++
++			if (ip[9] == 17u && (sport == 67u || sport == 68u) && length >= l4 + 8u + 240u) {
++				const uint8_t *o = e + l4 + 8u + 240u, *oend = e + length;
++
++				for (; o + 2 <= oend && o[0] != 255u; o += o[0] == 0 ? 1 : 2 + o[1]) {
++					if (o[0] == 53u && o[1] == 1u && o + 3 <= oend) {
++						static const char *const kinds[9] = { "?", "DISCOVER", "OFFER", "REQUEST", "DECLINE",
++							                              "ACK", "NAK", "RELEASE", "INFORM" };
++						dhcp = o[2] < 9u ? kinds[o[2]] : "?";
++						break;
++					}
++				}
++			}
++			snprintf(what, sizeof(what), "IPv4 %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u%s%s", ip[9] == 6u ? "TCP" : "UDP",
++			    ip[12], ip[13], ip[14], ip[15], sport, ip[16], ip[17], ip[18], ip[19], dport, dhcp[0] ? " DHCP " : "", dhcp);
++		} else {
++			snprintf(what, sizeof(what), "IPv4 protocol %u %u.%u.%u.%u -> %u.%u.%u.%u", ip[9], ip[12], ip[13], ip[14], ip[15],
++			    ip[16], ip[17], ip[18], ip[19]);
++		}
++	} else if (type == 0x0806u && length >= 42u) {
++		snprintf(what, sizeof(what), "ARP %s %u.%u.%u.%u -> %u.%u.%u.%u", e[21] == 1u ? "request" : "reply", e[28], e[29],
++		    e[30], e[31], e[38], e[39], e[40], e[41]);
++	} else {
++		snprintf(what, sizeof(what), "type 0x%04x", type);
++	}
++	a34w_say("%s %u bytes, to %02x:%02x:%02x:%02x:%02x:%02x: %s%s", way, length, e[0], e[1], e[2], e[3], e[4], e[5], what, how);
++}
++
++static void
++a34w_hex_line(char *out, size_t room, const uint8_t *p, uint32_t n)
++{
++	size_t at = 0;
++
++	out[0] = '\0';
++	for (uint32_t i = 0; i < n && at + 4u < room; i++) {
++		at += (size_t)snprintf(out + at, room - at, "%02x%s", p[i], i + 1u < n ? " " : "");
++	}
++}
++
++/*
++ * (0967) An action frame from the AP (to us or to everybody): said in the log, decoded where it
++ * matters. An ADDBA request reaching the host is declined (status 37, as Linux's mac80211 does
++ * for a station without aggregation): left unanswered, an AP tears the agreement -- or us -- down.
++ */
++static bool a34w_mgmt_tx(const uint8_t *frame, uint32_t length, const char *what);
++
++static void
++a34w_action_in(const uint8_t *f, uint32_t length)
++{
++	static const char *const categories[] = { "spectrum management", "QoS", "DLS", "block ack", "public",
++		                                  "radio measurement", "fast BSS transition", "HT", "SA query",
++		                                  "protected dual of public", "WNM", "unprotected WNM", "TDLS", "mesh",
++		                                  "multihop", "self-protected", "DMG", "-", "fast session transfer",
++		                                  "robust AV streaming", "unprotected DMG", "VHT" };
++	uint8_t category = length > 24u ? f[24] : 0xffu, action = length > 25u ? f[25] : 0xffu;
++	char bytes[3 * 24 + 4];
++
++	a34w_hex_line(bytes, sizeof(bytes), f + 24, length - 24u > 24u ? 24u : length - 24u);
++	if (a34w_actions_said < 48u) {
++		a34w_actions_said++;
++		a34w_say("the AP sent an action frame%s: category %u (%s), action %u, %u bytes: %s",
++		    (f[4] & 1u) ? " to everybody" : "", category, category < sizeof(categories) / sizeof(categories[0]) ?
++		    categories[category] : category == 127u ? "vendor" : "?", action, length, bytes);
++	}
++	if (category == 3u && action == 0u && length >= 33u && (f[4] & 1u) == 0) {      /* ADDBA Request */
++		uint8_t r[24 + 9];
++
++		bzero(r, sizeof(r));
++		r[0] = 0xd0;                            /* Action */
++		memcpy(r + 4, a34w_target.bssid, 6);
++		memcpy(r + 10, a34w_mac, 6);
++		memcpy(r + 16, a34w_target.bssid, 6);
++		r[24] = 3;                              /* block ack */
++		r[25] = 1;                              /* ADDBA Response */
++		r[26] = f[26];                          /* dialog token */
++		r[27] = 37;                             /* status: request declined */
++		r[29] = f[27];                          /* the BA parameter set as asked */
++		r[30] = f[28];
++		a34w_say("the AP asks for a block ack agreement (TID %u, %u frames): declined", (f[27] >> 2) & 0xfu,
++		    (unsigned)((f[27] | f[28] << 8) >> 6));
++		(void)a34w_mgmt_tx(r, sizeof(r), "ADDBA Response (declined)");
++	} else if (category == 10u && action == 7u && length >= 31u) {             /* BSS Transition Management Request */
++		a34w_say("the AP asks us to move (BSS transition request: token %u, mode 0x%02x, disassociation in %u beacons, "
++		    "valid %u)", f[26], f[27], (unsigned)(f[28] | f[29] << 8), f[30]);
++	}
++}
++
+ /* ---- what comes from the AP ---- */
+ 
+ /* (from RX ring 0) a management frame the firmware forwarded, from its Frame Control on */
+@@ -2671,10 +2794,15 @@ a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel)
+ 		a34w_target_heard(frame, length, rssi, channel);
+ 		return;
+ 	}
+-	if (!a34w_target.found || memcmp(frame + 10, a34w_target.bssid, 6) != 0 || memcmp(frame + 4, a34w_mac, 6) != 0) {
+-		return;                                 /* not from the target, or not to us */
++	if (!a34w_target.found || memcmp(frame + 10, a34w_target.bssid, 6) != 0 ||
++	    (memcmp(frame + 4, a34w_mac, 6) != 0 && (frame[4] & 1u) == 0)) {
++		return;                                 /* not from the target, or not to us (or everybody) */
+ 	}
+ 	switch (subtype) {
++	case 13u:                                       /* (0967) Action */
++	case 14u:
++		a34w_action_in(frame, length);
++		break;
+ 	case 11u:                                       /* Authentication: algorithm, transaction 2, status */
+ 		if (length >= 30u && (frame[26] | frame[27] << 8) == 2u) {
+ 			a34w_auth_status = frame[28] | frame[29] << 8;
+@@ -2688,16 +2816,19 @@ a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel)
+ 		}
+ 		break;
+ 	case 10u:                                       /* Disassociation, Deauthentication: reason */
+-	case 12u:
+-		a34w_say("the AP %s us (reason %u)%s", subtype == 12u ? "deauthenticated" : "disassociated",
+-		    length >= 26u ? (unsigned)(frame[24] | frame[25] << 8) : 0u, a34w_joined ? ": LEFT the network" : "");
+-		if (a34w_joined && a34w_link_change != NULL) {
+-			a34w_link_change(false);
++	case 12u: {
++		char bytes[3 * 32 + 4];
++
++		a34w_hex_line(bytes, sizeof(bytes), frame, length > 32u ? 32u : length);
++		a34w_say("the AP %s us (reason %u)%s; the frame: %s", subtype == 12u ? "deauthenticated" : "disassociated",
++		    length >= 26u ? (unsigned)(frame[24] | frame[25] << 8) : 0u, a34w_joined ? ": LEFT the network" : "", bytes);
++		if (a34w_joined) {
++			a34w_lost("the AP let us go");
+ 		}
+-		a34w_joined = false;
+ 		a34w_associated = false;
+ 		a34w_keys_in = false;
+ 		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -2721,9 +2852,43 @@ a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length)
+ 		}
+ 		return true;
+ 	}
++	if (eid == EVENT_ID_BSS_BEACON_TIMEOUT && a34w_joined) {     /* (0967) the AP is no longer heard */
++		a34w_say("the firmware hears the AP no more (beacon timeout, reason %u)", length >= 2u ? body[1] : 0u);
++		a34w_lost("beacon timeout");
++		return true;
++	}
++	if (eid == EVENT_ID_RX_ADDBA || eid == EVENT_ID_RX_DELBA || eid == EVENT_ID_TX_ADDBA) {
++		char bytes[3 * 16 + 4];
++
++		a34w_hex_line(bytes, sizeof(bytes), body, length > 16u ? 16u : length);
++		a34w_say("event %s: %s", eid == EVENT_ID_RX_ADDBA ? "RX_ADDBA (the firmware took a block ack agreement)" :
++		    eid == EVENT_ID_RX_DELBA ? "RX_DELBA" : "TX_ADDBA", bytes);
++		return true;
++	}
+ 	return false;
+ }
+ 
++/* (0967) the link is gone: the interface told, and a join again in 3 s (5 times a boot at most) */
++static void
++a34w_lost(const char *why)
++{
++	if (a34w_joined && a34w_link_change != NULL) {
++		a34w_link_change(false);
++	}
++	a34w_joined = false;
++	a34w_unjoin(false);                             /* the firmware's side of it undone, as Android's disconnect */
++	memcpy(a34w_kicked, a34w_target.bssid, 6);
++	a34w_kicked_at = a34w_ms();
++	if (a34w_auto_rejoins < 5u) {
++		a34w_auto_rejoins++;
++		a34w_auto_rejoin_at = a34w_ms() + 3000u;
++		a34w_say("LEFT the network (%s): joining again in 3 s (%u of 5 this boot; that BSS scores 20 dB less for 5 min)",
++		    why, a34w_auto_rejoins);
++	} else {
++		a34w_say("LEFT the network (%s): not joining again by itself any more ('a34wifi join' does)", why);
++	}
++}
++
+ static void a34w_eapol_in(const uint8_t *frame, uint32_t length);
+ 
+ /*
+@@ -2771,6 +2936,9 @@ a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated)
+ 	}
+ 	a34w_data_frames_in++;
+ 	a34w_data_bytes_in += length;
++	if ((eth[12] << 8 | eth[13]) != ETHERTYPE_EAPOL) {
++		a34w_trace("in ", eth, length, (dw1 & (0x1fu << 16)) != 0 ? " (was ciphered)" : " (was NOT ciphered)");
++	}
+ 	if ((eth[12] << 8 | eth[13]) == ETHERTYPE_EAPOL) {
+ 		a34w_eapol_in(eth, length);
+ 	} else if (a34w_eth_input != NULL && a34w_joined) {
+@@ -2900,7 +3068,7 @@ a34w_eapol_in(const uint8_t *frame, uint32_t length)
+ 	reply[13] = 0x8e;
+ 	a34w_say("EAPOL: message %s from the AP; answered", what == A34_WPA_ANSWER ? "1 of 4" : what == A34_WPA_KEYS ?
+ 	    "3 of 4" : "1 of 2 (a new group key)");
+-	(void)a34w_data_tx(reply, 14u + reply_length, true, what == A34_WPA_GROUP && a34w_keys_in);
++	(void)a34w_data_tx(reply, 14u + reply_length, true, what == A34_WPA_GROUP && a34w_keys_in, true);
+ 	a34w_eapol_tx++;
+ 	if (what == A34_WPA_KEYS) {
+ 		bool p = a34w_key_install(true, 0, a34w_wpa.pairwise, AP_WLAN_INDEX);
+@@ -3226,7 +3394,7 @@ a34w_step8(void)
+ 	bzero(&a34w_target, sizeof(a34w_target));
+ 	a34w_target.rssi = -128;
+ 	a34w_joining = true;
+-	for (uint32_t scan = 1; scan <= 2u && !a34w_target.found; scan++) {
++	for (uint32_t scan = 1; scan <= 2u; scan++) {     /* (0967) both, always: one may miss a BSS's beacon */
+ 		(void)a34w_scan("step 8", true);
+ 	}
+ 	a34w_joining = false;
+@@ -3240,6 +3408,19 @@ a34w_step8(void)
+ 	    "%u TU", ssid, a34w_target.bssid[0], a34w_target.bssid[1], a34w_target.bssid[2], a34w_target.bssid[3],
+ 	    a34w_target.bssid[4], a34w_target.bssid[5], a34w_target.channel, a34w_target.rssi, a34w_target.capability,
+ 	    a34w_target.beacon_interval);
++	{                                               /* (0967) what the AP's beacon has */
++		char list[200];
++		size_t at = 0;
++		const uint8_t *ie = a34w_target.ies, *end = a34w_target.ies + a34w_target.ies_length;
++
++		list[0] = '\0';
++		for (; ie + 2 <= end && ie + 2 + ie[1] <= end && at + 16u < sizeof(list); ie += 2 + ie[1]) {
++			at += (size_t)snprintf(list + at, sizeof(list) - at, ie[0] == 221u && ie[1] >= 4u ?
++			    " 221(%02x%02x%02x-%u)" : " %u", ie[0] == 221u && ie[1] >= 4u ? ie[2] : ie[0], ie[3], ie[4],
++			    ie[1] >= 4u ? ie[5] : 0u);
++		}
++		a34w_say("step 8: its elements:%s", list);
++	}
+ 	why = a34w_rsn_check();
+ 	if (a34w_net.psk_given && why != NULL) {
+ 		a34w_say("step 8: cannot join it with WPA2-PSK: %s", why);
+@@ -3302,7 +3483,19 @@ a34w_service(void)
+ static bool
+ a34w_net_tx(const uint8_t *frame, uint32_t length)
+ {
+-	return a34w_joined && a34w_data_tx(frame, length, false, a34w_keys_in);
++	uint32_t type = length >= 14u ? (uint32_t)(frame[12] << 8 | frame[13]) : 0, l4 = 14u + 4u * (frame[14] & 0xfu);
++	bool dhcp = type == 0x0800u && length >= l4 + 4u && frame[23] == 17u && (frame[l4 + 3u] == 67u || frame[l4 + 3u] == 68u) &&
++	    frame[l4 + 2u] == 0;
++	bool status = type == 0x0806u || dhcp;          /* (0967) as Android: ARP and DHCP get their TX status */
++	bool sent;
++
++	if (!a34w_joined) {
++		return false;
++	}
++	sent = a34w_data_tx(frame, length, false, a34w_keys_in, status);
++	a34w_trace(sent ? "out" : "out (DROPPED)", frame, length, a34w_keys_in ? " (ciphered: pairwise key, WTBL 5)" :
++	    " (open)");
++	return sent;
+ }
+ 
+ /*
+@@ -3372,7 +3565,7 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		lck_mtx_lock(&a34w_run_mtx);
+ 		while ((a34w_want <= a34w_done || a34w_failed != 0) && !a34w_rescan && !a34w_rejoin) {
+ 			a34w_busy = 0;
+-			if (a34w_joined) {              /* (0964) the rings serviced every 2 ms while joined */
++			if (a34w_joined || a34w_auto_rejoin_at != 0) {  /* (0964) the rings serviced every 2 ms while joined */
+ 				uint64_t deadline;
+ 
+ 				clock_interval_to_deadline(2, NSEC_PER_MSEC, &deadline);
+@@ -3381,6 +3574,10 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 				lck_mtx_unlock(&a34w_run_mtx);
+ 				a34w_service();
+ 				lck_mtx_lock(&a34w_run_mtx);
++				if (!a34w_joined && a34w_auto_rejoin_at != 0 && a34w_ms() >= a34w_auto_rejoin_at) {
++					a34w_auto_rejoin_at = 0;        /* (0967) the join again, by itself */
++					a34w_rejoin = 1;
++				}
+ 			} else {
+ 				lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
+ 			}
+@@ -3390,6 +3587,11 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 			a34w_rejoin = 0;
+ 			lck_mtx_unlock(&a34w_run_mtx);
+ 			(void)a34w_step8();             /* (0965) joined again: the interface's link follows */
++			if (!a34w_joined && a34w_auto_rejoins != 0 && a34w_auto_rejoins < 5u) {
++				a34w_auto_rejoins++;    /* (0967) by itself again in 10 s */
++				a34w_auto_rejoin_at = a34w_ms() + 10000u;
++				a34w_say("not joined: trying again in 10 s (%u of 5 this boot)", a34w_auto_rejoins);
++			}
+ 			sweet_log_flush();
+ 			continue;
+ 		}
+@@ -3517,6 +3719,8 @@ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, rescan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+     a34w_sysctl_rescan, "I", "write 1: scan again (after step 7)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
++SYSCTL_UINT(_kern_a34wifi, OID_AUTO, trace, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_trace_left, 0,
++    "(0967) frames either way still to be said in the log (48 at boot)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, phyaction, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_phyaction, 0,
+     "(0966) 1: PHY_ACTION before the RAM code (set before step 5)");
+ 

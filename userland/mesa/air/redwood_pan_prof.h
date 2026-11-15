@@ -47,6 +47,16 @@ enum redwood_pan_prof_index {
    RWP_EMPTY_SUBMITS,   /* batches let go with nothing in them */
    RWP_JOB_SUBMITS,     /* batches with work, submitted */
    RWP_JOB_SUBMIT_NS,
+   /* (patch 0018) the tiles of the batches submitted: memory traffic */
+   RWP_PASSES,          /* batches with a fragment job */
+   RWP_FULL_PASSES,     /* ... of them over 2 million pixels (the screen) */
+   RWP_PRELOADS,        /* colour attachments read back into the tiles */
+   RWP_ZS_PRELOADS,     /* depth/stencil attachments read back */
+   RWP_PRELOAD_KB,      /* ... both, in KB over the drawn area */
+   RWP_WRITEBACKS,      /* colour attachments written out */
+   RWP_ZS_WRITEBACKS,   /* depth/stencil attachments written out */
+   RWP_WRITEBACK_KB,
+   RWP_CLEARS,          /* colour attachments cleared in the tiles */
    RWP_SLOTS
 };
 
@@ -85,6 +95,17 @@ int redwood_pan_pass_open(struct pipe_context *pctx, const struct pipe_surface *
                           const struct pipe_surface *zs);
 int redwood_pan_pass_flush(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
                            const struct pipe_surface *zs);
+/*
+ * Metal's load and store actions (Mesa patch 0018): redwood_pan_forget, MTLLoadActionDontCare --
+ * the level's contents are not needed, so the next batch drawing it does not preload it (a 2D
+ * resource of one layer only); redwood_pan_pass_discard, MTLStoreActionDontCare -- the open batch
+ * of this pass does not write back the colour attachments in `color_mask` (bit i: attachment i)
+ * nor the aspects in `zs_mask` (PIPE_CLEAR_DEPTH, PIPE_CLEAR_STENCIL); the number of batches.
+ */
+struct pipe_resource;
+void redwood_pan_forget(struct pipe_resource *res, unsigned level);
+int redwood_pan_pass_discard(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
+                             const struct pipe_surface *zs, unsigned color_mask, unsigned zs_mask);
 
 static inline uint64_t
 rwp_now(void)

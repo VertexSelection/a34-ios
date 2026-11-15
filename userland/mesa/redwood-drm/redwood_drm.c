@@ -765,6 +765,80 @@ submit(unsigned selector, void *data, size_t size)
 }
 
 /*
+ * SUBMIT_BATCH (kernel 0988, redwood_drm.h): several SUBMITs in one request -- panfrost's two of a
+ * batch, the vertex/tiler chain and the fragment job, cost a kernel call each (~35 us, boot
+ * 0980-b), and a frame has ~15 batches. Each job's syncobj and buffers are noted with its own
+ * number, as submit() does for one. The most the kernel takes is asked once.
+ */
+static uint32_t
+batch_most(void)
+{
+	static int most = -1;
+
+	if (most < 0) {
+		struct drm_panfrost_get_param param = { .param = REDWOOD_DRM_PARAM_SUBMIT_BATCH };
+		size_t size = sizeof(param);
+
+		most = 0;
+		if (strcmp(setting("REDWOOD_DRM_BATCH", "1"), "0") != 0 && redwood_drm_queued() && connected() &&
+		    IOConnectCallStructMethod(connection, DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param,
+			sizeof(param), &param, &size) == kIOReturnSuccess) {
+			most = param.value < 64 ? (int)param.value : 64;
+		}
+		fprintf(stderr, "redwood-drm: %s[%d]: SUBMIT_BATCH %s (up to %d jobs a request)\n", getprogname(),
+		    (int)getpid(), most > 1 ? "used" : "not offered", most);
+	}
+	return (uint32_t)most;
+}
+
+EXPORT int
+redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t count)
+{
+	struct drm_panfrost_submit jobs[64];
+	uint32_t out_syncs[64];
+	struct redwood_drm_submit_batch request;
+	int ret;
+
+	if (count == 0 || count > batch_most() || count > 64) {
+		errno = ENOTSUP;
+		return -1;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		jobs[i] = submits[i];
+		out_syncs[i] = jobs[i].out_sync;
+		/* (queued: a job queued before this one ends before it starts, so in_syncs need no wait) */
+		jobs[i].in_syncs = 0;
+		jobs[i].in_sync_count = 0;
+		jobs[i].out_sync = 0;
+	}
+	memset(&request, 0, sizeof(request));
+	request.submits = (uint64_t)(uintptr_t)jobs;
+	request.count = count;
+	__atomic_fetch_add(&submits_running, 1, __ATOMIC_SEQ_CST);
+	ret = call(REDWOOD_DRM_SUBMIT_BATCH, &request, sizeof(request));
+	__atomic_fetch_sub(&submits_running, 1, __ATOMIC_SEQ_CST);
+	if (ret != 0) {
+		return ret;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t seq = request.seq - count + 1 + i;
+		const uint32_t *bos = (const uint32_t *)(uintptr_t)jobs[i].bo_handles;
+
+		__atomic_fetch_add(&stats.queued_jobs, 1, __ATOMIC_RELAXED);
+		note_last_seq(seq);
+		for (uint32_t k = 0; bos != NULL && k < jobs[i].bo_handle_count; k++) {
+			note_handle_seq(bos[k], seq);
+		}
+		if (out_syncs[i] != 0) {
+			syncobj_set_fence(&out_syncs[i], 1, true, seq);
+		}
+	}
+	note("submit batch: jobs %llu..%llu queued", (unsigned long long)(request.seq - count + 1),
+	    (unsigned long long)request.seq);
+	return 0;
+}
+
+/*
  * For the Metal driver (HackiOS's air_metal.c: rwa_flush_seq, rwa_wait_seq, rwa_surface_seq;
  * userland/a34metal). Their libdrm stand-in answers these over their kernel's requests 0x7d
  * and 0x7c; here they are this client's queued jobs (kernel 0919):

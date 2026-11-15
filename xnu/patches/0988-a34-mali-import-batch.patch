@@ -1,0 +1,545 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index ad1e9a2..2c0a800 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -212,6 +212,7 @@ enum {
+ 	kA34MaliSetMode         = 0x7a,         /* A34 (0919): ours, queued or synchronous SUBMIT for this client */
+ 	kA34MaliWaitSeq         = 0x7b,         /* A34 (0919): ours, wait for this client's queued jobs */
+ 	kA34SurfaceSeq          = 0x7c,         /* A34 (0935): HackiOS's, a surface drawn on a driver's own thread, not yet sent */
++	kA34MaliSubmitBatch     = 0x7d,         /* A34 (0987): ours, several SUBMITs queued in one call, in their order */
+ 	kA34RedwoodSurface      = 0x7e,         /* A34 (0914): ios-topaz's, an IOSurface's memory as a buffer */
+ };
+ 
+@@ -227,6 +228,8 @@ enum {
+ #define PANFROST_MADV_DONTNEED  1u              /* (PANFROST_MADV_WILLNEED 0) */
+ #define DRM_PANFROST_BO_IS_IMPORTED 1u
+ #define A34_PARAM_ASYNC         0x1000u         /* A34 (0919): GET_PARAM, ours: 1: SET_MODE can queue this client's jobs */
++#define A34_PARAM_BATCH         0x1001u         /* A34 (0987): GET_PARAM, ours: the most SUBMITs request 0x7d takes (0: none) */
++#define A34_BATCH_MAX           16u
+ #define A34_REDWOOD_DESCRIBE    0xffffffffu     /* 0x7e's handle in: only describe the surface */
+ 
+ struct a34_drm_version {                /* the start of drm.h's struct drm_version */
+@@ -321,6 +324,25 @@ struct a34_wait_seq {
+ };
+ static_assert(sizeof(struct a34_wait_seq) == 24, "WAIT_SEQ is 24 bytes");
+ 
++/*
++ * A34 (0987): request 0x7d, SUBMIT_BATCH, for a client that queues (SET_MODE
++ * async = 1; else kIOReturnNotPermitted). `submits`: the user address of
++ * `count` (1..A34_BATCH_MAX, GET_PARAM A34_PARAM_BATCH) struct
++ * drm_panfrost_submit as SUBMIT (0x40) takes them (48 bytes each; in_syncs,
++ * in_sync_count, out_sync and jm_ctx_handle are not looked at, as there).
++ * They are checked and their bo_handles copied in first: one bad, none is
++ * queued. Then queued together, in their order, with no other client's job
++ * between them (a vertex/tiler chain and the fragment chain after it stay a
++ * pair for 0985's a34malipair). Out: seq, the last one's number for WAIT_SEQ;
++ * the i-th's is seq - count + 1 + i (a client's numbers go up by one a job).
++ */
++struct a34_submit_batch {
++	uint64_t submits;
++	uint32_t count, pad;
++	uint64_t seq;
++};
++static_assert(sizeof(struct a34_submit_batch) == 24, "SUBMIT_BATCH is 24 bytes");
++
+ /*
+  * A34 (0935, from the Metal agent's research/metal/kernel/a34metal-kernel.patch):
+  * request 0x7c, HackiOS's kRedwoodSurfaceSeq (their RedwoodMali.cpp, MIT), for
+@@ -355,6 +377,7 @@ union a34_request {
+ 	struct a34_set_mode mode;
+ 	struct a34_wait_seq waitseq;
+ 	struct a34_surface_seq sseq;    /* A34 (0935) */
++	struct a34_submit_batch batch;  /* A34 (0987) */
+ 	uint8_t raw[64];                /* the largest: struct drm_version */
+ };
+ 
+@@ -379,6 +402,11 @@ struct a34_bo {
+ 	 * wrote for that job was written back by it: no clean before the job.
+ 	 */
+ 	uint64_t upkeptSeq;
++	/*
++	 * A34 (0986), with gA34MaliQLock: a surface's buffer GEM_CLOSEd and kept
++	 * (mach time | 1; 0: in use): a 0x7e of the same surface gets it back.
++	 */
++	uint64_t keptAt;
+ };
+ 
+ /* A34 (0915): struct a34_bo state */
+@@ -421,6 +449,8 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_STALL_NS            (250ull * NSEC_PER_MSEC)       /* A34 (0935): a queued job slower than this is told of */
+ #define A34_STALL_SAY_NS        (10ull * NSEC_PER_SEC)         /* ... once per this at most */
+ #define A34_SCAN_WAIT_MS        50u             /* A34 (0983): a job waits so long at most for the display (scanWait()) */
++#define A34_KEEP_NS             (2ull * NSEC_PER_SEC)   /* A34 (0986): a kept surface buffer goes after this long unused, */
++#define A34_KEEP_BYTES          (96ull << 20)           /* ... or when the kept ones of a client are more than this */
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+@@ -451,6 +481,7 @@ static int gA34MaliLastSlot = -1;               /* the worker's: slot of the que
+ static uint32_t gA34MaliSkip = 1;               /* A34 (0985): boot-arg a34maliskip=0: every clean before a job done */
+ static uint32_t gA34MaliPair = 1;               /* A34 (0985): boot-arg a34malipair=0: every flush after a job done */
+ static uint32_t gA34MaliScanWaits, gA34MaliScanLate;    /* A34 (0983): the worker's, scanWait() */
++static uint32_t gA34MaliKeep = 16;              /* A34 (0986): a34malikeep: surface buffers kept after GEM_CLOSE, a client */
+ static uint64_t gA34MaliScanTicks;
+ 
+ /*
+@@ -715,6 +746,7 @@ RedwoodMaliStart(void)
+ 	(void)PE_parse_boot_argn("a34malicpu", &gA34MaliCPU, sizeof(gA34MaliCPU));
+ 	(void)PE_parse_boot_argn("a34maliskip", &gA34MaliSkip, sizeof(gA34MaliSkip));    /* A34 (0985) */
+ 	(void)PE_parse_boot_argn("a34malipair", &gA34MaliPair, sizeof(gA34MaliPair));    /* A34 (0985) */
++	(void)PE_parse_boot_argn("a34malikeep", &gA34MaliKeep, sizeof(gA34MaliKeep));    /* A34 (0986) */
+ 	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
+ 		/* A34 (0919): the queue and the thread that runs it */
+ 		IOLock *qlock = IOLockAlloc();
+@@ -892,6 +924,10 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fWinSkips, fWinPairs;
+ 	uint64_t fWinSkipBytes, fWinPairBytes;   /* (and the flushes after a job left to the next one) */
+ 	bool fHeld;                             /* A34 (0985), with gA34MaliLock: upkeep() left a flush to the next job */
++	/* A34 (0986), with gA34MaliQLock: surface buffers kept after GEM_CLOSE, their bytes; imports served from them */
++	uint32_t fKept, fKeptHits, fImportsSlow;
++	uint32_t fWinBatchJobs;                 /* A34 (0987): jobs queued by SUBMIT_BATCH in the window */
++	uint64_t fKeptBytes, fImportTicks;
+ 	/* A34 (0985), counted by the caller's thread (atomics): the window's queued SUBMITs and WAIT_SEQs in the kernel */
+ 	uint32_t fWinSubmitN, fWinWaitN;
+ 	uint64_t fWinSubmitTicks, fWinSubmitMax, fWinWaitTicks;
+@@ -899,6 +935,9 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	struct a34_bo *lookup(uint32_t handle);
+ 	void detachBo(struct a34_bo *b);
+ 	IOReturn closeBo(uint32_t handle);
++	IOReturn closeBoNow(uint32_t handle, bool onlyKept);
++	uint32_t keepVictim(void);
++	uint32_t surfaceHandle(SweetSurface *s);
+ 	bool markListed(user_addr_t list, uint32_t count);
+ 	uint64_t upkeep(bool before, bool all, const struct a34_qjob *q);
+ 	void upkeepList(void);
+@@ -906,6 +945,10 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	IOReturn runChain(struct a34_mali_job *job, bool all, uint64_t t0, const struct a34_qjob *q);
+ 	void runQueued(struct a34_qjob *j);
+ 	IOReturn queueSubmit(struct a34_submit *req);
++	IOReturn queueSubmitBatch(struct a34_submit_batch *req);
++	struct a34_qjob *queuePrepare(const struct a34_submit *req, IOReturn *ret);
++	IOReturn queueRoomLocked(uint32_t count);
++	void queueOneLocked(struct a34_qjob *j);
+ 	void scanWait(const struct a34_qjob *j);
+ 	IOReturn setMode(struct a34_set_mode *req);
+ 	IOReturn waitSeq(struct a34_wait_seq *req);
+@@ -1240,13 +1283,26 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 		absolutetime_to_nanoseconds(__atomic_exchange_n(&fWinSubmitTicks, 0ull, __ATOMIC_RELAXED), &subNs);
+ 		absolutetime_to_nanoseconds(__atomic_exchange_n(&fWinSubmitMax, 0ull, __ATOMIC_RELAXED), &subMost);
+ 		absolutetime_to_nanoseconds(__atomic_exchange_n(&fWinWaitTicks, 0ull, __ATOMIC_RELAXED), &waitNs);
++		uint32_t batched = __atomic_exchange_n(&fWinBatchJobs, 0u, __ATOMIC_RELAXED);
++
+ 		if (subs != 0 || waits != 0 || fWinSkips != 0 || fWinPairs != 0) {
+-			IOLog("A34 MALI UC: %s: in the kernel: SUBMIT x%u %llu us each (most %llu), WAIT_SEQ x%u %llu ms; not done: "
+-			    "%u cleans %llu MB (a34maliskip), %u flushes %llu MB (a34malipair)\n", fName, subs,
+-			    (unsigned long long)(subs != 0 ? subNs / 1000 / subs : 0), (unsigned long long)(subMost / 1000), waits,
++			IOLog("A34 MALI UC: %s: in the kernel: SUBMIT x%u %llu us each (most %llu, %u jobs batched), WAIT_SEQ x%u %llu ms; "
++			    "not done: %u cleans %llu MB, %u flushes %llu MB\n", fName, subs,
++			    (unsigned long long)(subs != 0 ? subNs / 1000 / subs : 0), (unsigned long long)(subMost / 1000), batched,
++			    waits,
+ 			    (unsigned long long)(waitNs / NSEC_PER_MSEC), fWinSkips, (unsigned long long)(fWinSkipBytes >> 20),
+ 			    fWinPairs, (unsigned long long)(fWinPairBytes >> 20));
+ 		}
++		if (fKeptHits != 0 || fImportsSlow != 0) {
++			uint64_t impNs;
++
++			absolutetime_to_nanoseconds(fImportTicks, &impNs);
++			IOLog("A34 MALI UC: %s: surfaces (0x7e): %u given back kept buffers, %u made anew (%llu us each); %u kept, %llu MB "
++			    "(a34malikeep)\n", fName, fKeptHits, fImportsSlow, (unsigned long long)(fImportsSlow != 0 ?
++			    impNs / 1000 / fImportsSlow : 0), fKept, (unsigned long long)(fKeptBytes >> 20));
++			fKeptHits = fImportsSlow = 0;
++			fImportTicks = 0;
++		}
+ 		if (gA34MaliScanWaits != 0) {
+ 			uint64_t scanNs;
+ 
+@@ -1499,19 +1555,106 @@ IOReturn
+ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ {
+ 	struct a34_qjob *j;
+-	uint32_t n = req->bo_handle_count;
+ 	uint64_t seq = 0;
+ 	IOReturn ret = kIOReturnSuccess;
+ 
+-	if (req->jc == 0 || (req->requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
++	if (fLazyHeaps != 0 && !heapGrow()) {
++		return kIOReturnNoMemory;       /* A34 (0936) */
++	}
++	j = queuePrepare(req, &ret);
++	if (j == NULL) {
++		return ret;
++	}
++	IOLockLock(gA34MaliQLock);
++	ret = queueRoomLocked(1);
++	if (ret == kIOReturnSuccess) {
++		queueOneLocked(j);
++		seq = j->seq;
++		IOLockWakeup(gA34MaliQLock, &gA34MaliQWork, true);
++	}
++	IOLockUnlock(gA34MaliQLock);
++	if (ret != kIOReturnSuccess) {
++		a34_qjob_free(j);
++		release();
++		return ret;
++	}
++	req->in_syncs = seq;            /* (j is the worker's now, and may be gone) */
++	return kIOReturnSuccess;
++}
++
++/*
++ * A34 (0987): request 0x7d (struct a34_submit_batch above). Each SUBMIT
++ * costs a program a kernel call (~35 us with the IOKit round trip), and
++ * panfrost makes two of them a batch (its vertex/tiler chain, then its
++ * fragment chain), 15-30 batches a frame for CoreAnimation on Metal.
++ */
++IOReturn
++RedwoodMaliUserClient::queueSubmitBatch(struct a34_submit_batch *req)
++{
++	struct a34_submit subs[A34_BATCH_MAX];
++	struct a34_qjob *jobs[A34_BATCH_MAX];
++	uint32_t n = req->count, made = 0;
++	uint64_t seq = 0;
++	IOReturn ret = kIOReturnSuccess;
++
++	req->seq = 0;
++	if (n == 0 || n > A34_BATCH_MAX || req->pad != 0 || req->submits == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (!fAsync) {
++		return kIOReturnNotPermitted;   /* (SET_MODE async = 1 first) */
++	}
++	if (copyin(req->submits, subs, n * sizeof(subs[0])) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (fLazyHeaps != 0 && !heapGrow()) {
+ 		return kIOReturnNoMemory;       /* A34 (0936) */
+ 	}
++	for (made = 0; made < n; made++) {
++		jobs[made] = queuePrepare(&subs[made], &ret);
++		if (jobs[made] == NULL) {
++			break;
++		}
++	}
++	if (made == n) {
++		IOLockLock(gA34MaliQLock);
++		ret = queueRoomLocked(n);
++		if (ret == kIOReturnSuccess) {
++			for (uint32_t i = 0; i < n; i++) {
++				queueOneLocked(jobs[i]);
++			}
++			seq = jobs[n - 1]->seq;
++			IOLockWakeup(gA34MaliQLock, &gA34MaliQWork, true);
++		}
++		IOLockUnlock(gA34MaliQLock);
++	}
++	if (made != n || ret != kIOReturnSuccess) {
++		for (uint32_t i = 0; i < made; i++) {
++			a34_qjob_free(jobs[i]);
++			release();
++		}
++		return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
++	}
++	req->seq = seq;                 /* (the jobs are the worker's now) */
++	__atomic_fetch_add(&fWinBatchJobs, n, __ATOMIC_RELAXED);
++	return kIOReturnSuccess;
++}
++
++/* A34 (0919, 0987): a SUBMIT checked and made a queued job, bo_handles copied in; it holds the client. NULL: *ret. */
++struct a34_qjob *
++RedwoodMaliUserClient::queuePrepare(const struct a34_submit *req, IOReturn *ret)
++{
++	struct a34_qjob *j;
++	uint32_t n = req->bo_handle_count;
++
++	if (req->jc == 0 || (req->requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
++		*ret = kIOReturnBadArgument;
++		return NULL;
++	}
+ 	j = IONewZero(struct a34_qjob, 1);
+ 	if (j == NULL) {
+-		return kIOReturnNoMemory;
++		*ret = kIOReturnNoMemory;
++		return NULL;
+ 	}
+ 	j->all = true;
+ 	if (req->bo_handles != 0 && n != 0 && n <= A34_SUBMIT_BOS_MAX) {
+@@ -1527,9 +1670,16 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 	j->job.jc = req->jc;
+ 	j->job.requirements = req->requirements;
+ 	retain();                       /* the job's hold on the client, until it is done or dropped */
++	return j;
++}
+ 
+-	IOLockLock(gA34MaliQLock);
+-	while (fOpen && !fClosed && !fClosing && fAsync && fLastSeq - fDoneSeq >= A34_QUEUE_MAX) {
++/* A34 (0919, 0987), with the queue's lock: room for `count` more jobs of this client (it may sleep), or why not. */
++IOReturn
++RedwoodMaliUserClient::queueRoomLocked(uint32_t count)
++{
++	IOReturn ret = kIOReturnSuccess;
++
++	while (fOpen && !fClosed && !fClosing && fAsync && fLastSeq - fDoneSeq + count > A34_QUEUE_MAX) {
+ 		/* the program is far ahead of the GPU: it waits here */
+ 		if (IOLockSleep(gA34MaliQLock, &gA34MaliQDone, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
+ 			ret = kIOReturnAborted;
+@@ -1541,8 +1691,15 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 	} else if (ret == kIOReturnSuccess && !fAsync) {
+ 		ret = kIOReturnNotPermitted;    /* (SET_MODE 0 from another thread meanwhile) */
+ 	}
+-	if (ret == kIOReturnSuccess) {
+-		seq = j->seq = ++fLastSeq;
++	return ret;
++}
++
++/* A34 (0919, 0987), with the queue's lock and room for it: the job numbered, what it names marked busy, queued. */
++void
++RedwoodMaliUserClient::queueOneLocked(struct a34_qjob *j)
++{
++	{
++		j->seq = ++fLastSeq;
+ 		j->gseq = ++gA34MaliQSeq;
+ 		j->queued = mach_absolute_time();
+ 		j->depth = gA34MaliQDepth + (gA34MaliQRunning != NULL ? 1 : 0);
+@@ -1582,16 +1739,7 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 		}
+ 		gA34MaliQTail = j;
+ 		gA34MaliQDepth++;
+-		IOLockWakeup(gA34MaliQLock, &gA34MaliQWork, true);
+-	}
+-	IOLockUnlock(gA34MaliQLock);
+-	if (ret != kIOReturnSuccess) {
+-		a34_qjob_free(j);
+-		release();
+-		return ret;
+ 	}
+-	req->in_syncs = seq;            /* (j is the worker's now, and may be gone) */
+-	return kIOReturnSuccess;
+ }
+ 
+ /* A34 (0919): request 0x7a. */
+@@ -1874,9 +2022,114 @@ a34_bo_dispose(struct a34_bo *b)
+ 	bzero(b, sizeof(*b));
+ }
+ 
+-/* GEM_CLOSE. Takes the lock itself (0918). */
++/*
++ * A34 (0986): GEM_CLOSE. A surface's buffer (0x7e) is kept, not closed: its
++ * pages stay in the GPU's tables, the surface held and GPU-shared, the handle
++ * taken, so that the next 0x7e of the same surface gives it back at once
++ * (surfaceHandle()). CoreAnimation makes textures over the same IOSurfaces
++ * again and again (applications' backing stores, while scrolling): each
++ * import took ~2 ms of its render thread (the GPU's lock behind the running
++ * job, the kernel mapping, the GPU tables, a clean+invalidate of the whole
++ * surface). No lock but the queue's, no waiting: the buffer leaves nothing.
++ * At most a34malikeep (default 16) a client and A34_KEEP_BYTES; one unused
++ * for A34_KEEP_NS goes at the next GEM_CLOSE, oldest first (closeBoNow()).
++ * a34malikeep=0: closed at once, as before.
++ */
+ IOReturn
+ RedwoodMaliUserClient::closeBo(uint32_t handle)
++{
++	uint32_t victim = 0;
++	bool kept = false, gone = false;
++
++	if (gA34MaliKeep != 0 && gA34MaliQLock != NULL && fBos != NULL && handle != 0 && handle <= A34_BOS) {
++		IOLockLock(gA34MaliQLock);
++		struct a34_bo *b = &fBos[handle - 1];
++
++		if (fOpen && !fClosed && !fClosing && b->surface != NULL) {
++			if (b->keptAt != 0) {
++				gone = true;            /* (closed already) */
++			} else {
++				b->keptAt = mach_absolute_time() | 1;
++				fKept++;
++				fKeptBytes += b->backed;
++				kept = true;
++			}
++			victim = keepVictim();
++		}
++		IOLockUnlock(gA34MaliQLock);
++		if (victim != 0) {
++			(void)closeBoNow(victim, true);
++		}
++		if (gone) {
++			return kIOReturnNotFound;
++		}
++		if (kept) {
++			return kIOReturnSuccess;
++		}
++	}
++	return closeBoNow(handle, false);
++}
++
++/*
++ * A34 (0986), with gA34MaliQLock: a kept surface buffer to close now (the
++ * oldest, when there are more than a34malikeep or A34_KEEP_BYTES of them or
++ * it was not used for A34_KEEP_NS), 0: none.
++ */
++uint32_t
++RedwoodMaliUserClient::keepVictim(void)
++{
++	uint64_t oldest = ~0ull, age;
++	uint32_t victim = 0;
++
++	if (fKept == 0) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < A34_BOS; i++) {
++		if (fBos[i].keptAt != 0 && fBos[i].keptAt < oldest) {
++			oldest = fBos[i].keptAt;
++			victim = i + 1;
++		}
++	}
++	nanoseconds_to_absolutetime(A34_KEEP_NS, &age);
++	if (victim != 0 && fKept <= gA34MaliKeep && fKeptBytes <= A34_KEEP_BYTES && mach_absolute_time() - oldest < age) {
++		victim = 0;
++	}
++	return victim;
++}
++
++/*
++ * A34 (0986), without the GPU's lock: the handle of this client's buffer of
++ * surface s, in use or kept (then in use again), 0: none. Handles are set
++ * and cleared with the queue's lock (surfaceBo(), closeBoNow()).
++ */
++uint32_t
++RedwoodMaliUserClient::surfaceHandle(SweetSurface *s)
++{
++	uint32_t found = 0;
++
++	if (gA34MaliQLock == NULL) {
++		return 0;
++	}
++	IOLockLock(gA34MaliQLock);
++	for (uint32_t i = 0; fBos != NULL && fOpen && !fClosed && !fClosing && i < A34_BOS; i++) {
++		if (fBos[i].surface == s) {
++			found = i + 1;
++			if (fBos[i].keptAt != 0) {
++				fBos[i].keptAt = 0;
++				fKept--;
++				fKeptBytes -= fBos[i].backed;
++				fKeptHits++;
++			}
++			break;
++		}
++	}
++	IOLockUnlock(gA34MaliQLock);
++	return found;
++}
++
++/* GEM_CLOSE as it was (0918: takes the lock itself); A34 (0986): a kept buffer too. */
++IOReturn
++RedwoodMaliUserClient::closeBoNow(uint32_t handle, bool onlyKept)
+ {
+ 	struct a34_bo gone, *b;
+ 
+@@ -1909,11 +2162,21 @@ RedwoodMaliUserClient::closeBo(uint32_t handle)
+ 	a34_gpu_lock();
+ 	b = (fBos != NULL && fOpen) ? lookup(handle) : NULL;
+ 	if (b != NULL) {
+-		detachBo(b);
+-		/* (0919: the handle goes with the queue's lock held: SUBMIT reads a surface's handle with only that) */
++		/*
++		 * (0919: the handle goes with the queue's lock held: SUBMIT reads a
++		 * surface's handle with only that. A34 (0986): and a kept buffer
++		 * given back meanwhile (surfaceHandle()) stays: `onlyKept`.)
++		 */
+ 		a34_q_lock();
+-		gone = *b;
+-		bzero(b, sizeof(*b));
++		if (!onlyKept || b->keptAt != 0) {
++			detachBo(b);
++			gone = *b;
++			if (gone.keptAt != 0) {
++				fKept--;
++				fKeptBytes -= gone.backed;
++			}
++			bzero(b, sizeof(*b));
++		}
+ 		a34_q_unlock();
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
+@@ -2349,6 +2612,13 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 		s->release();
+ 		return kIOReturnSuccess;
+ 	}
++	/* A34 (0986): already a buffer of this client (in use, or kept after its GEM_CLOSE): that one, no lock waited for */
++	if ((handle = surfaceHandle(s)) != 0) {
++		req->handle = handle;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	uint64_t slowFrom = mach_absolute_time();
+ 
+ 	a34_gpu_lock();
+ 	if (fBos == NULL || !fOpen || fClosed) {
+@@ -2358,6 +2628,13 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	/* the same surface again: the same buffer (freedreno/panfrost look their buffers up by handle) */
+ 	for (uint32_t i = 0; i < A34_BOS; i++) {
+ 		if (fBos[i].surface == s) {
++			a34_q_lock();
++			if (fBos[i].keptAt != 0) {
++				fBos[i].keptAt = 0;     /* A34 (0986): kept since surfaceHandle() looked: in use again */
++				fKept--;
++				fKeptBytes -= fBos[i].backed;
++			}
++			a34_q_unlock();
+ 			req->handle = i + 1;
+ 			ret = kIOReturnSuccess;
+ 			goto out;
+@@ -2383,9 +2660,15 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	 * (sweet_surface_cpu_end()); then all of it clean+invalidated once: the
+ 	 * kernel zeroed it when it was made, programs wrote it with no GPU about.
+ 	 */
+-	OSIncrementAtomic(&s->gpuShared);
++	/*
++	 * A34 (0986): only when nothing had it GPU-shared yet: while anything
++	 * has, every IOSurfaceUnlock cleans what the CPU wrote (and upkeep()
++	 * keeps a wrapped one); a scan-out pool surface no cache holds (0983).
++	 */
++	if (OSIncrementAtomic(&s->gpuShared) == 0 && s->scanPA == 0) {
++		sweet_surface_cpu_whole(s);
++	}
+ 	counted = true;
+-	sweet_surface_cpu_whole(s);
+ 	va = a34_mali_va_alloc(size + A34_SURFACE_GUARD, false);
+ 	if (va == 0) {
+ 		IOLog("A34 MALI UC: %s: no GPU addresses left for surface %u (%llu KB)\n", fName, req->surface,
+@@ -2435,6 +2718,8 @@ RedwoodMaliUserClient::surfaceBo(struct a34_redwood_surface *req)
+ 	}
+ 	req->handle = handle;
+ 	ret = kIOReturnSuccess;
++	fImportsSlow++;                 /* A34 (0986): made anew */
++	fImportTicks += mach_absolute_time() - slowFrom;
+ out:
+ 	if (s != NULL && counted) {
+ 		OSDecrementAtomic(&s->gpuShared);       /* no buffer made of it */
+@@ -2537,6 +2822,8 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 	case kA34PanfrostGetParam:
+ 		if (r->param.pad == 0 && r->param.param == A34_PARAM_ASYNC) {
+ 			r->param.value = gA34MaliAsync != 0 ? 1 : 0;    /* A34 (0919): SET_MODE can queue jobs */
++		} else if (r->param.pad == 0 && r->param.param == A34_PARAM_BATCH) {
++			r->param.value = gA34MaliAsync != 0 ? A34_BATCH_MAX : 0;       /* A34 (0987): request 0x7d */
+ 		} else if (r->param.pad != 0 || !a34_mali_param(r->param.param, &r->param.value)) {
+ 			ret = kIOReturnBadArgument;
+ 		}
+@@ -2663,7 +2950,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			if (ret != kIOReturnSuccess && ret != kIOReturnUnsupported && fErrors++ < A34_LOGGED_ERRORS) {
+ 				IOLog("A34 MALI UC: %s: request 0x%02x for surface %u -> 0x%x\n", fName, selector, r.surface.surface, ret);
+ 			}
+-		} else if (selector == kA34MaliSetMode || selector == kA34MaliWaitSeq || (fAsync &&
++		} else if (selector == kA34MaliSetMode || selector == kA34MaliWaitSeq || selector == kA34MaliSubmitBatch || (fAsync &&
+ 		    (selector == kA34PanfrostSubmit || selector == kA34PanfrostWaitBO || selector == kA34PanfrostMadvise ||
+ 		    selector == kA34PanfrostSetLabelBO || selector == kA34PanfrostMmapBO || selector == kA34PanfrostGetBOOffset ||
+ 		    selector == kA34PanfrostQueryBOInfo))) {
+@@ -2675,9 +2962,10 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 
+ 			ret = selector == kA34MaliSetMode ? setMode(&r.mode) :
+ 			    selector == kA34MaliWaitSeq ? waitSeq(&r.waitseq) :
++			    selector == kA34MaliSubmitBatch ? (insize == sizeof(r.batch) ? queueSubmitBatch(&r.batch) : kIOReturnBadArgument) :
+ 			    selector == kA34PanfrostSubmit ? queueSubmit(&r.submit) : requestQueued(selector, &r);
+ 			took = mach_absolute_time() - began;
+-			if (selector == kA34PanfrostSubmit) {
++			if (selector == kA34PanfrostSubmit || selector == kA34MaliSubmitBatch) {
+ 				/* A34 (0985): for the summary (upkeepLog()); the most is not exact when two threads race */
+ 				__atomic_fetch_add(&fWinSubmitN, 1u, __ATOMIC_RELAXED);
+ 				__atomic_fetch_add(&fWinSubmitTicks, took, __ATOMIC_RELAXED);

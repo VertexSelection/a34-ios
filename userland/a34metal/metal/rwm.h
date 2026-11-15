@@ -61,6 +61,22 @@ struct rwm_perf {
 extern struct rwm_perf rwm_perf;
 /* A34: set on the driver's completion queue while it waits for a buffer's GPU work (redwoodmetal.m) */
 extern __thread bool rwm_on_completion_queue;
+/*
+ * A34: one command buffer's run in parts -- its works by kind (rwm_run_works), the slowest of them, the submit at
+ * its end, and what the library did meanwhile (rwa_cb_counters, the difference over the run) -- and the slowest
+ * buffer's of each profile period printed with it ("rwm worst cb", perf.cpp).
+ */
+struct rwm_cb_parts {
+	uint64_t took_ns;
+	uint64_t draws, draw_ns, blits, blit_ns, dispatches, dispatch_ns, copyins, copyin_ns, submit_ns;
+	uint64_t slowest_ns;
+	unsigned slowest_index, slowest_kind, works;
+	uint64_t lib[RWA_CB_SLOTS];
+};
+extern __thread struct rwm_cb_parts rwm_cb_now;
+void rwm_cb_parts_note(const struct rwm_cb_parts *parts);
+/* one of the compiler library's calls that are not part of the contract (profiles), or NULL */
+void *rwm_profile_call(const char *name);
 /* A34: a line HackiOS kept with their kernel's sysctl kern.redwood.say (which ours has not): written to
  * stdout as "redwoodmetal kept: ...", which in backboardd reaches the kernel log through the devnull tee */
 void rwm_keep(const char *line);
@@ -185,6 +201,9 @@ bool rwm_texture_read_depth(struct rwm_texture *texture, const unsigned origin[3
 			    float *depth, uint8_t *stencil);
 /* the surface a texture laid over its memory lies over (src/metal/import.cpp), drawn in place; 0: none */
 uint32_t rwm_texture_in_place(const struct rwm_texture *texture);
+/* (metal-fx, rwm_scene) the surface a texture shows: laid over it (its number), copied in from it (its number with
+ * bit 31 set), or 0 */
+uint32_t rwm_texture_scene_id(const struct rwm_texture *texture);
 void rwm_texture_set_in_place(struct rwm_texture *texture, uint32_t surface);
 int rwm_texture_sync_surface(struct rwm_texture *texture, char *why, size_t why_size);
 
@@ -249,8 +268,12 @@ struct rwm_draw {
 	bool color_levels;                         /* ... given (rwm_levels=0: not) */
 	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action */
 	float clear_colors[8][4];
+	/* A34: Metal's DontCare load actions (the pass's first draw only) and store actions (struct rwa_draw) */
+	unsigned load_dontcare_mask, store_dontcare_mask;
 	char probe[64];                            /* (metal-fx) rwm_blurdump: the pipeline, when one to probe */
 	char label[64];                            /* (metal-fx) rwm_framedump: every pipeline's */
+	unsigned color_surface[8];                 /* (metal-fx, rwm_scene) the surface each attachment lies over, 0: none */
+	unsigned texture_surface[RWM_MAX_BUFFERS]; /* (metal-fx, rwm_scene) ... and each texture read */
 	const float *clear_color;       /* NULL: kept, not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -377,6 +400,9 @@ struct rwm_render_state {
 	float clear_color[4], clear_depth;
 	unsigned clear_stencil;
 	bool clears, clears_depth, clears_stencil;
+	/* A34: the attachments whose load action is DontCare (until the first draw) and whose store action is
+	 * (RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL for the depth/stencil aspects) -- rwm_render_actions */
+	unsigned load_dontcare_mask, store_dontcare_mask;
 	char probe[64];                 /* (metal-fx, rwm_blurdump) the pipeline's label when it is a blur's or a material's */
 	char label[64];                 /* (metal-fx, rwm_framedump) the pipeline's label, whatever it is */
 	void *pipeline;
@@ -403,10 +429,18 @@ struct rwm_render_state {
  * store action 2 or 3 or a resolve texture is said and not done), the depth and stencil attachments (one texture
  * carries both aspects; two different ones: said, neither) */
 void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device);
+/* A34: the pass's DontCare actions: `load`/`store` bit i colour attachment i, RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL;
+ * rwm_render_store_action: a store action set later (-setColorStoreAction:atIndex: and the like; index 8 depth,
+ * 9 stencil) */
+void rwm_render_actions(struct rwm_render_state *state, unsigned load, unsigned store);
+void rwm_render_store_action(struct rwm_render_state *state, unsigned index, unsigned long action);
 /* (metal-fx) rwm_blurdump=N: whether it is on, and the label of the pipeline just set (kept when it is a blur's or a
  * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
 bool rwm_blurdump_on(void);
 bool rwm_framedump_on(void);           /* (metal-fx) rwm_framedump=N */
+bool rwm_scene_on(void);               /* (metal-fx) rwm_scene=N: what is drawn, and whether it draws anything */
+void rwm_scene_copy(struct rwa_texture *from, unsigned from_level, struct rwa_texture *to, unsigned to_level,
+		    const unsigned size[3]);
 void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */
 void rwm_render_set_label(struct rwm_render_state *state, const char *label);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,

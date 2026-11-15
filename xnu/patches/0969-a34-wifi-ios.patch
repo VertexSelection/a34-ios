@@ -1,0 +1,1514 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0bd74c7..04cda08 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+ bsd/dev/a34_wpa.c			standard
+ bsd/dev/a34_wifi_net.c			standard
++bsd/dev/a34_apple80211.c		standard
+ bsd/dev/ruby_spi3.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_goodix_spi.c		standard
+diff --git a/bsd/dev/a34_apple80211.c b/bsd/dev/a34_apple80211.c
+new file mode 100644
+index 0000000..da365e8
+--- /dev/null
++++ b/bsd/dev/a34_apple80211.c
+@@ -0,0 +1,603 @@
++/*
++ * A34 (0969): Apple80211, answered in the kernel -- what iOS's Wi-Fi side (wifid, and through
++ * it Settings and the status bar) asks of a Wi-Fi driver.
++ *
++ * Without a user client on the driver's service (iokit/Kernel/arm/A34WLAN.cpp has none, on
++ * purpose), IO80211.framework falls back to ioctls: SIOCGA80211 and SIOCSA80211 on any socket,
++ * a struct apple80211req naming the interface, a request type, a value and a buffer in the
++ * caller's memory. XNU hands an interface ioctl it does not know to the interface: they arrive
++ * in a34_wifi_net.c, which passes them here. What is asked is answered from the station
++ * boundary (a34_sta.h: the radio's power, its channels, a scan and what it heard, the network
++ * joined); what happens by itself is told the way a driver tells it, as kernel events of class
++ * 6 (IEEE 802.11), subclass 1, whose code is Apple80211's event number and whose data begins
++ * with the interface's name in 16 bytes.
++ *
++ * A join: ASSOCIATE (20) carries the network's name, perhaps its access point, and the
++ * passphrase as typed, and is answered at once; when the station has joined or failed, event 9
++ * says so and ASSOCIATE_RESULT (21) gives the outcome as Apple80211's result number: 1 success,
++ * 21 a wrong passphrase, 9 a timeout, 2 anything else.
++ *
++ * Every request is written to the log (who, get or set, the type, the value, the length; never
++ * what it carries: a network's name or its key may be in there), a few hundred of them.
++ *
++ * This is HackiOS's bsd/dev/redwood_apple80211.c (github.com/oosexgang/hakios-xnu-kernel, branch
++ * mtk, APSL 2.0) on our station boundary instead of theirs; the request types and the layouts are
++ * Apple's, as that file read them out of iOS 16.5's IO80211.framework (Apple80211GetWithIOCTL,
++ * _getScanData, _performAssociation, _dispatchLinkChangedEvent); 16.7.16's framework is the same
++ * generation.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <sys/errno.h>
++#include <sys/kern_event.h>
++#include <sys/proc.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++
++#include "a34_sta.h"
++#include "a34_wifi_net.h"
++
++#define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
++#define KEV_IEEE80211_CLASS_A34 6u
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++static const char *
++type_name(int32_t type)
++{
++	static const struct {
++		int32_t type;
++		const char *name;
++	} names[] = {
++		{ 1, "SSID" }, { 2, "AUTH_TYPE" }, { 4, "CHANNEL" }, { 5, "POWERSAVE" }, { 7, "TXPOWER" }, { 8, "RATE" }, { 9, "BSSID" },
++		{ 10, "SCAN_REQ" }, { 11, "SCAN_RESULT" }, { 12, "CARD_CAPABILITIES" }, { 13, "STATE" }, { 14, "PHY_MODE" },
++		{ 15, "OP_MODE" }, { 16, "RSSI" }, { 17, "NOISE" }, { 19, "POWER" }, { 20, "ASSOCIATE" }, { 21, "ASSOCIATE_RESULT" },
++		{ 22, "DISASSOCIATE" }, { 23, "STATUS_DEV_NAME" }, { 27, "SUPPORTED_CHANNELS" }, { 28, "LOCALE" }, { 29, "DEAUTH" },
++		{ 32, "RATE_SET" }, { 43, "DRIVER_VERSION" }, { 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 48, "AP_IE_LIST" },
++		{ 49, "STATS" }, { 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" },
++		{ 79, "STA_STATS" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 90, "SCANCACHE_CLEAR" }, { 103, "CURRENT_NETWORK" },
++		{ 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++	};
++
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (names[i].type == type) {
++			return names[i].name;
++		}
++	}
++	return "?";
++}
++
++/* ---- the layouts (iOS 16.5's, as HackiOS read them) ---- */
++
++#define CHANNEL_20MHZ           0x2u
++#define CHANNEL_2GHZ            0x8u
++#define CHANNEL_5GHZ            0x10u
++#define CHANNEL_ACTIVE          0x80u
++
++struct apple80211_channel {
++	uint32_t version, channel, flags;
++};
++
++struct apple80211_channels {                    /* SUPPORTED_CHANNELS (27), HW_SUPPORTED_CHANNELS (254) */
++	uint32_t version, count;
++	struct apple80211_channel channels[401];
++	uint32_t unused;
++};
++
++struct apple80211_channels_info {               /* CHANNELS_INFO (207) */
++	uint8_t unknown_0[12];
++	uint16_t count;
++	uint8_t unknown_1[800];
++	uint8_t number[400], indoor[400], dfs[400], passive[400], wide_40[400], wide_80[400];
++	uint8_t unknown_2[1602];
++	uint32_t flags[400];
++	uint8_t unknown_3[3600];
++} __attribute__((packed));
++
++struct apple80211_scan_request {                /* SCAN_REQ (10) */
++	uint32_t version, bss_type;
++	uint8_t bssid[6], unused_0[2];
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint32_t scan_type;
++	uint32_t phy_mode;
++	uint16_t dwell_ms, unused_1;
++	uint32_t rest_ms;
++	uint32_t channel_count;
++	struct apple80211_channel channels[400];
++	uint64_t flags;
++	uint32_t unused_2;
++	uint32_t name_count;
++	uint8_t names[10][56];
++	uint32_t short_ssid, unused_3;
++};
++
++struct apple80211_scan_result {                 /* SCAN_RESULT (11), CURRENT_NETWORK (103) */
++	uint32_t version;
++	struct apple80211_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;
++	uint8_t elements[1024];
++};
++
++struct apple80211_assoc {                       /* ASSOCIATE (20) */
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key */
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++
++#define CIPHER_PMK              6
++#define CIPHER_PASSPHRASE       10
++
++struct apple80211_link_changed {                /* the link event's data (32 bytes at least) */
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && __builtin_offsetof(struct apple80211_assoc, key) == 0x48,
++    "the association request as iOS 16 has it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && __builtin_offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "the link event as iOS 16 reads it");
++_Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16 has it");
++_Static_assert(sizeof(struct apple80211_channels_info) == 10016 &&
++    __builtin_offsetof(struct apple80211_channels_info, number) == 0x32e &&
++    __builtin_offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16 has it");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5456 &&
++    __builtin_offsetof(struct apple80211_scan_request, channels) == 0x48, "the scan request as iOS 16 has it");
++_Static_assert(sizeof(struct apple80211_scan_result) == 1164 &&
++    __builtin_offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    __builtin_offsetof(struct apple80211_scan_result, elements) == 0x8c, "a scan's result as iOS 16 has it");
++
++enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
++       EVENT_SCAN_DONE = 10 };
++
++static LCK_GRP_DECLARE(a34a_grp, "a34_apple80211");
++static LCK_MTX_DECLARE(a34a_mtx, &a34a_grp);
++static unsigned a34a_result_next;               /* which of the last scan's a SCAN_RESULT request gets next */
++static uint32_t a34a_join_result;               /* of the last join asked for: 0 while it runs, then Apple80211's number */
++
++/* the channels this radio scans (a34_wifi.c's list): 2.4 GHz 1-13, 5 GHz 36-48 and 149-165 */
++static const uint8_t a34a_channels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 36, 40, 44, 48, 149, 153, 157, 161, 165 };
++
++static void
++channel_fill(struct apple80211_channel *channel, unsigned number)
++{
++	channel->version = 1;
++	channel->channel = number;
++	channel->flags = CHANNEL_20MHZ | CHANNEL_ACTIVE | (number <= 14u ? CHANNEL_2GHZ : CHANNEL_5GHZ);
++}
++
++/* ---- what the caller is given back ---- */
++
++static int
++give(const struct apple80211req *request, const void *data, size_t length)
++{
++	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
++	       request->req_len);
++}
++
++/* an access point as a scan's result; the caller has said how much room for elements there is */
++static int
++give_network(const struct apple80211req *request, const struct a34_sta_bss *bss)
++{
++	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
++	unsigned room = sizeof(result->elements);
++	int error;
++
++	if (result == NULL) {
++		return ENOMEM;
++	}
++	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result,
++	    __builtin_offsetof(struct apple80211_scan_result, elements)) == 0 && result->elements_length < room) {
++		room = result->elements_length;
++	}
++	bzero(result, sizeof(*result));
++	result->version = 1;
++	channel_fill(&result->channel, bss->channel);
++	result->rssi = bss->rssi;
++	result->beacon_interval = bss->beacon_interval;
++	result->capability = bss->capability;
++	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
++	result->ssid_length = bss->ssid_length;
++	memcpy(result->ssid, bss->ssid, bss->ssid_length);
++	result->age_ms = bss->age_ms;
++	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
++	memcpy(result->elements, bss->elements, result->elements_length);
++	for (unsigned at = 0; at + 2u <= bss->elements_length && at + 2u + bss->elements[at + 1] <= bss->elements_length;
++	    at += 2u + bss->elements[at + 1]) {
++		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
++			unsigned rate = (bss->elements[at + 2 + i] & 0x7fu) / 2u;
++
++			if (rate != 0 && rate <= 54u && result->rate_count < 15u) {
++				result->rates[result->rate_count++] = rate;
++			}
++		}
++	}
++	error = give(request, result, sizeof(*result));
++	kfree_data(result, sizeof(*result));
++	return error;
++}
++
++/* ---- get ---- */
++
++static int
++get(struct apple80211req *request)
++{
++	struct a34_sta_state *state;
++	int error = 0;
++
++	switch (request->req_type) {
++	case 43:
++	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
++		static const char name[256] = "a34: MediaTek MT6635 (soc5_0)";
++
++		return give(request, name, sizeof(name));
++	}
++	case 12: {
++		/* what the card can do, a bit each (APPLE80211_CAP_*): AES, AES-CCM, power management, short slot and
++		 * preamble, WPA2, WME, short GI at 20 MHz -- without WPA2 here the framework builds no WPA2 join */
++		uint8_t bits[13] = { 0 };
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++
++		for (unsigned i = 0; i < sizeof(has); i++) {
++			bits[has[i] / 8u] |= (uint8_t)(1u << (has[i] % 8u));
++		}
++		return give(request, bits, sizeof(bits));
++	}
++	case 19: {                              /* the radio's power: one radio, on unless iOS turned it off (until the */
++		struct {                        /* firmware is up it counts as on: it is being brought up) */
++			uint32_t version, radios, state[4];
++		} answer = { .version = 1, .radios = 1, .state = { a34_sta_switched_off() ? 0u : 1u } };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 15:                                /* the mode: a station */
++		request->req_val = 1;
++		return 0;
++	case 27:
++	case 254: {
++		struct apple80211_channels *answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO);
++
++		if (answer == NULL) {
++			return ENOMEM;
++		}
++		answer->version = 1;
++		answer->count = sizeof(a34a_channels);
++		for (unsigned i = 0; i < sizeof(a34a_channels); i++) {
++			channel_fill(&answer->channels[i], a34a_channels[i]);
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 207: {
++		struct apple80211_channels_info *answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO);
++
++		if (answer == NULL) {
++			return ENOMEM;
++		}
++		answer->count = sizeof(a34a_channels);
++		for (unsigned i = 0; i < sizeof(a34a_channels); i++) {
++			struct apple80211_channel channel;
++
++			channel_fill(&channel, a34a_channels[i]);
++			answer->number[i] = a34a_channels[i];
++			answer->flags[i] = channel.flags;
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 21:                                /* how the last join went (0: not over yet) */
++		lck_mtx_lock(&a34a_mtx);
++		request->req_val = (int32_t)a34a_join_result;
++		lck_mtx_unlock(&a34a_mtx);
++		return 0;
++	case 11: {                              /* what the last scan heard, one a request; EIO: that was all */
++		struct a34_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++		unsigned index;
++
++		if (bss == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&a34a_mtx);
++		index = a34a_result_next++;
++		lck_mtx_unlock(&a34a_mtx);
++		error = a34_sta_heard(index, bss) ? give_network(request, bss) : EIO;
++		kfree_data(bss, sizeof(*bss));
++		return error;
++	}
++	default:
++		break;
++	}
++
++	/* the rest is about the network joined */
++	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
++		return ENOMEM;
++	}
++	a34_sta_state(state);
++	switch (request->req_type) {
++	case 13:                                /* APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
++		request->req_val = state->phase == A34_STA_JOINED ? 4 : state->phase == A34_STA_JOINING ? 2 :
++		    state->phase == A34_STA_SCANNING ? 1 : 0;
++		break;
++	case 1:
++		if (state->phase != A34_STA_JOINED) {
++			error = ENXIO;
++		} else if ((error = give(request, state->bss.ssid, state->bss.ssid_length)) == 0) {
++			request->req_len = state->bss.ssid_length;
++		}
++		break;
++	case 9:
++		error = state->phase != A34_STA_JOINED ? ENXIO : give(request, state->bss.bssid, 6);
++		break;
++	case 4: {
++		struct {
++			uint32_t version;
++			struct apple80211_channel channel;
++		} answer = { .version = 1 };
++
++		if (state->phase != A34_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			channel_fill(&answer.channel, state->bss.channel);
++			error = give(request, &answer, sizeof(answer));
++		}
++		break;
++	}
++	case 16: {                              /* dBm, per radio and all together, twice over */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
++			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
++
++		error = state->phase != A34_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 103:
++		error = state->phase != A34_STA_JOINED ? ENXIO : give_network(request, &state->bss);
++		break;
++	case 2: {                               /* open system, then WPA2 with a passphrase */
++		struct {
++			uint32_t version, lower, upper, extended;
++		} answer = { .version = 1, .lower = 1, .upper = 8 };
++
++		error = state->phase != A34_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	default:
++		error = EOPNOTSUPP;
++		break;
++	}
++	kfree_data(state, sizeof(*state));
++	return error;
++}
++
++/* ---- set ---- */
++
++static int
++set_scan(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_scan_request *asked;
++	int error;
++
++	if (request->req_len != sizeof(*asked)) {
++		return EINVAL;
++	}
++	if ((asked = kalloc_data(sizeof(*asked), Z_WAITOK)) == NULL) {
++		return ENOMEM;
++	}
++	if ((error = copyin(request->req_data, asked, sizeof(*asked))) == 0) {
++		snprintf(said, said_size, " (a scan: type %u, %u channels, %u ms on each, a name of %u bytes; ours is passive over "
++		    "our channels)", asked->scan_type, asked->channel_count, asked->dwell_ms, asked->ssid_length);
++		lck_mtx_lock(&a34a_mtx);
++		a34a_result_next = 0;
++		lck_mtx_unlock(&a34a_mtx);
++		error = a34_sta_ask_scan(asked->ssid, asked->ssid_length <= 32u ? asked->ssid_length : 0);
++	}
++	kfree_data(asked, sizeof(*asked));
++	return error;
++}
++
++static int
++set_join(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_assoc *asked;
++	struct a34_sta_join *what;
++	int error;
++
++	if (request->req_len < __builtin_offsetof(struct apple80211_assoc, rest)) {
++		return EINVAL;
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
++	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	if (asked == NULL || what == NULL ||
++	    (error = copyin(request->req_data, asked, __builtin_offsetof(struct apple80211_assoc, rest))) != 0) {
++		error = asked == NULL || what == NULL ? ENOMEM : error;
++		goto out;
++	}
++	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes "
++	    "of kind %u)", asked->ssid_length, (asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] |
++	    asked->bssid[4] | asked->bssid[5]) != 0 ? "a given" : "any", asked->auth_lower, asked->auth_upper,
++	    asked->key_length, asked->key_cipher);
++	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
++		error = EINVAL;
++		goto out;
++	}
++	what->ssid_length = (uint8_t)asked->ssid_length;
++	memcpy(what->ssid, asked->ssid, asked->ssid_length);
++	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
++	if (asked->key_length == 0) {
++		what->security = A34_STA_OPEN;
++	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8u && asked->key_length <= 63u) {
++		what->security = A34_STA_WPA2_PSK;
++		what->passphrase_length = (uint8_t)asked->key_length;
++		memcpy(what->passphrase, asked->key, asked->key_length);
++	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
++		what->security = A34_STA_WPA2_PSK;
++		memcpy(what->pmk, asked->key, sizeof(what->pmk));
++	} else {
++		error = EINVAL;
++		goto out;
++	}
++	lck_mtx_lock(&a34a_mtx);
++	a34a_join_result = 0;
++	lck_mtx_unlock(&a34a_mtx);
++	error = a34_sta_ask_join(what);
++out:
++	if (asked != NULL) {
++		bzero(asked, sizeof(*asked));
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (what != NULL) {
++		bzero(what, sizeof(*what));
++		kfree_data(what, sizeof(*what));
++	}
++	return error;
++}
++
++static int
++set(const struct apple80211req *request, char *said, size_t said_size)
++{
++	switch (request->req_type) {
++	case 20:
++		return set_join(request, said, said_size);
++	case 22:                                /* leave the network */
++		return a34_sta_ask_leave();
++	case 19: {                              /* the radio's power */
++		struct {
++			uint32_t version, radios, state[4];
++		} asked;
++		int error;
++
++		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
++			return request->req_len < sizeof(asked) ? EINVAL : error;
++		}
++		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
++		return a34_sta_ask_power(asked.state[0] != 0);
++	}
++	case 10:
++		return set_scan(request, said, said_size);
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- events ---- */
++
++static void
++post(uint32_t code, const void *data, uint32_t length)
++{
++	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS_A34, .kev_subclass = 1,
++		                   .event_code = code };
++	char name[16];
++
++	bzero(name, sizeof(name));
++	strlcpy(name, a34_wifi_net_name(), sizeof(name));
++	if (name[0] == '\0') {
++		return;                         /* (no interface yet: nobody to tell) */
++	}
++	message.dv[0].data_length = sizeof(name);
++	message.dv[0].data_ptr = name;
++	if (length != 0) {
++		message.dv[1].data_length = length;
++		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	(void)kev_post_msg(&message);
++}
++
++void
++a34_apple80211_event(enum a34_sta_event event, int status)
++{
++	static unsigned said;
++
++	if (said < 200u) {
++		said++;
++		printf("A34 WIFI: apple80211: %s, %d\n", event == A34_STA_POWER ? "power" : event == A34_STA_SCAN_DONE ?
++		    "a scan is over" : event == A34_STA_JOIN_DONE ? "a join is over" : "the link", status);
++	}
++	switch (event) {
++	case A34_STA_POWER:
++		post(EVENT_POWER_CHANGED, NULL, 0);
++		break;
++	case A34_STA_SCAN_DONE:
++		lck_mtx_lock(&a34a_mtx);
++		a34a_result_next = 0;
++		lck_mtx_unlock(&a34a_mtx);
++		post(EVENT_SCAN_DONE, NULL, 0);
++		break;
++	case A34_STA_JOIN_DONE:
++		lck_mtx_lock(&a34a_mtx);
++		a34a_join_result = status == 0 ? 1u : status == EAUTH ? 21u : status == ETIMEDOUT ? 9u : 2u;
++		lck_mtx_unlock(&a34a_mtx);
++		post(EVENT_ASSOC_DONE, NULL, 0);
++		break;
++	case A34_STA_LINK: {
++		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
++			                                .reason = status != 1 && status != 0 ? 4u : 0u };
++		struct a34_sta_state now;
++
++		a34_sta_state(&now);
++		link.rssi = status == 1 ? now.bss.rssi : 0;
++		post(EVENT_SSID_CHANGED, NULL, 0);
++		post(EVENT_BSSID_CHANGED, NULL, 0);
++		post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		break;
++	}
++	}
++}
++
++/* ---- the requests as they arrive ---- */
++
++int
++a34_apple80211_ioctl(unsigned long command, void *data)
++{
++	static unsigned said;
++	struct apple80211req *request = data;
++	char who[32] = "?", what[200] = "";
++	bool is_set = command == SIOCSA80211;
++	int error;
++
++	if (command != SIOCSA80211 && command != SIOCGA80211) {
++		return EOPNOTSUPP;
++	}
++	proc_selfname(who, sizeof(who));
++	error = is_set ? set(request, what, sizeof(what)) : get(request);
++	if (said < 400u) {
++		said++;
++		printf("A34 WIFI: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s\n", who, is_set ? "sets" : "gets",
++		    request->req_type, type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ?
++		    "answered" : error == EOPNOTSUPP ? "REFUSED" : "error");
++	}
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/a34_sta.h b/bsd/dev/a34_sta.h
+new file mode 100644
+index 0000000..0ffd458
+--- /dev/null
++++ b/bsd/dev/a34_sta.h
+@@ -0,0 +1,72 @@
++/*
++ * A34 (0969): the station boundary -- what iOS's Wi-Fi side (a34_apple80211.c, wifid's requests)
++ * asks of the radio (a34_wifi.c), and what the radio tells it back.
++ *
++ * Every request is asked and returns at once; a34_wifi.c's thread does the work, one thing at a
++ * time with its own steps, and says how it went as an event. Frames do not pass here (they go
++ * through a34_wifi_net.c's interface).
++ *
++ * After HackiOS's bsd/sys/redwood_sta.h (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * APSL 2.0), cut down to one radio that is already ours.
++ */
++#ifndef _A34_STA_H_
++#define _A34_STA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define A34_STA_ELEMENTS_MOST   384
++
++/* one access point, as the last scan heard it */
++struct a34_sta_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint8_t channel;
++	int16_t rssi;                           /* dBm */
++	uint16_t beacon_interval;               /* TU */
++	uint16_t capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[A34_STA_ELEMENTS_MOST];
++};
++
++enum { A34_STA_OPEN, A34_STA_WPA2_PSK };
++
++struct a34_sta_join {
++	uint8_t ssid[32], ssid_length;
++	uint8_t bssid[6];                       /* all zero: the one of that name heard best */
++	int security;
++	uint8_t pmk[32];                        /* WPA2: the key ... */
++	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase */
++};
++
++enum a34_sta_phase { A34_STA_OFF, A34_STA_IDLE, A34_STA_SCANNING, A34_STA_JOINING, A34_STA_JOINED };
++
++struct a34_sta_state {
++	enum a34_sta_phase phase;
++	struct a34_sta_bss bss;                 /* the network joined (its elements not filled) */
++};
++
++enum a34_sta_event {
++	A34_STA_POWER,                          /* status: 1 on, 0 off */
++	A34_STA_SCAN_DONE,                      /* status: 0, or an errno */
++	A34_STA_JOIN_DONE,                      /* status: 0, EAUTH (a wrong passphrase), ETIMEDOUT, or another errno */
++	A34_STA_LINK,                           /* status: 1 joined, 0 left when asked, an errno: lost */
++};
++
++/* ---- a34_wifi.c: asked from any thread; 0 or an errno, the outcome comes as an event ---- */
++int  a34_sta_ask_power(bool on);
++int  a34_sta_ask_scan(const uint8_t *ssid, uint32_t ssid_length);
++int  a34_sta_ask_join(const struct a34_sta_join *what);
++int  a34_sta_ask_leave(void);
++bool a34_sta_powered(void);
++bool a34_sta_switched_off(void);                /* iOS turned the radio off */
++bool a34_sta_heard(unsigned index, struct a34_sta_bss *bss);   /* the `index`th of the last scan */
++void a34_sta_state(struct a34_sta_state *state);
++bool a34_sta_address(uint8_t address[6]);
++
++/* ---- a34_apple80211.c: told what happened (on a34_wifi.c's thread) ---- */
++void a34_apple80211_event(enum a34_sta_event event, int status);
++int  a34_apple80211_ioctl(unsigned long command, void *data);
++
++#endif
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 4ba6032..ccdd476 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -79,6 +79,7 @@
+ #include "ruby_hal.h"
+ #include "a34_wpa.h"
+ #include "a34_wifi_net.h"
++#include "a34_sta.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -1432,6 +1433,9 @@ struct a34w_bss {
+ 	uint16_t frames;
+ 	bool probe_response;
+ 	bool rsn, wpa;                  /* an RSN element, a WPA vendor element: WPA2/WPA3 or WPA, else open/WEP */
++	uint64_t heard_at;              /* (0969) ms */
++	uint16_t ies_length;            /* (0969) its elements, for iOS's scan results */
++	uint8_t ies[A34_STA_ELEMENTS_MOST];
+ };
+ 
+ static struct a34w_bss a34w_heard[SCAN_MOST];
+@@ -1473,6 +1477,9 @@ a34w_heard_frame(const uint8_t *frame, uint32_t length, int rssi, uint8_t rx_cha
+ 		b->channel = rx_channel;
+ 	}
+ 	b->frames++;
++	b->heard_at = a34w_ms();                        /* (0969) */
++	b->ies_length = (uint16_t)(length - 36u > A34_STA_ELEMENTS_MOST ? A34_STA_ELEMENTS_MOST : length - 36u);
++	memcpy(b->ies, frame + 36, b->ies_length);
+ 	if (rssi > b->rssi) {
+ 		b->rssi = (int8_t)rssi;
+ 	}
+@@ -1612,6 +1619,7 @@ static void a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_
+ static void a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated);
+ static bool a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length);
+ static bool a34w_data_poll(void);
++static void a34w_results_take(void);    /* (0969) */
+ static bool a34w_joined;                /* associated, and for WPA2 the keys in */
+ 
+ /* step 5, before the RAM code: where the mailbox is, and zeroed (halSwWfdmaInit, halSwWfdmaReset) */
+@@ -2065,6 +2073,7 @@ a34w_scan(const char *who, bool stay)
+ 	    "counted by the firmware; %u frames forwarded", who, (unsigned long long)(a34w_ms() - t0), done[0], a34w_scan_seq,
+ 	    done[4], done[5], done[6], a34w_le32(done + 8), a34w_rx_frames - frames0);
+ 	a34w_heard_report(who);
++	a34w_results_take();                            /* (0969) for iOS */
+ 	return true;
+ }
+ 
+@@ -2172,6 +2181,7 @@ static uint16_t a34w_mgmt_sn;
+ static int a34w_auth_status = -1, a34w_assoc_status = -1;
+ /* (0968) joined as Android joins: an HT (20 MHz, one stream) and WMM (QoS) station that can be told to move */
+ static int a34w_legacy;                         /* kern.a34wifi.legacy=1: as 0964, no HT, no WMM */
++static int a34w_join_error;                     /* (0969) why the last join failed: an errno */
+ static bool a34w_ht, a34w_qos;                  /* what this join is */
+ static uint8_t a34w_assoc_ies[512];             /* the Association Response's elements */
+ static uint32_t a34w_assoc_ies_length;
+@@ -2189,6 +2199,7 @@ static uint64_t a34w_kicked_at;                 /* ... and when (ms): it scores
+ static uint64_t a34w_auto_rejoin_at;            /* when to join again by itself (0: not) */
+ static uint32_t a34w_auto_rejoins;              /* how many times so far (5 at most a boot) */
+ static void a34w_lost(const char *why);
++static void a34w_link_tell(bool up, int status);
+ static void a34w_unjoin(bool deauth);
+ static void (*a34w_link_change)(bool up);
+ 
+@@ -2910,8 +2921,8 @@ a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length)
+ static void
+ a34w_lost(const char *why)
+ {
+-	if (a34w_joined && a34w_link_change != NULL) {
+-		a34w_link_change(false);
++	if (a34w_joined) {
++		a34w_link_tell(false, ENETDOWN);
+ 	}
+ 	a34w_joined = false;
+ 	a34w_unjoin(false);                             /* the firmware's side of it undone, as Android's disconnect */
+@@ -3430,8 +3441,8 @@ a34w_unjoin(bool deauth)
+ 	c[2] = BSS_AIS;
+ 	(void)a34w_cmd(CMD_ID_REMOVE_STA_RECORD, CMD_SET, c, sizeof(c));
+ 	(void)a34w_ch_privilege(false);
+-	if (a34w_joined && a34w_link_change != NULL) {
+-		a34w_link_change(false);
++	if (a34w_joined) {
++		a34w_link_tell(false, 0);
+ 	}
+ 	a34w_joined = false;
+ 	a34w_associated = false;
+@@ -3460,11 +3471,13 @@ a34w_connect(void)
+ 	if (a34w_ch_privilege(true) == 0 || !a34w_wait_status(&a34w_ch_status, 2000)) {
+ 		a34w_say("step 8: channel %u NOT GRANTED (CH_PRIVILEGE, token %u)", a34w_target.channel, a34w_ch_token);
+ 		(void)a34w_ch_privilege(false);
++		a34w_join_error = EBUSY;
+ 		return false;
+ 	}
+ 	if (a34w_ch_status != 0) {
+ 		a34w_say("step 8: channel %u refused (status %d)", a34w_target.channel, a34w_ch_status);
+ 		(void)a34w_ch_privilege(false);
++		a34w_join_error = EBUSY;
+ 		return false;
+ 	}
+ 	a34w_say("step 8: channel %u granted in %llu ms", a34w_target.channel, (unsigned long long)(a34w_ms() - t0));
+@@ -3484,6 +3497,7 @@ a34w_connect(void)
+ 		a34w_say("step 8: Authentication %s (status %d)", a34w_auth_status < 0 ? "NOT ANSWERED" : "REFUSED",
+ 		    a34w_auth_status);
+ 		a34w_unjoin(false);
++		a34w_join_error = a34w_auth_status < 0 ? ETIMEDOUT : ECONNREFUSED;
+ 		return false;
+ 	}
+ 	a34w_say("step 8: authenticated (open system)");
+@@ -3500,6 +3514,7 @@ a34w_connect(void)
+ 		a34w_say("step 8: Association %s (status %d)", a34w_assoc_status < 0 ? "NOT ANSWERED" : "REFUSED",
+ 		    a34w_assoc_status);
+ 		a34w_unjoin(true);
++		a34w_join_error = a34w_assoc_status < 0 ? ETIMEDOUT : ECONNREFUSED;
+ 		return false;
+ 	}
+ 	a34w_associated = true;
+@@ -3544,17 +3559,18 @@ a34w_connect(void)
+ 			    "frames in; token reports %u)%s", a34w_eapol_rx, a34w_eapol_tx,
+ 			    (unsigned long long)a34w_data_frames_in, a34w_reports, a34w_associated ? "" : ": the AP let go");
+ 			a34w_unjoin(a34w_associated);
++			a34w_join_error = a34w_eapol_rx != 0 ? EAUTH : ETIMEDOUT;      /* (no message 3: most often a wrong key) */
+ 			return false;
+ 		}
+ 	}
+ 	(void)a34w_ch_privilege(false);                 /* (Android: when the port is authorized) */
+ 	a34w_joined = true;
+-	if (a34w_link_change != NULL) {
+-		a34w_link_change(true);
+-	}
++	a34w_link_tell(true, 1);
+ 	return true;
+ }
+ 
++static bool a34w_join_now(void);
++
+ /*
+  * Step 8: the network file read, a scan for the network, the loudest BSS of that name joined.
+  * The step can be asked for again after a failure (a34w_thread): each try reads the file anew.
+@@ -3562,10 +3578,6 @@ a34w_connect(void)
+ static bool
+ a34w_step8(void)
+ {
+-	char ssid[33];
+-	const char *why;
+-	uint64_t t0 = a34w_ms();
+-
+ 	if (a34w_joined) {
+ 		a34w_say("step 8: joined already");
+ 		return true;
+@@ -3573,6 +3585,18 @@ a34w_step8(void)
+ 	if (!a34w_network_load()) {
+ 		return false;
+ 	}
++	return a34w_join_now();
++}
++
++/* (0969) the join of a34w_net -- from the network file (step 8) or asked for by iOS (a34_sta_ask_join) */
++static bool
++a34w_join_now(void)
++{
++	char ssid[33];
++	const char *why;
++	uint64_t t0 = a34w_ms();
++
++	a34w_join_error = 0;
+ 	bzero(&a34w_target, sizeof(a34w_target));
+ 	a34w_target.rssi = -128;
+ 	a34w_joining = true;
+@@ -3584,6 +3608,7 @@ a34w_step8(void)
+ 	if (!a34w_target.found) {
+ 		a34w_say("step 8: \"%s\" NOT HEARD in two scans (a hidden network is not looked for)", ssid);
+ 		(void)a34w_bss_activate(false);
++		a34w_join_error = ENOENT;
+ 		return false;
+ 	}
+ 	a34w_say("step 8: \"%s\": %02x:%02x:%02x:%02x:%02x:%02x on channel %u, %d dBm, capability 0x%04x, beacon every "
+@@ -3606,10 +3631,12 @@ a34w_step8(void)
+ 	why = a34w_rsn_check();
+ 	if (a34w_net.psk_given && why != NULL) {
+ 		a34w_say("step 8: cannot join it with WPA2-PSK: %s", why);
++		a34w_join_error = EPROTONOSUPPORT;
+ 		return false;
+ 	}
+ 	if (!a34w_net.psk_given && (a34w_target.capability & 0x10u) != 0) {
+ 		a34w_say("step 8: it is not open (it wants a passphrase: a psk= line)");
++		a34w_join_error = EAUTH;
+ 		return false;
+ 	}
+ 	bzero(&a34w_wpa, sizeof(a34w_wpa));
+@@ -3624,6 +3651,9 @@ a34w_step8(void)
+ 	sweet_log_flush();
+ 	if (!a34w_connect()) {
+ 		bzero(&a34w_wpa, sizeof(a34w_wpa));
++		if (a34w_join_error == 0) {
++			a34w_join_error = EIO;
++		}
+ 		return false;
+ 	}
+ 	a34w_say("step 8: JOINED \"%s\" (%s) in %llu ms: %02x:%02x:%02x:%02x:%02x:%02x, channel %u, AID %u", ssid,
+@@ -3681,32 +3711,260 @@ a34w_net_tx(const uint8_t *frame, uint32_t length)
+ }
+ 
+ /*
+- * Step 9: the interface made (once) and given the data path: frames from the stack go out on TX
+- * ring 0 (a34w_net_tx), data frames from the AP go up (a34w_data_in -> a34_wifi_net_input), and
+- * its link follows the join (up now; down when the AP lets go, up again on a rejoin).
++ * The interface made (once) and given the data path: frames from the stack go out on TX ring 0
++ * (a34w_net_tx), data frames from the AP go up (a34w_data_in -> a34_wifi_net_input), its link
++ * follows the join. (0969) Made as soon as the firmware is up (after step 7), so that iOS's Wi-Fi
++ * side finds it (and its registry entries, A34WLAN.cpp) before any network is joined.
+  */
++static bool a34w_attached;
++extern void a34_wlan_registry(const char *interface, const uint8_t *address);  /* iokit/Kernel/arm/A34WLAN.cpp */
++
+ static bool
+-a34w_step9(void)
++a34w_attach(void)
+ {
+ 	int error;
+ 
+-	if (!a34w_joined) {
+-		a34w_say("step 9: not joined (step 8 first, or the AP let go: 'a34wifi join' joins again)");
+-		return false;
++	if (a34w_attached) {
++		return true;
+ 	}
+ 	error = a34_wifi_net_attach(a34w_mac, a34w_net_tx);
+ 	if (error != 0) {
+-		a34w_say("step 9: the network interface NOT MADE (error %d)", error);
++		a34w_say("the network interface NOT MADE (error %d)", error);
+ 		return false;
+ 	}
++	a34w_attached = true;
+ 	a34w_link_change = a34_wifi_net_link;
+ 	a34w_eth_input = a34_wifi_net_input;
++	a34_wlan_registry(a34_wifi_net_name(), a34w_mac);
++	a34_wifi_net_link(a34w_joined);
++	a34w_say("%s attached with %02x:%02x:%02x:%02x:%02x:%02x, link %s; in the registry for iOS's Wi-Fi side (A34WLAN)",
++	    a34_wifi_net_name(), a34w_mac[0], a34w_mac[1], a34w_mac[2], a34w_mac[3], a34w_mac[4], a34w_mac[5],
++	    a34w_joined ? "up" : "down until a network is joined");
++	return true;
++}
++
++/* Step 9: the interface there and its link up: 'a34wifi dhcp' then */
++static bool
++a34w_step9(void)
++{
++	if (!a34w_attach()) {
++		return false;
++	}
++	if (!a34w_joined) {
++		a34w_say("step 9: %s is there, but no network is joined (step 8, Settings, or 'a34wifi join')", a34_wifi_net_name());
++		return false;
++	}
+ 	a34_wifi_net_link(true);
+-	a34w_say("step 9: %s attached with %02x:%02x:%02x:%02x:%02x:%02x, link up: 'a34wifi dhcp' asks configd for an "
+-	    "address", a34_wifi_net_name(), a34w_mac[0], a34w_mac[1], a34w_mac[2], a34w_mac[3], a34w_mac[4], a34w_mac[5]);
++	a34w_say("step 9: %s up: 'a34wifi dhcp' asks configd for an address", a34_wifi_net_name());
++	return true;
++}
++
++/* ---- (0969) the station boundary (a34_sta.h): iOS's Wi-Fi side asks, this thread does ---- */
++
++static LCK_MTX_DECLARE(a34w_sta_mtx, &a34w_grp);
++static struct a34_sta_bss a34w_results[SCAN_MOST];
++static uint32_t a34w_result_count;
++static int a34w_sta_scan, a34w_sta_leave, a34w_sta_join_asked;        /* asked (a34w_run_mtx) */
++static struct a34_sta_join a34w_sta_join_what;
++static bool a34w_sta_off;                       /* iOS turned the radio off: no scans, no joins */
++static bool a34w_sta_power_wait;                /* iOS asked for it on before the firmware was up */
++static enum a34_sta_phase a34w_sta_phase_now = A34_STA_IDLE;
++static int a34w_ask(int step);
++
++/* the link, told to the interface and to iOS */
++static void
++a34w_link_tell(bool up, int status)
++{
++	if (a34w_link_change != NULL) {
++		a34w_link_change(up);
++	}
++	if (a34w_attached) {
++		a34_apple80211_event(A34_STA_LINK, status);
++	}
++}
++
++/* (after a scan) what it heard, as iOS reads it */
++static void
++a34w_results_take(void)
++{
++	lck_mtx_lock(&a34w_sta_mtx);
++	a34w_result_count = 0;
++	for (uint32_t i = 0; i < a34w_heard_count; i++) {
++		const struct a34w_bss *b = &a34w_heard[i];
++		struct a34_sta_bss *r = &a34w_results[a34w_result_count++];
++
++		bzero(r, sizeof(*r));
++		memcpy(r->bssid, b->bssid, 6);
++		memcpy(r->ssid, b->ssid, b->ssid_length);
++		r->ssid_length = b->ssid_length;
++		r->channel = b->channel;
++		r->rssi = b->rssi;
++		r->beacon_interval = b->beacon_interval;
++		r->capability = b->capability;
++		r->elements_length = b->ies_length;
++		memcpy(r->elements, b->ies, b->ies_length);
++		r->age_ms = (uint32_t)(a34w_ms() - b->heard_at);
++	}
++	lck_mtx_unlock(&a34w_sta_mtx);
++}
++
++bool
++a34_sta_heard(unsigned index, struct a34_sta_bss *bss)
++{
++	bool there;
++
++	lck_mtx_lock(&a34w_sta_mtx);
++	there = index < a34w_result_count;
++	if (there) {
++		*bss = a34w_results[index];
++	}
++	lck_mtx_unlock(&a34w_sta_mtx);
++	return there;
++}
++
++bool
++a34_sta_switched_off(void)
++{
++	return a34w_sta_off;
++}
++
++bool
++a34_sta_powered(void)
++{
++	return a34w_done >= 7 && !a34w_sta_off;
++}
++
++bool
++a34_sta_address(uint8_t address[6])
++{
++	if (a34w_done < 6) {
++		return false;
++	}
++	memcpy(address, a34w_mac, 6);
+ 	return true;
+ }
+ 
++void
++a34_sta_state(struct a34_sta_state *state)
++{
++	bzero(state, sizeof(*state));
++	state->phase = a34w_sta_off || a34w_done < 7 ? A34_STA_OFF : a34w_joined ? A34_STA_JOINED : a34w_sta_phase_now;
++	if (a34w_joined) {
++		memcpy(state->bss.ssid, a34w_net.ssid, a34w_net.ssid_length);
++		state->bss.ssid_length = (uint8_t)a34w_net.ssid_length;
++		memcpy(state->bss.bssid, a34w_target.bssid, 6);
++		state->bss.channel = a34w_target.channel;
++		state->bss.rssi = a34w_target.rssi;
++		state->bss.beacon_interval = a34w_target.beacon_interval;
++		state->bss.capability = a34w_target.capability;
++	}
++}
++
++static int
++a34w_sta_queue(int *flag)
++{
++	lck_mtx_lock(&a34w_run_mtx);
++	if (a34w_failed != 0) {
++		lck_mtx_unlock(&a34w_run_mtx);
++		return EIO;
++	}
++	*flag = 1;
++	thread_wakeup((event_t)&a34w_chan);
++	lck_mtx_unlock(&a34w_run_mtx);
++	return 0;
++}
++
++int
++a34_sta_ask_scan(const uint8_t *ssid, uint32_t ssid_length)
++{
++	(void)ssid;                             /* (passive scans only: a hidden network is not asked for) */
++	(void)ssid_length;
++	return a34_sta_powered() ? a34w_sta_queue(&a34w_sta_scan) : ENETDOWN;
++}
++
++int
++a34_sta_ask_join(const struct a34_sta_join *what)
++{
++	if (!a34_sta_powered()) {
++		return ENETDOWN;
++	}
++	lck_mtx_lock(&a34w_run_mtx);
++	a34w_sta_join_what = *what;
++	lck_mtx_unlock(&a34w_run_mtx);
++	return a34w_sta_queue(&a34w_sta_join_asked);
++}
++
++int
++a34_sta_ask_leave(void)
++{
++	return a34w_sta_queue(&a34w_sta_leave);
++}
++
++int
++a34_sta_ask_power(bool on)
++{
++	if (!on) {
++		a34w_sta_off = true;
++		a34_apple80211_event(A34_STA_POWER, 0);
++		return a34w_joined ? a34w_sta_queue(&a34w_sta_leave) : 0;
++	}
++	a34w_sta_off = false;
++	if (a34w_done >= 7) {
++		a34_apple80211_event(A34_STA_POWER, 1);
++		return 0;
++	}
++	a34w_sta_power_wait = true;
++	return a34w_ask(7);                     /* the firmware up and a first scan; POWER when that is done */
++}
++
++/* (the thread) what iOS asked for, one after the other: leave, join, scan */
++static void
++a34w_sta_do(bool leave, const struct a34_sta_join *join, bool scan)
++{
++	if (leave && a34w_joined) {
++		a34w_say("iOS asks us to leave the network");
++		a34w_auto_rejoin_at = 0;
++		a34w_unjoin(true);
++	}
++	if (join != NULL) {
++		char ssid[33];
++		bool ok;
++
++		if (a34w_joined) {
++			a34w_unjoin(true);
++		}
++		bzero(&a34w_net, sizeof(a34w_net));
++		memcpy(a34w_net.ssid, join->ssid, join->ssid_length);
++		a34w_net.ssid_length = join->ssid_length;
++		a34w_net.bssid_given = (join->bssid[0] | join->bssid[1] | join->bssid[2] | join->bssid[3] | join->bssid[4] |
++		    join->bssid[5]) != 0;
++		memcpy(a34w_net.bssid, join->bssid, 6);
++		a34w_net.psk_given = join->security == A34_STA_WPA2_PSK;
++		if (a34w_net.psk_given && join->passphrase_length != 0) {
++			a34_wpa_pmk(join->passphrase, join->passphrase_length, a34w_net.ssid, a34w_net.ssid_length, a34w_net.pmk);
++		} else if (a34w_net.psk_given) {
++			memcpy(a34w_net.pmk, join->pmk, 32);
++		}
++		a34w_net_ssid(ssid);
++		a34w_say("iOS asks us to join \"%s\" (%s)", ssid, a34w_net.psk_given ? "WPA2-PSK" : "open");
++		a34w_sta_phase_now = A34_STA_JOINING;
++		ok = a34w_join_now();
++		a34w_sta_phase_now = A34_STA_IDLE;
++		if (ok) {
++			a34w_auto_rejoins = 0;
++		}
++		a34_apple80211_event(A34_STA_JOIN_DONE, ok ? 0 : a34w_join_error != 0 ? a34w_join_error : EIO);
++	}
++	if (scan) {
++		bool ok;
++
++		a34w_sta_phase_now = A34_STA_SCANNING;
++		ok = a34w_scan("scan for iOS", a34w_joined);
++		a34w_sta_phase_now = A34_STA_IDLE;
++		a34_apple80211_event(A34_STA_SCAN_DONE, ok ? 0 : EIO);
++	}
++}
++
+ /* ---- the thread: steps up to what is asked, one at a time ---- */
+ 
+ static bool
+@@ -3745,7 +4003,8 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		bool again;
+ 
+ 		lck_mtx_lock(&a34w_run_mtx);
+-		while ((a34w_want <= a34w_done || a34w_failed != 0) && !a34w_rescan && !a34w_rejoin) {
++		while ((a34w_want <= a34w_done || a34w_failed != 0) && !a34w_rescan && !a34w_rejoin && !a34w_sta_scan &&
++		    !a34w_sta_leave && !a34w_sta_join_asked) {
+ 			a34w_busy = 0;
+ 			if (a34w_joined || a34w_auto_rejoin_at != 0) {  /* (0964) the rings serviced every 2 ms while joined */
+ 				uint64_t deadline;
+@@ -3758,7 +4017,7 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 				lck_mtx_lock(&a34w_run_mtx);
+ 				if (!a34w_joined && a34w_auto_rejoin_at != 0 && a34w_ms() >= a34w_auto_rejoin_at) {
+ 					a34w_auto_rejoin_at = 0;        /* (0967) the join again, by itself */
+-					a34w_rejoin = 1;
++					a34w_rejoin = 2;                /* (0969) of the network last joined */
+ 				}
+ 			} else {
+ 				lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
+@@ -3766,9 +4025,15 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		}
+ 		a34w_busy = 1;
+ 		if (a34w_rejoin != 0 && (a34w_want <= a34w_done || a34w_failed != 0)) {
++			int how = a34w_rejoin;
++
+ 			a34w_rejoin = 0;
+ 			lck_mtx_unlock(&a34w_run_mtx);
+-			(void)a34w_step8();             /* (0965) joined again: the interface's link follows */
++			if (how == 2 && a34w_net.ssid_length != 0 && !a34w_sta_off) {
++				(void)a34w_join_now();  /* (0969) the network last joined, whoever asked for it */
++			} else if (how != 2) {
++				(void)a34w_step8();     /* (0965) joined again: the interface's link follows */
++			}
+ 			if (!a34w_joined && a34w_auto_rejoins != 0 && a34w_auto_rejoins < 5u) {
+ 				a34w_auto_rejoins++;    /* (0967) by itself again in 10 s */
+ 				a34w_auto_rejoin_at = a34w_ms() + 10000u;
+@@ -3778,6 +4043,18 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 			continue;
+ 		}
+ 		a34w_rejoin = 0;
++		if ((a34w_sta_scan || a34w_sta_leave || a34w_sta_join_asked) && (a34w_want <= a34w_done || a34w_failed != 0)) {
++			struct a34_sta_join what = a34w_sta_join_what;  /* (0969) what iOS asked for */
++			bool leave = a34w_sta_leave != 0, join = a34w_sta_join_asked != 0, scan = a34w_sta_scan != 0;
++
++			bzero(&a34w_sta_join_what, sizeof(a34w_sta_join_what));
++			a34w_sta_scan = a34w_sta_leave = a34w_sta_join_asked = 0;
++			lck_mtx_unlock(&a34w_run_mtx);
++			a34w_sta_do(leave, join ? &what : NULL, scan);
++			bzero(&what, sizeof(what));
++			sweet_log_flush();
++			continue;
++		}
+ 		again = a34w_rescan != 0 && (a34w_want <= a34w_done || a34w_failed != 0);
+ 		a34w_rescan = 0;
+ 		step = again ? 7 : a34w_done + 1;
+@@ -3801,6 +4078,13 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		    ok && step == 7 ? ": milestone 2 reached" : ok && step == 8 ? ": milestone 3 reached" : ok && step == 9 ?
+ 		    ": the data path is up" : "");
+ 		sweet_log_flush();
++		if (ok && step >= 7 && !a34w_attached) {
++			(void)a34w_attach();            /* (0969) the interface, for iOS, once the firmware is up */
++		}
++		if (ok && step >= 7 && a34w_sta_power_wait) {
++			a34w_sta_power_wait = false;
++			a34_apple80211_event(A34_STA_POWER, 1);
++		}
+ 		lck_mtx_lock(&a34w_run_mtx);
+ 		if (ok) {
+ 			a34w_done = step;
+diff --git a/bsd/dev/a34_wifi_net.c b/bsd/dev/a34_wifi_net.c
+index 13552fd..b7cfd09 100644
+--- a/bsd/dev/a34_wifi_net.c
++++ b/bsd/dev/a34_wifi_net.c
+@@ -34,6 +34,7 @@
+ #include <sys/systm.h>
+ 
+ #include "a34_wifi_net.h"
++#include "a34_sta.h"
+ 
+ #define A34N_FRAME_MOST                 (ETHER_HDR_LEN + ETHERMTU)
+ 
+@@ -145,7 +146,7 @@ a34n_ioctl(ifnet_t ifp, u_long command, void *data)
+ 	case SIOCDELMULTI:
+ 		break;                          /* every multicast frame the radio hears comes up anyway */
+ 	default:
+-		error = EOPNOTSUPP;
++		error = a34_apple80211_ioctl(command, data);    /* (0969) what iOS's Wi-Fi side asks: Apple80211 */
+ 		break;
+ 	}
+ 	return error;
+diff --git a/iokit/Kernel/arm/A34WLAN.cpp b/iokit/Kernel/arm/A34WLAN.cpp
+new file mode 100644
+index 0000000..9e4a25a
+--- /dev/null
++++ b/iokit/Kernel/arm/A34WLAN.cpp
+@@ -0,0 +1,237 @@
++/*
++ * A34 (0969): the registry entries by which iOS finds the Wi-Fi interface.
++ *
++ * en0 is made with the BSD interface KPI (bsd/dev/a34_wifi_net.c) and has no IOKit object of its
++ * own; iOS looks for some, as IO80211Family and IONetworkingFamily would have made them:
++ *
++ *   - wifid's device is the service with IO80211InterfaceRole = "Infrastructure", and
++ *     IO80211.framework binds to an interface through a service whose IOInterfaceName is its
++ *     name. That service has no user client, on purpose: the framework's attempt to open one
++ *     fails, it falls back to ioctls, which bsd/dev/a34_apple80211.c answers.
++ *   - SystemConfiguration lists IONetworkInterface objects and calls one Wi-Fi when its parent
++ *     is an IO80211Controller (whose IOMACAddress is the address); configd makes a network
++ *     service for an interface it has listed -- which wifid waits for after a join.
++ *   - configd's interface namer opens IOResources/IONetworkStack before it says the registry
++ *     is quiet; until then SCNetworkInterfaceCopyAll -- wifid, and behind it SpringBoard -- waits
++ *     up to five minutes. The stand-in here can be opened and names nothing.
++ *
++ * The classes are named as Apple's are and have nothing but properties. This is HackiOS's
++ * iokit/Kernel/RedwoodWLAN.cpp and MiniIONetworkStack.cpp (github.com/oosexgang/hakios-xnu-kernel,
++ * branch mtk, APSL 2.0), made once a34_wifi.c has its interface.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <sys/proc.h>
++
++extern "C" void a34_wlan_registry(const char *interface, const uint8_t *address);
++
++class IO80211Controller : public IOService
++{
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class A34WLAN : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(A34WLAN);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(A34WLAN, IONetworkInterface);
++
++/* there is none (see the top); that somebody asked shows that the service was found */
++IOReturn
++A34WLAN::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties, IOUserClient ** handler)
++{
++	static unsigned said;
++
++	if (said++ < 8) {
++		IOLog("A34 WIFI: A34WLAN: a user client of type %u is asked for: there is none (ioctls instead)\n", (unsigned) type);
++	}
++	return kIOReturnUnsupported;
++}
++
++class IONetworkStack : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	setName("IONetworkStack");
++	registerService();
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++bool
++IONetworkStackUserClient::start(IOService * provider)
++{
++	char who[32] = "?";
++
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	proc_selfname(who, sizeof(who));
++	IOLog("A34 WIFI: IONetworkStack opened by %s; the registry's busy state is %u\n", who,
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	return true;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++/* "name this interface": there are none to name (ours are born with their names) */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject * properties)
++{
++	static unsigned said;
++
++	if (said++ < 4) {
++		IOLog("A34 WIFI: IONetworkStack: asked to name an interface: there are none of that kind\n");
++	}
++	return kIOReturnUnsupported;
++}
++
++/* attach, start, register: the service, or NULL */
++static IOService *
++publish(IOService * service, IOService * provider, const char * name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++static void
++a34_wlan_stack(void)
++{
++	IOService * resources = IOService::getResourceService();
++	IONetworkStack * stack = OSTypeAlloc(IONetworkStack);
++
++	if (resources == NULL || stack == NULL || !stack->init() || !stack->attach(resources)) {
++		OSSafeReleaseNULL(stack);
++		IOLog("A34 WIFI: IONetworkStack cannot be made\n");
++		return;
++	}
++	if (!stack->start(resources)) {
++		stack->detach(resources);
++	}
++	stack->release();
++}
++
++/* once, when the interface exists: the controller with the address, below it the interface; and the network stack */
++void
++a34_wlan_registry(const char * interface, const uint8_t * address)
++{
++	static bool made;
++	IOService * platform = IOService::getPlatform();
++	IO80211Controller * controller;
++	A34WLAN * wlan;
++	OSData * mac;
++	OSNumber * number;
++	unsigned unit = 0;
++
++	if (made || interface == NULL || interface[0] == '\0') {
++		return;
++	}
++	made = true;
++	a34_wlan_stack();
++	controller = OSTypeAlloc(IO80211Controller);
++	wlan = OSTypeAlloc(A34WLAN);
++	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(wlan);
++		IOLog("A34 WIFI: A34WLAN: the services cannot be made\n");
++		return;
++	}
++	if ((mac = OSData::withBytes(address, 6)) != NULL) {
++		controller->setProperty("IOMACAddress", mac);
++		mac->release();
++	}
++	controller->setProperty("IOBuiltin", true);
++	if ((controller = (IO80211Controller *) publish(controller, platform, "A34WLANController")) == NULL) {
++		wlan->release();
++		IOLog("A34 WIFI: A34WLAN: the controller did not start\n");
++		return;
++	}
++	for (const char * p = interface + 2; *p >= '0' && *p <= '9'; p++) {
++		unit = unit * 10 + (unsigned) (*p - '0');
++	}
++	wlan->setProperty("IOInterfaceName", interface);
++	wlan->setProperty("BSD Name", interface);
++	wlan->setProperty("IOInterfaceNamePrefix", "en");
++	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
++		wlan->setProperty("IOInterfaceType", number);
++		number->release();
++	}
++	if ((number = OSNumber::withNumber((unsigned long long) unit, 32)) != NULL) {
++		wlan->setProperty("IOInterfaceUnit", number);
++		number->release();
++	}
++	wlan->setProperty("IOBuiltin", true);
++	wlan->setProperty("IOPrimaryInterface", true);
++	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (publish(wlan, controller, "A34WLAN") == NULL) {
++		IOLog("A34 WIFI: A34WLAN: the interface's service did not start\n");
++	} else {
++		wlan->release();
++		IOLog("A34 WIFI: A34WLAN: %s in the registry (IO80211Controller / IONetworkInterface, Infrastructure)\n", interface);
++	}
++	controller->release();
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 74cd935..40bab9f 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@ iokit/Kernel/arm/RubyEINTParent.cpp                              optional iokitc
+ iokit/Kernel/arm/RubyEINTInterruptController.cpp                 optional iokitcpp
+ iokit/Kernel/arm/SweetGoodixTouch.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetKPD.cpp                                    optional iokitcpp
++iokit/Kernel/arm/A34WLAN.cpp                                     optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

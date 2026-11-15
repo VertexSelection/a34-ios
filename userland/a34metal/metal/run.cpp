@@ -86,12 +86,52 @@ rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned
 	unsigned ndrawn = 0;
 
 	*waited_ns = 0;
+	rwm_cb_now.works = count;
 	for (unsigned n = 0; n < count; n++) {
 		struct rwm_work *w = works[n];
+		uint64_t t0 = rwm_ns();
 
 		for (unsigned i = 0; copy && i < w->copy_in_count; i++) {
 			rwm_copy_in(w->copy_in[i]);
 		}
+		/* (A34: the buffer's parts, "rwm worst cb") */
+		const uint64_t t1 = rwm_ns();
+
+		if (t1 - t0 > 0 && copy && w->copy_in_count != 0) {
+			rwm_cb_now.copyins += w->copy_in_count;
+			rwm_cb_now.copyin_ns += t1 - t0;
+		}
+		struct work_timer {
+			const struct rwm_work *w;
+			unsigned n;
+			uint64_t from;
+
+			~work_timer()
+			{
+				const uint64_t took = rwm_ns() - from;
+
+				switch (w->kind) {
+				case RWM_WORK_DRAW:
+					rwm_cb_now.draws++;
+					rwm_cb_now.draw_ns += took;
+					break;
+				case RWM_WORK_BLIT:
+					rwm_cb_now.blits++;
+					rwm_cb_now.blit_ns += took;
+					break;
+				case RWM_WORK_DISPATCH:
+					rwm_cb_now.dispatches++;
+					rwm_cb_now.dispatch_ns += took;
+					break;
+				}
+				if (took > rwm_cb_now.slowest_ns) {
+					rwm_cb_now.slowest_ns = took;
+					rwm_cb_now.slowest_index = n;
+					rwm_cb_now.slowest_kind = (unsigned)w->kind;
+				}
+			}
+		} timer = { w, n, t1 };
+
 		switch (w->kind) {
 		case RWM_WORK_BLIT:
 			if (rwm_run_blit(&w->blit, why, why_size) != 0) {
@@ -151,6 +191,7 @@ rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned
 		rwm_print("THE GPU DID NOT FINISH the command buffer: %s\n", why);
 	}
 	*waited_ns = rwm_ns() - began;
+	rwm_cb_now.submit_ns = *waited_ns;
 	for (unsigned k = 0; k < ndrawn; k++) {
 		static unsigned long times;
 		char reason[256] = { 0 };

@@ -145,6 +145,30 @@ struct redwood_drm_wait_seq {
 
 int redwood_drm_queued(void);
 
+/*
+ * SUBMIT_BATCH (kernel 0988): GET_PARAM REDWOOD_DRM_PARAM_SUBMIT_BATCH answers the most jobs one
+ * request takes (16; an older kernel refuses the parameter). Request 0x7d, 24 bytes in and out:
+ * `submits` is the address of `count` (1 to that most) struct drm_panfrost_submit, exactly as
+ * SUBMIT's; `seq` comes back as the last job's number, job i being seq - count + 1 + i. Queued
+ * mode only (else kIOReturnNotPermitted); all of them validated before any is queued, and queued
+ * together in order.
+ *
+ * redwood_drm_submit_batch(): `count` SUBMITs in one request, their syncobjs answered here as
+ * SUBMIT's are; 0, or -1 with errno -- ENOTSUP when this kernel or mode has no SUBMIT_BATCH (or
+ * REDWOOD_DRM_BATCH=0), nothing then having been queued: the caller sends them one by one.
+ */
+#define REDWOOD_DRM_PARAM_SUBMIT_BATCH  0x1001
+#define REDWOOD_DRM_SUBMIT_BATCH        0x7d
+
+struct redwood_drm_submit_batch {
+	uint64_t submits;
+	uint32_t count, pad;
+	uint64_t seq;
+};
+
+struct drm_panfrost_submit;
+int redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t count);
+
 /* A34: drmPrimeHandleToFD's in-process "file descriptor": the GEM handle with this bit, which no
  * IOSurface ID has (redwood_drm.c) */
 #define REDWOOD_DRM_PRIME_LOCAL 0x40000000u
