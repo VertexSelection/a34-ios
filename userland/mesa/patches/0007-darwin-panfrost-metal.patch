@@ -6,9 +6,10 @@ panfrost-redwood-perf.patch), ported to Mesa 26.3 and to Valhall:
 
 - counters of batch submissions and draw-time shader variants that air_metal.c reads
   (rwa_submit_profile);
-- 256 bytes of slack after every transient pool allocation (their G52's fragment preload
-  wrote past one);
-- no transaction elimination (CRC) on Darwin: IOSurface memory changes behind a resource;
+- in a process that draws through Metal (redwood_pan_metal, set by air_metal.c) only: no
+  transaction elimination (CRC: IOSurface memory changes behind a resource), and 256 bytes of
+  slack after every transient pool allocation (their G52's fragment preload wrote past one).
+  A process that only uses OpenGL ES keeps panfrost as upstream;
 - 16-bit UBO loads widened to 32-bit, for the Metal driver's shaders only (label "air";
   boot-arg widen16=0 turns it off).
 
@@ -17,8 +18,8 @@ Not taken (performance only, to come once the Metal path draws right): pushing e
 arrays into registers (scratchregs). Their Bifrost-v7-only build switches are not taken
 either: our build keeps every architecture panfrost has.
 
---- a/src/gallium/drivers/panfrost/pan_job.c	2026-11-13 23:52:23.849642992 +0300
-+++ b/src/gallium/drivers/panfrost/pan_job.c	2026-11-13 23:52:58.731354111 +0300
+--- a/src/gallium/drivers/panfrost/pan_job.c	2026-11-15 05:04:39.786565340 +0300
++++ b/src/gallium/drivers/panfrost/pan_job.c	2026-11-15 05:04:39.798565208 +0300
 @@ -17,6 +17,7 @@
  #include "pan_context.h"
  #include "pan_trace.h"
@@ -38,7 +39,7 @@ either: our build keeps every architecture panfrost has.
     struct pipe_screen *pscreen = ctx->base.screen;
     struct panfrost_screen *screen = pan_screen(pscreen);
     bool has_frag = panfrost_has_fragment_job(batch);
-@@ -776,8 +781,14 @@
+@@ -776,8 +781,20 @@
  
  out:
     panfrost_batch_cleanup(ctx, batch);
@@ -50,12 +51,18 @@ either: our build keeps every architecture panfrost has.
 +uint64_t redwood_pan_submit_ns, redwood_pan_submits, redwood_pan_blend_compiles;
 +uint64_t redwood_pan_variant_compiles, redwood_pan_variant_ns;
 +
++/* A34: set by the Metal driver's library when it opens its device (air_metal.c,
++ * rwa_device_open): this process draws through Metal, and the two changes below that are
++ * Metal's (no CRC, pool slack) apply. A process that only uses OpenGL ES keeps panfrost as it
++ * is upstream. */
++bool redwood_pan_metal;
++
  void
  panfrost_flush_batch(struct panfrost_batch *batch, const char *reason)
  {
---- a/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-13 23:52:23.851643034 +0300
-+++ b/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-13 23:52:58.731354111 +0300
-@@ -152,17 +152,25 @@
+--- a/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-15 05:04:39.789565307 +0300
++++ b/src/gallium/drivers/panfrost/pan_mempool.c	2026-11-15 05:04:39.798565208 +0300
+@@ -152,17 +152,26 @@
     }
  #endif
  
@@ -64,8 +71,9 @@ either: our build keeps every architecture panfrost has.
 +    * bytes past the end of one of its descriptor allocations -- past the end of a 64 KB pool
 +    * buffer twice, a fault in the window server drawing through Metal; what it overruns now
 +    * is its own slack. Whether Valhall's preload does the same is not known; the slack is
-+    * kept for it. */
-+   size_t slack = sz + 256;
++    * kept for it -- in a process that draws through Metal (redwood_pan_metal, pan_job.c). */
++   extern bool redwood_pan_metal;
++   size_t slack = sz + (redwood_pan_metal ? 256 : 0);
 +
     /* If we don't fit, allocate a new backing */
 -   if (unlikely(bo == NULL || (offset + sz) >= pool->base.slab_size)) {
@@ -84,28 +92,30 @@ either: our build keeps every architecture panfrost has.
  
     struct pan_ptr ret = {
        .cpu = bo->ptr.cpu + offset,
---- a/src/gallium/drivers/panfrost/pan_resource.c	2026-11-13 23:52:23.852643054 +0300
-+++ b/src/gallium/drivers/panfrost/pan_resource.c	2026-11-13 23:52:58.731354111 +0300
-@@ -795,6 +795,17 @@
+--- a/src/gallium/drivers/panfrost/pan_resource.c	2026-11-15 05:04:39.790565296 +0300
++++ b/src/gallium/drivers/panfrost/pan_resource.c	2026-11-15 05:04:39.798565208 +0300
+@@ -795,6 +795,19 @@
      * size of the writeback buffer, so don't checksum formats
      * that use too much space. */
  
 +#ifdef __APPLE__
-+   /* A34 (from HackiOS, Darwin on redwood): no transaction elimination. A tile is not
-+    * written back when its checksum matches the one kept from this resource's last render,
-+    * and the memory of an IOSurface changes behind that resource -- other textures over the
-+    * same surface, copies, the processor -- so tiles of an older frame stayed on the
-+    * screen. */
-+   (void)dev;
-+   (void)pres;
-+   return false;
++   /* A34 (from HackiOS, Darwin on redwood): no transaction elimination in a process that
++    * draws through Metal (redwood_pan_metal, pan_job.c). A tile is not written back when its
++    * checksum matches the one kept from this resource's last render, and the memory of an
++    * IOSurface changes behind that resource -- other textures over the same surface, copies,
++    * the processor -- so tiles of an older frame stayed on the screen there. OpenGL ES alone
++    * keeps CRC, as upstream. */
++   extern bool redwood_pan_metal;
++
++   if (redwood_pan_metal)
++      return false;
 +#endif
 +
     unsigned bytes_per_pixel_max = (dev->arch == 6) ? 6 : 4;
  
     unsigned bytes_per_pixel = MAX2(pres->base.nr_samples, 1) *
---- a/src/gallium/drivers/panfrost/pan_shader.c	2026-11-13 23:52:23.850643013 +0300
-+++ b/src/gallium/drivers/panfrost/pan_shader.c	2026-11-13 23:52:58.731354111 +0300
+--- a/src/gallium/drivers/panfrost/pan_shader.c	2026-11-15 05:04:39.787565329 +0300
++++ b/src/gallium/drivers/panfrost/pan_shader.c	2026-11-15 05:04:39.793565263 +0300
 @@ -21,6 +21,7 @@
  #include "compiler/bifrost/bifrost_compile.h"
  #include "panfrost/compiler/midgard/midgard_quirks.h"
@@ -129,8 +139,8 @@ either: our build keeps every architecture panfrost has.
  
     prog->earlyzs = pan_earlyzs_analyze(&prog->info, dev->arch);
  
---- a/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-13 23:52:23.854643096 +0300
-+++ b/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-13 23:52:58.731354111 +0300
+--- a/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-15 05:04:39.792565274 +0300
++++ b/src/panfrost/compiler/bifrost/bifrost_nir.c	2026-11-15 05:04:39.793565263 +0300
 @@ -19,6 +19,68 @@
  #include "compiler.h"
  #include "../kraid/kraid.h"

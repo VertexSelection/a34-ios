@@ -599,6 +599,13 @@ rwa_device_open(char *why, size_t why_size)
          options_parsed = true;
       }
       device->screen = panfrost_drm_screen_create(fd, &config);
+      {
+         /* A34 (userland/mesa/patches/0007): this process draws through Metal, so panfrost's
+          * Metal-only changes apply in it (no CRC over IOSurfaces, pool slack) */
+         extern bool redwood_pan_metal;
+
+         redwood_pan_metal = true;
+      }
       if (!device->screen) {
          say(why, why_size, "the kernel's panfrost device opened but panfrost made no "
                             "screen for it, so this GPU is present and unusable");
