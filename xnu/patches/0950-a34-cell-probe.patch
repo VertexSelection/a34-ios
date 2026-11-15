@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..2dfdad2
+index 0000000..42823b6
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1624 @@
+@@ -0,0 +1,1728 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -423,6 +423,103 @@ index 0000000..2dfdad2
 +		len -= n;
 +	}
 +	return true;
++}
++
++/* ---- CCB control: what Android's userspace writes ---- */
++
++/*
++ * port_smem.c ccb_configs[] (dl_page_size, ul_page_size, dl_buff_size, ul_buff_size): 18 DHL
++ * entries (control, exception, PS, HW loggers 1-3, 12 dummies), MD_MONITOR, META. The data
++ * buffers lie in this order from CCB_DHL's base (DL then UL), 0x17c000 in all.
++ */
++#define R_CCB_CTRL      4
++#define CCB_GUARD_E     0xEEFF0011u
++static const uint32_t ccb_cfg[20][4] = {
++	{ 0x400, 0x400, 0x8000, 0x8000 }, { 0x5000, 0x80, 0x1e000, 0x80 },
++	{ 0x200, 0x400, 0x9000, 0x8000 }, { 0x200, 0x80, 0x8000, 0x80 },
++	{ 0x200, 0x80, 0x8000, 0x80 }, { 0x200, 0x80, 0x20000, 0x80 },
++	{ 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 },
++	{ 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 },
++	{ 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 },
++	{ 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x80, 0x80, 0x280, 0x80 },
++	{ 0x200, 0x400, 0x4000, 0x4000 },                                       /* MD_MONITOR */
++	{ 0x10400, 0x10400, 0x82000, 0x82000 },                                 /* META */
++};
++
++/*
++ * Android's ccci_mdinit, right after it starts the modem ("modem boot up, set runtime data"),
++ * calls libccci_util ccci_ccb_init_users for DHL, MD_MONITOR and META: through
++ * /dev/ccci_ccb_ctrl it writes one 64-byte buffer header per ccb_configs[] entry, at
++ * (the user's ccb_ctrl_offset + k) * 64: DL {0, 0, 0, 0, 0, page size, buffer size,
++ * 0xEEFF0011}, then UL the same. The kernel never writes CCB_CTRL; without these headers the
++ * modem's CCB buffer manager (ccci_shm_bm) asserts.
++ */
++static bool
++ccb_ctrl_init(void)
++{
++	vm_offset_t c = rva(R_CCB_CTRL);
++
++	if (!c || rg[R_CCB_CTRL].size < 20 * 64) {
++		printf("A34 CELL: CCB_CTRL missing or too small (%u bytes): no CCB headers\n",
++		    rg[R_CCB_CTRL].size);
++		return false;
++	}
++	for (int i = 0; i < 20; i++) {
++		uint32_t h[16];
++		memset(h, 0, sizeof(h));
++		h[5] = ccb_cfg[i][0];
++		h[6] = ccb_cfg[i][2];
++		h[7] = CCB_GUARD_E;
++		h[13] = ccb_cfg[i][1];
++		h[14] = ccb_cfg[i][3];
++		h[15] = CCB_GUARD_E;
++		dm_put(c, 64u * (uint32_t)i, h, sizeof(h));
++	}
++	__asm__ volatile ("dsb st" ::: "memory");
++	printf("A34 CELL: CCB_CTRL: 20 buffer headers written as Android's ccci_mdinit "
++	    "(DHL 18, MD_MONITOR 1, META 1)\n");
++	return true;
++}
++
++/* CCB_CTRL header words (indices, sizes, guards) in hex. */
++static void
++ccb_ctrl_show(const char *when, uint32_t first, uint32_t count)
++{
++	vm_offset_t c = rva(R_CCB_CTRL);
++	uint32_t w[16];
++
++	if (!c || rg[R_CCB_CTRL].size < 64u * (first + count))
++		return;
++	for (uint32_t i = first; i < first + count; i++) {
++		dm_get(w, c, 64u * i, sizeof(w));
++		printf("A34 CELL: CCB_CTRL %s: header %u DL %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    when, i, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		printf("A34 CELL: CCB_CTRL %s: header %u UL %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    when, i, w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
++	}
++}
++
++/*
++ * Whether the start of each CCB data area holds anything: a count of non-zero words only,
++ * never their contents (these buffers carry the modem's own logs).
++ */
++static void
++ccb_data_show(const char *when)
++{
++	static const char *const nm[4] = { "", "DHL", "MD_MONITOR", "META" };
++
++	for (int id = 1; id <= 3; id++) {
++		if (!rg[id].size || (rg[id].ap & PAGE_MASK))
++			continue;
++		vm_offset_t m = ml_io_map_unmappable((vm_offset_t)rg[id].ap, PAGE_SIZE, CC_WIMG_IO);
++		if (!m)
++			continue;
++		uint32_t nz = 0;
++		for (uint32_t o = 0; o < 64; o += 4)
++			nz += rd32(m, o) != 0;
++		ml_io_unmap(m, PAGE_SIZE);
++		printf("A34 CELL: CCB %s data %s: %u of its first 16 words non-zero\n", nm[id], when, nz);
++	}
 +}
 +
 +/* ---- rings ---- */
@@ -1152,6 +1249,9 @@ index 0000000..2dfdad2
 +	    le32(in + 272));
 +	printf("A34 CELL: modem exception: as fatal: code1 0x%x code2 0x%x code3 0x%x\n", le32(in),
 +	    le32(in + 4), le32(in + 8));
++	ccb_ctrl_show("at the exception", 0, 3);
++	ccb_ctrl_show("at the exception", 18, 2);
++	ccb_data_show("at the exception");
 +}
 +
 +static void
@@ -1353,7 +1453,11 @@ index 0000000..2dfdad2
 +		printf("A34 CELL: shared memory not mapped\n");
 +		return false;
 +	}
++	ccb_ctrl_show("before the clear", 0, 1);
++	ccb_data_show("before the clear");
 +	smem_clear_first_boot();
++	if (ccb_ctrl_init())
++		ccb_ctrl_show("as written", 0, 1);
 +	ccism_size = rings_build(mcu, rg[R_CCISM_MCU].size, rx_kib, tx_kib, q);
 +	uint32_t exp_total = rings_build(exp, rg[R_CCISM_MCU_EXP].size, exp_kib, exp_kib, NULL);
 +	if (ccism_size != 0xB4280u || exp_total != 0x1E280u) {
