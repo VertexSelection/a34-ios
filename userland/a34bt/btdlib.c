@@ -16,11 +16,11 @@
  * 3. The Mach services bluetoothd connects to are said (the first 40).
  * 4. Its keychain kept here (boot 0988-all-a). bluetoothd keeps everything it must remember -- its LE identity root,
  *    encryption root, cloud keys, static random address (readRootKeys, +0x594fac), paired devices -- as generic
- *    passwords of the service "MobileBluetooth" in the system keychain (+0x254c30 get, +0x255334 set, +0x25602c and
+ *    passwords of the services BluetoothGlobal, MobileBluetooth, BluetoothLE and BluetoothLESync in the system keychain (+0x254c30 get, +0x255334 set, +0x25602c and
  *    +0x25656c lists, +0x255e40 delete). securityd cannot store an item here: this kernel's AppleKeyStore does not
  *    wrap keys (selector 10, "SWEET AKS: securityd sel 10 ... -> 0xe00002c7"), so "Failed to set new identity root!",
  *    and the stack's init (+0x599048) restarts bluetoothd (+0x487df8 -> +0x90734 _exit(1)) -- 15 times in that boot.
- *    SecItemCopyMatching/Add/Update/Delete of service "MobileBluetooth" are answered from
+ *    SecItemCopyMatching/Add/Update/Delete of those services are answered from
  *    /var/mobile/Library/Bluetooth/com.a34.keychain.plist (a binary plist, bluetoothd's own user: NOT encrypted --
  *    the pairing keys of this research port are readable by root); every other keychain call goes to securityd as
  *    before. A34BT_KEYCHAIN=securityd leaves bluetoothd's to securityd too.
@@ -180,21 +180,58 @@ my_send(xpc_connection_t c, xpc_object_t message)
 #define KC_DIR  "/var/mobile/Library/Bluetooth"
 #define KC_FILE KC_DIR "/com.a34.keychain.plist"
 
+/*
+ * bluetoothd's generic passwords: the services its helpers pass (+0x254c30 get, +0x255334 set, +0x25602c and +0x25656c
+ * lists, +0x255e40 delete; a NULL service there is "MobileBluetooth"): BluetoothGlobal (its root keys: "Identity
+ * Root", "Encryption Root", cloud keys, "Local Device Static Random Address" ...), MobileBluetooth (classic devices:
+ * LinkKey, Pincode ...), BluetoothLE and BluetoothLESync (LE devices, listed by label). Boot 0989-bt-a: only
+ * MobileBluetooth was caught, so the root keys still went to securityd and failed (-25300, -25291).
+ */
+static const char *const kc_services[] = { "MobileBluetooth", "BluetoothGlobal", "BluetoothLE", "BluetoothLESync" };
+
 static pthread_mutex_t kc_lock = PTHREAD_MUTEX_INITIALIZER;
-static CFMutableDictionaryRef kc_items;          /* account -> item (attributes, v_Data) */
+static CFMutableDictionaryRef kc_items;          /* "service|account" -> item (its attributes and v_Data) */
 static bool kc_local = true;
 static unsigned kc_said;
+
+static void
+kc_cstr(CFTypeRef v, char *out, size_t room)
+{
+	out[0] = 0;
+	if (v != NULL && CFGetTypeID(v) == CFStringGetTypeID()) {
+		(void)CFStringGetCString(v, out, (CFIndex)room, kCFStringEncodingUTF8);
+	} else if (v != NULL) {
+		snprintf(out, room, "(not a string)");
+	} else {
+		snprintf(out, room, "-");
+	}
+}
+
+/* "service|account" of an item or a query (NULL when either is missing or not a string) */
+static CFStringRef
+kc_key(CFDictionaryRef d)
+{
+	CFTypeRef service = CFDictionaryGetValue(d, kSecAttrService), account = CFDictionaryGetValue(d, kSecAttrAccount);
+
+	if (service == NULL || account == NULL || CFGetTypeID(service) != CFStringGetTypeID() ||
+	    CFGetTypeID(account) != CFStringGetTypeID()) {
+		return NULL;
+	}
+	return CFStringCreateWithFormat(NULL, NULL, CFSTR("%@|%@"), service, account);
+}
 
 static void
 kc_load(void)
 {
 	CFDataRef data = NULL;
+	CFPropertyListRef plist = NULL;
 	struct stat st;
 	int fd;
 
 	if (kc_items != NULL) {
 		return;
 	}
+	kc_items = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 	if ((fd = open(KC_FILE, O_RDONLY | O_CLOEXEC)) >= 0) {
 		if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < (4 << 20)) {
 			UInt8 *bytes = malloc((size_t)st.st_size);
@@ -207,19 +244,36 @@ kc_load(void)
 		close(fd);
 	}
 	if (data != NULL) {
-		CFPropertyListRef plist = CFPropertyListCreateWithData(NULL, data, kCFPropertyListMutableContainersAndLeaves, NULL, NULL);
-
+		plist = CFPropertyListCreateWithData(NULL, data, kCFPropertyListMutableContainersAndLeaves, NULL, NULL);
 		CFRelease(data);
-		if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
-			kc_items = (CFMutableDictionaryRef)plist;
-		} else if (plist != NULL) {
-			CFRelease(plist);
+	}
+	if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+		/* every item under its own service and account (rekeyed: a file of 0988's kept only the account) */
+		CFIndex n = CFDictionaryGetCount(plist);
+		const void **k = malloc(sizeof(void *) * (size_t)(n ? n : 1)), **v = malloc(sizeof(void *) * (size_t)(n ? n : 1));
+
+		CFDictionaryGetKeysAndValues(plist, k, v);
+		for (CFIndex i = 0; i < n; i++) {
+			CFStringRef key;
+
+			if (CFGetTypeID(v[i]) != CFDictionaryGetTypeID()) {
+				continue;
+			}
+			if (CFDictionaryGetValue(v[i], kSecAttrService) == NULL) {
+				CFDictionarySetValue((CFMutableDictionaryRef)v[i], kSecAttrService, CFSTR("MobileBluetooth"));
+			}
+			if ((key = kc_key(v[i])) != NULL) {
+				CFDictionarySetValue(kc_items, key, v[i]);
+				CFRelease(key);
+			}
 		}
+		free(k);
+		free(v);
 	}
-	if (kc_items == NULL) {
-		kc_items = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (plist != NULL) {
+		CFRelease(plist);
 	}
-	say("keychain: %ld MobileBluetooth items from " KC_FILE, (long)CFDictionaryGetCount(kc_items));
+	say("keychain: %ld items of bluetoothd's services from " KC_FILE, (long)CFDictionaryGetCount(kc_items));
 }
 
 static void
@@ -248,41 +302,45 @@ kc_save(void)
 	CFRelease(data);
 }
 
+/* a generic password of one of bluetoothd's services (or of its access group, with no service named) */
 static bool
 kc_is_ours(CFDictionaryRef query)
 {
-	CFTypeRef cls, service;
+	CFTypeRef cls, service, group;
 
 	if (!kc_local || query == NULL || CFGetTypeID(query) != CFDictionaryGetTypeID()) {
 		return false;
 	}
 	cls = CFDictionaryGetValue(query, kSecClass);
-	service = CFDictionaryGetValue(query, kSecAttrService);
-	return cls != NULL && CFEqual(cls, kSecClassGenericPassword) && service != NULL &&
-	       CFGetTypeID(service) == CFStringGetTypeID() && CFEqual(service, CFSTR("MobileBluetooth"));
-}
-
-static void
-kc_name(CFTypeRef v, char *out, size_t room)
-{
-	out[0] = 0;
-	if (v != NULL && CFGetTypeID(v) == CFStringGetTypeID()) {
-		(void)CFStringGetCString(v, out, (CFIndex)room, kCFStringEncodingUTF8);
-	} else {
-		snprintf(out, room, "(any)");
+	if (cls == NULL || !CFEqual(cls, kSecClassGenericPassword)) {
+		return false;
 	}
+	service = CFDictionaryGetValue(query, kSecAttrService);
+	if (service != NULL && CFGetTypeID(service) == CFStringGetTypeID()) {
+		char name[64];
+
+		kc_cstr(service, name, sizeof(name));
+		for (unsigned i = 0; i < sizeof(kc_services) / sizeof(kc_services[0]); i++) {
+			if (strcmp(name, kc_services[i]) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+	group = CFDictionaryGetValue(query, kSecAttrAccessGroup);
+	return service == NULL && group != NULL && CFEqual(group, CFSTR("com.apple.bluetooth"));
 }
 
-/* the item matches the query's account and label, where the query names them */
+/* the item matches the query's service, account and label, where the query names them */
 static bool
 kc_matches(CFDictionaryRef item, CFDictionaryRef query)
 {
-	static const CFStringRef *const keys[] = { &kSecAttrAccount, &kSecAttrLabel };
+	static const CFStringRef *const keys[] = { &kSecAttrService, &kSecAttrAccount, &kSecAttrLabel };
 
-	for (unsigned i = 0; i < 2; i++) {
-		CFTypeRef want = CFDictionaryGetValue(query, *keys[i]);
+	for (unsigned i = 0; i < 3; i++) {
+		CFTypeRef want = CFDictionaryGetValue(query, *keys[i]), have = CFDictionaryGetValue(item, *keys[i]);
 
-		if (want != NULL && !CFEqual(want, CFDictionaryGetValue(item, *keys[i]) ?: CFSTR(""))) {
+		if (want != NULL && (have == NULL || !CFEqual(want, have))) {
 			return false;
 		}
 	}
@@ -298,6 +356,7 @@ kc_plist_value(CFTypeRef v)
 	       t == CFDateGetTypeID() || t == CFArrayGetTypeID() || t == CFDictionaryGetTypeID();
 }
 
+/* the attributes worth keeping: not the class, not the query's own keys (match limit, return flags, use-*) */
 static void
 kc_copy_attrs(CFMutableDictionaryRef into, CFDictionaryRef from)
 {
@@ -306,13 +365,57 @@ kc_copy_attrs(CFMutableDictionaryRef into, CFDictionaryRef from)
 
 	CFDictionaryGetKeysAndValues(from, k, v);
 	for (CFIndex i = 0; i < n; i++) {
-		if (CFGetTypeID(k[i]) == CFStringGetTypeID() && !CFEqual(k[i], kSecClass) && !CFEqual(k[i], kSecMatchLimit) &&
-		    !CFEqual(k[i], kSecReturnData) && !CFEqual(k[i], kSecReturnAttributes) && kc_plist_value(v[i])) {
-			CFDictionarySetValue(into, k[i], v[i]);
+		char name[48];
+
+		if (CFGetTypeID(k[i]) != CFStringGetTypeID()) {
+			continue;
 		}
+		kc_cstr(k[i], name, sizeof(name));
+		if (strcmp(name, "class") == 0 || strncmp(name, "m_", 2) == 0 || strncmp(name, "r_", 2) == 0 ||
+		    strncmp(name, "u_", 2) == 0 || !kc_plist_value(v[i])) {
+			continue;
+		}
+		CFDictionarySetValue(into, k[i], v[i]);
 	}
 	free(k);
 	free(v);
+}
+
+/* "op service account [label]: keys ... -> status", for the log */
+static void
+kc_say(const char *op, CFDictionaryRef query, CFDictionaryRef more, OSStatus status, long count)
+{
+	char service[48], account[96], label[64], keys[400];
+	size_t used = 0;
+	CFIndex n;
+
+	if (kc_said++ >= 200) {
+		return;
+	}
+	kc_cstr(CFDictionaryGetValue(query, kSecAttrService), service, sizeof(service));
+	kc_cstr(CFDictionaryGetValue(query, kSecAttrAccount), account, sizeof(account));
+	kc_cstr(CFDictionaryGetValue(query, kSecAttrLabel), label, sizeof(label));
+	keys[0] = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		CFDictionaryRef d = pass == 0 ? query : more;
+		const void **k;
+
+		if (d == NULL || (n = CFDictionaryGetCount(d)) == 0) {
+			continue;
+		}
+		k = malloc(sizeof(void *) * (size_t)n);
+		CFDictionaryGetKeysAndValues(d, k, NULL);
+		used += (size_t)snprintf(keys + used, sizeof(keys) - used, "%s", pass == 0 ? "" : " |");
+		for (CFIndex i = 0; i < n && used < sizeof(keys) - 20; i++) {
+			char name[32];
+
+			kc_cstr(k[i], name, sizeof(name));
+			used += (size_t)snprintf(keys + used, sizeof(keys) - used, " %s", name);
+		}
+		free(k);
+	}
+	say("keychain: %s %s/%s%s%s: %ld item(s), %d [keys:%s]", op, service, account, label[0] != '-' ? " label " : "",
+	    label[0] != '-' ? label : "", count, (int)status, keys);
 }
 
 static CFTypeRef
@@ -337,14 +440,36 @@ kc_result(CFDictionaryRef item, bool data, bool attrs)
 	return CFRetain(item);
 }
 
+/* the items the query matches, as an array (+1); kc_lock held */
+static CFMutableArrayRef
+kc_find_locked(CFDictionaryRef query, bool keys_too)
+{
+	CFMutableArrayRef found = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	CFIndex n = CFDictionaryGetCount(kc_items);
+
+	if (n > 0) {
+		const void **k = malloc(sizeof(void *) * (size_t)n), **v = malloc(sizeof(void *) * (size_t)n);
+
+		CFDictionaryGetKeysAndValues(kc_items, k, v);
+		for (CFIndex i = 0; i < n; i++) {
+			if (kc_matches(v[i], query)) {
+				CFArrayAppendValue(found, keys_too ? k[i] : v[i]);
+			}
+		}
+		free(k);
+		free(v);
+	}
+	return found;
+}
+
 static OSStatus
 my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 {
 	CFTypeRef limit;
 	bool all, data, attrs;
-	CFMutableArrayRef found;
+	CFMutableArrayRef found, out;
+	OSStatus status;
 	CFIndex n;
-	char name[96];
 
 	if (!kc_is_ours(query)) {
 		return SecItemCopyMatching(query, result);
@@ -353,54 +478,34 @@ my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 	all = limit != NULL && CFEqual(limit, kSecMatchLimitAll);
 	data = CFDictionaryGetValue(query, kSecReturnData) == kCFBooleanTrue;
 	attrs = CFDictionaryGetValue(query, kSecReturnAttributes) == kCFBooleanTrue;
-	found = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
 	pthread_mutex_lock(&kc_lock);
 	kc_load();
-	n = CFDictionaryGetCount(kc_items);
-	if (n > 0) {
-		const void **k = malloc(sizeof(void *) * (size_t)n), **v = malloc(sizeof(void *) * (size_t)n);
+	found = kc_find_locked(query, false);
+	n = CFArrayGetCount(found);
+	out = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	for (CFIndex i = 0; i < n && (all || i < 1); i++) {
+		CFTypeRef r = kc_result(CFArrayGetValueAtIndex(found, i), data, attrs);
 
-		CFDictionaryGetKeysAndValues(kc_items, k, v);
-		for (CFIndex i = 0; i < n; i++) {
-			if (kc_matches(v[i], query)) {
-				CFTypeRef r = kc_result(v[i], data, attrs);
-
-				CFArrayAppendValue(found, r);
-				CFRelease(r);
-				if (!all) {
-					break;
-				}
-			}
-		}
-		free(k);
-		free(v);
+		CFArrayAppendValue(out, r);
+		CFRelease(r);
 	}
 	pthread_mutex_unlock(&kc_lock);
-	kc_name(CFDictionaryGetValue(query, kSecAttrAccount), name, sizeof(name));
-	if (kc_said++ < 60) {
-		say("keychain: copy %s%s: %ld found", name, all ? " (all)" : "", (long)CFArrayGetCount(found));
-	}
-	if (CFArrayGetCount(found) == 0) {
-		CFRelease(found);
-		if (result != NULL) {
-			*result = NULL;
-		}
-		return errSecItemNotFound;
-	}
-	if (result != NULL) {
-		*result = all ? CFRetain(found) : CFRetain(CFArrayGetValueAtIndex(found, 0));
-	}
 	CFRelease(found);
-	return errSecSuccess;
+	status = n != 0 ? errSecSuccess : errSecItemNotFound;
+	kc_say(all ? "copy-all" : "copy", query, NULL, status, n);
+	if (result != NULL) {
+		*result = n == 0 ? NULL : all ? CFRetain(out) : CFRetain(CFArrayGetValueAtIndex(out, 0));
+	}
+	CFRelease(out);
+	return status;
 }
 
 static OSStatus
 my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
 {
-	CFTypeRef account;
+	CFStringRef key;
 	CFMutableDictionaryRef item;
 	OSStatus status = errSecSuccess;
-	char name[96];
 
 	if (!kc_is_ours(attributes)) {
 		return SecItemAdd(attributes, result);
@@ -408,100 +513,78 @@ my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
 	if (result != NULL) {
 		*result = NULL;
 	}
-	account = CFDictionaryGetValue(attributes, kSecAttrAccount);
-	kc_name(account, name, sizeof(name));
-	if (account == NULL) {
-		say("keychain: add without an account: refused");
-		return errSecParam;
+	item = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	kc_copy_attrs(item, attributes);
+	if (CFDictionaryGetValue(item, kSecAttrService) == NULL) {
+		CFDictionarySetValue(item, kSecAttrService, CFSTR("MobileBluetooth"));
 	}
-	pthread_mutex_lock(&kc_lock);
-	kc_load();
-	if (CFDictionaryGetValue(kc_items, account) != NULL) {
-		status = errSecDuplicateItem;
+	if ((key = kc_key(item)) == NULL) {
+		status = errSecParam;                   /* (no account) */
 	} else {
-		item = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		kc_copy_attrs(item, attributes);
-		CFDictionarySetValue(kc_items, account, item);
-		CFRelease(item);
-		kc_save();
+		pthread_mutex_lock(&kc_lock);
+		kc_load();
+		if (CFDictionaryGetValue(kc_items, key) != NULL) {
+			status = errSecDuplicateItem;
+		} else {
+			CFDictionarySetValue(kc_items, key, item);
+			kc_save();
+		}
+		pthread_mutex_unlock(&kc_lock);
+		CFRelease(key);
 	}
-	pthread_mutex_unlock(&kc_lock);
-	if (kc_said++ < 60) {
-		say("keychain: add %s: %d", name, (int)status);
-	}
+	CFRelease(item);
+	kc_say("add", attributes, NULL, status, status == errSecSuccess ? 1 : 0);
 	return status;
 }
 
 static OSStatus
 my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef update)
 {
-	CFIndex n, changed = 0;
-	char name[96];
+	CFMutableArrayRef found;
+	CFIndex n;
 
 	if (!kc_is_ours(query)) {
 		return SecItemUpdate(query, update);
 	}
 	pthread_mutex_lock(&kc_lock);
 	kc_load();
-	n = CFDictionaryGetCount(kc_items);
-	if (n > 0) {
-		const void **k = malloc(sizeof(void *) * (size_t)n), **v = malloc(sizeof(void *) * (size_t)n);
-
-		CFDictionaryGetKeysAndValues(kc_items, k, v);
-		for (CFIndex i = 0; i < n; i++) {
-			if (kc_matches(v[i], query)) {
-				kc_copy_attrs((CFMutableDictionaryRef)v[i], update);
-				changed++;
-			}
-		}
-		free(k);
-		free(v);
+	found = kc_find_locked(query, false);
+	n = CFArrayGetCount(found);
+	for (CFIndex i = 0; i < n; i++) {
+		kc_copy_attrs((CFMutableDictionaryRef)CFArrayGetValueAtIndex(found, i), update);
 	}
-	if (changed != 0) {
+	if (n != 0) {
 		kc_save();
 	}
 	pthread_mutex_unlock(&kc_lock);
-	kc_name(CFDictionaryGetValue(query, kSecAttrAccount), name, sizeof(name));
-	if (kc_said++ < 60) {
-		say("keychain: update %s: %ld item(s)", name, (long)changed);
-	}
-	return changed != 0 ? errSecSuccess : errSecItemNotFound;
+	CFRelease(found);
+	kc_say("update", query, update, n != 0 ? errSecSuccess : errSecItemNotFound, n);
+	return n != 0 ? errSecSuccess : errSecItemNotFound;
 }
 
 static OSStatus
 my_SecItemDelete(CFDictionaryRef query)
 {
-	CFIndex n, removed = 0;
-	char name[96];
+	CFMutableArrayRef keys;
+	CFIndex n;
 
 	if (!kc_is_ours(query)) {
 		return SecItemDelete(query);
 	}
 	pthread_mutex_lock(&kc_lock);
 	kc_load();
-	n = CFDictionaryGetCount(kc_items);
-	if (n > 0) {
-		const void **k = malloc(sizeof(void *) * (size_t)n), **v = malloc(sizeof(void *) * (size_t)n);
-
-		CFDictionaryGetKeysAndValues(kc_items, k, v);
-		for (CFIndex i = 0; i < n; i++) {
-			if (kc_matches(v[i], query)) {
-				CFDictionaryRemoveValue(kc_items, k[i]);
-				removed++;
-			}
-		}
-		free(k);
-		free(v);
+	keys = kc_find_locked(query, true);
+	n = CFArrayGetCount(keys);
+	for (CFIndex i = 0; i < n; i++) {
+		CFDictionaryRemoveValue(kc_items, CFArrayGetValueAtIndex(keys, i));
 	}
-	if (removed != 0) {
+	if (n != 0) {
 		kc_save();
 	}
 	pthread_mutex_unlock(&kc_lock);
-	kc_name(CFDictionaryGetValue(query, kSecAttrAccount), name, sizeof(name));
-	if (kc_said++ < 60) {
-		say("keychain: delete %s: %ld item(s)", name, (long)removed);
-	}
-	return removed != 0 ? errSecSuccess : errSecItemNotFound;
+	CFRelease(keys);
+	kc_say("delete", query, NULL, n != 0 ? errSecSuccess : errSecItemNotFound, n);
+	return n != 0 ? errSecSuccess : errSecItemNotFound;
 }
 
 /* ---- 5. its os_log on the console ---- */
@@ -868,6 +951,6 @@ btd_init(void)
 	kc_local = !(kc != NULL && strcmp(kc, "securityd") == 0);
 	unsetenv("DYLD_INSERT_LIBRARIES");     /* (not into what bluetoothd starts) */
 	crash_handlers();
-	say("liba34bt-btd loaded: BlueTool %s, keychain (MobileBluetooth) %s, os_log on the console, exits and crashes said",
+	say("liba34bt-btd loaded: BlueTool %s, keychain (bluetoothd's services) %s, os_log on the console, exits and crashes said",
 	    bluetool_local ? "answered here" : "left to launchd", kc_local ? "kept in " KC_FILE : "left to securityd");
 }
