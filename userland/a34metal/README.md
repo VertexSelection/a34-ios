@@ -179,8 +179,15 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   into level 1 (352x128) carry a full-size second attachment (704x256), and all 97 were refused
   ("colour attachment 1 is 704x256 and attachment 0 is 352x128"), so no blur was drawn. y2sios
   found and fixed the same. Boot-arg `rwm_area=strict`: refused as before.
-- **`rwm_blurdump=N`**: for the first N draws into a level below the first, the texel at the
-  centre of that level and of level 0 after the draw (lines `blurdump:`; waits for the GPU).
+- **`rwm_blurdump=N`**: for the first N draws into a level below the first, and the first N
+  draws of a blur's or a material's pipeline (labels with `_Tds`, `_Tn1`, `_Tn2`, `_Tvr`,
+  `_Tcma`, `_Tvcm`, `_Tc3`, `_Tmua`, `_Tm1a`, `_Tasg`, `_Tlub` or a `Bpl` blend), the texel at
+  the centre of attachment 0 after the draw, with the pipeline's name (lines `blurdump:`; waits
+  for the GPU). Boot 70's blurs (ds4/ds8, n15/n23) draw at level 0 and were not dumped before.
+- **`rwm_caps=1`**: every capability question CoreAnimation or Metal asks of the device
+  (`supports*`, `max*`, `min*`, `readWrite*`, `are*`, `is*`, `has*`, ... with integer or pointer
+  arguments) with our answer, once each, and every `new*` of the device that answers nil, with
+  its descriptor (lines `caps:`).
 
 Files: `userland/mesa/air/air_metal.[ch]` (the library), `metal/render.cpp`, `draw.cpp`,
 `blit.cpp`, `texture.cpp`, `import.cpp`, `air.cpp`, `rwm.h`, `redwoodmetal.m` (attachments, views

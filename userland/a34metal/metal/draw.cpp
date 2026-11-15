@@ -15,29 +15,38 @@ static_assert(RWM_MAX_BUFFERS <= 32, "the stream mask is 32 bits");
  * smaller copies, CoreAnimation's pyramid), the texel at the centre of that level and of the first, after the draw
  * (waits for the GPU: those draws are slow). Lines "blurdump:".
  */
+static long blur_dumps_left = -1;
+
+extern "C" bool
+rwm_blurdump_on(void)
+{
+	if (blur_dumps_left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_blurdump=");
+
+		blur_dumps_left = at != nullptr ? atol(at + 13) : 0;
+	}
+	return blur_dumps_left > 0;
+}
+
 static void
 blur_dump(const struct rwm_draw *d)
 {
-	static long left = -1;
+	const unsigned level = d->color_levels ? d->color_level[0] : 0;
 
-	if (left < 0) {
-		const char *at = strstr(rwm_boot_args(), "rwm_blurdump=");
-
-		left = at != nullptr ? atol(at + 13) : 0;
-	}
-	if (left <= 0 || d->color_count == 0 || !d->color_levels || d->color_level[0] == 0 || d->color[0] == nullptr ||
+	/* a draw into a level below the first (a pyramid), or one of a blur's or a material's pipelines (any target) */
+	if (!rwm_blurdump_on() || d->color_count == 0 || d->color[0] == nullptr || (level == 0 && d->probe[0] == '\0') ||
 	    rwm_air()->texture_probe == nullptr) {
 		return;
 	}
-	left--;
+	blur_dumps_left--;
 
-	char line[256];
+	char line[320];
 	size_t used = 0;
-	const unsigned levels[2] = { d->color_level[0], 0 };
+	const unsigned levels[2] = { level, 0 };
 
-	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: a pass into level %u (attachments %u):",
-				 d->color_level[0], d->color_count);
-	for (unsigned k = 0; k < 2 && used < sizeof(line) - 64; k++) {
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: %s into level %u (attachments %u):",
+				 d->probe[0] ? d->probe : "a pass", level, d->color_count);
+	for (unsigned k = 0; k < (level != 0 ? 2u : 1u) && used < sizeof(line) - 64; k++) {
 		uint8_t texel[16] = {};
 		unsigned w = 0, h = 0;
 		char why[160] = {};
