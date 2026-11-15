@@ -892,6 +892,51 @@ driver_request(unsigned nr, void *data, size_t size)
 	return call(nr, data, size);
 }
 
+struct mapping {
+	uintptr_t address;
+	uint64_t size;
+	uint32_t handle;
+};
+
+static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct mapping *mappings;
+static size_t mapping_count, mapping_room;
+static uint64_t closed_mapped;          /* handles closed while still mapped here (unmapped first) */
+
+/*
+ * A34: a buffer's CPU mapping is given back before its handle is closed. Unmapping after GEM_CLOSE
+ * fails without a word -- IOConnectUnmapMemory64 finds the mapping by the handle, which is gone --
+ * and the kernel's map then keeps the buffer's memory wired: viva-gpu saw backboardd grow ~140 MB an
+ * app open and close that way (their ae12bec; reimplemented here). Mesa unmaps first (patches 0002,
+ * 0005); this is for any other road, and says how often it was needed.
+ */
+static void
+unmap_before_close(uint32_t handle)
+{
+	for (;;) {
+		struct mapping found = { 0, 0, 0 };
+
+		pthread_mutex_lock(&map_lock);
+		for (size_t i = mapping_count; i-- > 0;) {
+			if (mappings[i].handle == handle) {
+				found = mappings[i];
+				mappings[i] = mappings[--mapping_count];
+				break;
+			}
+		}
+		pthread_mutex_unlock(&map_lock);
+		if (found.address == 0) {
+			return;
+		}
+		if ((++closed_mapped & (closed_mapped - 1)) == 0) {
+			fprintf(stderr, "redwood-drm: %s[%d]: buffer %u closed while mapped at %#lx: unmapped first "
+			    "(%llu so far)\n", getprogname(), (int)getpid(), handle, (unsigned long)found.address,
+			    (unsigned long long)closed_mapped);
+		}
+		IOConnectUnmapMemory64(connection, handle, mach_task_self(), found.address);
+	}
+}
+
 EXPORT int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
@@ -905,6 +950,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	switch (request) {
 	case DRM_IOCTL_GEM_CLOSE:
 		set_handle_kind(((const struct drm_gem_close *)arg)->handle, 0);
+		unmap_before_close(((const struct drm_gem_close *)arg)->handle);
 		return call(nr, arg, size);
 	case DRM_IOCTL_VERSION: {
 		struct drm_version *v = arg;
@@ -1375,15 +1421,7 @@ redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
 	return surface_request(surface);
 }
 
-struct mapping {
-	uintptr_t address;
-	uint64_t size;
-	uint32_t handle;
-};
 
-static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct mapping *mappings;
-static size_t mapping_count, mapping_room;
 
 EXPORT void *
 redwood_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, uint32_t handle)
