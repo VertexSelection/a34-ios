@@ -7,17 +7,18 @@ Why: LK loads and verifies the modem image (md1img) only on a normal boot, never
 boot ("[ccci] recovery mode, no need load modem" in lk-verified.img; docs/cellular-plan.md).
 XNU therefore has to start from `boot` for the modem to exist.
 
-BLOB is build-xnu.sh's build/xnu-blob.bin (loader, XNU payload, TWRP kernel). In a normal boot
-LK hands over vendor_boot's/init_boot's ramdisk and the normal device tree, so the loader's
-Volume Up escape cannot start a working TWRP from here; use the bootloader's recovery key combo
-(Volume Up + Power) for TWRP in `recovery` instead.
+BLOB is loader + XNU payload as tools/build-xnu-boot.sh makes it (no TWRP kernel behind it: in
+a normal boot LK hands over vendor_boot's/init_boot's ramdisk, not TWRP's, so the loader's
+Volume Up escape has nothing to start and goes on to XNU). TWRP stays in `recovery`.
 
 The header copies the stock boot.img's os_version (the template, default the DYG1 stock image);
 kernel = gzip of BLOB (as in the stock and recovery images), no ramdisk (LK takes vendor_boot's
-and init_boot's), then "SEANDROIDENFORCE" and an AVB hash footer for a 64 MiB `boot` partition
-signed with AOSP's test key, like build-xnu.sh does for `recovery`.
+and init_boot's), then "SEANDROIDENFORCE" and an AVB hash footer for the 32 MiB `boot` partition
+signed with AOSP's test key, like build-xnu.sh does for `recovery` (vbmeta's flags=3, set for
+Magisk, already turn verification off; the footer is there so avbtool's view of the partition
+is consistent).
 
-UNTESTED on the phone. Flashing it replaces Android's kernel: Android does not start again until
+Not booted on the phone yet. Flashing it replaces Android's kernel: Android does not start again until
 the stock boot.img is flashed back (download mode). Nothing else is touched; never flash any of
 the identity partitions (README).
 """
@@ -31,7 +32,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PAGE = 4096
-BOOT_PARTITION_SIZE = 64 << 20          # PIT: boot, 16384 blocks of 4 KiB
+BOOT_PARTITION_SIZE = 32 << 20          # GPT (LK's log): boot, 0x2000 sectors of 4 KiB
 HEADER_V4_SIZE = 1584
 
 
