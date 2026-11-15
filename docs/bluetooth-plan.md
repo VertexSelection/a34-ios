@@ -81,6 +81,15 @@ Status (2026-11-15):
   0977 answers every vendor command with 240 zero bytes after the status (0xFD1B's first still 0x51). The
   "0401 with status 0x4" lines were 0975's logging reading a Command Status' length byte: HCI_Inquiry was
   taken and ended with Inquiry Complete, status 0 (classic discovery works; nothing discoverable answered).
+- **Boot 0977-120-a**: no AssertFail; instead "BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller",
+  reason 3602, the spinner in Settings. `_BCM_SubOpcodeChecker` (`+0x126390`) takes an answer to 0xFCE9 (LE
+  meta) only if its first byte after the status is the command's sub-opcode, or if it has no bytes (so 0976's
+  empty answers passed, 0977's zeros not); the 0xFC2C parsers check the same ("AdvBufConfig sub-opcode
+  incorrect"). 0978 echoes the sub-opcode for those two (0xFD1B's 0x51 is its own parameter echoed too) and
+  caps an LE scan window at half its interval (bluetoothd asks 30/300 ms, a34bt 30/60 ms). Wi-Fi was deaf in
+  that boot (0 beacons) from its first scan, before bluetoothd connected, with the same Bluetooth state as in
+  0975-modes120-a (a34bt's 30/60 ms scan running), where Wi-Fi heard 5-12 beacons per scan: not 0975-0977's
+  doing; that kernel was the first with Wi-Fi's 1010/1011.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
