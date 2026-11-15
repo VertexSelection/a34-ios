@@ -24,6 +24,7 @@
  * reason in an NSError that an application will show a person.
  */
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -631,14 +632,37 @@ load_store_actions_on(void)
    return on;
 }
 
+/* the kernel's per-job GPU trace (kernel 0992, boot-arg a34malijobtrace=1; redwood-drm) */
+extern int redwood_drm_trace_jobs(uint64_t first_seq, uint32_t count) __attribute__((weak_import));
+/* the jobs of the traced span asked of it, and its answer: 0 asked, else an errno (-1: no call) */
+static uint64_t rwa_trace_first_job, rwa_trace_last_job;
+static int rwa_trace_answer = -1;
+
 /* a span of work sent: panfrost told (re-entries are counted within one), and the pass trace of
- * the span that recorded something ended (rwa_pan_profile) */
+ * the span that recorded something ended (rwa_pan_profile) -- its GPU jobs then asked of the
+ * kernel's per-job trace, so that each pass's line meets its jobs' GPU times one for one */
 static void
 span_ended(void)
 {
    redwood_pan_span = rwa_bind_span;
-   if (redwood_pan_trace_on && redwood_pan_trace_n)
+   if (redwood_pan_trace_on && redwood_pan_trace_n) {
       redwood_pan_trace_on = false;
+      uint64_t first = 0, last = 0;
+      for (unsigned i = 0; i < redwood_pan_trace_n && i < RWP_TRACE; i++) {
+         const struct redwood_pan_pass *r = &redwood_pan_trace[i];
+         if (r->first_seq && (!first || r->first_seq < first))
+            first = r->first_seq;
+         if (r->seq > last)
+            last = r->seq;
+      }
+      rwa_trace_first_job = first;
+      rwa_trace_last_job = last;
+      rwa_trace_answer = -1;
+      if (first && last >= first && redwood_drm_trace_jobs) {
+         uint64_t n = MIN2(last - first + 1, 128ull);
+         rwa_trace_answer = redwood_drm_trace_jobs(first, (uint32_t)n) == 0 ? 0 : errno;
+      }
+   }
 }
 
 static void
@@ -5310,23 +5334,38 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                   (unsigned long long)(now.local_madvises - before.local_madvises));
       return 1;
    }
+   case 5: {
+      static uint64_t first, last;
+      static int answer;
+      first = rwa_trace_first_job;
+      last = rwa_trace_last_job;
+      answer = rwa_trace_answer;
+      if (!ntrace)
+         return 0;
+      snprintf(line, size, "rwm passes of one command buffer: %u, GPU jobs %llu-%llu; the kernel's job trace "
+               "(0x79): %s", ntrace, (unsigned long long)first, (unsigned long long)last,
+               answer == 0 ? "asked (its lines: A34 MALI JOB: asked backboardd #N)"
+               : answer == ENOTSUP ? "not offered (kernel 0992 and boot-arg a34malijobtrace=1)"
+               : answer < 0 ? "not asked (no job numbers, or no redwood_drm_trace_jobs)" : strerror(answer));
+      return 1;
+   }
    default: {
-      /* 5, 6, ...: the passes of one span of work, in the order they were submitted */
-      unsigned k = which - 5;
-      if (which < 5 || k >= ntrace)
+      /* 6, 7, ...: the passes of one span of work, in the order they were submitted */
+      unsigned k = which - 6;
+      if (which < 6 || k >= ntrace)
          return 0;
       const struct redwood_pan_pass *r = &trace[k];
       static const char *const kinds[] = { "linear", "16x16 tiled", "AFBC", "other" };
       snprintf(line, size, "rwm pass %u of %u: %ux%u %s %s%s level %u (framebuffer %ux%u, drawn %ux%u), "
                "%u draws, %u colour attachments; colour 0 %s%s%s, %s; depth/stencil %s%s%s; sent for: %s; "
-               "GPU job %llu",
+               "GPU jobs %llu-%llu",
                k + 1, ntrace, r->res_w, r->res_h, util_format_short_name((enum pipe_format)r->format),
                kinds[r->kind & 3], r->shared ? " IOSurface" : "", r->level, r->width, r->height, r->extent_w,
                r->extent_h, r->draws, r->nr_cbufs, r->clear ? "cleared" : r->preload ? "preloaded" : "not loaded",
                r->reentry ? " (re-entry)" : "", "", r->writeback ? "written back" : "not written back",
                !r->zs ? "none" : r->zs_preload ? "preloaded" : "not loaded",
                r->zs ? (r->zs_writeback ? ", written back" : ", not written back") : "", "", r->why,
-               (unsigned long long)r->seq);
+               (unsigned long long)r->first_seq, (unsigned long long)r->seq);
       return 1;
    }
    }

@@ -204,6 +204,12 @@ rwm_perf_report(uint64_t now)
 	snprintf(line, sizeof(line), "rwm making: %llu buffers, %.1f ms each from made to committed, the maker running %.1f of them",
 		 p.made_cbs, p.made_cbs ? p.made_ns / 1e6 / p.made_cbs : 0.0, p.made_cbs ? p.made_cpu / 1e6 / p.made_cbs : 0.0);
 	say(line);
+	snprintf(line, sizeof(line), "rwm frames in flight: %llu buffers begun while the GPU still drew the one committed before, "
+		 "%llu after it had finished (%llu of them within 1 ms of its end as the completion queue saw it, %.1f ms "
+		 "after it on average); handlers delivered: %llu scheduled, %llu completed", p.begun_overlapped,
+		 p.begun_after_done, p.begun_soon, p.begun_gap_n ? p.begun_gap_ns / 1e6 / p.begun_gap_n : 0.0,
+		 p.scheduled_handlers, p.completed_handlers);
+	say(line);
 
 	static void (*profile)(uint64_t *);
 	static void (*submits)(uint64_t *);
@@ -243,7 +249,7 @@ rwm_perf_report(uint64_t now)
 		say(line);
 	}
 	say_worst_cb();
-	for (unsigned which = 0; pan != nullptr && which < 45; which++) {    /* (4: tiles; 5 and on: one span's passes) */
+	for (unsigned which = 0; pan != nullptr && which < 47; which++) {    /* (4: tiles; 5: one span's jobs; 6 and on: its passes) */
 		char wide[600];
 
 		if (pan(which, wide, sizeof(wide)) != 0) {

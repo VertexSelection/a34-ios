@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/a34_apple80211.c b/bsd/dev/a34_apple80211.c
+index da365e8..efa1477 100644
+--- a/bsd/dev/a34_apple80211.c
++++ b/bsd/dev/a34_apple80211.c
+@@ -445,10 +445,10 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ 		error = asked == NULL || what == NULL ? ENOMEM : error;
+ 		goto out;
+ 	}
+-	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes "
+-	    "of kind %u)", asked->ssid_length, (asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] |
+-	    asked->bssid[4] | asked->bssid[5]) != 0 ? "a given" : "any", asked->auth_lower, asked->auth_upper,
+-	    asked->key_length, asked->key_cipher);
++	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, %s of kind %u)",
++	    asked->ssid_length, (asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
++	    asked->bssid[5]) != 0 ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length != 0 ?
++	    "a key" : "no key", asked->key_cipher);        /* (0995: not the key's length either) */
+ 	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
+ 		error = EINVAL;
+ 		goto out;
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index ccdd476..ab45e22 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -2317,8 +2317,9 @@ a34w_network_load(void)
+ 		t0 = a34w_ms();
+ 		a34_wpa_pmk(a34w_net.passphrase, a34w_net.passphrase_length, a34w_net.ssid, a34w_net.ssid_length, a34w_net.pmk);
+ 		bzero(a34w_net.passphrase, sizeof(a34w_net.passphrase));
+-		a34w_say("step 8: network \"%s\": WPA2-PSK, a passphrase of %u characters (its key made in %llu ms)%s", ssid,
+-		    a34w_net.passphrase_length, (unsigned long long)(a34w_ms() - t0), a34w_net.bssid_given ? ", one BSSID only" : "");
++		a34w_net.passphrase_length = 0;         /* (0995: not even its length in the log) */
++		a34w_say("step 8: network \"%s\": WPA2-PSK, a passphrase (its key made in %llu ms)%s", ssid,
++		    (unsigned long long)(a34w_ms() - t0), a34w_net.bssid_given ? ", one BSSID only" : "");
+ 	} else {
+ 		a34w_say("step 8: network \"%s\": %s%s", ssid, a34w_net.psk_given ? "WPA2-PSK, a 64-digit key" : "open",
+ 		    a34w_net.bssid_given ? ", one BSSID only" : "");
+diff --git a/iokit/Kernel/arm/A34WLAN.cpp b/iokit/Kernel/arm/A34WLAN.cpp
+index 9e4a25a..4b148aa 100644
+--- a/iokit/Kernel/arm/A34WLAN.cpp
++++ b/iokit/Kernel/arm/A34WLAN.cpp
+@@ -15,6 +15,13 @@
+  *     is quiet; until then SCNetworkInterfaceCopyAll -- wifid, and behind it SpringBoard -- waits
+  *     up to five minutes. The stand-in here can be opened and names nothing.
+  *
++ * (0995) MobileGestalt (in SpringBoard, for the Wi-Fi address) looks for a service named "sdio",
++ * "wlan" or "marconi-wifi" and then waits for an IONetworkController to be published: the
++ * controller is now named "wlan", carries the address as local-mac-address, mac-address-wifi0
++ * and IOMACAddress, and is an IONetworkController -- the baseline's class
++ * (iokit/Kernel/arm/SweetNetwork.cpp, ruby patch 0082), declared here as it is declared there --,
++ * as IO80211Family's controllers are.
++ *
+  * The classes are named as Apple's are and have nothing but properties. This is HackiOS's
+  * iokit/Kernel/RedwoodWLAN.cpp and MiniIONetworkStack.cpp (github.com/oosexgang/hakios-xnu-kernel,
+  * branch mtk, APSL 2.0), made once a34_wifi.c has its interface.
+@@ -33,12 +40,34 @@
+ 
+ extern "C" void a34_wlan_registry(const char *interface, const uint8_t *address);
+ 
+-class IO80211Controller : public IOService
++/* the baseline's (SweetNetwork.cpp), word for word: one class, defined there */
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++class IO80211Controller : public IONetworkController
+ {
+ 	OSDeclareDefaultStructors(IO80211Controller);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+ };
+ 
+-OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++OSDefineMetaClassAndStructors(IO80211Controller, IONetworkController);
++
++/* IOService's start, not SweetNetwork's (which looks for mac-address-wifi0 in its provider, the platform here) */
++bool
++IO80211Controller::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	registerService();
++	return true;
++}
+ 
+ class IONetworkInterface : public IOService
+ {
+@@ -201,10 +230,21 @@ a34_wlan_registry(const char * interface, const uint8_t * address)
+ 	}
+ 	if ((mac = OSData::withBytes(address, 6)) != NULL) {
+ 		controller->setProperty("IOMACAddress", mac);
++		controller->setProperty("local-mac-address", mac);     /* (0995) for MobileGestalt */
++		controller->setProperty("mac-address-wifi0", mac);
+ 		mac->release();
+ 	}
+ 	controller->setProperty("IOBuiltin", true);
+-	if ((controller = (IO80211Controller *) publish(controller, platform, "A34WLANController")) == NULL) {
++	if (!controller->attach(platform)) {            /* (0995) named "wlan"; its start registers it */
++		controller->release();
++		wlan->release();
++		IOLog("A34 WIFI: A34WLAN: the controller did not attach\n");
++		return;
++	}
++	controller->setName("wlan");
++	if (!controller->start(platform)) {
++		controller->detach(platform);
++		controller->release();
+ 		wlan->release();
+ 		IOLog("A34 WIFI: A34WLAN: the controller did not start\n");
+ 		return;
+@@ -230,7 +270,8 @@ a34_wlan_registry(const char * interface, const uint8_t * address)
+ 		IOLog("A34 WIFI: A34WLAN: the interface's service did not start\n");
+ 	} else {
+ 		wlan->release();
+-		IOLog("A34 WIFI: A34WLAN: %s in the registry (IO80211Controller / IONetworkInterface, Infrastructure)\n", interface);
++		IOLog("A34 WIFI: A34WLAN: %s in the registry (\"wlan\": IO80211Controller, an IONetworkController, with the "
++		    "address / IONetworkInterface, Infrastructure)\n", interface);
+ 	}
+ 	controller->release();
+ }

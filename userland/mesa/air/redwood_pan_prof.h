@@ -100,7 +100,7 @@ struct redwood_pan_pass {
    bool shared, preload, writeback, clear, reentry, zs, zs_preload, zs_writeback;
    uint32_t draws;
    const char *why;
-   uint64_t seq;                      /* its last GPU job's number (redwood-drm), 0: not known */
+   uint64_t first_seq, seq;           /* its GPU jobs' numbers, first and last (redwood-drm); 0: not known */
 };
 extern bool redwood_pan_trace_on;
 extern unsigned redwood_pan_trace_n;

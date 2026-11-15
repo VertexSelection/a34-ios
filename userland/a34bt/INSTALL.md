@@ -144,3 +144,70 @@ In the log:
     A34 BT: br> / br< / br= ...
     a34bt-btd: bluetoothd[N]: _exit(1) from bluetoothd+0x... (if it still restarts: where from)
     A34 BT: LE Apple types (type:count, 07 = proximity pairing): 07:.. 10:.. 12:..
+
+## 7. bluetoothd's keychain (boot 0988-all-a)
+
+bluetoothd passed BlueTool's place in 0988-all-a and then `_exit(1)` from `bluetoothd+0x90778 <-
++0x487edc <- +0x5993e4 <- +0x42a5d4 <- +0x42b174 <- +0x429084 <- main`: its stack's init
+(`+0x599048`) reads its root keys (`readRootKeys`, `+0x594fac`) -- LE identity root, encryption root,
+cloud keys, static random address -- from the system keychain (generic passwords of service
+`MobileBluetooth`) and stores new ones when there are none. securityd cannot store an item on this
+kernel (AppleKeyStore selector 10, wrap key: `SWEET AKS: securityd sel 10 ... -> 0xe00002c7`), so
+"Failed to set new identity root!" and a restart. (The only other way past it is
+`/product/boot-ios-diagnostics` in the device tree, which turns the whole system into iOS Diagnostics.)
+
+`liba34bt-btd` now keeps bluetoothd's `MobileBluetooth` items itself, in
+`/var/mobile/Library/Bluetooth/com.a34.keychain.plist` (not encrypted); every other keychain use is
+unchanged. And it formats bluetoothd's os_log onto the console (`bt: ...`), since
+`OS_ACTIVITY_DT_MODE` showed nothing. Only `/a34` changes (same kernel, same wraps):
+
+    sudo python3 -I tools/root-add-job.py --copy /mnt /a34 a34
+
+Expected: `a34bt-btd: bluetoothd[N]: keychain: copy Identity Root ...: 0 found`, `keychain: add ...: 0`,
+then `bt: ...` lines of its start, `com.apple.BlueTool asked ... boot`, `bt: HCI Transport is set to
+H4BC`, and the kernel's `A34 BT: br: com.apple.uart.sk.bluetooth connected by bluetoothd`.
+
+## 8. The crash of boot 0988-btkc-a was liba34bt-btd's
+
+With the keychain kept, bluetoothd went much further (H4BC chosen, DeviceManager, paired-device list
+read, cloud keys absent) and then died: `CRASH bluetoothd sig 11 ... far 0x68736160`, frames
+`liba34bt-btd` (the os_log formatter) <- `bluetoothd+0x3847d8`, its os_log "statedump:
+MagicPairingManager: SignedIn: %d, loginID: %{private, mask.hash}s". A `mask.hash` annotation puts an
+extra item holding the bytes "hash" ahead of the string; the formatter took it for the string pointer
+(0x...68736168). Fixed: os_log items are read by their type (masks skipped; only string, object and
+pointer items followed, and only above 4 GB). A crash in bluetoothd is now also said by the library:
+`a34bt-btd: bluetoothd[N]: crash: signal 11 at ...: pc IMAGE+OFF lr ... frames ...`.
+
+Same kernel and wraps; only `/a34` (`root-add-job.py --copy /mnt /a34 a34`) from the new artifact.
+
+## 9. All of bluetoothd's keychain (boot 0989-bt-a)
+
+0989-bt-a: no crash, but "Failed to set new identity root!" again (copy/update -25300, add -25291,
+"restarting { reason=130 }"), and the library had answered only one call ("copy (any) (all)").
+bluetoothd's keychain helpers take the service from their caller and default to `MobileBluetooth`
+only when it is NULL: the root keys are under `BluetoothGlobal`, LE devices under `BluetoothLE` and
+`BluetoothLESync`. Those went to securityd. Now every generic password of the four services (or of
+access group `com.apple.bluetooth` without a service) is kept by the library, keyed by service and
+account, and each call is logged:
+
+    a34bt-btd: bluetoothd[N]: keychain: copy BluetoothGlobal/Identity Root: 0 item(s), -25300 [keys: class svce acct ...]
+    a34bt-btd: bluetoothd[N]: keychain: add BluetoothGlobal/Identity Root: 1 item(s), 0 [keys: ...]
+
+Same kernel and wraps; only `/a34` from the new artifact. (A stale
+`/var/mobile/Library/Bluetooth/com.a34.keychain.plist` from earlier boots is read and rekeyed.)
+
+## 10. HCI initialization (kernel 0973)
+
+0989-dbe-a: with the keychain kept, bluetoothd connected to the bridge and ran its HCI init over it:
+Reset, version, supported commands, address, features, event masks, LE buffer sizes, data length,
+PHY, periodic advertising list size, flow control -- every command answered with status 0 -- and then
+"OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization failed", reason 108.
+That command was never sent: bluetoothd checks each command against the controller's supported-commands
+mask first (its table at `bluetoothd+0x8448e0`), and the MT6635 does not list
+Write_Default_Erroneous_Data_Reporting (octet 18 bit 3). Of the 36 commands bluetoothd knows and the
+mask lacks, 0973 advertises and answers here the three an HCI 5.3 host's init may ask: 0x0C5A, 0x0C5B
+and 0x0C84 (Set_Min_Encryption_Key_Size); `A34 BT: br: command 0c5b ... answered here` and `br=` lines
+show them. Also: once bluetoothd has connected, the raw channel (a34bt) only listens. The com.a34.btprobe
+job can stay (it then just counts what bluetoothd's scans hear).
+
+Kernel: main with 0970-0973, `a34bt=2`. Root unchanged (the 43726586862 artifact).

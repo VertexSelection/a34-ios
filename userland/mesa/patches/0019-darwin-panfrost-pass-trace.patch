@@ -14,8 +14,10 @@ and, for one span after each profile report (redwood_pan_trace_on, set by air_me
 submitted in order: colour attachment 0's resource (size, format, layout, IOSurface or not, level),
 the framebuffer and the drawn area, draws, whether colour 0 was cleared, preloaded (and whether
 that was a re-entry) or not loaded and whether it was written back, the same for depth/stencil, and
-why the batch was sent, and its last GPU job's number (redwood_drm_last_seq) for the kernel's
-per-job timing. The counting of patch 0018 moves into the same function.
+why the batch was sent, and its GPU jobs' numbers, first and last (redwood_drm_last_seq around the
+submission), which the Metal driver asks the kernel's per-job trace for (kernel 0992, 0x79): the
+passes then meet their GPU times one for one. The counting of patch 0018 moves into the same
+function.
 
 --- a/src/gallium/drivers/panfrost/pan_job.c
 +++ b/src/gallium/drivers/panfrost/pan_job.c
@@ -155,7 +157,7 @@ per-job timing. The counting of patch 0018 moves into the same function.
  static struct panfrost_batch *
  find_best_render_batch(struct panfrost_context *ctx)
  {
-@@ -838,50 +967,18 @@
+@@ -838,50 +967,29 @@
  
     panfrost_batch_to_fb_info(batch, &fb, rts, &zs, &s, false);
  
@@ -199,7 +201,13 @@ per-job timing. The counting of patch 0018 moves into the same function.
 -      }
 -   }
 +   int rwp_slot = redwood_pan_metal ? redwood_pan_count_pass(batch, &fb) : -1;
++   uint64_t rwp_seq_before = 0;
 +   (void)rwp_slot;
++   (void)rwp_seq_before;
++#ifdef __APPLE__
++   if (rwp_slot >= 0 && redwood_drm_last_seq)
++      rwp_seq_before = redwood_drm_last_seq();
++#endif
     panfrost_emit_tile_map(batch, &fb);
  
     ret = screen->vtbl.submit_batch(batch, &fb);
@@ -207,8 +215,13 @@ per-job timing. The counting of patch 0018 moves into the same function.
        mesa_loge("panfrost_batch_submit failed: %d\n", ret);
 +#ifdef __APPLE__
 +   /* (patch 0019) the traced batch's last GPU job, by number: the kernel's per-job timing names it */
-+   if (rwp_slot >= 0 && redwood_drm_last_seq)
-+      redwood_pan_trace[rwp_slot].seq = redwood_drm_last_seq();
++   if (rwp_slot >= 0 && redwood_drm_last_seq) {
++      uint64_t after = redwood_drm_last_seq();
++      if (after > rwp_seq_before) {
++         redwood_pan_trace[rwp_slot].first_seq = rwp_seq_before + 1;
++         redwood_pan_trace[rwp_slot].seq = after;
++      }
++   }
 +#endif
     if (redwood_pan_metal) {
        /* A34 (patch 0011): a batch with work, and why it went */

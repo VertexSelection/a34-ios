@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 865c8af..840a532 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -40,6 +40,18 @@
+  * pairing" adverts; no addresses). The raw channel keeps seeing everything; it may send only while bluetoothd is
+  * not connected. Ported in its scheme from HackiOS's redwood_mtkbt_skel.c (APSL 2.0 / MIT).
+  *
++ * A34 (0973): bluetoothd (20H392) checks each HCI command against the controller's Read_Local_Supported_Commands
++ * mask before it sends it (+0x10ca98: descriptor table at +0x8448e0, 24 bytes an entry, the mask byte and octet at
++ * +4/+5) and refuses one the mask lacks with status 628. The MT6635's mask lacks Write_Default_Erroneous_Data_
++ * Reporting (octet 18 bit 3), and bluetoothd's HCI init needs it: boot 0989-dbe-a, "OI_HCICMD_WriteDefaultErroneous
++ * DataReporting (status=628)", "HCI initialization failed", reason 108, 13 restarts. Of the 36 commands bluetoothd
++ * knows and this mask lacks, the ones an HCI 5.3 host's init may ask are advertised here and answered without the
++ * controller: 0x0C5A Read_Default_Erroneous_Data_Reporting (mode 0), 0x0C5B Write_Default_Erroneous_Data_Reporting,
++ * 0x0C84 Set_Min_Encryption_Key_Size (octet 45 bit 7). The others are deprecated (hold, park, page scan modes), AMP,
++ * MWS coexistence, or LE features this controller does not claim (PAST, power control, subrating), which bluetoothd
++ * gates on the LE feature bits. Also: once bluetoothd has connected, the raw channel only listens (0989-dbe-a: a34bt's
++ * scan-off went out while bluetoothd was restarting, between its connections).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -169,6 +181,7 @@ static const char *const bt_fw_names[2] = { "soc5_0_ram_mcu_1_1_hdr.bin", "soc5_
+ static vm_offset_t bt_rgu, bt_cfg, bt_swirq, bt_hc, bt_bgf, bt_bgfinfo, bt_infra, bt_ccif, bt_btif;
+ static uint32_t bt_step_max = 99, bt_wait_s = 180, bt_sync = 1, bt_log_max = 48;
+ static uint32_t bt_level;                       /* a34bt: 1 milestone 1, 2 also the bridge to bluetoothd (0971) */
++static bool br_ever;                            /* (0973) bluetoothd has connected once: the raw channel only listens */
+ static uint32_t bt_said_in, bt_said_out;
+ 
+ static uint8_t *bt_fw[2];
+@@ -970,7 +983,7 @@ bt_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *u
+ 	if (error == 0 && (n < 4 || pkt[0] == 4 || bt_h4_length(pkt, (uint32_t)n) != n)) {
+ 		error = EINVAL;
+ 	}
+-	if (error == 0 && bt_level >= 2 && a34_btsk_connected()) {
++	if (error == 0 && bt_level >= 2 && (br_ever || a34_btsk_connected())) {
+ 		static uint32_t said;
+ 
+ 		if (said++ < 4) {
+@@ -1073,9 +1086,14 @@ br_quirks(uint8_t *p, uint32_t n)
+ 			/* Read_Local_Supported_Commands (octet k at p[7 + k]): the MT6631 left the LE commands out (HackiOS) */
+ 			if (!commands_said) {
+ 				commands_said = true;
+-				printf("A34 BT: br: supported commands octets 24-28: %02x %02x %02x %02x %02x%s\n", p[7 + 24],
++				printf("A34 BT: br: supported commands octets 18 %02x, 24-28: %02x %02x %02x %02x %02x%s; "
++				    "0x0C5A, 0x0C5B, 0x0C84 added (answered here)\n", p[7 + 18], p[7 + 24],
+ 				    p[7 + 25], p[7 + 26], p[7 + 27], p[7 + 28], p[7 + 25] == 0 ? " (LE ones added)" : "");
+ 			}
++			p[7 + 18] |= (1u << 2) | (1u << 3);           /* (0973) Read/Write_Default_Erroneous_Data_Reporting */
++			if (n >= 7 + 46) {
++				p[7 + 45] |= 1u << 7;                    /* (0973) Set_Min_Encryption_Key_Size */
++			}
+ 			if (p[7 + 25] == 0) {
+ 				static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
+ 
+@@ -1138,6 +1156,33 @@ br_vsc(const uint8_t *cmd, uint32_t n)
+ 	a34_btsk_deliver(ev, 7 + extra);
+ }
+ 
++/*
++ * (0973) The standard commands this controller lacks and bluetoothd's init asks, answered here: Command Complete,
++ * status 0, and their return parameters. True when cmd was one of them.
++ */
++static bool
++br_standard_here(const uint8_t *cmd, uint32_t n)
++{
++	static uint32_t said;
++	uint16_t op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++	uint8_t ev[8] = { 0x04, 0x0e, 4, 1, cmd[1], cmd[2], 0, 0 };
++	uint32_t len = 7;
++
++	if (op == 0x0c5a) {
++		ev[2] = 5;                                      /* Read_Default_Erroneous_Data_Reporting: mode 0 (off) */
++		len = 8;
++	} else if (op != 0x0c5b && op != 0x0c84) {
++		return false;
++	}
++	if (said++ < 16) {
++		printf("A34 BT: br: command %04x (%u bytes) answered here: the controller does not have it\n", op, n - 4);
++	}
++	br_dump("br=", ev, len);
++	bt_deliver(ev, len);
++	a34_btsk_deliver(ev, len);
++	return true;
++}
++
+ /* bluetoothd's packets out, whole; true if any went */
+ static bool
+ br_drain(void)
+@@ -1181,6 +1226,9 @@ br_drain(void)
+ 			br_vsc(pkt, n);
+ 			continue;
+ 		}
++		if (pkt[0] == 0x01 && br_standard_here(pkt, n)) {
++			continue;
++		}
+ 		br_dump("br>", pkt, n);
+ 		(void)bt_btif_write(pkt, n);
+ 	}
+@@ -1335,6 +1383,7 @@ br_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused voi
+ 	lck_mtx_lock(&br_lock);
+ 	br_txq_count = 0;                                               /* a new user: nothing half-written from the last */
+ 	lck_mtx_unlock(&br_lock);
++	br_ever = true;                                                 /* (0973) from now on the raw channel only listens */
+ 	printf("A34 BT: br: com.apple.uart.sk.bluetooth connected by %s[%d], unit %u\n", name, proc_selfpid(), sac->sc_unit);
+ 	return 0;
+ }

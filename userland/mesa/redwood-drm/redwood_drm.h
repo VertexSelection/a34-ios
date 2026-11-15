@@ -169,6 +169,22 @@ struct redwood_drm_submit_batch {
 struct drm_panfrost_submit;
 int redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t count);
 
+/*
+ * TRACE_JOBS (kernel 0992, boot-arg a34malijobtrace=1): request 0x79, 16 bytes in, nothing out:
+ * the kernel logs this client's jobs first_seq .. first_seq + count - 1 (1 to 128) as "A34 MALI
+ * JOB: asked <process> #N ...": when each started, its time on the GPU, queued and upkeep, relative
+ * to the first -- those already done at once, the rest as they finish. kIOReturnUnsupported
+ * without the boot-arg. redwood_drm_trace_jobs(): 0, or -1 with errno (ENOTSUP then).
+ */
+#define REDWOOD_DRM_TRACE_JOBS          0x79
+
+struct redwood_drm_trace_jobs {
+	uint64_t first_seq;
+	uint32_t count, pad;
+};
+
+int redwood_drm_trace_jobs(uint64_t first_seq, uint32_t count);
+
 /* A34: drmPrimeHandleToFD's in-process "file descriptor": the GEM handle with this bit, which no
  * IOSurface ID has (redwood_drm.c) */
 #define REDWOOD_DRM_PRIME_LOCAL 0x40000000u

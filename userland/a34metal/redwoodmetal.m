@@ -4085,6 +4085,8 @@ rw_core_of(id texture)
 
 	_scheduled = nil;
 	_completed = nil;
+	rwm_perf.scheduled_handlers += [scheduled count];      /* (A34: rwm frames in flight) */
+	rwm_perf.completed_handlers += [completed count];
 	for (id handler in scheduled) {
 		[self redwoodDeliver:(void (^)(id))handler];
 	}
@@ -4243,7 +4245,7 @@ rw_core_of(id texture)
 	RedwoodMetalRenderPipeline *p = state;
 
 	rwm_render_set_pipeline(&_state, p, [p render], [p vertexStreamMask], [p vertexStreamCount], [p writesDepth]);
-	if (rwm_blurdump_on() || rwm_framedump_on() || rwm_scene_on()) {  /* (metal-fx) which draws the probes follow */
+	if (rwm_blurdump_on() || rwm_framedump_on() || rwm_scene_on() || rwm_glyphs_on()) {  /* (metal-fx) which draws the probes follow */
 		rwm_render_set_label(&_state, [[p label] UTF8String]);
 	}
 }

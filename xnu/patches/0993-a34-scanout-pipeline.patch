@@ -1,0 +1,324 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 539996a..9c29069 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -102,6 +102,8 @@ struct a34_mali_job {
+ bool a34_mali_ready(void);
+ bool a34_mali_param(uint32_t param, uint64_t *value);
+ uint32_t a34_mali_flush_id(void);
++extern uint64_t a34_mali_asflush[2];
++uint64_t a34_mali_asflush[2];           /* A34 (0993): AS0 flushes before a job (page tables changed), their mach time */
+ uint64_t a34_mali_va_alloc(uint64_t size, bool exec);
+ void a34_mali_va_free(uint64_t va, uint64_t size);
+ bool a34_mali_map(uint64_t va, uint64_t pa, uint64_t size);
+@@ -1573,7 +1575,14 @@ a34_mali_submit(struct a34_mali_job *job)
+ 	if (!am_uc_ready || am_dead) {
+ 		return false;
+ 	}
+-	if (am_pt_dirty && !am_as0_flush()) {
++	uint64_t asAt = mach_absolute_time();
++	bool asDirty = am_pt_dirty, asOk = !am_pt_dirty || am_as0_flush();
++
++	if (asDirty) {
++		a34_mali_asflush[0]++;          /* A34 (0993) */
++		a34_mali_asflush[1] += mach_absolute_time() - asAt;
++	}
++	if (!asOk) {
+ 		printf("A34 MALI UC: AS0 flush not done in 50 ms (AS_STATUS 0x%x)\n", am_rd(am_gpu, AS0 + AS_STATUS));
+ 		am_uc_recover(js);
+ 		return false;
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index f4a3e7b..801fb3d 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -189,6 +189,7 @@ void a34_mali_cpu_clean(uintptr_t va, uint64_t size);     /* A34 (0915): dc cvac
+ uint32_t a34_mali_spin_us(void);                         /* A34 (0928): a34malispin */
+ uint32_t a34_mali_flush_id(void);                        /* A34 (0989): GPU_LATEST_FLUSH */
+ uint32_t a34_clocks_gpu_khz(void);                       /* A34 (0991): bsd/dev/a34_clocks.c */
++extern uint64_t a34_mali_asflush[2];                     /* A34 (0993): bsd/dev/a34_mali.c */
+ int a34_ddr_state(uint32_t r[4]);
+ bool a34_ddr_top(bool on);
+ bool a34_mali_spin_unbound(bool bind_failed);            /* A34 (0985): no spin where the worker is not bound */
+@@ -515,6 +516,7 @@ static uint64_t gA34MaliScanTicks;
+  */
+ static uint64_t gA34MaliWinStart, gA34MaliWinNs[2], gA34MaliWinMost[2], gA34MaliWinIdle, gA34MaliLastEnd;
+ static uint32_t gA34MaliWinN[2];
++static uint64_t gA34MaliYieldTicks, gA34MaliAsSeen[2], gA34MaliScanWin;       /* A34 (0993): the second GPU line */
+ static uint32_t gA34MaliDdrBoost;
+ static bool gA34MaliDdrOn;
+ #define A34_GPU_WINDOW_NS       (10ull * NSEC_PER_SEC)
+@@ -722,6 +724,37 @@ a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
+  */
+ bool
+ a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st)
++{
++	return a34_mali_surface_ready(surface, ~0ull, ms, st);
++}
++
++/*
++ * A34 (0993): the last place in the order of queued jobs given out (0: none,
++ * or nothing is queued here): AppleCLCD's scan-out takes it when a frame is
++ * swapped, the jobs up to it being the ones that draw the frame.
++ */
++uint64_t
++a34_mali_queue_mark(void)
++{
++	uint64_t mark;
++
++	if (gA34MaliQLock == NULL) {
++		return 0;
++	}
++	IOLockLock(gA34MaliQLock);
++	mark = gA34MaliQSeq;
++	IOLockUnlock(gA34MaliQLock);
++	return mark;
++}
++
++/*
++ * A34 (0989, 0993): a34_mali_surface_idle(), and only up to the job `upto`
++ * (~0: all that name it): the jobs queued after a scan-out frame was swapped
++ * that name its surface wait for the display (scanWait()) and are not waited
++ * for here.
++ */
++bool
++a34_mali_surface_ready(SweetSurface *surface, uint64_t upto, uint32_t ms, uint64_t *st)
+ {
+ 	static uint32_t said, staleSaid;
+ 	uint64_t busy, mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE), began = mach_absolute_time();
+@@ -753,6 +786,9 @@ a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st)
+ 		}
+ 	}
+ 	busy = surface->gpuBusySeq;
++	if (busy > upto) {
++		busy = upto;            /* A34 (0993) */
++	}
+ 	if (st != NULL) {
+ 		uint64_t now = mach_absolute_time();
+ 
+@@ -1548,12 +1584,26 @@ gpuWindow(const struct a34_mali_job *job, uint64_t now)
+ 
+ 	absolutetime_to_nanoseconds(gA34MaliWinIdle, &idle);
+ 	IOLog("A34 MALI: %llu s: GPU busy %llu ms at %u MHz: vertex/tiler %u x %llu us (most %llu), fragment %u x %llu us "
+-	    "(most %llu); idle with a job ready %llu ms; DDR OPP %d\n", (unsigned long long)(win / NSEC_PER_SEC),
++	    "(most %llu); DDR OPP %d\n", (unsigned long long)(win / NSEC_PER_SEC),
+ 	    (unsigned long long)((gA34MaliWinNs[0] + gA34MaliWinNs[1]) / NSEC_PER_MSEC), a34_clocks_gpu_khz() / 1000u,
+ 	    gA34MaliWinN[1], (unsigned long long)(gA34MaliWinN[1] != 0 ? gA34MaliWinNs[1] / 1000u / gA34MaliWinN[1] : 0),
+ 	    (unsigned long long)(gA34MaliWinMost[1] / 1000u), gA34MaliWinN[0],
+ 	    (unsigned long long)(gA34MaliWinN[0] != 0 ? gA34MaliWinNs[0] / 1000u / gA34MaliWinN[0] : 0),
+-	    (unsigned long long)(gA34MaliWinMost[0] / 1000u), (unsigned long long)(idle / NSEC_PER_MSEC), ddr);
++	    (unsigned long long)(gA34MaliWinMost[0] / 1000u), ddr);
++	/* A34 (0993): what the GPU waited for between jobs that were ready */
++	uint64_t asN = a34_mali_asflush[0] - gA34MaliAsSeen[0], asNs, yieldNs, scanNs;
++
++	absolutetime_to_nanoseconds(a34_mali_asflush[1] - gA34MaliAsSeen[1], &asNs);
++	absolutetime_to_nanoseconds(gA34MaliYieldTicks, &yieldNs);
++	absolutetime_to_nanoseconds(gA34MaliScanWin, &scanNs);
++	gA34MaliAsSeen[0] = a34_mali_asflush[0];
++	gA34MaliAsSeen[1] = a34_mali_asflush[1];
++	gA34MaliScanWin = 0;
++	gA34MaliYieldTicks = 0;
++	IOLog("A34 MALI: %llu s: idle with a job ready %llu ms; of it AS0 flushes x%llu %llu us, yielding to the GPU lock "
++	    "%llu ms, waiting for the display %llu ms\n", (unsigned long long)(win / NSEC_PER_SEC),
++	    (unsigned long long)(idle / NSEC_PER_MSEC), (unsigned long long)asN, (unsigned long long)(asNs / 1000),
++	    (unsigned long long)(yieldNs / NSEC_PER_MSEC), (unsigned long long)(scanNs / NSEC_PER_MSEC));
+ 	gA34MaliWinStart = now;
+ 	gA34MaliWinN[0] = gA34MaliWinN[1] = 0;
+ 	gA34MaliWinNs[0] = gA34MaliWinNs[1] = gA34MaliWinMost[0] = gA34MaliWinMost[1] = 0;
+@@ -1743,9 +1793,12 @@ RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
+ 		j->taken = mach_absolute_time();        /* A34 (0935) */
+ 		IOLockUnlock(gA34MaliQLock);
+ 		/* whoever waits for the GPU's lock to make, map or close a buffer goes first (a34_gpu_lock()): 1 ms at most */
++		uint64_t yieldFrom = mach_absolute_time();
++
+ 		for (uint32_t waits = 0; gA34MaliWaiters > 0 && waits < 100; waits++) {
+ 			IODelay(10);
+ 		}
++		gA34MaliYieldTicks += mach_absolute_time() - yieldFrom;     /* A34 (0993) */
+ 		c = j->client;
+ 		if (sweet_surface_scan_total > 0) {
+ 			c->scanWait(j);         /* A34 (0983) */
+@@ -1797,7 +1850,9 @@ RedwoodMaliUserClient::scanWait(const struct a34_qjob *j)
+ 		for (uint32_t i = 0; fBos != NULL && !fClosing && s == NULL && i < n; i++) {
+ 			uint32_t h = j->all ? i + 1 : j->handles[i];
+ 
+-			if (h != 0 && h <= A34_BOS && fBos[h - 1].surface != NULL && fBos[h - 1].surface->scanHeld > 0) {
++			/* A34 (0993): a job queued up to the oldest held frame's swap draws that frame: it runs */
++			if (h != 0 && h <= A34_BOS && fBos[h - 1].surface != NULL && fBos[h - 1].surface->scanHeld > 0 &&
++			    j->gseq > __atomic_load_n(&fBos[h - 1].surface->scanHoldMin, __ATOMIC_ACQUIRE)) {
+ 				s = fBos[h - 1].surface;
+ 				s->retain();
+ 			}
+@@ -1807,10 +1862,11 @@ RedwoodMaliUserClient::scanWait(const struct a34_qjob *j)
+ 			break;
+ 		}
+ 		waited = true;
+-		while (s->scanHeld > 0 && mach_absolute_time() - t0 < limit) {
++		while (s->scanHeld > 0 && j->gseq > __atomic_load_n(&s->scanHoldMin, __ATOMIC_ACQUIRE) &&
++		    mach_absolute_time() - t0 < limit) {
+ 			IODelay(50);
+ 		}
+-		bool late = s->scanHeld > 0;
++		bool late = s->scanHeld > 0 && j->gseq > __atomic_load_n(&s->scanHoldMin, __ATOMIC_ACQUIRE);
+ 		s->release();
+ 		if (late) {
+ 			if (gA34MaliScanLate++ < 8) {
+@@ -1823,6 +1879,7 @@ RedwoodMaliUserClient::scanWait(const struct a34_qjob *j)
+ 	if (waited) {
+ 		gA34MaliScanWaits++;
+ 		gA34MaliScanTicks += mach_absolute_time() - t0;
++		gA34MaliScanWin += mach_absolute_time() - t0;   /* A34 (0993) */
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 818e8e1..be3485a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -195,6 +195,8 @@ public:
+ 	bool          fScanOn;
+ 	uint32_t      fPitch[4];
+ 	SweetSurface *fScanSurf[4];
++	uint64_t      fScanUpto[4];             /* A34 (0993): the jobs up to this place draw frame k (~0: not known yet) */
++	bool          fScanReady[4];            /* A34 (0993): frame k's GPU jobs seen done (by the kick) */
+ 	uint64_t      fOvlPA;
+ 	uint32_t      fOvlPitch;
+ 	SweetSurface *fScanLast;
+@@ -219,6 +221,7 @@ public:
+ 	int32_t drawTarget(bool full, bool *seed);
+ 	bool scanOut(const uint8_t *rec, uint32_t mask);
+ 	SweetSurface *scanRelease(int32_t k);
++	void scanHoldMin(SweetSurface *s);
+ 	void queuedAt(uint64_t now);
+ 	void drawDone(int32_t target);
+ 	void layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6]);
+@@ -2172,6 +2175,27 @@ AppleCLCD::kickOne(void)
+ 	fTaken = t;
+ 	readyAt = fQueuedAt > fXferEnd ? fQueuedAt : fXferEnd;  /* A34 (0938): the first moment it could have gone */
+ 	IOLockUnlock(fFlipLock);
++	if (t >= 2 && !fScanReady[t] && fScanSurf[t] != NULL) {
++		/*
++		 * A34 (0993): a scan-out frame's GPU jobs (scanOut() did not wait):
++		 * up to its swap's mark; frame t stays this kick's meanwhile, a newer
++		 * one goes to the other frame.
++		 */
++		uint64_t g0 = mach_absolute_time();
++
++		(void)a34_mali_surface_ready(fScanSurf[t], fScanUpto[t], 500, sweet_fb_gpu_wait);
++		sweet_fb_path_stats[2] += mach_absolute_time() - g0;
++		fScanReady[t] = true;
++		if (fScanUpto[t] == ~0ull) {
++			IOLockLock(fFlipLock);
++			fScanUpto[t] = a34_mali_queue_mark();   /* (the driver's mark is gone: from now on) */
++			scanHoldMin(fScanSurf[t]);
++			IOLockUnlock(fFlipLock);
++		}
++		if (mach_absolute_time() > readyAt) {
++			readyAt = mach_absolute_time();         /* (drawn: from now on it could go) */
++		}
++	}
+ 	if (fTEBitWanted && !fTEBit && a34_dsi_lock()) {
+ 		/* A34 (0931): a34fbte=2, the TE seen only with EXT_TE_EN (teProbe()): set now, the DSI idle */
+ 		a34_dsi_wr(SWEET_FB_DSI_TXRX_CTRL, a34_dsi_rd(SWEET_FB_DSI_TXRX_CTRL) | SWEET_FB_EXT_TE_EN);
+@@ -2320,12 +2344,32 @@ AppleCLCD::scanRelease(int32_t k)
+ 
+ 	fScanSurf[k] = NULL;
+ 	if (s != NULL) {
++		scanHoldMin(s);         /* A34 (0993): before scanHeld drops */
+ 		OSDecrementAtomic(&s->scanHeld);
+ 		OSDecrementAtomic(&sweet_surface_scan_total);
+ 	}
+ 	return s;
+ }
+ 
++/*
++ * A34 (0993), with fFlipLock: s->scanHoldMin, the oldest of the frames 2 and
++ * 3 that show s, its swap's place in the order of queued GPU jobs (~0: none,
++ * or not known): a later job that names s waits for the display (A34Mali.cpp
++ * scanWait()), one up to it draws that frame and runs.
++ */
++void
++AppleCLCD::scanHoldMin(SweetSurface *s)
++{
++	uint64_t least = ~0ull;
++
++	for (int32_t k = 2; k < 4; k++) {
++		if (fScanSurf[k] == s && fScanUpto[k] < least) {
++			least = fScanUpto[k];
++		}
++	}
++	__atomic_store_n(&s->scanHoldMin, least, __ATOMIC_RELEASE);
++}
++
+ /* A34 (0982, 0983), with fFlipLock: a frame queued now, for the PATH line. */
+ void
+ AppleCLCD::queuedAt(uint64_t now)
+@@ -2393,13 +2437,21 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 		s->release();
+ 		return false;
+ 	}
+-	/* the GPU's jobs that draw it done first, as before a copy (no cache to clean: see above) */
++	/*
++	 * A34 (0993): not waited for here. Until 0992 present() waited for the
++	 * GPU's jobs that draw the frame (5.8 ms a frame, boot 0991), and with it
++	 * the swap, so backboardd's SwapWait returned only then: its next frame
++	 * was encoded after this one was drawn, not while. Now the frame is queued
++	 * at once with the place of the last job given out (a34_mali_queue_mark():
++	 * the jobs up to it draw it; none if the driver's 0x7c mark says some are
++	 * still to come, then the kick takes it), the swap is done, and the kick
++	 * waits for those jobs before the TE (kickOne()). A later job that names
++	 * the surface waits for its transfer (scanHoldMin()).
++	 */
+ 	t0 = mach_absolute_time();
+-	if (s->gpuShared > 0) {
+-		(void)a34_mali_surface_idle_stats(s, 500, sweet_fb_gpu_wait);  /* A34 (0989) */
+-	}
+-	now = mach_absolute_time();
+-	sweet_fb_path_stats[2] += now - t0;
++	uint64_t upto = __atomic_load_n(&s->gpuPendingSince, __ATOMIC_ACQUIRE) != 0 ? ~0ull : a34_mali_queue_mark();
++
++	now = t0;
+ 	IOLockLock(fFlipLock);
+ 	k = fTaken == 2 ? 3 : 2;                /* the scan-out frame not being sent */
+ 	if (fQueued >= 2) {
+@@ -2409,9 +2461,12 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 	if (fScanSurf[k] != NULL) {
+ 		stale = scanRelease(k);
+ 	}
++	fScanSurf[k] = s;                       /* (sweet_surface_copy()'s reference) */
++	fScanUpto[k] = upto;                    /* A34 (0993) */
++	fScanReady[k] = s->gpuShared <= 0;
++	scanHoldMin(s);
+ 	OSIncrementAtomic(&s->scanHeld);
+ 	OSIncrementAtomic(&sweet_surface_scan_total);
+-	fScanSurf[k] = s;                       /* (sweet_surface_copy()'s reference) */
+ 	fBufPA[k] = addr;
+ 	fPitch[k] = s->bytesPerRow;
+ 	fQueued = k;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 1591b05..86a2a5f 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -78,6 +78,14 @@ public:
+ 	 */
+ 	uint64_t                  scanPA;
+ 	SInt32                    scanHeld;
++	/*
++	 * A34 (0993): with scanHeld, the place in the order of queued GPU jobs
++	 * (A34Mali.cpp) of the last job given out when the oldest of those
++	 * frames was swapped: jobs up to it draw that frame and run; a later one
++	 * that names the surface waits for the display (scanWait()).
++	 * ~0: no job waits.
++	 */
++	uint64_t                  scanHoldMin;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; scanPA = 0; scanHeld = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -128,6 +136,8 @@ void sweet_surface_report(void);
+  */
+ bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
+ bool a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st);    /* A34 (0989): A34Mali.cpp */
++uint64_t a34_mali_queue_mark(void);                                                     /* A34 (0993): A34Mali.cpp */
++bool a34_mali_surface_ready(SweetSurface *surface, uint64_t upto, uint32_t ms, uint64_t *st);
+ 
+ /*
+  * A34 (0927): the display-hold detector, read by AppleCLCD's 10 s line: [0]

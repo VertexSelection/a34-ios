@@ -838,6 +838,33 @@ redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t cou
 	return 0;
 }
 
+/* TRACE_JOBS (kernel 0992, redwood_drm.h): the kernel told to log these jobs' GPU times */
+EXPORT int
+redwood_drm_trace_jobs(uint64_t first_seq, uint32_t jobs)
+{
+	struct redwood_drm_trace_jobs request = { .first_seq = first_seq, .count = jobs, .pad = 0 };
+	kern_return_t result;
+	uint64_t began;
+
+	if (jobs == 0 || jobs > 128 || first_seq == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!connected()) {
+		errno = ENODEV;
+		return -1;
+	}
+	began = mach_absolute_time();
+	/* (nothing comes back: no output structure at all, which is what the kernel's method declares) */
+	result = IOConnectCallStructMethod(connection, REDWOOD_DRM_TRACE_JOBS, &request, sizeof(request), NULL, NULL);
+	count(&stats.calls[REDWOOD_DRM_TRACE_JOBS], &stats.ticks[REDWOOD_DRM_TRACE_JOBS], began);
+	if (result != kIOReturnSuccess) {
+		errno = result == kIOReturnUnsupported ? ENOTSUP : errno_of(result);
+		return -1;
+	}
+	return 0;
+}
+
 /*
  * For the Metal driver (HackiOS's air_metal.c: rwa_flush_seq, rwa_wait_seq, rwa_surface_seq;
  * userland/a34metal). Their libdrm stand-in answers these over their kernel's requests 0x7d
