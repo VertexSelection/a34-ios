@@ -123,8 +123,14 @@ def d22ap_product(path):
     """/product of the real iPhone X tree (MobileGestalt identity). Optional:
     the kernel boots without it; the iOS userland needs it."""
     if not path or not os.path.exists(path):
-        print(f'note: {path} missing, no /product node', file=sys.stderr)
-        return None
+        # Without /product, MobileGestalt has no device identity and SpringBoard
+        # dies on its first screen asset (BoundingPathBitmap...): a hard error,
+        # unless the caller asks for a kernel-only tree with --no-product.
+        if os.environ.get('A34_ADT_NO_PRODUCT') == '1':
+            print(f'note: {path} missing, no /product node (A34_ADT_NO_PRODUCT=1)', file=sys.stderr)
+            return None
+        raise SystemExit(f'{path} missing: the iOS userland needs its /product node '
+                         '(MobileGestalt identity); set A34_ADT_NO_PRODUCT=1 for a kernel-only test')
     root, _ = adt.parse(adt.load(path))
     for c in root.children:
         if c.prop('name') == b'product\0':
