@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 65ad43e..5d0ce6d 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -126,6 +126,10 @@
+  * always goes to bluetoothd; any other is passed once per address, advert type and data per scan start, as the
+  * controller would have. The 10 s LE line also says how many reports went on to bluetoothd.
+  *
++ * A34 (0981): that count also counts the reports passed while bluetoothd's scan does not filter duplicates (boot
++ * 1004-120-a's "0 passed" lines were such stretches). The A2DP crash of that boot was Skywalk's user-pipe privilege,
++ * not the bridge: bsd/kern/sweet_amfi.c now grants Skywalk's privileges from their entitlements.
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1843,7 +1847,11 @@ br_dup_report(uint8_t *p, uint32_t n)
+ {
+ 	uint32_t at = 5, o = 5, kept = 0, count = n > 4 ? p[4] : 0;
+ 
+-	if (!br_dup_on || n < 5 || p[0] != 0x04 || p[1] != 0x3e || p[3] != 0x02) {
++	if (n < 5 || p[0] != 0x04 || p[1] != 0x3e || (p[3] != 0x02 && p[3] != 0x0d)) {
++		return n;
++	}
++	if (!br_dup_on || p[3] != 0x02) {
++		br_dup_passed += count;                         /* (0981) passed unfiltered: counted too */
+ 		return n;
+ 	}
+ 	for (uint32_t i = 0; i < count && at + 10 <= n; i++) {
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index baf54c3..cd119a5 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -360,7 +360,29 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ *
++ * A34 (0981): and Skywalk's, to a process whose signature carries the
++ * entitlement AMFI would grant it for (the names sk_priv_chk prints,
++ * bsd/skywalk/core/skywalk.c). Boot 1004-120-a: "bluetoothd privilege 12000
++ * denied" -- bluetoothd (entitled com.apple.private.skywalk.register-user-pipe)
++ * could not register its A2DP audio pipe ("com.apple.bluetooth.AudioPipe"),
++ * os_channel_create_extended gave NULL, and publishing the AirPods' audio
++ * device crashed it at os_channel_get_fd(NULL) (+0x3effb4), seven times.
+  */
++extern struct proc *current_proc(void);
++
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_priv_entitlements[] = {
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
++	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
++	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
++	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
++	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
++};
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -376,6 +398,22 @@ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ 	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
++	for (size_t i = 0; i < sizeof(sweet_priv_entitlements) / sizeof(sweet_priv_entitlements[0]); i++) {
++		if (sweet_priv_entitlements[i].priv == priv) {
++			void *ent = sweet_proc_entitlements(current_proc());
++
++			if (ent != NULL && sweet_entitlements_bool(ent, sweet_priv_entitlements[i].entitlement)) {
++				static uint32_t granted_said;
++
++				if (granted_said++ < 16) {
++					printf("SWEET Sandbox: %s privilege %d granted (%s)\n", name, priv,
++					    sweet_priv_entitlements[i].entitlement);
++				}
++				return 0;
++			}
++			break;
++		}
++	}
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+ 		if (sweet_priv_logged[i].priv == priv &&
+ 		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {

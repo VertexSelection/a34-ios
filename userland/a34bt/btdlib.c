@@ -34,7 +34,8 @@
  *    first 400 of a run) and the lines that say where bluetoothd stands (restarts, HCI init, power state changes,
  *    "Could not", timeouts) are written; the last 30 lines of every kind are kept, and written as "bt~ " when
  *    bluetoothd exits or crashes; every 10 s that hid anything, one line counts them. With /a34/bluetoothd.verbose
- *    (or A34BT_LOG=verbose) every line is written, the first 3000 of a run, and the keychain calls and BlueTool's
+ *    (or A34BT_LOG=verbose) every line is written, the first 30000 of a run (0981: 3000 ended boot 1004-120-a's
+ *    trace long before the crash it was wanted for), and the keychain calls and BlueTool's
  *    messages in full, as before.
  *
  * Lines go to the console (the kernel's log) as "a34bt-btd: bluetoothd[PID]: ...".
@@ -855,7 +856,7 @@ log_say(os_log_type_t type, const char *format, uint8_t *buf, uint32_t size)
 
 	static __thread int inside;
 
-	if (type == OS_LOG_TYPE_DEBUG || format == NULL || inside || (log_verbose && log_said++ >= 3000)) {
+	if (type == OS_LOG_TYPE_DEBUG || format == NULL || inside || (log_verbose && log_said++ >= 30000)) {
 		return;
 	}
 	inside = 1;                     /* (a description that logs is not formatted again) */
