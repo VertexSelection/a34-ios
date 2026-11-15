@@ -12,14 +12,16 @@ index 70c2540..058916d 100644
  bsd/dev/ruby_irq.c			standard
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..7a6d372
+index 0000000..46976d4
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,702 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
-+ * Boot-arg a34cell=1 (default 0: nothing here runs, nothing is mapped). One thread, a few
++ * Boot-arg a34cell=1 (default 0: nothing here runs, nothing is mapped); a34cell=2 adds the
++ * first contact with the modem (ac_first_contact(), below), the only part that writes registers
++ * (CCIF clocks and reset, the modem's start) -- never a voltage, never a partition. One thread, a few
 + * seconds after the disk is up, logs "A34 CELL:" lines and fills the read-only sysctl
 + * kern.a34cell with a one-line summary (userland/a34cell prints it). Plan and evidence:
 + * docs/cellular-plan.md.
@@ -375,6 +377,31 @@ index 0000000..7a6d372
 +	AC_NOTE("ccifclk=%s", (cg1 >> 23 & 1) ? "gated" : "on");
 +}
 +
++/* SMC 0xC2000505 (MTK_SIP_KERNEL_CCCI_CONTROL) with x1 = sub-ID, x2 = argument; x0..x3 back. */
++static void
++ac_smc(uint64_t sub, uint64_t arg, uint64_t out[4])
++{
++	register uint64_t x0 __asm__("x0") = AC_SMC_CCCI_CONTROL;
++	register uint64_t x1 __asm__("x1") = sub;
++	register uint64_t x2 __asm__("x2") = arg;
++	register uint64_t x3 __asm__("x3") = 0;
++
++	__asm__ volatile(
++	    "mov x4, xzr\n\t"
++	    "mov x5, xzr\n\t"
++	    "mov x6, xzr\n\t"
++	    "mov x7, xzr\n\t"
++	    "smc #0\n\t"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
++	      "x17", "memory");
++	out[0] = x0;
++	out[1] = x1;
++	out[2] = x2;
++	out[3] = x3;
++}
++
 +static void
 +ac_boot_status(void)
 +{
@@ -400,7 +427,7 @@ index 0000000..7a6d372
 +
 +/* MD_POWER_CONFIG / MD_CHECK_DONE (3): 0 once the modem's boot ROM check passed ("BROM PASS"
 + * in Android's md_start_platform, which polls it the same way). */
-+static void
++static bool
 +ac_brom_check(void)
 +{
 +	register uint64_t x0 __asm__("x0") = AC_SMC_CCCI_CONTROL;
@@ -421,6 +448,133 @@ index 0000000..7a6d372
 +	printf("A34 CELL: MD boot ROM check (SMC MD_POWER_CONFIG/MD_CHECK_DONE): 0x%llx%s\n", x0,
 +	    x0 == 0 ? " = BROM PASS" : "");
 +	AC_NOTE("brom=%s", x0 == 0 ? "pass" : "no");
++	return x0 == 0;
++}
++
++/* ---- a34cell=2: first contact (starts the modem LK loaded; no power or voltage change) ---- */
++
++#define AC_AP_CCIF_PA           0x10209000ull
++#define AC_MD_CCIF_PA           0x1020A000ull
++#define CCIF_BUSY               0x04u
++#define CCIF_RCHNUM             0x10u
++#define CCIF_ACK                0x14u
++#define CCIF_CHDATA             0x100u
++#define CCIF_SRAM_SIZE          512u
++#define CCIF_D2H_SRAM           15u
++#define AC_INFRA_CG1_CLR        0x08Cu
++#define AC_INFRA_CG3_CLR        0x0C4u
++#define AC_INFRA_CG3_STA        0x0C8u
++#define AC_INFRA_RST_SET        0x150u
++#define AC_INFRA_RST_CLR        0x154u
++#define AC_CCIF_CLK_REQUEST     14u
++#define AC_MD_KERNEL_BOOT_UP    0u
++#define AC_MD_INIT_CHK_ID       0x5555FFFFu
++#define AC_MD_PATTERN           0x49434343u
++
++static void
++ac_wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb st" ::: "memory");
++}
++
++static void
++ac_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ac_tag_base, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * Android's order (ccci_fsm.c fsm_routine_start, ccci_hif_ccif.c ccif_start/ccci_reset_ccif_hw,
++ * md_sys1_platform.c md_cd_let_md_go), minus the power cycle: LK has powered the modem and its
++ * boot ROM check passed (checked first); no regulator, MTCMOS or clock-mux is changed here.
++ *   1. SMC CCIF_CLK_REQUEST; the six CCIF clock gates opened (infracfg_ao CG1 clr bits 23, 26,
++ *      12, 13; CG3 clr bits 10, 29).
++ *   2. CCIF reset (infracfg_ao +0x150/+0x154 bit 8), both CCIF SRAMs cleared.
++ *   3. SMC MD_POWER_CONFIG / MD_KERNEL_BOOT_UP ("make boot vector take effect").
++ *   4. Wait up to 30 s for the modem's first handshake: D2H_SRAM (bit 15) in AP_CCIF RCHNUM, the
++ *      CCCI header at CHDATA (channel 0, data[1] = MD_INIT_START_BOOT 0, reserved 0x5555FFFF)
++ *      and its feature query behind it (head/tail 0x49434343, 64 feature bytes), acknowledged.
++ * Not yet: the AP's runtime data answer (stage 1b proper), so the modem then waits and times
++ * out; the transmitter is never switched on by a modem that has not finished its handshake and
++ * read its NVRAM.
++ */
++static void
++ac_first_contact(void)
++{
++	uint64_t r[4];
++	vm_offset_t infra = ml_io_map((vm_offset_t)AC_INFRA_PA, PAGE_SIZE);
++	vm_offset_t ap = ml_io_map((vm_offset_t)AC_AP_CCIF_PA, PAGE_SIZE);
++	vm_offset_t md = ml_io_map((vm_offset_t)AC_MD_CCIF_PA, PAGE_SIZE);
++
++	if (!infra || !ap || !md)
++		return;
++	printf("A34 CELL: first contact (a34cell=2): CCIF up, modem let go, waiting for its handshake\n");
++	ac_smc(AC_CCIF_CLK_REQUEST, 0, r);
++	printf("A34 CELL: SMC CCIF_CLK_REQUEST: 0x%llx\n", r[0]);
++	ac_wr32(infra, AC_INFRA_CG1_CLR, (1u << 23) | (1u << 26) | (1u << 12) | (1u << 13));
++	ac_wr32(infra, AC_INFRA_CG3_CLR, (1u << 10) | (1u << 29));
++	uint32_t cg1 = ac_rd32(infra, AC_INFRA_CG1_STA), cg3 = ac_rd32(infra, AC_INFRA_CG3_STA);
++	printf("A34 CELL: CCIF clock gates now CG1 0x%08x CG3 0x%08x (bits 23/26/12/13, 10/29 should be 0)\n",
++	    cg1, cg3);
++	if ((cg1 >> 23 & 1) || (cg1 >> 26 & 1)) {
++		printf("A34 CELL: CCIF clocks still gated: stopping before touching CCIF\n");
++		AC_NOTE("contact=noclk");
++		return;
++	}
++	ac_wr32(infra, AC_INFRA_RST_SET, 1u << 8);
++	ac_wr32(infra, AC_INFRA_RST_CLR, 1u << 8);
++	for (uint32_t o = 0; o < CCIF_SRAM_SIZE; o += 4) {
++		ac_wr32(ap, CCIF_CHDATA + o, 0);
++		ac_wr32(md, CCIF_CHDATA + o, 0);
++	}
++	printf("A34 CELL: CCIF reset, SRAM cleared (AP RCHNUM 0x%08x BUSY 0x%08x)\n",
++	    ac_rd32(ap, CCIF_RCHNUM), ac_rd32(ap, CCIF_BUSY));
++
++	ac_smc(AC_MD_POWER_CONFIG, AC_MD_KERNEL_BOOT_UP, r);
++	printf("A34 CELL: SMC MD_KERNEL_BOOT_UP: ret %llu boot_status_0 %llu boot_status_1 %llu boot_slave %llu\n",
++	    r[0], r[1], r[2], r[3]);
++
++	uint32_t seen = 0;
++	for (int i = 0; i < 3000; i++) {
++		uint32_t ch = ac_rd32(ap, CCIF_RCHNUM);
++		if (ch & ~seen) {
++			printf("A34 CELL: CCIF from the modem: RCHNUM 0x%08x after %d ms\n", ch, i * 10);
++			seen |= ch;
++		}
++		if (ch & (1u << CCIF_D2H_SRAM)) {
++			uint32_t h[4], f[56];
++			for (int k = 0; k < 4; k++)
++				h[k] = ac_rd32(ap, CCIF_CHDATA + 4u * (uint32_t)k);
++			for (int k = 0; k < 56; k++)
++				f[k] = ac_rd32(ap, CCIF_CHDATA + 16u + 4u * (uint32_t)k);
++			ac_wr32(ap, CCIF_ACK, ch & 0xFFFFu);
++			bool hs1 = h[1] == 0 && (h[2] & 0xFFFF) == 0 && h[3] == AC_MD_INIT_CHK_ID;
++			printf("A34 CELL: %s: header %08x %08x %08x %08x; feature query head 0x%08x tail 0x%08x\n",
++			    hs1 ? "HS1 -- the modem is running and asks for the AP's features" : "SRAM message",
++			    h[0], h[1], h[2], h[3], f[0], f[17]);
++			char hex[64 * 2 + 1];
++			const uint8_t *fb = (const uint8_t *)&f[1];
++			for (int k = 0; k < 64; k++)
++				snprintf(hex + 2 * k, 3, "%02x", fb[k]);
++			printf("A34 CELL: modem feature set: %s\n", hex);
++			AC_NOTE("contact=%s", hs1 ? "hs1" : "sram");
++			ac_smc(AC_MD_POWER_CONFIG, AC_MD_BOOT_STATUS, r);
++			printf("A34 CELL: MD boot status now 0x%llx 0x%llx\n", r[1], r[2]);
++			return;
++		}
++		if (ch)
++			ac_wr32(ap, CCIF_ACK, ch & 0xFFFFu);
++		ac_sleep_ms(10);
++	}
++	ac_smc(AC_MD_POWER_CONFIG, AC_MD_BOOT_STATUS, r);
++	printf("A34 CELL: no handshake in 30 s (RCHNUM seen 0x%08x); MD boot status 0x%llx 0x%llx\n",
++	    seen, r[1], r[2]);
++	AC_NOTE("contact=none");
 +}
 +
 +/* ---- 5. the md1img partition ---- */
@@ -524,14 +678,22 @@ index 0000000..7a6d372
 +	ac_lk_fdt();
 +	bool on = ac_md1_power();
 +	ac_ccif_clocks();
++	bool brom = false;
 +	if (on) {
 +		ac_boot_status();
-+		ac_brom_check();
++		brom = ac_brom_check();
 +	}
 +	else
 +		printf("A34 CELL: MD1 is off: no boot status query\n");
 +	ac_partitions();
 +	ac_md1img();
++	if (ac_mode >= 2) {
++		if (ac_lk_md == 1 && on && brom)
++			ac_first_contact();
++		else
++			printf("A34 CELL: a34cell=2 needs a modem LK loaded (%d), MD1 on (%d) and BROM PASS (%d): "
++			    "not started\n", ac_lk_md, on, brom);
++	}
 +	printf("A34 CELL: summary: %s\n", ac_state);
 +	if (ac_lk_md != 1)
 +		printf("A34 CELL: the modem cannot be started from this boot: LK loads and verifies "
