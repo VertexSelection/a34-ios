@@ -56,6 +56,10 @@ bool model_registered(const struct cell_state *s);
 int model_dbm(const struct cell_state *s);
 int model_bars(const struct cell_state *s);
 
+/* A modem line for the log: every run of 8 or more digits (an IMEI, IMSI, ICCID or phone
+ * number would be one) replaced by '#'s of the same length. */
+void model_redact(const char *in, char *out, size_t outsz);
+
 /* The state as an XML property list (for SpringBoard's status-bar hook later). Returns the
  * length written, or -1 if it did not fit. */
 int model_plist(const struct cell_state *s, char *out, size_t outsz);

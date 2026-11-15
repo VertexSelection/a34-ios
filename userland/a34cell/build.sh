@@ -80,7 +80,12 @@ the kernel's CCCI stage, a34cell=3) it prints the kernel's cellular state and ex
 else is touched. The transmitter stays off unless "-radio" is added to the job's arguments AND
 the modem reports a well-formed identity of its own; the identity is never printed or stored.
 
-  a34cell [-port /dev/a34at0] [-state /var/run/a34cell.plist] [-inbox DIR] [-radio] [-trace] [-once]
+  a34cell [-port /dev/a34at0] [-wait 180] [-state /var/run/a34cell.plist] [-inbox DIR] [-radio] [-trace] [-once]
+
+It waits up to -wait seconds for the port (the kernel makes it at the modem's HS2), asks the
+modem for its model, firmware, SIM state and registration, keeps it in flight mode (AT+CFUN=4:
+SIM on, transmitter off) unless -radio, and logs the state when it changes. No IMSI, ICCID,
+phone number or IMEI is asked for or logged.
 
 The status bar: liba34cell-sb.dylib, loaded into SpringBoard through the kernel's a34inject
 (several libraries separated by ':'), e.g. boot-arg

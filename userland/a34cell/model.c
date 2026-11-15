@@ -318,3 +318,29 @@ model_plist(const struct cell_state *s, char *out, size_t outsz)
 		return -1;
 	return (int)(pos + (size_t)w);
 }
+
+void
+model_redact(const char *in, char *out, size_t outsz)
+{
+	size_t n = strlen(in), o = 0;
+
+	if (outsz == 0)
+		return;
+	for (size_t i = 0; i < n && o + 1 < outsz;) {
+		size_t run = 0;
+		while (i + run < n && in[i + run] >= '0' && in[i + run] <= '9')
+			run++;
+		if (run >= 8) {
+			for (size_t k = 0; k < run && o + 1 < outsz; k++)
+				out[o++] = '#';
+			i += run;
+		} else if (run > 0) {
+			for (size_t k = 0; k < run && o + 1 < outsz; k++)
+				out[o++] = in[i + k];
+			i += run;
+		} else {
+			out[o++] = in[i++];
+		}
+	}
+	out[o] = 0;
+}

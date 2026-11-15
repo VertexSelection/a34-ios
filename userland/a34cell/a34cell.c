@@ -7,7 +7,10 @@
  * registration, the signal, IMS and calls (model.h), which it writes as a property list and
  * announces with the Darwin notification "com.a34.cell.state" whenever it changes.
  *
- * Safe by construction (policy.h): an allowlist of commands, never the identity programming
+ * Logs carry no identity: no IMSI, ICCID, phone number or IMEI is ever asked for or printed
+ * (the identity check reads the modem's answer to AT+CGSN and wipes it); any run of 8 or more
+ * digits in a logged modem line is masked (model_redact). SMS bodies and numbers stay out of
+ * the log. Safe by construction (policy.h): an allowlist of commands, never the identity programming
  * commands, and the transmitter stays off unless -radio is given AND the modem reports a
  * well-formed identity of its own (which it does after reading the phone's NVRAM, read-only);
  * the identity itself is never logged, stored or passed on. Without a modem port (the kernel's
@@ -167,8 +170,8 @@ radio_policy(struct at_chan *ch, bool want)
 	if (st.radio_gate) {
 		if (st.cfun != 1 && at_cmd(ch, "AT+CFUN=1", 30000, NULL) == AT_OK)
 			fprintf(stderr, "a34cell: transmitter on (AT+CFUN=1)\n");
-	} else if (st.cfun != 4 && st.cfun != 0) {
-		/* Whatever the modem came up with: off (flight mode), the safe state. */
+	} else if (st.cfun != 4) {
+		/* Whatever the modem came up with: flight mode (SIM on, transmitter off). */
 		enum at_result res = at_cmd(ch, "AT+CFUN=4", 30000, NULL);
 		fprintf(stderr, "a34cell: transmitter off (AT+CFUN=4): %s\n", at_result_name(res));
 	} else {
@@ -181,8 +184,12 @@ radio_policy(struct at_chan *ch, bool want)
 static void
 log_lines(const char *what, struct at_resp *r)
 {
-	for (size_t i = 0; i < r->nlines; i++)
-		fprintf(stderr, "a34cell: %s: %s\n", what, r->lines[i]);
+	char red[AT_MAX_LINE];
+
+	for (size_t i = 0; i < r->nlines; i++) {
+		model_redact(r->lines[i], red, sizeof(red));
+		fprintf(stderr, "a34cell: %s: %s\n", what, red);
+	}
 }
 
 int
@@ -190,6 +197,7 @@ main(int argc, char **argv)
 {
 	const char *port = "/dev/a34at0";
 	bool radio = false, once = false;
+	int wait_s = 180;
 	int trace = 0;
 	struct at_chan ch;
 	struct at_resp r;
@@ -207,8 +215,10 @@ main(int argc, char **argv)
 			trace = 1;
 		else if (strcmp(argv[i], "-once") == 0)
 			once = true;
+		else if (strcmp(argv[i], "-wait") == 0 && i + 1 < argc)
+			wait_s = atoi(argv[++i]);
 		else {
-			fprintf(stderr, "usage: a34cell [-port DEV] [-state PLIST] [-inbox DIR] [-radio] [-trace] [-once]\n");
+			fprintf(stderr, "usage: a34cell [-port DEV] [-wait SECONDS] [-state PLIST] [-inbox DIR] [-radio] [-trace] [-once]\n");
 			return 2;
 		}
 	}
@@ -220,7 +230,16 @@ main(int argc, char **argv)
 	fprintf(stderr, "a34cell: start (port %s, radio %s)\n", port, radio ? "wanted" : "off");
 	kernel_state();
 
-	int fd = open(port, O_RDWR | O_NOCTTY);
+	/* The kernel makes the port at the modem's HS2, which may come after this job starts. */
+	int fd = -1;
+	for (int waited = 0; waited <= wait_s; waited++) {
+		fd = open(port, O_RDWR | O_NOCTTY);
+		if (fd >= 0 || stop)
+			break;
+		if (waited == 0)
+			fprintf(stderr, "a34cell: waiting up to %d s for %s\n", wait_s, port);
+		sleep(1);
+	}
 	if (fd < 0) {
 		fprintf(stderr, "a34cell: no modem port %s (%s): the kernel's CCCI stage is not running "
 		    "(needs a34cell=3 on a boot from `boot`, and the modem's HS2); nothing to do\n", port,
@@ -248,6 +267,9 @@ main(int argc, char **argv)
 	at_cmd(&ch, "AT+CMEE=1", 2000, NULL);
 	if (at_cmd(&ch, "ATI", 2000, &r) == AT_OK)
 		log_lines("ATI", &r);
+	at_resp_free(&r);
+	if (at_cmd(&ch, "AT+CGMM", 2000, &r) == AT_OK)
+		log_lines("model", &r);
 	at_resp_free(&r);
 	if (at_cmd(&ch, "AT+CGMR", 2000, &r) == AT_OK)
 		log_lines("firmware", &r);

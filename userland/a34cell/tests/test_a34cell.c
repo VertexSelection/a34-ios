@@ -177,6 +177,11 @@ test_model(void)
 	CHECK_STR(s.calls[0].number, "+905551112233");
 	CHECK(model_line(&s, "RING", false) && s.ringing);
 	CHECK(!model_line(&s, "+ECSQ: 1,2,3", false));
+	char red[64];
+	model_redact("IMEI: 123456789012345, rev MOLY.NR15.R3.TC10 2025", red, sizeof(red));
+	CHECK_STR(red, "IMEI: ###############, rev MOLY.NR15.R3.TC10 2025");
+	model_redact("+CNUM: \"\",\"+905551112233\",145", red, sizeof(red));
+	CHECK_STR(red, "+CNUM: \"\",\"+############\",145");
 	char pl[4096];
 	CHECK(model_plist(&s, pl, sizeof(pl)) > 0);
 	CHECK(strstr(pl, "<key>Operator</key><string>Turkcell</string>") != NULL);
