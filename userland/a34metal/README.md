@@ -196,4 +196,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-Mesa (MIT) is fetched at build time; the patches are under Mesa's licence.
+Textures over a buffer's memory (`rwa_texture_from_buffer` in `air_metal.c`, the buffer's
+`-newTextureWithDescriptor:offset:bytesPerRow:`, the in-process export in redwood-drm) are ported
+from **y2sios** (<https://github.com/stormtroopxyz/y2sios>, MIT, Copyright (c) 2026 the y2sios
+contributors); the queue QoS, the bindings label and the unmap-before-close follow leads from
+y2sios and viva-gpu (the latter's ideas only, no code).
+
+Mesa (MIT) is fetched at build time; the patches are under Mesa's licence (0009 and 0010 are
+upstream Mesa commits, unchanged).
