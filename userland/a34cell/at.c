@@ -40,6 +40,25 @@ at_result_name(enum at_result r)
 	return (unsigned)r < sizeof(names) / sizeof(names[0]) ? names[r] : "?";
 }
 
+static int write_all(int fd, const char *p, size_t n);
+
+/*
+ * One write() per command line: on the CCCI tty each write() is one packet to the modem, and
+ * its AT interpreter takes a command with its terminator in one piece.
+ */
+static int
+write_line(int fd, const char *a, const char *term)
+{
+	char buf[AT_MAX_LINE + 2];
+	size_t n = strlen(a), t = strlen(term);
+
+	if (n + t > sizeof(buf))
+		return -1;
+	memcpy(buf, a, n);
+	memcpy(buf + n, term, t);
+	return write_all(fd, buf, n + t);
+}
+
 static int
 write_all(int fd, const char *p, size_t n)
 {
@@ -254,7 +273,7 @@ at_cmd(struct at_chan *ch, const char *cmd, int timeout_ms, struct at_resp *resp
 	}
 	if (ch->trace)
 		fprintf(stderr, "a34cell: > %s\n", strncmp(cmd, "ATD", 3) == 0 ? "ATD<number>" : cmd);
-	if (write_all(ch->fd, cmd, strlen(cmd)) < 0 || write_all(ch->fd, "\r", 1) < 0)
+	if (write_line(ch->fd, cmd, "\r") < 0)
 		return r->result = AT_IO;
 	answer_prefix(cmd, prefix, sizeof(prefix));
 	enum at_result res = wait_final(ch, prefix, now_ms() + timeout_ms, r, false);
@@ -285,7 +304,7 @@ at_send_pdu(struct at_chan *ch, int tpdu_len, const char *pdu_hex, int timeout_m
 	}
 	if (policy_check(cmd) != POLICY_ALLOW)
 		return r->result = AT_REFUSED;
-	if (write_all(ch->fd, cmd, strlen(cmd)) < 0 || write_all(ch->fd, "\r", 1) < 0)
+	if (write_line(ch->fd, cmd, "\r") < 0)
 		return r->result = AT_IO;
 	long long deadline = now_ms() + timeout_ms;
 	enum at_result res = wait_final(ch, "+CMGS:", deadline, r, true);
@@ -294,7 +313,7 @@ at_send_pdu(struct at_chan *ch, int tpdu_len, const char *pdu_hex, int timeout_m
 			at_resp_free(&local);
 		return res;
 	}
-	if (write_all(ch->fd, pdu_hex, strlen(pdu_hex)) < 0 || write_all(ch->fd, "\x1a", 1) < 0)
+	if (write_line(ch->fd, pdu_hex, "\x1a") < 0)
 		return r->result = AT_IO;
 	r->result = AT_OK;
 	res = wait_final(ch, "+CMGS:", deadline, r, false);
