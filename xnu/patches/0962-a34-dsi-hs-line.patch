@@ -1,0 +1,157 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4733d86..18ba463 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -435,13 +435,70 @@ sweet_fb_dsi_dump(const char *when)
+ 		0x104, 0x108, 0x110, 0x114, 0x118, 0x11c,      /* PHY_LCCON, LD0CON, PHY_TIMECON0-3 */
+ 		0xc00, 0xc04,           /* SHADOW_DEBUG ([1] BYPASS_SHADOW), its next word */
+ 	};
+-	char line[420];
++	char line[160];
+ 	size_t n = 0;
+ 
+-	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && n < sizeof(line); i++) {
++	/* A34 (0939): six registers a line: the log cuts lines near 256 characters */
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+ 		n += (size_t)snprintf(line + n, sizeof(line) - n, " %x=%08x", regs[i], a34_dsi_rd(regs[i]));
++		if ((i % 6) == 5 || i + 1 == sizeof(regs) / sizeof(regs[0])) {
++			IOLog("A34 FB 120: DSI %s:%s\n", when, line);
++			n = 0;
++		}
++	}
++}
++
++/*
++ * A34 (0939): why 0937/0938 changed nothing. LK leaves DSI_CON_CTRL =
++ * 0x01000000: bit 24, DSI_CM_MODE_WAIT_DATA_EVERY_LINE_EN, which MediaTek's
++ * mtk_dsi.c sets only for "LP mode per line" (ext->params->lp_perline_en)
++ * and clears otherwise -- this panel's driver never sets lp_perline_en, so
++ * Android runs it with the bit clear, and on MT6877 sets bit 27
++ * (DSI_CM_WAIT_FIFO_FULL_EN, need_wait_fifo) in mtk_dsi_enable(). LP after
++ * every line is 331 byte clocks a line: 7.69 ms a frame (mtk_dsi_get_line_time()),
++ * what we measure; kept in HS 272: 6.32 ms. 0x6C bit 16 cannot help while
++ * the DSI waits in LP each line.
++ * Boot-arg a34dsicon (bits): 1 clears bit 24, 2 sets bit 27. Applied at start,
++ * the link idle; the first SWEET_FB_CON_WATCH transfers are watched for
++ * DSI_INTSTA BUFFER_UNDERRUN (bit 12) or INP_UNFINISH (bit 14) -- the display
++ * pipe not keeping up with a link kept in HS (Android runs the display clock
++ * at 416 MHz for it; LK's is not known) -- and CON_CTRL goes back to LK's
++ * value if one is seen.
++ */
++#define SWEET_FB_DSI_CON_CTRL   0x010u
++#define SWEET_FB_CM_WAIT_EVERY_LINE (1u << 24)
++#define SWEET_FB_CM_WAIT_FIFO_FULL  (1u << 27)
++#define SWEET_FB_UNDERRUN       ((1u << 12) | (1u << 14))
++#define SWEET_FB_CON_WATCH      16u
++static uint32_t sweet_fb_con_was, sweet_fb_con_watch;   /* LK's CON_CTRL; transfers left to watch */
++
++/* After a transfer (both kick paths): a34dsicon's guard, and its first transfer time, said once. */
++static void
++sweet_fb_con_check(uint64_t xfer)
++{
++	uint32_t sta;
++	uint64_t ns;
++
++	if (sweet_fb_con_watch == 0) {
++		return;
++	}
++	sta = a34_dsi_rd(SWEET_FB_DSI_INTSTA);
++	absolutetime_to_nanoseconds(xfer, &ns);
++	if ((sta & SWEET_FB_UNDERRUN) != 0) {
++		a34_dsi_wr(SWEET_FB_DSI_CON_CTRL, sweet_fb_con_was);
++		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_UNDERRUN);
++		sweet_fb_con_watch = 0;
++		IOLog("A34 FB 120: a34dsicon: DSI_INTSTA 0x%08x (underrun/unfinished input) after a %llu us transfer: CON_CTRL "
++		    "back to 0x%08x\n", sta, (unsigned long long)(ns / NSEC_PER_USEC), sweet_fb_con_was);
++		return;
++	}
++	if (sweet_fb_con_watch-- == SWEET_FB_CON_WATCH) {
++		IOLog("A34 FB 120: a34dsicon: the first transfer with CON_CTRL 0x%08x took %llu us\n",
++		    a34_dsi_rd(SWEET_FB_DSI_CON_CTRL), (unsigned long long)(ns / NSEC_PER_USEC));
++	} else if (sweet_fb_con_watch == 0) {
++		IOLog("A34 FB 120: a34dsicon: %u transfers without an underrun; the last took %llu us\n", SWEET_FB_CON_WATCH,
++		    (unsigned long long)(ns / NSEC_PER_USEC));
+ 	}
+-	IOLog("A34 FB 120: DSI %s:%s\n", when, line);
+ }
+ 
+ static void
+@@ -604,6 +661,7 @@ a34_kick_action(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
+ 	sweet_fb_hs_say(xfer);
++	sweet_fb_con_check(xfer);       /* A34 (0939) */
+ 	a34_kick_stats[0]++;
+ 	a34_kick_stats[1] += wait;
+ 	a34_kick_stats[2] += xfer;
+@@ -701,16 +759,36 @@ AppleCLCD::start(IOService *provider)
+ 		    sweet_fb_dsi_hs == 1 ? "set for each frame" : "set now and kept", a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS),
+ 		    sweet_fb_dsi_hs == 3 ? ", DSI shadow registers bypassed" : "");
+ 	}
+-	if (sweet_fb_dsi_hs >= 2 && a34_dsi_lock()) {
++	uint32_t dsiCon = 0;
++	(void)PE_parse_boot_argn("a34dsicon", &dsiCon, sizeof(dsiCon));         /* A34 (0939) */
++	if ((sweet_fb_dsi_hs >= 2 || (dsiCon & 3u) != 0) && (a34_dsi_rd(SWEET_FB_DSI_MODE_CTRL) & 3u) == 0 &&
++	    a34_dsi_lock()) {
+ 		uint64_t idleTicks;
++		uint32_t shadow = 0, type1 = 0, con = 0;
+ 
+ 		(void)a34_dsi_wait_idle(&idleTicks, SWEET_FB_TE_PROBE_MS);
+ 		if (sweet_fb_dsi_hs == 3) {
+ 			a34_dsi_wr(SWEET_FB_DSI_SHADOW, a34_dsi_rd(SWEET_FB_DSI_SHADOW) | SWEET_FB_DSI_BYPASS_SHADOW);
++			shadow = a34_dsi_rd(SWEET_FB_DSI_SHADOW);
++		}
++		if (sweet_fb_dsi_hs >= 2) {
++			a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS) | SWEET_FB_HS_BLANKING);
++			type1 = a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS);
++		}
++		if ((dsiCon & 3u) != 0) {
++			sweet_fb_con_was = a34_dsi_rd(SWEET_FB_DSI_CON_CTRL);
++			con = sweet_fb_con_was;
++			con = (dsiCon & 1u) != 0 ? (con & ~SWEET_FB_CM_WAIT_EVERY_LINE) : con;
++			con = (dsiCon & 2u) != 0 ? (con | SWEET_FB_CM_WAIT_FIFO_FULL) : con;
++			a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_UNDERRUN);
++			a34_dsi_wr(SWEET_FB_DSI_CON_CTRL, con);
++			con = a34_dsi_rd(SWEET_FB_DSI_CON_CTRL);
++			sweet_fb_con_watch = SWEET_FB_CON_WATCH;
+ 		}
+-		a34_dsi_wr(SWEET_FB_DSI_TYPE1_HS, a34_dsi_rd(SWEET_FB_DSI_TYPE1_HS) | SWEET_FB_HS_BLANKING);
+ 		a34_dsi_unlock();
+-		sweet_fb_dsi_dump("after a34dsihs");
++		IOLog("A34 FB 120: read back: SHADOW_DEBUG 0x%08x, CMD_TYPE1_HS 0x%08x, CON_CTRL 0x%08x (was 0x%08x; "
++		    "a34dsicon=%u)\n", shadow, type1, con, sweet_fb_con_was, dsiCon);
++		sweet_fb_dsi_dump("after the changes");
+ 	}
+ 	if (panelRate == 60 || panelRate == 120) {
+ 		panelHz(panelRate);
+@@ -909,15 +987,15 @@ sweet_fb_flip_log(void)
+ 	}
+ 	absolutetime_to_nanoseconds(d[4], &most);
+ 	absolutetime_to_nanoseconds(d[8], &te);
+-	IOLog("A34 FB FLIP: 10 s: %llu frames drawn into the picture not shown, %llu into the latest one, %llu replaced "
+-	    "before being sent; %llu draws waited for a transfer (longest %llu us); %llu flips, %llu transfers; %llu TE "
+-	    "waits (%llu us each on average, %llu without a TE in %u ms); %llu TEs missed with a frame ready, %llu caught "
+-	    "within %u us after they came\n", (unsigned long long)d[0],
++	/* A34 (0939): two lines (the log cuts lines near 256 characters) */
++	IOLog("A34 FB FLIP: 10 s: %llu frames into the picture not shown, %llu into the latest, %llu replaced before "
++	    "being sent; %llu draws waited for a transfer (longest %llu us)\n", (unsigned long long)d[0],
+ 	    (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3],
+-	    (unsigned long long)(most / NSEC_PER_USEC), (unsigned long long)d[5], (unsigned long long)d[6],
++	    (unsigned long long)(most / NSEC_PER_USEC));
++	IOLog("A34 FB FLIP: 10 s: %llu flips, %llu transfers; %llu TE waits (%llu us avg, %llu without a TE); %llu TEs "
++	    "missed with a frame ready, %llu caught <= %u us late\n", (unsigned long long)d[5], (unsigned long long)d[6],
+ 	    (unsigned long long)d[7], (unsigned long long)(d[7] != 0 ? te / NSEC_PER_USEC / d[7] : 0),
+-	    (unsigned long long)d[9], SWEET_FB_TE_MAX_MS, (unsigned long long)d[10], (unsigned long long)d[11],
+-	    SWEET_FB_TE_LATE_US);
++	    (unsigned long long)d[9], (unsigned long long)d[10], (unsigned long long)d[11], SWEET_FB_TE_LATE_US);
+ }
+ 
+ 
+@@ -1776,6 +1854,7 @@ AppleCLCD::kickOne(void)
+ 	}
+ 	sweet_fb_hs(false);             /* A34 (0937): the frame is over */
+ 	sweet_fb_hs_say(xfer);
++	sweet_fb_con_check(xfer);       /* A34 (0939) */
+ 	if (fTE) {
+ 		a34_dsi_wr(SWEET_FB_DSI_INTSTA, ~SWEET_FB_TE_RDY);      /* A34 (0938): see teWait() */
+ 	}

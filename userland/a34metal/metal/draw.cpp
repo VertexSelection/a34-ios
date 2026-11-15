@@ -15,44 +15,82 @@ static_assert(RWM_MAX_BUFFERS <= 32, "the stream mask is 32 bits");
  * smaller copies, CoreAnimation's pyramid), the texel at the centre of that level and of the first, after the draw
  * (waits for the GPU: those draws are slow). Lines "blurdump:".
  */
+static long blur_dumps_left = -1;
+
+extern "C" bool
+rwm_blurdump_on(void)
+{
+	if (blur_dumps_left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_blurdump=");
+
+		blur_dumps_left = at != nullptr ? atol(at + 13) : 0;
+	}
+	return blur_dumps_left > 0;
+}
+
+/* " WxH bytes" of the texel at the centre of `level` (and `slice`) of a texture, appended to `line` */
+static size_t
+probe_into(char *line, size_t used, size_t size, struct rwa_texture *texture, unsigned level, unsigned slice)
+{
+	uint8_t texel[16] = {};
+	unsigned w = 0, h = 0;
+	char why[120] = {};
+	int bytes = rwm_air()->texture_probe(texture, level, slice, texel, &w, &h, why, sizeof(why));
+
+	if (bytes <= 0) {
+		return used + (size_t)snprintf(line + used, size - used, " (%s)", why);
+	}
+	used += (size_t)snprintf(line + used, size - used, " %ux%u", w, h);
+	for (int b = 0; b < bytes && b < 8 && used < size - 4; b++) {
+		used += (size_t)snprintf(line + used, size - used, "%s%02x", b == 0 ? " " : "", texel[b]);
+	}
+	return used;
+}
+
+extern "C" void
+rwm_blurdump_used(void)
+{
+	if (blur_dumps_left > 0) {
+		blur_dumps_left--;
+	}
+}
+
 static void
 blur_dump(const struct rwm_draw *d)
 {
-	static long left = -1;
+	const unsigned level = d->color_levels ? d->color_level[0] : 0;
 
-	if (left < 0) {
-		const char *at = strstr(rwm_boot_args(), "rwm_blurdump=");
-
-		left = at != nullptr ? atol(at + 13) : 0;
-	}
-	if (left <= 0 || d->color_count == 0 || !d->color_levels || d->color_level[0] == 0 || d->color[0] == nullptr ||
+	/* a draw into a level below the first (a pyramid), or one of a blur's or a material's pipelines (any target) */
+	if (!rwm_blurdump_on() || d->color_count == 0 || d->color[0] == nullptr || (level == 0 && d->probe[0] == '\0') ||
 	    rwm_air()->texture_probe == nullptr) {
 		return;
 	}
-	left--;
+	blur_dumps_left--;
 
-	char line[256];
+	char line[400];
 	size_t used = 0;
-	const unsigned levels[2] = { d->color_level[0], 0 };
 
-	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: a pass into level %u (attachments %u):",
-				 d->color_level[0], d->color_count);
-	for (unsigned k = 0; k < 2 && used < sizeof(line) - 64; k++) {
-		uint8_t texel[16] = {};
-		unsigned w = 0, h = 0;
-		char why[160] = {};
-		int bytes = rwm_air()->texture_probe(d->color[0], levels[k], d->color_slice[0], texel, &w, &h, why,
-						     sizeof(why));
-
-		if (bytes <= 0) {
-			used += (size_t)snprintf(line + used, sizeof(line) - used, " level %u: %s;", levels[k], why);
+	/* what it drew: the centre of every attachment (the second is CoreAnimation's clip mask) */
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "blurdump: %s into level %u:", d->probe[0] ? d->probe
+												: "a pass", level);
+	for (unsigned i = 0; i < d->color_count && i < 3 && used < sizeof(line) - 80; i++) {
+		if (d->color[i] == nullptr) {
 			continue;
 		}
-		used += (size_t)snprintf(line + used, sizeof(line) - used, " level %u (%ux%u) centre", levels[k], w, h);
-		for (int b = 0; b < bytes && b < 8 && used < sizeof(line) - 4; b++) {
-			used += (size_t)snprintf(line + used, sizeof(line) - used, " %02x", texel[b]);
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s a%u", i ? ";" : "", i);
+		used = probe_into(line, used, sizeof(line), d->color[i], d->color_levels ? d->color_level[i] : 0,
+				  d->color_levels ? d->color_slice[i] : 0);
+	}
+	rwm_print("%s\n", line);
+
+	/* and what it read: the centre of level 0 of every texture bound for the fragment stage */
+	used = (size_t)snprintf(line, sizeof(line), "blurdump:   reads");
+	for (unsigned i = 0, n = 0; i < d->texture_count && i < RWM_MAX_BUFFERS && n < 6 && used < sizeof(line) - 80; i++) {
+		if (d->textures[i] == nullptr) {
+			continue;
 		}
-		used += (size_t)snprintf(line + used, sizeof(line) - used, ";");
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s t%u", n++ ? ";" : "", i);
+		used = probe_into(line, used, sizeof(line), d->textures[i], 0, 0);
 	}
 	rwm_print("%s\n", line);
 }

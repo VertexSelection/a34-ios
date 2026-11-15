@@ -243,6 +243,7 @@ struct rwm_draw {
 	bool color_levels;                         /* ... given (rwm_levels=0: not) */
 	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action */
 	float clear_colors[8][4];
+	char probe[64];                            /* (metal-fx) rwm_blurdump: the pipeline, when one to probe */
 	const float *clear_color;       /* NULL: kept, not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -369,6 +370,7 @@ struct rwm_render_state {
 	float clear_color[4], clear_depth;
 	unsigned clear_stencil;
 	bool clears, clears_depth, clears_stencil;
+	char probe[64];                 /* (metal-fx, rwm_blurdump) the pipeline's label when it is a blur's or a material's */
 	void *pipeline;
 	struct rwa_render *render;
 	unsigned stream_mask, stream_count;
@@ -393,6 +395,11 @@ struct rwm_render_state {
  * store action 2 or 3 or a resolve texture is said and not done), the depth and stencil attachments (one texture
  * carries both aspects; two different ones: said, neither) */
 void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device);
+/* (metal-fx) rwm_blurdump=N: whether it is on, and the label of the pipeline just set (kept when it is a blur's or a
+ * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
+bool rwm_blurdump_on(void);
+void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */
+void rwm_render_set_label(struct rwm_render_state *state, const char *label);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,
 		      bool clears, const double color[4], unsigned long store_action, bool resolve_texture,
 		      unsigned long level, unsigned long slice);

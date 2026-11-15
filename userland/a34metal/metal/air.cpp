@@ -7,6 +7,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mutex>
 
 namespace {
@@ -42,6 +43,24 @@ load()
 	/* (metal-fx) boot-arg rwm_area=strict: attachments of different sizes refused by the library, as before */
 	if (rwm_boot_arg("rwm_area=strict")) {
 		setenv("RWA_RENDER_AREA", "strict", 1);
+	}
+	/* (metal-fx) boot-arg rwm_pandebug=FLAGS: Mesa's PAN_MESA_DEBUG for the driver's own screen, before it is made
+	 * (sync: every job waited for -- whether the blur's black is a read before the write; nocrc, noafbc, linear) */
+	if (const char *at = strstr(rwm_boot_args(), "rwm_pandebug=")) {
+		char flags[64];
+		size_t n = strcspn(at + 13, " ");
+
+		if (n > 0 && n < sizeof(flags)) {
+			memcpy(flags, at + 13, n);
+			flags[n] = '\0';
+			setenv("PAN_MESA_DEBUG", flags, 1);
+			rwm_print("PAN_MESA_DEBUG=%s (rwm_pandebug)\n", flags);
+		}
+	}
+	/* boot-arg rwm_rebind=all: every state set for every draw and the framebuffer let go after
+	 * each, as before the library kept what was bound (air_metal.c, bind_framebuffer) */
+	if (rwm_boot_arg("rwm_rebind=all")) {
+		setenv("RWA_REBIND_ALL", "1", 1);
 	}
 	struct rwm_air &c = calls;
 	const Call table[] = {

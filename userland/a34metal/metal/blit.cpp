@@ -41,10 +41,31 @@ rwm_run_blit(const struct rwm_blit *blit, char *why, size_t why_size)
 		return -1;
 	}
 	switch (blit->kind) {
-	case RWM_BLIT_TEXTURE_TO_TEXTURE:
-		return air->texture_copy(blit->to_texture, blit->to_level, blit->to_slice, blit->to_origin,
-					 blit->from_texture, blit->from_level, blit->from_slice, blit->from_origin,
-					 blit->size, why, why_size) == 0 ? 0 : -1;
+	case RWM_BLIT_TEXTURE_TO_TEXTURE: {
+		const int done = air->texture_copy(blit->to_texture, blit->to_level, blit->to_slice, blit->to_origin,
+						   blit->from_texture, blit->from_level, blit->from_slice,
+						   blit->from_origin, blit->size, why, why_size) == 0 ? 0 : -1;
+
+		/* (metal-fx) rwm_blurdump: the copies too -- a backdrop may be captured by one -- with the texel at the
+		 * centre of what was copied, in the source and in the destination */
+		if (done == 0 && rwm_blurdump_on() && air->texture_probe != nullptr) {
+			uint8_t a[16] = {}, b[16] = {};
+			unsigned w = 0, h = 0;
+			char ignored[64];
+
+			rwm_blurdump_used();
+			air->texture_probe(blit->from_texture, blit->from_level, blit->from_slice, a, &w, &h, ignored,
+					   sizeof(ignored));
+			air->texture_probe(blit->to_texture, blit->to_level, blit->to_slice, b, &w, &h, ignored,
+					   sizeof(ignored));
+			rwm_print("blurdump: a copy of %ux%u from (%u, %u) level %u to (%u, %u) level %u of a %ux%u "
+				  "texture; the source's centre %02x%02x%02x%02x, the destination's %02x%02x%02x%02x\n",
+				  blit->size[0], blit->size[1], blit->from_origin[0], blit->from_origin[1], blit->from_level,
+				  blit->to_origin[0], blit->to_origin[1], blit->to_level, w, h, a[0], a[1], a[2], a[3], b[0],
+				  b[1], b[2], b[3]);
+		}
+		return done;
+	}
 	case RWM_BLIT_BUFFER_TO_BUFFER:
 		return air->buffer_copy(blit->to_buffer, blit->to_offset, blit->from_buffer, blit->from_offset,
 					blit->bytes, why, why_size) == 0 ? 0 : -1;
