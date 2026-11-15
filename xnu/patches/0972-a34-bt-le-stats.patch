@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 9b8511f..865c8af 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -1194,10 +1194,12 @@ br_drain(void)
+  */
+ static struct {
+ 	uint32_t reports, apple, proximity, start_ms;
++	bool started;
+ 	uint32_t addrs[48], naddrs, apple_addrs[16], napple;
+ 	int best_rssi;
+ 	uint8_t model[2];
+ 	int model_rssi;
++	uint16_t apple_type[32];        /* (0972) Apple's TLV types heard: 0x07 proximity pairing, 0x10 nearby, 0x12 Find My ... */
+ } br_le;
+ 
+ static void
+@@ -1225,6 +1227,15 @@ br_le_one(const uint8_t *addr, const uint8_t *data, uint32_t len, int rssi)
+ 		}
+ 		if (data[at + 1] == 0xff && l >= 3 && data[at + 2] == 0x4c && data[at + 3] == 0x00) {
+ 			apple = true;
++			/* (0972) every TLV of Apple's data: type, length, value */
++			for (uint32_t t = at + 4; t + 1 < at + 1 + l; t += 2u + data[t + 1]) {
++				if (data[t] < 32 && br_le.apple_type[data[t]] < 0xffff) {
++					br_le.apple_type[data[t]]++;
++				}
++				if (data[t] == 0x07 && t != at + 4 && t + 4 < at + 1 + l) {    /* proximity pairing, not first */
++					br_le.proximity++;
++				}
++			}
+ 			if (l >= 8 && data[at + 4] == 0x07) {                   /* proximity pairing: 07 len prefix model(2) ... */
+ 				br_le.proximity++;
+ 				if (rssi != 127 && (br_le.model_rssi == 0 || rssi > br_le.model_rssi)) {
+@@ -1279,17 +1290,30 @@ br_le_heard(const uint8_t *p, uint32_t n)
+ 			at += 24 + dl;
+ 		}
+ 	}
+-	if (br_le.start_ms == 0) {
+-		br_le.start_ms = bt_ms() | 1;
++	if (!br_le.started) {                                           /* (0972: was "| 1", a start 1 ms ahead) */
++		br_le.started = true;
++		br_le.start_ms = bt_ms();
+ 	}
+ }
+ 
+ static void
+ br_le_say(void)
+ {
+-	if (br_le.start_ms == 0 || bt_ms() - br_le.start_ms < 10000) {
++	char types[200];
++	size_t used = 0;
++
++	if (!br_le.started || bt_ms() - br_le.start_ms < 10000) {
+ 		return;
+ 	}
++	types[0] = 0;
++	for (unsigned t = 0; t < 32; t++) {
++		if (br_le.apple_type[t] != 0 && used < sizeof(types) - 12) {
++			used += (size_t)snprintf(types + used, sizeof(types) - used, " %02x:%u", t, br_le.apple_type[t]);
++		}
++	}
++	if (br_le.apple != 0) {
++		printf("A34 BT: LE Apple types (type:count, 07 = proximity pairing):%s\n", types);
++	}
+ 	printf("A34 BT: LE heard in %u s: %u reports from %u devices (best %d dBm); Apple: %u reports from %u devices; "
+ 	    "proximity pairing (AirPods/Beats): %u%s",
+ 	    (bt_ms() - br_le.start_ms) / 1000, br_le.reports, br_le.naddrs, br_le.best_rssi, br_le.apple, br_le.napple,

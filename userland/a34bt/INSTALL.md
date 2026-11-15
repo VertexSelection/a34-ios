@@ -111,3 +111,36 @@ What to look for (`grep -a 'A34 BT\|a34bt' log`):
 Then Settings > Bluetooth: the switch should be on and show the phone as discoverable. If bluetoothd
 keeps restarting (`exec bluetoothd` again and again), the last `br>` before each restart is the command it
 gave up on: that is the next thing to answer.
+
+## 6. bluetoothd past BlueTool (0972, `a34bt-btd`)
+
+Boot 0980-btmetal-a: everything of 0971 was there, but bluetoothd never opened it. Its start
+(bluetoothd 20H392, read in the binary): address and registry checks pass; then it has BlueTool boot
+the chip -- `{kMsgId: RunBuiltinScript, kMsgArgs: {script: boot, btaddress}}` to `com.apple.BlueTool`,
+synchronously (`+0x272034`). BlueTool's job was never started (no `exec` of it or of
+`a34bt-bluetool`), the reply was an XPC error, which bluetoothd counts as "Init failed, still in high
+power result=1", and it `_exit`ed (`+0x3a6128`) and was restarted: 15 times.
+
+Now BlueTool is answered inside bluetoothd: its job runs `a34bt-btd`, which execs the real
+bluetoothd with `liba34bt-btd.dylib` inserted (every message to `com.apple.BlueTool` answered there:
+result 0) and with its stderr and os_log on the console, so the next wall, if any, is in the log.
+
+    sudo python3 -I tools/root-add-job.py --copy /mnt /a34 a34
+    sudo python3 -I tools/root-add-job.py --wrap /mnt com.apple.bluetoothd /a34/a34bt-btd
+
+(`--unwrap /mnt com.apple.bluetoothd` undoes it. The BlueTool wrap of section 5 may stay. The
+files `/a34/bluetoothd.quiet` (no os_log on the console) and `/a34/bluetoothd.nolib` (no library) are
+switches.) Kernel: main with 0972 (LE counts every 10 s fixed; Apple advert types counted), `a34bt=2`.
+
+In the log:
+
+    a34bt-btd[N]: exec /usr/sbin/bluetoothd (os_log on stderr: yes, /a34/liba34bt-btd.dylib)
+    a34bt-btd: bluetoothd[N]: liba34bt-btd loaded: BlueTool answered here, exits said
+    ...Bluetooth Super Server Robot Destroyer...            (bluetoothd's own stderr)
+    a34bt-btd: bluetoothd[N]: connects to com.apple.BlueTool ...
+    a34bt-btd: bluetoothd[N]: com.apple.BlueTool asked { ... boot ... }: answered here
+    HCI Transport is set to H4BC                            (its os_log)
+    A34 BT: br: com.apple.uart.sk.bluetooth connected by bluetoothd[N]
+    A34 BT: br> / br< / br= ...
+    a34bt-btd: bluetoothd[N]: _exit(1) from bluetoothd+0x... (if it still restarts: where from)
+    A34 BT: LE Apple types (type:count, 07 = proximity pairing): 07:.. 10:.. 12:..
