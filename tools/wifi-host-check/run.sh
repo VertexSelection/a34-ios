@@ -32,7 +32,7 @@ cp "$TMP/tree/bsd/dev/a34_wifi.c" "$TMP/tree/bsd/dev/a34_connsys.c" "$TMP/"
 echo "a34_wifi.c: $(wc -l <"$TMP/a34_wifi.c") lines, a34_connsys.c: $(wc -l <"$TMP/a34_connsys.c") lines"
 cp "$HERE/ruby_hal.h" "$TMP/"
 # the XNU headers it includes, each standing for xnu_mock.h (ahead of the host's own on the -I path)
-for h in sys/param.h sys/systm.h sys/errno.h sys/sysctl.h sys/vnode.h sys/vnode_internal.h sys/uio.h \
+for h in sys/param.h sys/systm.h sys/errno.h sys/sysctl.h sys/vnode.h sys/vnode_internal.h sys/uio.h sys/random.h \
 	kern/locks.h kern/clock.h kern/kalloc.h kern/thread.h kern/sched_prim.h machine/machine_routines.h \
 	pexpert/pexpert.h libkern/libkern.h; do
 	mkdir -p "$TMP/inc/$(dirname "$h")"

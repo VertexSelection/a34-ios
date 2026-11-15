@@ -57,6 +57,7 @@ extern wait_result_t lck_mtx_sleep(lck_mtx_t *, lck_sleep_action_t, event_t, wai
 extern void thread_wakeup(event_t);
 extern int PE_parse_boot_argn(const char *, void *, int);
 extern void *kalloc_data(size_t, int);
+extern void read_random(void *, unsigned int);        /* bsd/sys/random.h */
 extern void kfree_data(void *, size_t);
 #define Z_WAITOK 0
 #define Z_ZERO 0

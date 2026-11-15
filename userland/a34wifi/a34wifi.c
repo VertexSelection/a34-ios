@@ -21,6 +21,12 @@
  *   7  (M2) one scan: the station's BSS activated, a scan request, beacons and probe responses
  *      collected until SCAN_DONE: one line per network heard (BSSID, channel, RSSI, SSID)
  *
+ * The phone's Wi-Fi address (0963): /a34/wifi/mac, one line "xx:xx:xx:xx:xx:xx". The chip's
+ * efuse has none and Samsung's is in /efs, which nothing here reads; so this tool makes one
+ * the first time it is needed -- random, locally administered, unicast -- and keeps it, so
+ * that every phone has its own and keeps it from boot to boot. Step 6 reads it. Delete the
+ * file to get a new one.
+ *
  * Usage (as root):
  *   a34wifi                 the state and the kernel's Wi-Fi log
  *   a34wifi up N [SECONDS]  ask for steps up to N, then follow the log until the kernel is
@@ -28,6 +34,8 @@
  *   a34wifi scan            once step 7 is done: scan again (kern.a34wifi.rescan), and follow
  *   a34wifi log             the kernel's Wi-Fi log only
  *   a34wifi files           the firmware files in /a34/wifi: present, sizes, what they say
+ *   a34wifi mac             the phone's Wi-Fi address, made and kept first if there is none
+ *                           ("up" does that too, before it asks the kernel for anything)
  *
  * Output goes to stdout; as a launchd job (tools/root-add-job.py) that is /dev/console, so it
  * lands in the kernel's persistent log too (tools/pull-log.sh).
@@ -44,6 +52,7 @@
 #include <unistd.h>
 
 #define A34WIFI_DIR     "/a34/wifi"
+#define MAC_FILE        A34WIFI_DIR "/mac"
 #define LOG_MAX         (16 * 1024)
 
 static int
@@ -120,12 +129,78 @@ follow(size_t *printed)
 
 static int ask(const char *name, int value, int step, int seconds);
 
+/* ---- the phone's own Wi-Fi address (0963) ---- */
+
+/* one line "xx:xx:xx:xx:xx:xx" with a locally administered unicast address, as the kernel reads it */
+static int
+mac_parse(const char *text, uint8_t mac[6])
+{
+	unsigned v[6];
+	char rest[8] = "";
+	int n = sscanf(text, " %2x:%2x:%2x:%2x:%2x:%2x %7s", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], rest);
+
+	if (n != 6) {
+		return -1;
+	}
+	for (int i = 0; i < 6; i++) {
+		mac[i] = (uint8_t)v[i];
+	}
+	return (mac[0] & 3) == 2 ? 0 : -1;
+}
+
+/* says the kept address; makes and keeps a new one if there is no file. 0: there is one now */
+static int
+keep_mac(void)
+{
+	char text[65], line[32];
+	uint8_t mac[6];
+	ssize_t got;
+	int fd = open(MAC_FILE, O_RDONLY);
+
+	if (fd >= 0) {
+		got = read(fd, text, sizeof(text) - 1);
+		close(fd);
+		text[got > 0 ? got : 0] = '\0';
+		if (got > 0 && got < (ssize_t)sizeof(text) - 1 && mac_parse(text, mac) == 0) {
+			printf("a34wifi: Wi-Fi address %02x:%02x:%02x:%02x:%02x:%02x (kept in %s)\n", mac[0], mac[1], mac[2],
+			    mac[3], mac[4], mac[5], MAC_FILE);
+			return 0;
+		}
+		printf("a34wifi: %s is not one line \"xx:xx:xx:xx:xx:xx\" with a locally administered unicast address; "
+		    "the kernel will not use it (delete it and run 'a34wifi mac' for a new one)\n", MAC_FILE);
+		return 1;
+	}
+	if (errno != ENOENT) {
+		printf("a34wifi: %s: %s\n", MAC_FILE, strerror(errno));
+		return 1;
+	}
+	arc4random_buf(mac, sizeof(mac));
+	mac[0] = (uint8_t)((mac[0] & 0xfc) | 0x02);     /* locally administered, unicast */
+	snprintf(line, sizeof(line), "%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	fd = open(MAC_FILE, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd < 0 || write(fd, line, strlen(line)) != (ssize_t)strlen(line) || fsync(fd) != 0) {
+		printf("a34wifi: %s not written: %s (the kernel will use a random address for this boot)\n", MAC_FILE,
+		    strerror(errno));
+		if (fd >= 0) {
+			close(fd);
+			unlink(MAC_FILE);
+		}
+		return 1;
+	}
+	close(fd);
+	printf("a34wifi: new Wi-Fi address %.17s, kept in %s from now on\n", line, MAC_FILE);
+	return 0;
+}
+
 static int
 up(int step, int seconds)
 {
 	if (step < 1 || step > 9) {
 		fprintf(stderr, "a34wifi: step %d: 1 to 9\n", step);
 		return 2;
+	}
+	if (step >= 6) {
+		(void)keep_mac();       /* step 6 reads it; without it the kernel uses a random one for this boot */
 	}
 	return ask("kern.a34wifi.want", step, step, seconds);
 }
@@ -280,6 +355,9 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "files") == 0) {
 		return files();
 	}
-	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files]\n");
+	if (strcmp(argv[1], "mac") == 0) {
+		return keep_mac();
+	}
+	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files | mac]\n");
 	return 2;
 }

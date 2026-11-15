@@ -6,9 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "xnu_mock.h"
 
-static const char *fw_dir;
+static const char *fw_dir, *mac_path;     /* (0963) /a34/wifi/mac is mac_path */
 vnode_t rootvnode = (vnode_t)1;
 struct vnode { char path[512]; };
 vfs_context_t vfs_context_kernel(void) { return NULL; }
@@ -19,7 +20,8 @@ int vnode_lookup(const char *path, int f, vnode_t *vp, vfs_context_t c)
 	(void)f; (void)c;
 	const char *base = strrchr(path, '/');
 	struct vnode *v = calloc(1, sizeof(*v));
-	snprintf(v->path, sizeof(v->path), "%s%s", fw_dir, base);
+	if (strcmp(base, "/mac") == 0) snprintf(v->path, sizeof(v->path), "%s", mac_path);
+	else snprintf(v->path, sizeof(v->path), "%s%s", fw_dir, base);
 	struct stat st;
 	if (stat(v->path, &st) != 0) { free(v); return ENOENT; }
 	*vp = v;
@@ -35,6 +37,7 @@ int vn_rdwr(enum uio_rw rw, vnode_t v, caddr_t base, int len, long long off, enu
 }
 void *kalloc_data(size_t n, int fl) { (void)fl; return malloc(n); }
 void kfree_data(void *p, size_t n) { (void)n; free(p); }
+void read_random(void *p, unsigned int n) { for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0x5d + 13 * i); }
 void delay(int us) { (void)us; }
 void delay_for_interval(uint32_t a, uint32_t b) { (void)a; (void)b; }
 static uint64_t now;
@@ -163,6 +166,44 @@ int main(int argc, char **argv)
 		    a34w_heard[0].channel != 6 || strcmp(a34w_heard[0].ssid, "hello") != 0;
 	}
 	printf("milestone 2 paths: %s\n", bad ? "WRONG" : "ok");
+
+	/* ---- 0963: the phone's own address, /a34/wifi/mac ---- */
+	{
+		static const struct { const char *text; const char *want; bool efuse; } cases[] = {
+			{ NULL, "5e:6a:77:84:91:9e", false },                   /* no file: random (read_random), made local */
+			{ NULL, "00:11:22:33:44:55", true },                    /* no file, an efuse address: the chip's */
+			{ "06:a1:b2:c3:d4:e5\n", "06:a1:b2:c3:d4:e5", true },   /* the kept one wins */
+			{ "  0a-1b-2c-3d-4e-5f \r\n", "0a:1b:2c:3d:4e:5f", false },
+			{ "03:11:22:33:44:55\n", "5e:6a:77:84:91:9e", false },   /* multicast and local: refused */
+			{ "04:11:22:33:44:55\n", "00:11:22:33:44:55", true },    /* not locally administered: refused */
+			{ "06:11:22:33:44:5\n", "5e:6a:77:84:91:9e", false },    /* short */
+			{ "06:11:22:33:44:55 x\n", "5e:6a:77:84:91:9e", false }, /* more on the line */
+		};
+		static const uint8_t efuse[6] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+		char path[600], got[24];
+		int failed = 0;
+
+		snprintf(path, sizeof(path), "/tmp/a34wifi-host-check-mac-%d", (int)getpid());
+		mac_path = path;
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			const char *source;
+
+			unlink(path);
+			if (cases[i].text != NULL) {
+				FILE *mf = fopen(path, "w"); fputs(cases[i].text, mf); fclose(mf);
+			}
+			source = a34w_mac_choose(cases[i].efuse ? efuse : NULL);
+			snprintf(got, sizeof(got), "%02x:%02x:%02x:%02x:%02x:%02x", a34w_mac[0], a34w_mac[1], a34w_mac[2], a34w_mac[3],
+			    a34w_mac[4], a34w_mac[5]);
+			if (strcmp(got, cases[i].want) != 0) {
+				printf("MAC case %zu: %s (%s), wanted %s\n", i, got, source, cases[i].want);
+				failed = 1;
+			}
+		}
+		unlink(path);
+		printf("0963 kept MAC address: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
 	printf("log:\n%s", a34w_log);
 	return bad;
 }
