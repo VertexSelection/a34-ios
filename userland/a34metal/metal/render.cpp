@@ -493,6 +493,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 	d->instance_count = (unsigned)call->instances;
 	d->base_instance = (unsigned)call->base_instance;
 	loaded(s);
+	s->last_draw = w;
 	return true;
 }
 
@@ -500,6 +501,13 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 extern "C" bool
 rwm_render_end(struct rwm_render_state *s, struct rwm_work *w)
 {
+	/* A34: the store actions as they are at -endEncoding -- CoreAnimation sets them there
+	 * (-setColorStoreAction:atIndex:, after an Unknown in the descriptor), after every draw was recorded -- given
+	 * to the pass's last draw, whose mask the library applies when the pass ends */
+	if (s->last_draw != nullptr && s->last_draw->kind == RWM_WORK_DRAW) {
+		s->last_draw->draw.store_dontcare_mask = s->store_dontcare_mask;
+	}
+	s->last_draw = nullptr;
 	if (!s->clears && !s->clears_depth && !s->clears_stencil && s->clear_mask == 0) {
 		return false;
 	}

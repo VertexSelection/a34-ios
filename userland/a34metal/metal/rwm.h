@@ -407,6 +407,7 @@ struct rwm_render_state {
 	/* A34: the attachments whose load action is DontCare (until the first draw) and whose store action is
 	 * (RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL for the depth/stencil aspects) -- rwm_render_actions */
 	unsigned load_dontcare_mask, store_dontcare_mask;
+	struct rwm_work *last_draw;     /* A34: the pass's last draw recorded: -endEncoding gives it the store actions */
 	char probe[64];                 /* (metal-fx, rwm_blurdump) the pipeline's label when it is a blur's or a material's */
 	char label[64];                 /* (metal-fx, rwm_framedump) the pipeline's label, whatever it is */
 	void *pipeline;
