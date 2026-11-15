@@ -1,0 +1,290 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 35ee667..539996a 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -97,6 +97,7 @@ struct a34_mali_job {
+ 	uint32_t job_raw;               /* out: JOB_INT_RAWSTAT bits of the slot (0: no answer) */
+ 	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
+ 	uint32_t pad;
++	uint64_t started;               /* out, A34 (0992): mach time of JS_COMMAND_START */
+ };
+ bool a34_mali_ready(void);
+ bool a34_mali_param(uint32_t param, uint64_t *value);
+@@ -1564,6 +1565,7 @@ a34_mali_submit(struct a34_mali_job *job)
+ 	uint64_t start;
+ 
+ 	job->ns = 0;
++	job->started = 0;
+ 	job->js_status = 0;
+ 	job->fault_va = 0;
+ 	job->mmu_raw = 0;
+@@ -1605,6 +1607,7 @@ a34_mali_submit(struct a34_mali_job *job)
+ 		am_wr(am_gpu, base + JS_CONFIG_NEXT, JS_CONFIG_AS0);
+ 	}
+ 	start = mach_absolute_time();
++	job->started = start;           /* A34 (0992) */
+ 	am_wr(am_gpu, base + JS_COMMAND_NEXT, JS_COMMAND_START);
+ 	raw = am_wait_job(want, &mmu);
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &job->ns);
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 80929a8..f4a3e7b 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -172,6 +172,7 @@ struct a34_mali_job {
+ 	uint32_t job_raw;               /* out: JOB_INT_RAWSTAT bits of the slot (0: no answer) */
+ 	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
+ 	uint32_t pad;
++	uint64_t started;               /* out, A34 (0992): mach time of JS_COMMAND_START */
+ };
+ 
+ extern "C" {
+@@ -219,6 +220,7 @@ enum {
+ 	kA34MaliWaitSeq         = 0x7b,         /* A34 (0919): ours, wait for this client's queued jobs */
+ 	kA34SurfaceSeq          = 0x7c,         /* A34 (0935): HackiOS's, a surface drawn on a driver's own thread, not yet sent */
+ 	kA34MaliSubmitBatch     = 0x7d,         /* A34 (0987): ours, several SUBMITs queued in one call, in their order */
++	kA34MaliTraceJobs       = 0x79,         /* A34 (0992): ours, log these jobs of this client (a34malijobtrace=1) */
+ 	kA34RedwoodSurface      = 0x7e,         /* A34 (0914): ios-topaz's, an IOSurface's memory as a buffer */
+ };
+ 
+@@ -349,6 +351,19 @@ struct a34_submit_batch {
+ };
+ static_assert(sizeof(struct a34_submit_batch) == 24, "SUBMIT_BATCH is 24 bytes");
+ 
++/*
++ * A34 (0992): request 0x79, TRACE_JOBS (boot-arg a34malijobtrace=1, else
++ * kIOReturnUnsupported): the client's jobs first_seq .. first_seq + count - 1
++ * (its own numbers, as SUBMIT gives them; count 1..A34_TRACE_MAX) logged, an
++ * "A34 MALI JOB" line each, those done already at once, the others as they
++ * end. 16 bytes in, nothing out.
++ */
++struct a34_trace_jobs {
++	uint64_t first_seq;
++	uint32_t count, pad;
++};
++static_assert(sizeof(struct a34_trace_jobs) == 16, "TRACE_JOBS is 16 bytes");
++
+ /*
+  * A34 (0935, from the Metal agent's research/metal/kernel/a34metal-kernel.patch):
+  * request 0x7c, HackiOS's kRedwoodSurfaceSeq (their RedwoodMali.cpp, MIT), for
+@@ -384,6 +399,7 @@ union a34_request {
+ 	struct a34_wait_seq waitseq;
+ 	struct a34_surface_seq sseq;    /* A34 (0935) */
+ 	struct a34_submit_batch batch;  /* A34 (0987) */
++	struct a34_trace_jobs trace;    /* A34 (0992) */
+ 	uint8_t raw[64];                /* the largest: struct drm_version */
+ };
+ 
+@@ -504,6 +520,33 @@ static bool gA34MaliDdrOn;
+ #define A34_GPU_WINDOW_NS       (10ull * NSEC_PER_SEC)
+ #define A34_DDR_IDLE_MS         500u
+ 
++/*
++ * A34 (0992): a34malijobtrace=1. Each job's times kept in a ring (with
++ * gA34MaliLock, runChain()): when it was queued, started on the GPU
++ * (JS_COMMAND_START) and seen done (am_wait_job(): read every microsecond
++ * for the first a34malispin us of a job, then every 100 us), the client and
++ * its number for the job. Every A34_TRACE_EVERY_NS the jobs that started in
++ * the last A34_TRACE_FRAME_NS (a 60 Hz frame) are logged, and request 0x79
++ * logs the ones a client names. Nothing is kept or logged without the
++ * boot-arg.
++ */
++struct a34_jobrec {
++	const void *client;
++	uint64_t queued, start, end;    /* mach time; queued 0: a synchronous SUBMIT */
++	uint64_t seq, gseq;             /* the client's number for it (0: synchronous), the place in every client's order */
++	uint32_t upkeepUs, ahead;       /* cache upkeep around it; jobs ahead of it when queued */
++	uint8_t fs, failed;
++	char name[18];
++};
++#define A34_JOBRING             256u
++#define A34_TRACE_MAX           128u
++#define A34_TRACE_EVERY_NS      (10ull * NSEC_PER_SEC)
++#define A34_TRACE_FRAME_NS      16667000ull     /* (ns) */
++static uint32_t gA34MaliJobTrace;
++static struct a34_jobrec *gA34JobRing;
++static uint32_t gA34JobN;                       /* jobs recorded; the newest is (gA34JobN - 1) % A34_JOBRING */
++static uint64_t gA34JobDumpAt;
++
+ /*
+  * A34 (0919): queued jobs.
+  *
+@@ -790,6 +833,15 @@ RedwoodMaliStart(void)
+ 	(void)PE_parse_boot_argn("a34malipair", &gA34MaliPair, sizeof(gA34MaliPair));    /* A34 (0985) */
+ 	(void)PE_parse_boot_argn("a34malikeep", &gA34MaliKeep, sizeof(gA34MaliKeep));    /* A34 (0986) */
+ 	(void)PE_parse_boot_argn("a34ddrboost", &gA34MaliDdrBoost, sizeof(gA34MaliDdrBoost));    /* A34 (0991) */
++	(void)PE_parse_boot_argn("a34malijobtrace", &gA34MaliJobTrace, sizeof(gA34MaliJobTrace));        /* A34 (0992) */
++	if (gA34MaliJobTrace != 0 && gA34JobRing == NULL) {
++		gA34JobRing = IONewZero(struct a34_jobrec, A34_JOBRING);
++		if (gA34JobRing == NULL) {
++			gA34MaliJobTrace = 0;
++		}
++		IOLog("A34 MALI UC: a34malijobtrace: %s\n", gA34JobRing != NULL ? "every GPU job's times kept; the jobs of one "
++		    "frame logged every 10 s, and those request 0x79 names" : "no memory for it: off");
++	}
+ 	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
+ 		/* A34 (0919): the queue and the thread that runs it */
+ 		IOLock *qlock = IOLockAlloc();
+@@ -979,6 +1031,8 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	/* A34 (0986), with gA34MaliQLock: surface buffers kept after GEM_CLOSE, their bytes; imports served from them */
+ 	uint32_t fKept, fKeptHits, fImportsSlow;
+ 	uint32_t fWinBatchJobs;                 /* A34 (0987): jobs queued by SUBMIT_BATCH in the window */
++	uint64_t fTraceFirst, fTraceLast;       /* A34 (0992), with gA34MaliLock: request 0x79's jobs (0: none) */
++	uint64_t fTraceT0;                      /* ... the first one's start, the lines' zero */
+ 	uint64_t fKeptBytes, fImportTicks;
+ 	/* A34 (0985), counted by the caller's thread (atomics): the window's queued SUBMITs and WAIT_SEQs in the kernel */
+ 	uint32_t fWinSubmitN, fWinWaitN;
+@@ -1002,6 +1056,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	IOReturn queueRoomLocked(uint32_t count);
+ 	void queueOneLocked(struct a34_qjob *j);
+ 	void scanWait(const struct a34_qjob *j);
++	void jobRecord(const struct a34_mali_job *job, const struct a34_qjob *q, uint64_t upkeepTicks, bool done);
+ 	IOReturn setMode(struct a34_set_mode *req);
+ 	IOReturn waitSeq(struct a34_wait_seq *req);
+ 	IOReturn requestQueued(uint32_t selector, union a34_request *r);
+@@ -1373,6 +1428,95 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 	}
+ }
+ 
++/* A34 (0992), with the lock held: one ring record as an "A34 MALI JOB" line, times from t0. */
++static void
++a34_job_say(const struct a34_jobrec *r, uint64_t t0, const char *why)
++{
++	uint64_t start, len, wait = 0;
++
++	absolutetime_to_nanoseconds(r->start > t0 ? r->start - t0 : 0, &start);
++	absolutetime_to_nanoseconds(r->end > r->start ? r->end - r->start : 0, &len);
++	if (r->queued != 0 && r->start > r->queued) {
++		absolutetime_to_nanoseconds(r->start - r->queued, &wait);
++	}
++	IOLog("A34 MALI JOB: %s %s #%llu (g%llu) %s: start +%llu us, %llu us on the GPU, %llu us queued (%u ahead), "
++	    "upkeep %u us%s\n", why, r->name, (unsigned long long)r->seq, (unsigned long long)r->gseq,
++	    r->fs ? "fragment" : "vertex/tiler", (unsigned long long)(start / 1000), (unsigned long long)(len / 1000),
++	    (unsigned long long)(wait / 1000), r->ahead, r->upkeepUs, r->failed ? ", FAILED" : "");
++}
++
++/*
++ * A34 (0992), with the lock held: the job just run into the ring; logged at
++ * once when request 0x79 named it; every A34_TRACE_EVERY_NS the jobs that
++ * started in the A34_TRACE_FRAME_NS before the newest one ended ("frame").
++ */
++void
++RedwoodMaliUserClient::jobRecord(const struct a34_mali_job *job, const struct a34_qjob *q, uint64_t upkeepTicks, bool done)
++{
++	struct a34_jobrec *r = &gA34JobRing[gA34JobN % A34_JOBRING];
++	uint64_t us, now = mach_absolute_time(), every, frame;
++
++	bzero(r, sizeof(*r));
++	r->client = this;
++	r->queued = q != NULL ? q->queued : 0;
++	r->start = job->started;
++	if (job->started != 0) {
++		uint64_t ticks;
++
++		nanoseconds_to_absolutetime(job->ns, &ticks);
++		r->end = job->started + ticks;
++	}
++	r->seq = q != NULL ? q->seq : 0;
++	r->gseq = q != NULL ? q->gseq : 0;
++	absolutetime_to_nanoseconds(upkeepTicks, &us);
++	r->upkeepUs = (uint32_t)(us / 1000);
++	r->ahead = q != NULL ? q->depth : 0;
++	r->fs = (job->requirements & PANFROST_JD_REQ_FS) != 0;
++	r->failed = !done;
++	strlcpy(r->name, fName, sizeof(r->name));
++	gA34JobN++;
++	if (q != NULL && fTraceFirst != 0 && q->seq >= fTraceFirst && q->seq <= fTraceLast) {
++		if (fTraceT0 == 0) {
++			fTraceT0 = r->start;
++		}
++		a34_job_say(r, fTraceT0, "asked");
++		if (q->seq == fTraceLast) {
++			fTraceFirst = fTraceLast = fTraceT0 = 0;
++		}
++	}
++	nanoseconds_to_absolutetime(A34_TRACE_EVERY_NS, &every);
++	if (gA34JobDumpAt != 0 && now - gA34JobDumpAt < every) {
++		return;
++	}
++	if (gA34JobDumpAt == 0) {
++		gA34JobDumpAt = now;
++		return;
++	}
++	gA34JobDumpAt = now;
++	/* the jobs that started within one frame before the newest ended, oldest first */
++	nanoseconds_to_absolutetime(A34_TRACE_FRAME_NS, &frame);
++	uint32_t n = 0, have = gA34JobN < A34_JOBRING ? gA34JobN : A34_JOBRING;
++
++	while (n < have && n < A34_TRACE_MAX) {
++		const struct a34_jobrec *o = &gA34JobRing[(gA34JobN - 1 - n) % A34_JOBRING];
++
++		if (o->start == 0 || r->end < o->start || r->end - o->start > frame) {
++			break;
++		}
++		n++;
++	}
++	if (n == 0) {
++		return;
++	}
++	const struct a34_jobrec *first = &gA34JobRing[(gA34JobN - n) % A34_JOBRING];
++
++	IOLog("A34 MALI JOB: frame: the %u jobs that started in the %llu us before the newest ended (GPU %u MHz)\n", n,
++	    (unsigned long long)(A34_TRACE_FRAME_NS / 1000), a34_clocks_gpu_khz() / 1000u);
++	for (uint32_t i = 0; i < n; i++) {
++		a34_job_say(&gA34JobRing[(gA34JobN - n + i) % A34_JOBRING], first->start, "frame");
++	}
++}
++
+ /*
+  * A34 (0991), with the lock held: a job's GPU time into the 10 s window, and
+  * the GPU line once it is full: busy time by slot (fragment chains: the
+@@ -1465,6 +1609,9 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ 	gpuWindow(job, t0);                     /* A34 (0991) */
+ 	flushed = upkeep(false, all, q);        /* and no stale lines over what the GPU wrote */
+ 	ticks += mach_absolute_time() - t0;
++	if (gA34MaliJobTrace != 0) {
++		jobRecord(job, q, ticks, done);         /* A34 (0992) */
++	}
+ 	if (q != NULL) {
+ 		uint64_t waited = mach_absolute_time() - q->queued, slow;
+ 
+@@ -3020,6 +3167,40 @@ RedwoodMaliUserClient::request(uint32_t selector, union a34_request *r)
+ 			r->ctx.handle = ++fNextCtx;
+ 		}
+ 		break;
++	case kA34MaliTraceJobs: {
++		/* A34 (0992): see struct a34_trace_jobs; the ones done already from the ring */
++		uint64_t first = r->trace.first_seq, last = first + r->trace.count - 1, t0 = 0;
++
++		if (gA34MaliJobTrace == 0 || gA34JobRing == NULL) {
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		if (first == 0 || r->trace.count == 0 || r->trace.count > A34_TRACE_MAX || r->trace.pad != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint32_t have = gA34JobN < A34_JOBRING ? gA34JobN : A34_JOBRING;
++
++		for (uint32_t i = have; i-- > 0;) {
++			const struct a34_jobrec *o = &gA34JobRing[(gA34JobN - 1 - i) % A34_JOBRING];
++
++			if (o->client == this && o->seq >= first && o->seq <= last) {
++				if (t0 == 0) {
++					t0 = o->start;
++				}
++				a34_job_say(o, t0, "asked");
++				if (o->seq == last) {
++					last = 0;       /* (all of them done already) */
++				}
++			}
++		}
++		if (last != 0) {
++			fTraceFirst = first;
++			fTraceLast = last;
++			fTraceT0 = t0;
++		}
++		break;
++	}
+ 	case kA34PanfrostJmCtxDestroy:
+ 		if (r->ctx.handle == 0 || r->ctx.handle > fNextCtx) {
+ 			ret = kIOReturnBadArgument;
