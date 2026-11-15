@@ -1432,7 +1432,18 @@ struct rwa_draw {
 	const unsigned *color_slice;
 	unsigned clear_color_mask;
 	const float *clear_colors;
+
+	/* A34, appended 16 November: Metal's DontCare actions, as masks -- bit i colour attachment
+	 * i, RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL. `load_dontcare_mask` is read on a pass's first
+	 * draw (the one that carries its clears): those attachments' old contents are not read back
+	 * into the tiles (MTLLoadActionDontCare). `store_dontcare_mask` of a pass's last draw
+	 * applies when the pass ends: those attachments are not written back
+	 * (MTLStoreActionDontCare). 0 and 0: everything loaded and stored, as before. */
+	unsigned load_dontcare_mask;
+	unsigned store_dontcare_mask;
 };
+#define RWA_ATTACH_DEPTH   (1u << 8)
+#define RWA_ATTACH_STENCIL (1u << 9)
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);

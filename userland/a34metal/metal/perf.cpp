@@ -243,7 +243,7 @@ rwm_perf_report(uint64_t now)
 		say(line);
 	}
 	say_worst_cb();
-	for (unsigned which = 0; pan != nullptr && which < 4; which++) {
+	for (unsigned which = 0; pan != nullptr && which < 5; which++) {
 		char wide[600];
 
 		if (pan(which, wide, sizeof(wide)) != 0) {

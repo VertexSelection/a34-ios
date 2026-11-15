@@ -268,6 +268,8 @@ struct rwm_draw {
 	bool color_levels;                         /* ... given (rwm_levels=0: not) */
 	unsigned clear_color_mask;                 /* (metal-fx) each attachment's own load action */
 	float clear_colors[8][4];
+	/* A34: Metal's DontCare load actions (the pass's first draw only) and store actions (struct rwa_draw) */
+	unsigned load_dontcare_mask, store_dontcare_mask;
 	char probe[64];                            /* (metal-fx) rwm_blurdump: the pipeline, when one to probe */
 	char label[64];                            /* (metal-fx) rwm_framedump: every pipeline's */
 	unsigned color_surface[8];                 /* (metal-fx, rwm_scene) the surface each attachment lies over, 0: none */
@@ -398,6 +400,9 @@ struct rwm_render_state {
 	float clear_color[4], clear_depth;
 	unsigned clear_stencil;
 	bool clears, clears_depth, clears_stencil;
+	/* A34: the attachments whose load action is DontCare (until the first draw) and whose store action is
+	 * (RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL for the depth/stencil aspects) -- rwm_render_actions */
+	unsigned load_dontcare_mask, store_dontcare_mask;
 	char probe[64];                 /* (metal-fx, rwm_blurdump) the pipeline's label when it is a blur's or a material's */
 	char label[64];                 /* (metal-fx, rwm_framedump) the pipeline's label, whatever it is */
 	void *pipeline;
@@ -424,6 +429,11 @@ struct rwm_render_state {
  * store action 2 or 3 or a resolve texture is said and not done), the depth and stencil attachments (one texture
  * carries both aspects; two different ones: said, neither) */
 void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device);
+/* A34: the pass's DontCare actions: `load`/`store` bit i colour attachment i, RWA_ATTACH_DEPTH, RWA_ATTACH_STENCIL;
+ * rwm_render_store_action: a store action set later (-setColorStoreAction:atIndex: and the like; index 8 depth,
+ * 9 stencil) */
+void rwm_render_actions(struct rwm_render_state *state, unsigned load, unsigned store);
+void rwm_render_store_action(struct rwm_render_state *state, unsigned index, unsigned long action);
 /* (metal-fx) rwm_blurdump=N: whether it is on, and the label of the pipeline just set (kept when it is a blur's or a
  * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
 bool rwm_blurdump_on(void);

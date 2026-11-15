@@ -51,6 +51,7 @@ loaded(struct rwm_render_state *s)
 	s->clears = false;
 	s->clears_depth = false;
 	s->clears_stencil = false;
+	s->load_dontcare_mask = 0;      /* (a load action is for the pass's start) */
 }
 
 } // namespace
@@ -68,6 +69,31 @@ rwm_render_begin(struct rwm_render_state *s, struct rwa_device *device)
 {
 	memset(s, 0, sizeof(*s));
 	s->device = device;
+}
+
+/*
+ * A34: Metal's DontCare actions reach the library (16 November): an attachment whose load action is DontCare is
+ * not read back into the GPU's tiles at the pass's start, and one whose store action is DontCare is not written
+ * out at its end -- each a full read or write of the attachment otherwise (11 MB a screen-sized one). Boot-arg
+ * rwm_actions=0 (RWA_LOAD_STORE=0, air.cpp): every attachment loaded and stored, as before.
+ */
+extern "C" void
+rwm_render_actions(struct rwm_render_state *s, unsigned load, unsigned store)
+{
+	s->load_dontcare_mask = load;
+	s->store_dontcare_mask = store;
+}
+
+extern "C" void
+rwm_render_store_action(struct rwm_render_state *s, unsigned index, unsigned long action)
+{
+	const unsigned bit = index < 8 ? 1u << index : index == 8 ? RWA_ATTACH_DEPTH : RWA_ATTACH_STENCIL;
+
+	if (action == 0) {              /* MTLStoreActionDontCare */
+		s->store_dontcare_mask |= bit;
+	} else {
+		s->store_dontcare_mask &= ~bit;
+	}
 }
 
 /*
@@ -404,6 +430,8 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 	memcpy(d->clear_colors, s->clear_colors, sizeof(d->clear_colors));
 	memcpy(w->clear_color, s->clear_color, sizeof(w->clear_color));
 	d->clear_color = s->clears ? w->clear_color : nullptr;
+	d->load_dontcare_mask = s->load_dontcare_mask;
+	d->store_dontcare_mask = s->store_dontcare_mask;
 	d->depth = mesa_of(s->depth.core);
 	w->clear_depth = s->clear_depth;
 	w->clear_stencil = s->clear_stencil;

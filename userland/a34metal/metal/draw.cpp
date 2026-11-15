@@ -686,6 +686,8 @@ rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
 	draw.color_slice = d->color_levels ? d->color_slice : nullptr;
 	draw.clear_color_mask = d->clear_color_mask;
 	draw.clear_colors = &d->clear_colors[0][0];
+	draw.load_dontcare_mask = d->load_dontcare_mask;
+	draw.store_dontcare_mask = d->store_dontcare_mask;
 	/* the depth attachment, its two load actions, the state that was bound, and the depth range of the
 	 * viewport -- where the quad's own depth comes from (without one, the contract's [0, 1]) */
 	draw.depth = d->depth;

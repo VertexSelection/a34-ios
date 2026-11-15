@@ -605,6 +605,46 @@ static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, 
 static uint64_t rwa_bind_returns, rwa_bind_span;
 /* passes that went back into a pass kept open and joined its batch (RWA_OPEN_PASSES) */
 static uint64_t rwa_bind_merges;
+
+/*
+ * The pass the last draw drew into -- its first colour attachment and its depth/stencil one, BY
+ * VALUE (the textures may be destroyed before the next draw; nothing here reads through them) --
+ * and the DontCare store actions of its last draw (struct rwa_draw, store_dontcare_mask), applied
+ * when the pass is left or the work sent (pass_store_actions). Counted: attachments whose old
+ * contents a pass did not preload (MTLLoadActionDontCare), passes whose attachments were not
+ * written back (MTLStoreActionDontCare). RWA_LOAD_STORE=0 (the plug-in's rwm_actions=0): every
+ * attachment loaded and stored, as before 16 November.
+ */
+static struct pipe_surface rwa_pass_c, rwa_pass_z;
+static bool rwa_pass_set;
+static unsigned rwa_pass_store_dontcare;
+static uint64_t rwa_bind_load_forgets, rwa_bind_store_discards;
+
+static bool
+load_store_actions_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("RWA_LOAD_STORE");
+      on = v == NULL || strcmp(v, "0") != 0;
+   }
+   return on;
+}
+
+static void
+pass_store_actions(struct pipe_context *pipe)
+{
+   unsigned m = rwa_pass_store_dontcare;
+
+   rwa_pass_store_dontcare = 0;
+   if (!m || !rwa_pass_set || !load_store_actions_on())
+      return;
+   unsigned zs = ((m & RWA_ATTACH_DEPTH) ? PIPE_CLEAR_DEPTH : 0) |
+                 ((m & RWA_ATTACH_STENCIL) ? PIPE_CLEAR_STENCIL : 0);
+   if (redwood_pan_pass_discard(pipe, rwa_pass_c.texture ? &rwa_pass_c : NULL,
+                                rwa_pass_z.texture ? &rwa_pass_z : NULL, m & 0xffu, zs))
+      rwa_bind_store_discards++;
+}
 /* draw_vbo on the processor (the thread's own time) against the clock: what of a draw's time
  * is work and what is the thread waiting to run */
 static uint64_t rwa_bind_vbo_wall_ns, rwa_bind_vbo_cpu_ns;
@@ -1825,12 +1865,14 @@ rwa_bind_profile(char *line, size_t size)
    if (!draws || !line || !size)
       return 0;
    snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes sent on a switch; "
-            "%llu back into one left before, %llu of them joined to it; "
+            "%llu back into one left before, %llu of them joined to it; %llu attachments not preloaded "
+            "(load DontCare), %llu passes not written back in part (store DontCare); "
             "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
             "%llu%% of it on the processor; states set %llu, skipped %llu%s; "
             "constant buffers %llu, %llu of them copied",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
             (unsigned long long)rwa_bind_returns, (unsigned long long)rwa_bind_merges,
+            (unsigned long long)rwa_bind_load_forgets, (unsigned long long)rwa_bind_store_discards,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
             (unsigned long long)rwa_bind_fresh_draws,
             (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
@@ -1841,6 +1883,7 @@ rwa_bind_profile(char *line, size_t size)
             (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies);
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
    rwa_bind_merges = 0;
+   rwa_bind_load_forgets = rwa_bind_store_discards = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
    rwa_bind_vbo_wall_ns = rwa_bind_vbo_cpu_ns = 0;
    rwa_bind_ubos = rwa_bind_ubo_copies = 0;
@@ -3924,6 +3967,7 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                   char *why, size_t why_size)
 {
    struct pipe_fence_handle *fence = NULL;
+   pass_store_actions(device->pipe);
    device->pipe->flush(device->pipe, &fence, 0);
    rwa_bind_span++;
    if (!fence) {
@@ -5099,6 +5143,26 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
       }
       return any;
    }
+   case 4: {
+      static uint64_t span_before;
+      uint64_t spans = rwa_bind_span - span_before;
+      span_before = rwa_bind_span;
+      if (!p[RWP_PASSES])
+         return 0;
+      if (!spans)
+         spans = 1;
+      snprintf(line, size, "rwm pan tiles: per work sent (%llu): %.1f passes, %.1f MB preloaded, %.1f MB written "
+               "back; in all %llu passes (%llu screen-sized); preloads %llu colour + %llu depth/stencil "
+               "= %.1f MB; write-backs %llu colour + %llu depth/stencil = %.1f MB; %llu colour clears in the tiles",
+               (unsigned long long)spans, (double)p[RWP_PASSES] / spans, p[RWP_PRELOAD_KB] / 1024.0 / spans,
+               p[RWP_WRITEBACK_KB] / 1024.0 / spans,
+               (unsigned long long)p[RWP_PASSES], (unsigned long long)p[RWP_FULL_PASSES],
+               (unsigned long long)p[RWP_PRELOADS], (unsigned long long)p[RWP_ZS_PRELOADS],
+               p[RWP_PRELOAD_KB] / 1024.0, (unsigned long long)p[RWP_WRITEBACKS],
+               (unsigned long long)p[RWP_ZS_WRITEBACKS], p[RWP_WRITEBACK_KB] / 1024.0,
+               (unsigned long long)p[RWP_CLEARS]);
+      return 1;
+   }
    case 3: {
       if (!redwood_drm_stats)
          return 0;
@@ -5152,6 +5216,7 @@ rwa_flush_seq(struct rwa_device *device)
    RWA_GUARD();
    if (!redwood_drm_last_seq)
       return 0;
+   pass_store_actions(device->pipe);
    device->pipe->flush(device->pipe, NULL, 0);
    rwa_bind_span++;
    return redwood_drm_last_seq();
@@ -8313,31 +8378,35 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       if (window != NULL && *window != '\0')
          open_window = MIN2((unsigned)strtoul(window, NULL, 10), 15u);
    }
-   if (flush_on_switch) {
-      static struct pipe_surface *last_cbuf, *last_zs;
-      static struct pipe_surface *left[16];
+   {
+      const struct pipe_surface *to_c = fb.nr_cbufs ? surf[0] : NULL;
+      static struct pipe_surface left[16];
       static unsigned nleft;
       static uint64_t left_span;
       /* the passes left and kept open, oldest first, by value (a texture may go meanwhile; its
        * batch holds the resource, so no other can take its address while the batch is open) */
       static struct { struct pipe_surface c, z; } open[16];
       static unsigned nopen;
-      if ((fb.nr_cbufs ? surf[0] : NULL) != last_cbuf || zsurf != last_zs) {
+      bool same_c = to_c ? rwa_pass_c.texture && pipe_surface_equal(&rwa_pass_c, to_c) : !rwa_pass_c.texture;
+      bool same_z = zsurf ? rwa_pass_z.texture && pipe_surface_equal(&rwa_pass_z, zsurf) : !rwa_pass_z.texture;
+
+      if (!rwa_pass_set || !same_c || !same_z) {
+         /* the pass left: its DontCare store actions first, before anything sends it */
+         pass_store_actions(pipe);
          if (left_span != rwa_bind_span) {
             nleft = 0;
             nopen = 0;
             left_span = rwa_bind_span;
          }
-         if (flush_on_switch == 1 && (last_cbuf || last_zs)) {
+         if (flush_on_switch == 1 && rwa_pass_set) {
             pipe->flush(pipe, NULL, 0);
             rwa_bind_flushes++;
          } else if (flush_on_switch == 2) {
-            const struct pipe_surface *to_c = fb.nr_cbufs ? surf[0] : NULL;
             /* going back into a pass kept open: joined, if panfrost still has it */
             for (unsigned i = 0; i < nopen; i++) {
-               bool same_c = to_c ? pipe_surface_equal(&open[i].c, to_c) : !open[i].c.texture;
-               bool same_z = zsurf ? pipe_surface_equal(&open[i].z, zsurf) : !open[i].z.texture;
-               if (same_c && same_z) {
+               bool oc = to_c ? pipe_surface_equal(&open[i].c, to_c) : !open[i].c.texture;
+               bool oz = zsurf ? pipe_surface_equal(&open[i].z, zsurf) : !open[i].z.texture;
+               if (oc && oz) {
                   if (redwood_pan_pass_open(pipe, open[i].c.texture ? &open[i].c : NULL,
                                             open[i].z.texture ? &open[i].z : NULL))
                      rwa_bind_merges++;
@@ -8347,18 +8416,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                }
             }
             /* the pass left joins the window; what falls out of it is sent */
-            if (last_cbuf || last_zs) {
+            if (rwa_pass_set) {
                if (nopen == ARRAY_SIZE(open)) {
                   redwood_pan_pass_flush(pipe, open[0].c.texture ? &open[0].c : NULL,
                                          open[0].z.texture ? &open[0].z : NULL);
                   memmove(&open[0], &open[1], (nopen - 1) * sizeof(open[0]));
                   nopen--;
                }
-               memset(&open[nopen], 0, sizeof(open[0]));
-               if (last_cbuf)
-                  open[nopen].c = *last_cbuf;
-               if (last_zs)
-                  open[nopen].z = *last_zs;
+               open[nopen].c = rwa_pass_c;
+               open[nopen].z = rwa_pass_z;
                nopen++;
             }
             while (nopen > open_window) {
@@ -8369,16 +8435,46 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
             }
          }
          /* counted for the profile only: a pass back into colour attachments left before */
-         for (unsigned i = 0; fb.nr_cbufs && surf[0] && i < nleft; i++) {
-            if (left[i] == surf[0]) {
+         for (unsigned i = 0; to_c && i < nleft; i++) {
+            if (pipe_surface_equal(&left[i], to_c)) {
                rwa_bind_returns++;
                break;
             }
          }
-         if (last_cbuf && nleft < ARRAY_SIZE(left))
-            left[nleft++] = last_cbuf;
-         last_cbuf = fb.nr_cbufs ? surf[0] : NULL;
-         last_zs = zsurf;
+         if (rwa_pass_set && rwa_pass_c.texture && nleft < ARRAY_SIZE(left))
+            left[nleft++] = rwa_pass_c;
+         memset(&rwa_pass_c, 0, sizeof(rwa_pass_c));
+         memset(&rwa_pass_z, 0, sizeof(rwa_pass_z));
+         if (to_c)
+            rwa_pass_c = *to_c;
+         if (zsurf)
+            rwa_pass_z = *zsurf;
+         rwa_pass_set = true;
+      }
+      /* the store actions of the pass's last draw are the ones applied when it is left */
+      rwa_pass_store_dontcare = draw->store_dontcare_mask;
+
+      /* MTLLoadActionDontCare, on a pass's first draw: the old contents are not preloaded --
+       * unless panfrost still has a batch open for these attachments, whose tiles hold them */
+      if (draw->load_dontcare_mask && load_store_actions_on() &&
+          !redwood_pan_pass_open(pipe, to_c, zsurf)) {
+         for (unsigned i = 0; i < fb.nr_cbufs && i < 8; i++) {
+            if ((draw->load_dontcare_mask & (1u << i)) && surf[i] && surf[i]->texture &&
+                surf[i]->first_layer == 0 && surf[i]->last_layer == 0) {
+               redwood_pan_forget(surf[i]->texture, surf[i]->level);
+               rwa_bind_load_forgets++;
+            }
+         }
+         if (zsurf && zsurf->texture) {
+            /* one resource holds both aspects: forgotten only if neither is wanted */
+            bool has_s = format_has_stencil(zsurf->texture->format);
+            bool z_free = (draw->load_dontcare_mask & RWA_ATTACH_DEPTH) || draw->clear_depth;
+            bool s_free = !has_s || (draw->load_dontcare_mask & RWA_ATTACH_STENCIL) || draw->clear_stencil;
+            if (z_free && s_free && (draw->load_dontcare_mask & (RWA_ATTACH_DEPTH | RWA_ATTACH_STENCIL))) {
+               redwood_pan_forget(zsurf->texture, zsurf->level);
+               rwa_bind_load_forgets++;
+            }
+         }
       }
    }
    /* Set only when it changed: kept from the last draw into the same attachments, which

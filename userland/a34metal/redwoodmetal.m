@@ -4205,6 +4205,34 @@ rw_core_of(id texture)
 
 	rwm_render_depth(&_state, ztex, rw_core_of(ztex), [za loadAction] == MTLLoadActionClear, [za clearDepth], stex,
 			 rw_core_of(stex), [sa loadAction] == MTLLoadActionClear, (unsigned)[sa clearStencil]);
+	/* A34: the DontCare load and store actions, which the library now honours (render.cpp) */
+	{
+		unsigned load = 0, store = 0;
+
+		for (unsigned i = 0; i < 8; i++) {
+			MTLRenderPassColorAttachmentDescriptor *attachment =
+			    [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+
+			if (attachment == nil || [attachment texture] == nil) {
+				continue;
+			}
+			if ([attachment loadAction] == MTLLoadActionDontCare) {
+				load |= 1u << i;
+			}
+			if ([attachment storeAction] == MTLStoreActionDontCare) {
+				store |= 1u << i;
+			}
+		}
+		if (ztex != nil) {
+			load |= [za loadAction] == MTLLoadActionDontCare ? RWA_ATTACH_DEPTH : 0;
+			store |= [za storeAction] == MTLStoreActionDontCare ? RWA_ATTACH_DEPTH : 0;
+		}
+		if (stex != nil) {
+			load |= [sa loadAction] == MTLLoadActionDontCare ? RWA_ATTACH_STENCIL : 0;
+			store |= [sa storeAction] == MTLStoreActionDontCare ? RWA_ATTACH_STENCIL : 0;
+		}
+		rwm_render_actions(&_state, load, store);
+	}
 	return self;
 }
 
@@ -4656,9 +4684,12 @@ rw_core_of(id texture)
 		RW_ONCE("NOT DONE: -setColorStoreAction:%lu atIndex:%lu, a resolve\n", (unsigned long)action,
 		         (unsigned long)index);
 	}
+	if (index < 8) {
+		rwm_render_store_action(&_state, (unsigned)index, (unsigned long)action);  /* (A34: DontCare honoured) */
+	}
 }
-- (void)setDepthStoreAction:(NSUInteger)action                 { (void)action; }
-- (void)setStencilStoreAction:(NSUInteger)action               { (void)action; }
+- (void)setDepthStoreAction:(NSUInteger)action                 { rwm_render_store_action(&_state, 8, action); }
+- (void)setStencilStoreAction:(NSUInteger)action               { rwm_render_store_action(&_state, 9, action); }
 - (void)setColorStoreActionOptions:(NSUInteger)options atIndex:(NSUInteger)index
 {
 	(void)options; (void)index;

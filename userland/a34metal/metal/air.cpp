@@ -68,6 +68,10 @@ load()
 	if (rwm_boot_arg("rwm_pushubo=0")) {
 		setenv("REDWOOD_PAN_PUSHUBO", "0", 1);
 	}
+	/* boot-arg rwm_actions=0: DontCare load and store actions treated as Load and Store, as before 16 November */
+	if (rwm_boot_arg("rwm_actions=0")) {
+		setenv("RWA_LOAD_STORE", "0", 1);
+	}
 	/* boot-arg rwm_passes=all: every pass switch sends every batch (26 October to 15 November); rwm_passes=none: no
 	 * switch sends anything; rwm_passes=N: a pass left is kept open for N passes more (air_metal.c; 3 unless set) */
 	{
