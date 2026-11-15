@@ -62,6 +62,11 @@ load()
 	if (rwm_boot_arg("rwm_rebind=all")) {
 		setenv("RWA_REBIND_ALL", "1", 1);
 	}
+	/* boot-arg rwm_pushubo=0: panfrost pushes only UBO 0 of a Metal shader, as upstream (Mesa patch
+	 * 0012; shaders compiled from then on -- the disk cache keeps what it has) */
+	if (rwm_boot_arg("rwm_pushubo=0")) {
+		setenv("REDWOOD_PAN_PUSHUBO", "0", 1);
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),
