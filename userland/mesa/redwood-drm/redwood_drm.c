@@ -918,15 +918,43 @@ redwood_drm_afbc_scanout(void)
 #define kIOReturnNoSpace ((kern_return_t)0xe00002db)    /* iokit_common_err(0x2db), XNU's IOReturn.h: "no space for data" */
 #endif
 
-/* SURFACE_LAYOUT (0x78, redwood_drm.h): the request comes back with `size` filled in */
+/*
+ * SURFACE_LAYOUT (0x78, redwood_drm.h): the request comes back with what the kernel answers. 32 bytes
+ * (kernel 1009); a kernel before it takes only 24 and calls 32 a bad argument -- then 24 from there on,
+ * `cpu_locks` 0, and a query refused (ENOTSUP), it having none.
+ */
+static int
+layout_call(struct redwood_drm_surface_layout *request, size_t in)
+{
+	struct redwood_drm_surface_layout answer = *request;
+	size_t size = in;
+	kern_return_t result;
+	uint64_t began = mach_absolute_time();
+
+	result = IOConnectCallStructMethod(connection, REDWOOD_DRM_SURFACE_LAYOUT, request, in, &answer, &size);
+	count(&stats.calls[REDWOOD_DRM_SURFACE_LAYOUT], &stats.ticks[REDWOOD_DRM_SURFACE_LAYOUT], began);
+	if (result != kIOReturnSuccess) {
+		errno = result == kIOReturnUnsupported ? ENOTSUP : result == kIOReturnBadArgument ? EINVAL :
+		    result == kIOReturnNoSpace ? ENOSPC : errno_of(result);
+		return -1;
+	}
+	if (size >= 24) {
+		request->layout = answer.layout;
+		request->header = answer.header;
+		request->body = answer.body;
+		request->header_row = answer.header_row;
+		request->size = answer.size;
+	}
+	request->cpu_locks = size >= sizeof(answer) ? answer.cpu_locks : 0;
+	return 0;
+}
+
 EXPORT int
 redwood_drm_surface_layout(struct redwood_drm_surface_layout *request)
 {
-	_Static_assert(sizeof(struct redwood_drm_surface_layout) == 24, "SURFACE_LAYOUT is 24 bytes");
-	struct redwood_drm_surface_layout answer;
-	size_t size = sizeof(answer);
-	kern_return_t result;
-	uint64_t began;
+	_Static_assert(sizeof(struct redwood_drm_surface_layout) == 32, "SURFACE_LAYOUT is 32 bytes (24 before 1009)");
+	static int form;                /* 0 not known yet, then 32 or 24 */
+	int ret;
 
 	if (request == NULL || request->surface == 0) {
 		errno = EINVAL;
@@ -936,19 +964,31 @@ redwood_drm_surface_layout(struct redwood_drm_surface_layout *request)
 		errno = ENODEV;
 		return -1;
 	}
-	answer = *request;
-	began = mach_absolute_time();
-	result = IOConnectCallStructMethod(connection, REDWOOD_DRM_SURFACE_LAYOUT, request, sizeof(*request), &answer, &size);
-	count(&stats.calls[REDWOOD_DRM_SURFACE_LAYOUT], &stats.ticks[REDWOOD_DRM_SURFACE_LAYOUT], began);
-	if (result != kIOReturnSuccess) {
-		errno = result == kIOReturnUnsupported ? ENOTSUP : result == kIOReturnBadArgument ? EINVAL :
-		    result == kIOReturnNoSpace ? ENOSPC : errno_of(result);
+	request->cpu_locks = 0;
+	request->pad = 0;
+	if (__atomic_load_n(&form, __ATOMIC_RELAXED) == 24) {
+		if (request->layout == REDWOOD_DRM_LAYOUT_QUERY) {
+			errno = ENOTSUP;
+			return -1;
+		}
+		return layout_call(request, 24);
+	}
+	ret = layout_call(request, 32);
+	if (ret == 0) {
+		__atomic_store_n(&form, 32, __ATOMIC_RELAXED);
+		return 0;
+	}
+	if (errno != EINVAL || __atomic_load_n(&form, __ATOMIC_RELAXED) == 32 || request->layout == REDWOOD_DRM_LAYOUT_QUERY) {
 		return -1;
 	}
-	if (size == sizeof(answer)) {
-		request->size = answer.size;
+	/* (a bad argument at 32 bytes from a kernel not known to take them: asked again in 1007's 24) */
+	ret = layout_call(request, 24);
+	if (ret == 0 || errno != EINVAL) {
+		__atomic_store_n(&form, 24, __ATOMIC_RELAXED);
+		fprintf(stderr, "redwood-drm: %s[%d]: SURFACE_LAYOUT in 24 bytes (a kernel before 1009: no CPU lock count)\n",
+		    getprogname(), (int)getpid());
 	}
-	return 0;
+	return ret;
 }
 
 EXPORT int

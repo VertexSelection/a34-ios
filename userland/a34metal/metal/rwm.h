@@ -161,6 +161,7 @@ struct rwm_air {
 	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;   /* A34 (y2sios): may be NULL */
 	__typeof__(&rwa_render_stats) render_stats;                 /* A34: may be NULL */
 	__typeof__(&rwa_trace_jobs) trace_jobs;                     /* A34: may be NULL */
+	__typeof__(&rwa_afbc_check) afbc_check;                     /* A34 (rwm_afbcscan): may be NULL */
 	__typeof__(&rwa_texture_write) texture_write;
 	__typeof__(&rwa_texture_read) texture_read;
 	__typeof__(&rwa_texture_copy) texture_copy;

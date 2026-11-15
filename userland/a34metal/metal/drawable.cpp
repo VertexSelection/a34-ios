@@ -544,8 +544,8 @@ rwd_import_available(void)
  */
 typedef struct rwa_texture *(*rwd_import_afbc_call)(struct rwa_device *device,
 						    const struct rwd_texture_shape *shape,
-						    int surface_id, unsigned offset, char *why,
-						    size_t why_size);
+						    int surface_id, unsigned offset, unsigned row_bytes,
+						    char *why, size_t why_size);
 
 extern "C" bool rwm_boot_arg(const char *text);
 
@@ -686,8 +686,8 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 			known = refused[i] == id;
 		}
 		if (!known) {
-			texture = rwd_import_afbc()(mesa_device, want, (int)id, surface.offset, line,
-			    sizeof(line));
+			texture = rwd_import_afbc()(mesa_device, want, (int)id, surface.offset, surface.rowBytes,
+			    line, sizeof(line));
 			if (texture == NULL) {
 				refused[refused_n++ % 128] = id;
 			}

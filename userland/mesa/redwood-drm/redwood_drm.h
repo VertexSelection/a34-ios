@@ -200,20 +200,27 @@ int redwood_drm_trace_jobs(uint64_t first_seq, uint32_t count);
  * GET_PARAM 0x1002: 1 when request 0x78 takes AFBC (a34fbafbc=1 and the pool made), else 0 --
  * redwood_drm_afbc_scanout(), asked once.
  *
- * Request 0x78, SURFACE_LAYOUT, 24 bytes in and out: how the pixels of a scan-out pool surface are
+ * Request 0x78, SURFACE_LAYOUT, 32 bytes in and out (24 to a kernel before 1009, which has no
+ * `cpu_locks` and no query; redwood_drm_surface_layout falls back to it by itself): how the pixels of a
+ * scan-out pool surface are
  * laid out. layout 0: rows (as made; the default); 1: DRM_FORMAT_MOD_ARM_AFBC(32x8 | SPARSE | SPLIT
  * | YTR) with untiled headers, BGRA stored as AFBC's R,G,B,A (what the display expects). `header`
  * and `body`: bytes from the surface's first pixel (the offset 0x7e gives), multiples of 128;
  * `header_row` = 16 * ceil(width / 32); a 1 KB body slot a superblock, in raster order. Back:
  * `size`, the bytes the surface's buffer has from its first pixel. Set it before the first frame
  * drawn so and back to 0 before one drawn as rows: the display reads the surface as the last request
- * said. redwood_drm_surface_layout(): 0, or -1 with errno -- ENOTSUP (not a pool surface, or AFBC
- * off), EINVAL (a layout the kernel does not take), ENOSPC (the buffer is too small).
+ * said. layout REDWOOD_DRM_LAYOUT_QUERY (1009) changes nothing and gives back the surface's layout,
+ * header, body, header_row, size and cpu_locks. `cpu_locks` (out, 1009): the IOSurfaceLocks of the
+ * surface while it was AFBC since it was marked -- the processor saw compressed bytes, and the
+ * driver draws it as rows again. redwood_drm_surface_layout(): 0, or -1 with errno -- ENOTSUP (not a
+ * pool surface, AFBC off, or a query to a kernel before 1009), EINVAL (a layout the kernel does not
+ * take), ENOSPC (the buffer is too small).
  */
 #define REDWOOD_DRM_PARAM_AFBC          0x1002
 #define REDWOOD_DRM_SURFACE_LAYOUT      0x78
 #define REDWOOD_DRM_LAYOUT_ROWS         0u
 #define REDWOOD_DRM_LAYOUT_AFBC         1u
+#define REDWOOD_DRM_LAYOUT_QUERY        0xffffffffu
 
 struct redwood_drm_surface_layout {
 	uint32_t surface;               /* the IOSurface's ID */
@@ -221,6 +228,7 @@ struct redwood_drm_surface_layout {
 	uint32_t header, body;          /* (AFBC) bytes from the first pixel */
 	uint32_t header_row;            /* (AFBC) bytes from one row of headers to the next */
 	uint32_t size;                  /* out: bytes of the buffer from the first pixel */
+	uint32_t cpu_locks, pad;        /* out (1009): IOSurfaceLocks of it while AFBC; 0 before 1009 */
 };
 
 int redwood_drm_afbc_scanout(void);

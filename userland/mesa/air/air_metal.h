@@ -186,8 +186,17 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
  */
 struct rwa_texture *rwa_texture_from_surface_afbc(struct rwa_device *device,
                                                   const struct rwa_texture_shape *shape,
-                                                  int surface_id, unsigned offset, char *why,
+                                                  int surface_id, unsigned offset,
+                                                  unsigned row_bytes, char *why,
                                                   size_t why_size);
+
+/*
+ * A34: once a second at most (the driver calls it before each command buffer's work), the surfaces
+ * drawn compressed asked about (kernel 1009, request 0x78's query): one the processor locked while
+ * compressed is drawn as rows from then on -- its picture copied out and back by the GPU, the kernel
+ * told, every texture over it (views too) given the rows. The number switched, and a sentence.
+ */
+int rwa_afbc_check(char *why, size_t why_size);
 
 /*
  * A34 (from y2sios's air_metal.c, MIT): a texture over a buffer's memory,

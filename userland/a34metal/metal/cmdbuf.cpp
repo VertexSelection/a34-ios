@@ -251,6 +251,15 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 		rwm_burst_on = true;
 		rwm_burst_n = 0;
 	}
+	/* (A34, rwm_afbcscan=1: a display surface drawn compressed that the processor locked is drawn as rows from now
+	 * on -- asked of the kernel once a second at most, between buffers) */
+	if (rwm_air()->afbc_check != nullptr) {
+		char said[300];
+
+		if (rwm_air()->afbc_check(said, sizeof(said)) > 0) {
+			rwm_print("%s\n", said);
+		}
+	}
 	/* its copies in -- here, unless the driver's worker made them at -commit --, the draws, dispatches and copies in
 	 * order, the work sent off, the surfaces copied back */
 	ran = rwm_run_works(device, works, count, !(rwm_worker_on() && !rwm_copyin_late()), finish_wanted(), &c->seq,

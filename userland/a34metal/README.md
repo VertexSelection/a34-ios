@@ -155,7 +155,11 @@ the kernel is told panfrost's own layout of the import (Mesa 0025: headers at +0
 payloads from +176256, 1 KB a superblock) before anything is drawn into it; a refusal is said once
 per surface ("redwooddrawable: surface N: ...") and the surface is drawn as rows as before.
 GET_PARAM 0x1002 says whether the kernel scans AFBC out at all. The driver's own reads of such a
-texture (-getBytes:) go through panfrost's linear staging copy; nothing else of ours reads one.
+texture (-getBytes:) go through panfrost's linear staging copy. Another program's: kernel 1009
+counts the IOSurfaceLocks of a surface while it is AFBC (request 0x78 in its 32-byte form, `cpu_locks`;
+24 bytes to an older kernel, without), and the driver asks once a second at most, between command
+buffers; a surface the processor locked is drawn as rows from then on -- its picture copied out and
+back by the GPU, the kernel told (layout 0), every texture over it and its views given the rows.
 
 ## CoreAnimation's effects on Metal (metal-fx)
 

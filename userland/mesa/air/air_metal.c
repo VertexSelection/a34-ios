@@ -296,6 +296,11 @@ struct rwa_texture {
       unsigned level, layer;
       struct pipe_surface *surface;
    } rt_more[16];
+
+   /* A34 (rwm_afbcscan=1): the IOSurface it is drawn over compressed for the display, 0 for none;
+    * where the surface's rows start and how long one is, for drawing it as rows again */
+   uint32_t afbc_surface;
+   unsigned afbc_offset, afbc_row_bytes;
 };
 
 /* The format a texture is read and drawn as: a view's own, or the resource's. */
@@ -2030,12 +2035,14 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
  * surface at all, so that no other program's surface is ever imported compressed -- then imported,
  * and the kernel told panfrost's own layout of the import (patch 0025), which has to fit the buffer.
  */
-#define RWA_LAYOUT_ROWS 0u
-#define RWA_LAYOUT_AFBC 1u
+#define RWA_LAYOUT_ROWS  0u
+#define RWA_LAYOUT_AFBC  1u
+#define RWA_LAYOUT_QUERY 0xffffffffu
 struct rwa_drm_surface_layout {
    uint32_t surface, layout, header, body, header_row, size;
+   uint32_t cpu_locks, pad;   /* (kernel 1009) IOSurfaceLocks of it while AFBC; 0 from an older kernel */
 };
-static_assert(sizeof(struct rwa_drm_surface_layout) == 24, "redwood_drm.h's SURFACE_LAYOUT is 24 bytes");
+static_assert(sizeof(struct rwa_drm_surface_layout) == 32, "redwood_drm.h's SURFACE_LAYOUT is 32 bytes");
 extern int redwood_drm_afbc_scanout(void) __attribute__((weak_import));
 extern int redwood_drm_surface_layout(struct rwa_drm_surface_layout *request) __attribute__((weak_import));
 
@@ -2063,6 +2070,30 @@ afbc_marked(uint32_t id, int set)
    return found;
 }
 
+/* the textures drawn compressed (views of them too), for rwa_afbc_check */
+static struct rwa_texture *rwa_afbc_textures[32];
+static unsigned rwa_afbc_textures_n;
+static uint64_t rwa_afbc_checked;
+
+static void
+afbc_register(struct rwa_texture *t, bool add)
+{
+   pthread_mutex_lock(&rwa_afbc_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(rwa_afbc_textures); i++) {
+      if (add && !rwa_afbc_textures[i]) {
+         rwa_afbc_textures[i] = t;
+         rwa_afbc_textures_n++;
+         break;
+      }
+      if (!add && rwa_afbc_textures[i] == t) {
+         rwa_afbc_textures[i] = NULL;
+         rwa_afbc_textures_n--;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&rwa_afbc_mtx);
+}
+
 /* the surface back to rows, for the display, before anything draws it so */
 static void
 afbc_unmark(uint32_t id)
@@ -2074,7 +2105,8 @@ afbc_unmark(uint32_t id)
 
 struct rwa_texture *
 rwa_texture_from_surface_afbc(struct rwa_device *device, const struct rwa_texture_shape *shape,
-                              int surface_id, unsigned offset, char *why, size_t why_size)
+                              int surface_id, unsigned offset, unsigned row_bytes, char *why,
+                              size_t why_size)
 {
    /* (no lock, as rwa_texture_from_surface) */
    if (surface_id <= 0 || !shape || shape->width == 0) {
@@ -2136,8 +2168,12 @@ rwa_texture_from_surface_afbc(struct rwa_device *device, const struct rwa_textur
    };
    const bool fits = end <= UINT32_MAX && layout.offset + layout.size <= layout.bo_size &&
                      (was_marked || end <= room);
-   if (!fits || redwood_drm_surface_layout(&mark) != 0 || end > mark.size) {
-      int error = errno;
+   if (!fits || redwood_drm_surface_layout(&mark) != 0 || end > mark.size || mark.cpu_locks) {
+      int error = mark.cpu_locks ? 0 : errno;
+      if (mark.cpu_locks)
+         say(why, why_size, "IOSurface %d was locked by the processor %u times while compressed, so "
+                            "it is drawn as rows again", surface_id, mark.cpu_locks);
+      else
       say(why, why_size, "the kernel would not take IOSurface %d compressed%s (errno %d): headers at "
                          "+%llu, %u bytes a row of them, %u rows, payloads from +%llu to +%llu of a "
                          "buffer of %u bytes from the first pixel (%llu in all)", surface_id,
@@ -2149,6 +2185,10 @@ rwa_texture_from_surface_afbc(struct rwa_device *device, const struct rwa_textur
       return NULL;
    }
    afbc_marked(id, 1);
+   texture->afbc_surface = id;
+   texture->afbc_offset = offset;
+   texture->afbc_row_bytes = row_bytes;
+   afbc_register(texture, true);
    /* the layout, for the caller's log (a sentence that is not a refusal) */
    say(why, why_size, "IOSurface %d drawn compressed for the display: AFBC 32x8 sparse split YTR, "
                       "headers at +%llu, %u bytes a row of them, %u rows, payloads from +%llu to "
@@ -2156,6 +2196,137 @@ rwa_texture_from_surface_afbc(struct rwa_device *device, const struct rwa_textur
        layout.header_row_bytes, layout.rows, (unsigned long long)body, (unsigned long long)end,
        mark.size);
    return texture;
+}
+
+/*
+ * A surface drawn compressed whose memory the processor has locked (kernel 1009 counts IOSurfaceLocks
+ * of it while it is AFBC) is drawn as rows from then on: the picture copied out by the GPU, the
+ * surface imported as rows, the display told (layout 0), the picture copied back in, and every texture
+ * over it -- views too -- given the rows. Under the library's lock, between command buffers.
+ */
+static bool
+afbc_to_rows(uint32_t id, char *why, size_t why_size)
+{
+   struct rwa_texture *first = NULL;
+   pthread_mutex_lock(&rwa_afbc_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(rwa_afbc_textures); i++) {
+      struct rwa_texture *t = rwa_afbc_textures[i];
+      if (t && t->afbc_surface == id && (!first || (first->is_view && !t->is_view)))
+         first = t;   /* (the texture itself rather than a view, when it is still there) */
+   }
+   pthread_mutex_unlock(&rwa_afbc_mtx);
+   if (!first) {
+      afbc_unmark(id);
+      return false;
+   }
+   struct rwa_device *device = first->device;
+   struct pipe_context *pipe = device->pipe;
+   struct pipe_screen *screen = device->screen;
+   struct pipe_resource *old = first->res;
+   const unsigned w = old->width0, h = old->height0;
+
+   pipe->flush(pipe, NULL, 0);   /* everything drawn into it so far, sent first */
+   struct pipe_resource templ = *old;
+   templ.next = NULL;
+   templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
+   templ.flags = 0;
+   struct pipe_resource *copy = screen->resource_create(screen, &templ);
+   struct winsys_handle whandle = {
+      .type = WINSYS_HANDLE_TYPE_FD, .handle = id, .stride = first->afbc_row_bytes,
+      .offset = first->afbc_offset, .modifier = DRM_FORMAT_MOD_LINEAR,
+   };
+   templ = *old;
+   templ.next = NULL;
+   struct pipe_resource *rows =
+      copy ? screen->resource_from_handle(screen, &templ, &whandle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE)
+           : NULL;
+   if (!copy || !rows) {
+      say(why, why_size, "IOSurface %u could not be made rows again (%s); it stays compressed", id,
+          copy ? "no import as rows" : "no copy of its picture");
+      pipe_resource_reference(&copy, NULL);
+      return false;
+   }
+   struct pipe_blit_info blit = {
+      .src = { .resource = old, .format = old->format, .box = { .width = w, .height = h, .depth = 1 } },
+      .dst = { .resource = copy, .format = copy->format, .box = { .width = w, .height = h, .depth = 1 } },
+      .mask = PIPE_MASK_RGBA, .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pipe->blit(pipe, &blit);
+   pipe->flush(pipe, NULL, 0);
+   afbc_unmark(id);   /* the display reads rows from its next frame */
+   blit.src.resource = copy;
+   blit.src.format = copy->format;
+   blit.dst.resource = rows;
+   blit.dst.format = rows->format;
+   pipe->blit(pipe, &blit);
+   pipe->flush(pipe, NULL, 0);
+
+   unsigned moved = 0;
+   pthread_mutex_lock(&rwa_afbc_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(rwa_afbc_textures); i++) {
+      struct rwa_texture *t = rwa_afbc_textures[i];
+      if (!t || t->afbc_surface != id)
+         continue;
+      if (framebuffer_holds(device, t->res))
+         unbind_framebuffer(device);
+      if (t->view) {
+         pipe->sampler_view_destroy(pipe, t->view);
+         t->view = NULL;
+      }
+      rwa_surface_free(&t->rt);
+      for (unsigned k = 0; k < ARRAY_SIZE(t->rt_more); k++)
+         rwa_surface_free(&t->rt_more[k].surface);
+      pipe_resource_reference(&t->res, rows);
+      t->afbc_surface = 0;
+      rwa_afbc_textures[i] = NULL;
+      rwa_afbc_textures_n--;
+      moved++;
+   }
+   pthread_mutex_unlock(&rwa_afbc_mtx);
+   /* (the pass the library was in may name the old resource: forgotten, as at a span's end) */
+   memset(&rwa_pass_c, 0, sizeof(rwa_pass_c));
+   memset(&rwa_pass_z, 0, sizeof(rwa_pass_z));
+   rwa_pass_set = false;
+   rwa_bind_span++;
+   pipe_resource_reference(&copy, NULL);
+   pipe_resource_reference(&rows, NULL);
+   say(why, why_size, "IOSurface %u was locked by the processor while compressed: drawn as rows "
+                      "from now on (%u textures)", id, moved);
+   return true;
+}
+
+int
+rwa_afbc_check(char *why, size_t why_size)
+{
+   if (why && why_size)
+      why[0] = '\0';
+   if (__atomic_load_n(&rwa_afbc_textures_n, __ATOMIC_RELAXED) == 0 || !redwood_drm_surface_layout)
+      return 0;
+   const uint64_t now = os_time_get_nano();
+   if (now - rwa_afbc_checked < 1000000000ull)
+      return 0;
+   rwa_afbc_checked = now;
+   RWA_GUARD();
+   uint32_t ids[ARRAY_SIZE(rwa_afbc_textures)];
+   unsigned n = 0;
+   pthread_mutex_lock(&rwa_afbc_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(rwa_afbc_textures); i++) {
+      struct rwa_texture *t = rwa_afbc_textures[i];
+      bool seen = false;
+      for (unsigned k = 0; t && k < n; k++)
+         seen = seen || ids[k] == t->afbc_surface;
+      if (t && !seen)
+         ids[n++] = t->afbc_surface;
+   }
+   pthread_mutex_unlock(&rwa_afbc_mtx);
+   int switched = 0;
+   for (unsigned k = 0; k < n; k++) {
+      struct rwa_drm_surface_layout ask = { .surface = ids[k], .layout = RWA_LAYOUT_QUERY };
+      if (redwood_drm_surface_layout(&ask) == 0 && ask.cpu_locks != 0 &&
+          afbc_to_rows(ids[k], why, why_size))
+         switched++;
+   }
+   return switched;
 }
 
 /*
@@ -2216,6 +2387,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
    if (!texture)
       return;
    argbuf_scrub(texture->device, NULL, texture, NULL);
+   if (texture->afbc_surface)
+      afbc_register(texture, false);
    /* A draw leaves its framebuffer bound for the next one (bind_framebuffer); one with this
     * texture in it is let go here, so that the resource goes when its last reference does
     * rather than at the next pass into other attachments. */
@@ -2759,6 +2932,13 @@ rwa_texture_view(struct rwa_texture *texture, unsigned view_pixel_format, unsign
       view->shape.array_length = slice_count / 6;
    else
       view->shape.array_length = 1;
+   if (texture->afbc_surface) {
+      /* (a view of a surface drawn compressed is drawn as rows with it: rwa_afbc_check) */
+      view->afbc_surface = texture->afbc_surface;
+      view->afbc_offset = texture->afbc_offset;
+      view->afbc_row_bytes = texture->afbc_row_bytes;
+      afbc_register(view, true);
+   }
    return view;
 }
 
