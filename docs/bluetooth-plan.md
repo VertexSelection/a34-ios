@@ -9,6 +9,16 @@ Status (2026-11-15):
   default), 6 of 6 commands, up in 7.9 s. The `a34bt probe` job opened the raw channel but sent
   nothing: 0939's packet framing had no length for HCI commands (type 1); fixed in 0970. Its stdout
   did not reach the log either (nor `a34wifi`'s): `a34bt` now writes to `/dev/console` itself.
+- **Boot 0980-btmetal-a (0970 + 0971, `a34bt=2`)**: address `ed:68:5c:0b:9a:53` set, Skywalk pipe,
+  nodes, control and registry service all up; `a34bt`'s own LE scan heard 30-50 reports / 10 s from 6
+  Apple devices (best -46 dBm), no proximity pairing. bluetoothd ran 15 times and never connected.
+  From the binary: it passes `FindLocalMacAddress` and the registry check (`+0x266bc`), then has BlueTool
+  boot the chip (`+0x272034`: `{kMsgId: RunBuiltinScript, kMsgArgs: {script: boot, btaddress}}` to
+  `com.apple.BlueTool`, reply read at `+0x27249c`: `result` 0 ok, 10/13 "Unknown platform", not a
+  dictionary = status 1); BlueTool's job was never started, so status 1 = "Init failed, still in high
+  power result=1" and `_exit` (`+0x3a6128`). Next round: `a34bt-btd` + `liba34bt-btd.dylib` answer
+  BlueTool inside bluetoothd and put its stderr/os_log on the console; 0972 fixes the LE counter and
+  counts Apple advert types.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
