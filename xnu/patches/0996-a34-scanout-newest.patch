@@ -1,0 +1,476 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index b035776..85f1c9b 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -748,6 +748,49 @@ a34_mali_queue_mark(void)
+ 	return mark;
+ }
+ 
++/*
++ * A34 (0996): without waiting, whether the GPU is done with a surface: the
++ * driver's 0x7c mark gone (or stale), every queued job that names it done.
++ * AppleCLCD's kick picks the newest such scan-out frame at each TE.
++ */
++bool
++a34_mali_surface_done(SweetSurface *surface)
++{
++	uint64_t mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE), busy = surface->gpuBusySeq, stale;
++	bool done = true;
++
++	if (mark != 0) {
++		nanoseconds_to_absolutetime(A34_PENDING_STALE_NS, &stale);
++		if (mach_absolute_time() - mark < stale) {
++			return false;
++		}
++	}
++	if (gA34MaliQLock == NULL || busy == 0) {
++		return true;
++	}
++	IOLockLock(gA34MaliQLock);
++	done = a34_q_done() >= busy;
++	IOLockUnlock(gA34MaliQLock);
++	return done;
++}
++
++/* A34 (0996): asleep until the next queued job is done, `us` at most (the kick waiting for a frame to be drawn). */
++void
++a34_mali_progress_wait(uint32_t us)
++{
++	uint64_t deadline;
++
++	if (gA34MaliQLock == NULL) {
++		IODelay(us);
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)us * 1000ull, &deadline);
++	deadline += mach_absolute_time();
++	IOLockLock(gA34MaliQLock);
++	(void)IOLockSleepDeadline(gA34MaliQLock, &gA34MaliQDone, deadline, THREAD_UNINT);
++	IOLockUnlock(gA34MaliQLock);
++}
++
+ /*
+  * A34 (0989, 0993): a34_mali_surface_idle(), and only up to the job `upto`
+  * (~0: all that name it): the jobs queued after a scan-out frame was swapped
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index be3485a..363e0d1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -153,8 +153,8 @@ public:
+ 	bool          fFlip;
+ 	bool          fTE;
+ 	bool          fNewPath;                 /* fFlip or fTE: present() and the kick go by the state below */
+-	uintptr_t     fBufVA[4];                /* A34 (0983): 2 and 3 are scan-out frames (fScanSurf): no kernel address */
+-	uint64_t      fBufPA[4];                /* ... their first pixel's physical address */
++	uintptr_t     fBufVA[6];                /* A34 (0983, 0996): 2..5 are scan-out frames (fScanSurf): no kernel address */
++	uint64_t      fBufPA[6];                /* ... their first pixel's physical address */
+ 	IOMemoryDescriptor *fMem1;              /* A34 (0933): picture 1, mapped write-combined into kernel_map */
+ 	IOMemoryMap  *fMap1;
+ 	uintptr_t     fDraw;                    /* where present() draws the frame it is drawing */
+@@ -193,10 +193,12 @@ public:
+ 	 * after it (drawn over a copy of it).
+ 	 */
+ 	bool          fScanOn;
+-	uint32_t      fPitch[4];
+-	SweetSurface *fScanSurf[4];
+-	uint64_t      fScanUpto[4];             /* A34 (0993): the jobs up to this place draw frame k (~0: not known yet) */
+-	bool          fScanReady[4];            /* A34 (0993): frame k's GPU jobs seen done (by the kick) */
++	uint32_t      fPitch[6];
++	SweetSurface *fScanSurf[6];
++	/* A34 (0996), with fFlipLock: scan-out frame k's swap order (fScanSwaps) and state (SWEET_FB_SCAN_*) */
++	uint64_t      fScanSwapNo[6];
++	uint8_t       fScanState[6];
++	uint64_t      fScanSwaps;
+ 	uint64_t      fOvlPA;
+ 	uint32_t      fOvlPitch;
+ 	SweetSurface *fScanLast;
+@@ -222,6 +224,8 @@ public:
+ 	bool scanOut(const uint8_t *rec, uint32_t mask);
+ 	SweetSurface *scanRelease(int32_t k);
+ 	void scanHoldMin(SweetSurface *s);
++	int32_t scanPick(uint64_t after, SweetSurface *dropped[4], uint32_t *nd);
++	uint32_t scanPending(void);
+ 	void queuedAt(uint64_t now);
+ 	void drawDone(int32_t target);
+ 	void layerRect(const uint8_t *rec, uint32_t layer, const SweetSurface *s, int32_t r[6]);
+@@ -433,6 +437,19 @@ static uint64_t sweet_fb_scan_align = 4;        /* a34fbscanalign: the window's
+ #define SWEET_FB_OVL_PITCH(n)   (0x044u + 0x20u * (n))
+ #define SWEET_FB_OVL_PITCH_MSB(n) (0x040u + 0x20u * (n))
+ #define SWEET_FB_SCAN_POOL      4u              /* a34fbscanpool: buffers in the scan-out pool */
++/* A34 (0996): a scan-out frame (2..5): free; swapped, its GPU jobs perhaps still running; the kick's; being sent */
++#define SWEET_FB_SCAN_FREE      0u
++#define SWEET_FB_SCAN_PENDING   1u
++#define SWEET_FB_SCAN_TAKEN     2u
++#define SWEET_FB_SCAN_SENDING   3u
++#define SWEET_FB_FRAMES         6u
++
++/* A34 (0983): frames 0 and 1 are the panel's pictures (copied into); 2.. scanned-out surfaces */
++static inline bool
++sweet_fb_picture(int32_t t)
++{
++	return t == 0 || t == 1;
++}
+ 
+ static bool
+ a34_dsi_wait_idle(uint64_t *ticks, uint32_t ms)
+@@ -2137,7 +2154,7 @@ AppleCLCD::kickFlip(void)
+ 				}
+ 			}
+ 		}
+-		more = fQueued >= 0;
++		more = fQueued >= 0 || scanPending() != 0;     /* A34 (0996) */
+ 		IOLockUnlock(fFlipLock);
+ 		if (!more) {
+ 			break;
+@@ -2165,36 +2182,61 @@ AppleCLCD::kickOne(void)
+ 			}
+ 		}
+ 	}
++	SweetSurface *skip[4];
++	uint32_t nd = 0;
++
+ 	IOLockLock(fFlipLock);
+ 	t = fQueued;
+-	if (t < 0 || t == fWriting) {
+-		IOLockUnlock(fFlipLock);
+-		return false;
+-	}
+-	fQueued = -1;
+-	fTaken = t;
+-	readyAt = fQueuedAt > fXferEnd ? fQueuedAt : fXferEnd;  /* A34 (0938): the first moment it could have gone */
+-	IOLockUnlock(fFlipLock);
+-	if (t >= 2 && !fScanReady[t] && fScanSurf[t] != NULL) {
++	if (t >= 0 && t != fWriting) {
++		fQueued = -1;
++		fTaken = t;
++		readyAt = fQueuedAt > fXferEnd ? fQueuedAt : fXferEnd;  /* A34 (0938): the first moment it could have gone */
++	} else if (scanPending() != 0) {
+ 		/*
+-		 * A34 (0993): a scan-out frame's GPU jobs (scanOut() did not wait):
+-		 * up to its swap's mark; frame t stays this kick's meanwhile, a newer
+-		 * one goes to the other frame.
++		 * A34 (0996): scan-out frames. 0993's kick took the frame queued last
++		 * and waited for its GPU jobs, then the TE, then the transfer, and
++		 * only then looked again (boot 0994: 875 frames swapped, 447 sent):
++		 * here it takes the newest frame the GPU is done with (older ones are
++		 * dropped), waiting for the GPU only while none is; at the TE it looks
++		 * again and sends the newest done by then.
+ 		 */
+-		uint64_t g0 = mach_absolute_time();
++		uint64_t g0 = mach_absolute_time(), limit;
+ 
+-		(void)a34_mali_surface_ready(fScanSurf[t], fScanUpto[t], 500, sweet_fb_gpu_wait);
+-		sweet_fb_path_stats[2] += mach_absolute_time() - g0;
+-		fScanReady[t] = true;
+-		if (fScanUpto[t] == ~0ull) {
+-			IOLockLock(fFlipLock);
+-			fScanUpto[t] = a34_mali_queue_mark();   /* (the driver's mark is gone: from now on) */
+-			scanHoldMin(fScanSurf[t]);
++		nanoseconds_to_absolutetime(500ull * NSEC_PER_MSEC, &limit);
++		for (;;) {
++			t = scanPick(0, skip, &nd);
++			if (t >= 0 || scanPending() == 0 || mach_absolute_time() - g0 > limit) {
++				break;
++			}
+ 			IOLockUnlock(fFlipLock);
++			for (uint32_t i = 0; i < nd; i++) {
++				OSSafeReleaseNULL(skip[i]);
++			}
++			nd = 0;
++			a34_mali_progress_wait(2000);   /* (woken as each GPU job ends) */
++			IOLockLock(fFlipLock);
++		}
++		if (t < 0 && scanPending() != 0) {
++			t = scanPick(~0ull, skip, &nd);      /* (500 ms: the GPU is stuck; the newest all the same) */
+ 		}
+-		if (mach_absolute_time() > readyAt) {
+-			readyAt = mach_absolute_time();         /* (drawn: from now on it could go) */
++		if (t >= 0) {
++			fScanState[t] = SWEET_FB_SCAN_TAKEN;
++			fTaken = t;
+ 		}
++		readyAt = mach_absolute_time();
++		sweet_fb_path_stats[2] += readyAt - g0;
++		sweet_fb_gpu_wait[1] += readyAt - g0;   /* (the PATH line's "for its jobs") */
++	} else {
++		t = -1;
++		readyAt = 0;
++	}
++	IOLockUnlock(fFlipLock);
++	for (uint32_t i = 0; i < nd; i++) {
++		OSSafeReleaseNULL(skip[i]);
++	}
++	nd = 0;
++	if (t < 0) {
++		return false;
+ 	}
+ 	if (fTEBitWanted && !fTEBit && a34_dsi_lock()) {
+ 		/* A34 (0931): a34fbte=2, the TE seen only with EXT_TE_EN (teProbe()): set now, the DSI idle */
+@@ -2218,6 +2260,32 @@ AppleCLCD::kickOne(void)
+ 			sweet_fb_flip_stats[10] += (fTELast - readyAt) / fTEPeriod;   /* A34 (0938): whole periods it waited */
+ 		}
+ 	}
++	if (t >= 2) {
++		/* A34 (0996): a newer frame done by this TE goes instead; from here until its end the surface is held */
++		SweetSurface *instead = NULL;
++
++		IOLockLock(fFlipLock);
++		int32_t newer = scanPick(fScanSwapNo[t], skip, &nd);
++
++		if (newer >= 0) {
++			instead = scanRelease(t);
++			sweet_fb_scan_stats[6]++;
++			t = newer;
++			fTaken = t;
++		}
++		fScanState[t] = SWEET_FB_SCAN_SENDING;
++		if (fScanSurf[t] != NULL) {
++			scanHoldMin(fScanSurf[t]);
++			OSIncrementAtomic(&fScanSurf[t]->scanHeld);
++			OSIncrementAtomic(&sweet_surface_scan_total);
++		}
++		IOLockUnlock(fFlipLock);
++		OSSafeReleaseNULL(instead);
++		for (uint32_t i = 0; i < nd; i++) {
++			OSSafeReleaseNULL(skip[i]);
++		}
++		nd = 0;
++	}
+ 	if (!a34_dsi_lock()) {
+ 		a34_kick_stats[5]++;
+ 		IOLog("A34 FB FLIP: the display lock not got: picture %d stays queued\n", t);
+@@ -2225,10 +2293,18 @@ AppleCLCD::kickOne(void)
+ 
+ 		IOLockLock(fFlipLock);
+ 		fTaken = -1;
+-		if (fQueued < 0) {
++		if (t >= 2) {
++			/* A34 (0996): for the next kick (scanPick()), not held any more */
++			bool wasSending = fScanState[t] == SWEET_FB_SCAN_SENDING;
++
++			fScanState[t] = SWEET_FB_SCAN_PENDING;
++			if (wasSending && fScanSurf[t] != NULL) {
++				scanHoldMin(fScanSurf[t]);
++				OSDecrementAtomic(&fScanSurf[t]->scanHeld);
++				OSDecrementAtomic(&sweet_surface_scan_total);
++			}
++		} else if (fQueued < 0) {
+ 			fQueued = t;            /* (sent by the next kick) */
+-		} else if (t >= 2) {
+-			dropped = scanRelease(t);       /* A34 (0983): a newer frame is queued */
+ 		}
+ 		IOLockWakeup(fFlipLock, &fTaken, false);
+ 		IOLockUnlock(fFlipLock);
+@@ -2342,8 +2418,12 @@ AppleCLCD::scanRelease(int32_t k)
+ {
+ 	SweetSurface *s = fScanSurf[k];
+ 
++	bool sending = fScanState[k] == SWEET_FB_SCAN_SENDING;
++
+ 	fScanSurf[k] = NULL;
+-	if (s != NULL) {
++	fScanState[k] = SWEET_FB_SCAN_FREE;
++	fScanSwapNo[k] = 0;
++	if (s != NULL && sending) {
+ 		scanHoldMin(s);         /* A34 (0993): before scanHeld drops */
+ 		OSDecrementAtomic(&s->scanHeld);
+ 		OSDecrementAtomic(&sweet_surface_scan_total);
+@@ -2351,6 +2431,49 @@ AppleCLCD::scanRelease(int32_t k)
+ 	return s;
+ }
+ 
++/*
++ * A34 (0996), with fFlipLock: the newest pending scan-out frame swapped after
++ * `after` whose GPU jobs are done (~0 as `after`: the newest pending, done
++ * or not); the pending ones older than it dropped, their surfaces into
++ * dropped[] for the caller to release without the lock. -1: none.
++ */
++int32_t
++AppleCLCD::scanPick(uint64_t after, SweetSurface *dropped[4], uint32_t *nd)
++{
++	int32_t best = -1;
++	bool any = after == ~0ull;
++
++	for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
++		if (fScanState[k] == SWEET_FB_SCAN_PENDING && (any || fScanSwapNo[k] > after) &&
++		    (best < 0 || fScanSwapNo[k] > fScanSwapNo[best]) &&
++		    (any || fScanSurf[k] == NULL || a34_mali_surface_done(fScanSurf[k]))) {
++			best = k;
++		}
++	}
++	if (best < 0) {
++		return -1;
++	}
++	for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
++		if (k != best && fScanState[k] == SWEET_FB_SCAN_PENDING && fScanSwapNo[k] < fScanSwapNo[best] && *nd < 4) {
++			dropped[(*nd)++] = scanRelease(k);
++			sweet_fb_scan_stats[6]++;       /* (a newer one is done first) */
++		}
++	}
++	return best;
++}
++
++/* A34 (0996), with fFlipLock: scan-out frames waiting for the kick. */
++uint32_t
++AppleCLCD::scanPending(void)
++{
++	uint32_t n = 0;
++
++	for (uint32_t k = 2; k < SWEET_FB_FRAMES; k++) {
++		n += fScanState[k] == SWEET_FB_SCAN_PENDING ? 1u : 0u;
++	}
++	return n;
++}
++
+ /*
+  * A34 (0993), with fFlipLock: s->scanHoldMin, the oldest of the frames 2 and
+  * 3 that show s, its swap's place in the order of queued GPU jobs (~0: none,
+@@ -2362,9 +2485,10 @@ AppleCLCD::scanHoldMin(SweetSurface *s)
+ {
+ 	uint64_t least = ~0ull;
+ 
+-	for (int32_t k = 2; k < 4; k++) {
+-		if (fScanSurf[k] == s && fScanUpto[k] < least) {
+-			least = fScanUpto[k];
++	/* A34 (0996): held only while it is sent: then every job that names it waits */
++	for (int32_t k = 2; k < (int32_t)SWEET_FB_FRAMES; k++) {
++		if (fScanSurf[k] == s && fScanState[k] == SWEET_FB_SCAN_SENDING) {
++			least = 0;
+ 		}
+ 	}
+ 	__atomic_store_n(&s->scanHoldMin, least, __ATOMIC_RELEASE);
+@@ -2449,27 +2573,54 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+ 	 * the surface waits for its transfer (scanHoldMin()).
+ 	 */
+ 	t0 = mach_absolute_time();
+-	uint64_t upto = __atomic_load_n(&s->gpuPendingSince, __ATOMIC_ACQUIRE) != 0 ? ~0ull : a34_mali_queue_mark();
+-
+ 	now = t0;
+ 	IOLockLock(fFlipLock);
+-	k = fTaken == 2 ? 3 : 2;                /* the scan-out frame not being sent */
+-	if (fQueued >= 2) {
+-		gone = scanRelease(fQueued);    /* replaced before it was sent */
+-		sweet_fb_scan_stats[6]++;
++	/*
++	 * A34 (0996): a pending frame (scanPick() takes the newest one the GPU is
++	 * done with): one of the same surface still pending goes (it is drawn
++	 * again), a queued picture too; with no free one, the oldest pending.
++	 */
++	if (sweet_fb_picture(fQueued)) {
++		fQueued = -1;
++	}
++	k = -1;
++	for (int32_t i = 2; i < (int32_t)SWEET_FB_FRAMES; i++) {
++		if (fScanState[i] == SWEET_FB_SCAN_PENDING && fScanSurf[i] == s && gone == NULL) {
++			gone = scanRelease(i);
++			sweet_fb_scan_stats[6]++;
++		}
++		if (k < 0 && fScanState[i] == SWEET_FB_SCAN_FREE) {
++			k = i;
++		}
++	}
++	for (int32_t i = 2; k < 0 && i < (int32_t)SWEET_FB_FRAMES; i++) {
++		if (fScanState[i] == SWEET_FB_SCAN_FREE) {
++			k = i;
++		}
++	}
++	if (k < 0) {
++		for (int32_t i = 2; i < (int32_t)SWEET_FB_FRAMES; i++) {
++			if (fScanState[i] == SWEET_FB_SCAN_PENDING && (k < 0 || fScanSwapNo[i] < fScanSwapNo[k])) {
++				k = i;
++			}
++		}
++		if (k >= 0) {
++			stale = scanRelease(k);
++			sweet_fb_scan_stats[6]++;
++		}
+ 	}
+-	if (fScanSurf[k] != NULL) {
+-		stale = scanRelease(k);
++	if (k < 0) {
++		IOLockUnlock(fFlipLock);        /* (cannot be: one frame at most is the kick's) */
++		OSSafeReleaseNULL(gone);
++		s->release();
++		sweet_fb_scan_stats[1]++;
++		return false;
+ 	}
+ 	fScanSurf[k] = s;                       /* (sweet_surface_copy()'s reference) */
+-	fScanUpto[k] = upto;                    /* A34 (0993) */
+-	fScanReady[k] = s->gpuShared <= 0;
+-	scanHoldMin(s);
+-	OSIncrementAtomic(&s->scanHeld);
+-	OSIncrementAtomic(&sweet_surface_scan_total);
++	fScanSwapNo[k] = ++fScanSwaps;
++	fScanState[k] = SWEET_FB_SCAN_PENDING;
+ 	fBufPA[k] = addr;
+ 	fPitch[k] = s->bytesPerRow;
+-	fQueued = k;
+ 	queuedAt(now);
+ 	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
+ 	IOLockUnlock(fFlipLock);
+@@ -2507,12 +2658,6 @@ AppleCLCD::scanOut(const uint8_t *rec, uint32_t mask)
+  * latest frame is 2 or 3 to such a picture too, *seed set: present() first
+  * copies the scanned-out surface's window into it (fScanLast).
+  */
+-static inline bool
+-sweet_fb_picture(int32_t t)
+-{
+-	return t == 0 || t == 1;
+-}
+-
+ int32_t
+ AppleCLCD::drawTarget(bool full, bool *seed)
+ {
+@@ -2521,6 +2666,9 @@ AppleCLCD::drawTarget(bool full, bool *seed)
+ 	*seed = false;
+ 	IOLockLock(fFlipLock);
+ 	latest = fQueued >= 0 ? fQueued : (fTaken >= 0 ? fTaken : fShown);
++	if (scanPending() != 0) {
++		latest = 2;                     /* A34 (0996): a pending scan-out frame is the latest */
++	}
+ 	if (full || !sweet_fb_picture(latest)) {
+ 		t = sweet_fb_picture(fTaken) ? (fTaken ^ 1) : (sweet_fb_picture(fQueued) ? fQueued :
+ 		    (sweet_fb_picture(fShown) ? (fShown ^ 1) : 0));
+@@ -2562,19 +2710,24 @@ void
+ AppleCLCD::drawDone(int32_t target)
+ {
+ 	uint64_t now = mach_absolute_time();
+-	SweetSurface *gone = NULL;
++	SweetSurface *gone[4];
++	uint32_t ng = 0;
+ 
+ 	IOLockLock(fFlipLock);
+-	if (fQueued >= 2) {
+-		gone = scanRelease(fQueued);    /* A34 (0983): a scanned-out frame replaced before it was sent */
+-		sweet_fb_scan_stats[6]++;
++	for (uint32_t k = 2; k < SWEET_FB_FRAMES && ng < 4; k++) {
++		if (fScanState[k] == SWEET_FB_SCAN_PENDING) {
++			gone[ng++] = scanRelease((int32_t)k);   /* A34 (0983, 0996): scanned-out frames older than this one */
++			sweet_fb_scan_stats[6]++;
++		}
+ 	}
+ 	fWriting = -1;
+ 	fQueued = target;
+ 	queuedAt(now);                          /* A34 (0938, 0982): fQueuedAt, where in the TE period */
+ 	IOLockWakeup(fFlipLock, &fQueued, false);       /* (a kick waiting for it: kickFlip()) */
+ 	IOLockUnlock(fFlipLock);
+-	OSSafeReleaseNULL(gone);
++	for (uint32_t i = 0; i < ng; i++) {
++		OSSafeReleaseNULL(gone[i]);
++	}
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 86a2a5f..a029338 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -137,6 +137,8 @@ void sweet_surface_report(void);
+ bool a34_mali_surface_idle(SweetSurface *surface, uint32_t ms);
+ bool a34_mali_surface_idle_stats(SweetSurface *surface, uint32_t ms, uint64_t *st);    /* A34 (0989): A34Mali.cpp */
+ uint64_t a34_mali_queue_mark(void);                                                     /* A34 (0993): A34Mali.cpp */
++bool a34_mali_surface_done(SweetSurface *surface);                                      /* A34 (0996): A34Mali.cpp */
++void a34_mali_progress_wait(uint32_t us);
+ bool a34_mali_surface_ready(SweetSurface *surface, uint64_t upto, uint32_t ms, uint64_t *st);
+ 
+ /*
