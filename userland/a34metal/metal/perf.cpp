@@ -245,12 +245,16 @@ rwm_perf_report(uint64_t now)
 			say(line);
 		}
 	}
-	if (binds != nullptr && binds(line, sizeof(line)) != 0) {
-		say(line);
+	if (binds != nullptr) {
+		char wide[900];
+
+		if (binds(wide, sizeof(wide)) != 0) {
+			say(wide);
+		}
 	}
 	say_worst_cb();
 	for (unsigned which = 0; pan != nullptr && which < 47; which++) {    /* (4: tiles; 5: one span's jobs; 6 and on: its passes) */
-		char wide[600];
+		char wide[1000];
 
 		if (pan(which, wide, sizeof(wide)) != 0) {
 			say(wide);

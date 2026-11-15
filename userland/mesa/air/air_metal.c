@@ -590,8 +590,36 @@ rwa_unlock_at_return(int *held)
 /* pipelines made, and their time in AIR -> NIR and in the driver's compiler ("rwm pipelines") */
 static uint64_t rwa_pipelines_made, rwa_pipelines_translate_ns, rwa_pipelines_compile_ns;
 
+/*
+ * A34: waits for the lock, for the profile ("rwm lock"): how often a call found it held by another
+ * thread, how long it waited, the longest wait and which call held the lock then. Taken without a
+ * clock when it is free (trylock); the holder's name is the function that took it (__func__).
+ */
+static uint64_t rwa_lock_waits, rwa_lock_wait_ns, rwa_lock_wait_max;
+static const char *rwa_lock_holder, *rwa_lock_max_holder, *rwa_lock_max_waiter;
+
+static inline int
+rwa_lock_timed(const char *who)
+{
+   if (pthread_mutex_trylock(&rwa_lock) != 0) {
+      const char *holder = __atomic_load_n(&rwa_lock_holder, __ATOMIC_RELAXED);
+      uint64_t began = os_time_get_nano();
+      pthread_mutex_lock(&rwa_lock);
+      uint64_t waited = os_time_get_nano() - began;
+      rwa_lock_waits++;
+      rwa_lock_wait_ns += waited;
+      if (waited > rwa_lock_wait_max) {
+         rwa_lock_wait_max = waited;
+         rwa_lock_max_holder = holder;
+         rwa_lock_max_waiter = who;
+      }
+   }
+   __atomic_store_n(&rwa_lock_holder, who, __ATOMIC_RELAXED);
+   return 0;
+}
+
 #define RWA_GUARD() \
-   int rwa_held __attribute__((cleanup(rwa_unlock_at_return), unused)) = pthread_mutex_lock(&rwa_lock)
+   int rwa_held __attribute__((cleanup(rwa_unlock_at_return), unused)) = rwa_lock_timed(__func__)
 
 /*
  * The context's state, set only when it changes (struct rwa_device, bound_*). Counted for
@@ -1921,7 +1949,8 @@ rwa_bind_profile(char *line, size_t size)
             "(load DontCare), %llu passes not written back in part (store DontCare); "
             "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
             "%llu%% of it on the processor; states set %llu, skipped %llu%s; "
-            "constant buffers %llu, %llu of them copied",
+            "constant buffers %llu, %llu of them copied; the library's lock waited for %llu times, %.1f ms, "
+            "longest %.1f ms (%s waiting for %s)",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
             (unsigned long long)rwa_bind_returns, (unsigned long long)rwa_bind_merges,
             (unsigned long long)rwa_bind_load_forgets, (unsigned long long)rwa_bind_store_discards,
@@ -1932,7 +1961,11 @@ rwa_bind_profile(char *line, size_t size)
             (unsigned long long)(rwa_bind_vbo_wall_ns ? rwa_bind_vbo_cpu_ns * 100 / rwa_bind_vbo_wall_ns : 0),
             (unsigned long long)rwa_bind_sets,
             (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "",
-            (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies);
+            (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies,
+            (unsigned long long)rwa_lock_waits, rwa_lock_wait_ns / 1e6, rwa_lock_wait_max / 1e6,
+            rwa_lock_max_waiter ? rwa_lock_max_waiter : "-", rwa_lock_max_holder ? rwa_lock_max_holder : "-");
+   rwa_lock_waits = rwa_lock_wait_ns = rwa_lock_wait_max = 0;
+   rwa_lock_max_holder = rwa_lock_max_waiter = NULL;
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
    rwa_bind_merges = 0;
    rwa_bind_load_forgets = rwa_bind_store_discards = 0;
@@ -5248,7 +5281,8 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                "%llu buffers made (%llu us each), %llu of them new from the kernel (%llu us each); %llu batches "
                "sent from inside a draw (%llu us each); %llu sent with work (%llu us each), %llu empty; "
                "4 KB of a batch pool's memory: stored a word at a time %.1f us, memcpy %.1f us, loaded %.1f us "
-               "(malloc's: %.1f, %.1f, %.1f)",
+               "(malloc's: %.1f, %.1f, %.1f); the BO cache: %llu fetches answered, %llu refused (its oldest still "
+               "busy on the GPU), %llu with none of the size; %.1f MB new from the kernel; %.1f MB held",
                (unsigned long long)p[RWP_BATCH_INITS], RWP_EACH(RWP_BATCH_INITS, RWP_BATCH_INIT_NS),
                (unsigned long long)p[RWP_POOL_ALLOCS], RWP_EACH(RWP_POOL_ALLOCS, RWP_POOL_ALLOC_NS),
                (unsigned long long)p[RWP_BO_CREATES], RWP_EACH(RWP_BO_CREATES, RWP_BO_CREATE_NS),
@@ -5258,7 +5292,9 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                (unsigned long long)p[RWP_EMPTY_SUBMITS],
                redwood_pan_memtest[RWP_MEM_POOL_STORE] / 1e3, redwood_pan_memtest[RWP_MEM_POOL_COPY] / 1e3,
                redwood_pan_memtest[RWP_MEM_POOL_LOAD] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_STORE] / 1e3,
-               redwood_pan_memtest[RWP_MEM_RAM_COPY] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_LOAD] / 1e3);
+               redwood_pan_memtest[RWP_MEM_RAM_COPY] / 1e3, redwood_pan_memtest[RWP_MEM_RAM_LOAD] / 1e3,
+               (unsigned long long)p[RWP_CACHE_HITS], (unsigned long long)p[RWP_CACHE_BUSY],
+               (unsigned long long)p[RWP_CACHE_NONE], p[RWP_FRESH_KB] / 1024.0, p[RWP_CACHED_KB] / 1024.0);
       return 1;
    case 2: {
       size_t at = (size_t)snprintf(line, size, "rwm pan batches sent for:");
@@ -5357,14 +5393,22 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
       const struct redwood_pan_pass *r = &trace[k];
       static const char *const kinds[] = { "linear", "16x16 tiled", "AFBC", "other" };
       snprintf(line, size, "rwm pass %u of %u: %ux%u %s %s%s level %u (framebuffer %ux%u, drawn %ux%u), "
-               "%u draws, %u colour attachments; colour 0 %s%s%s, %s; depth/stencil %s%s%s; sent for: %s; "
-               "GPU jobs %llu-%llu",
+               "%u draws, %u colour attachments; colour 0 %s%s%s, %s; colour 1 %s; depth/stencil %s%s%s; "
+               "preloads %s; sent for: %s; GPU jobs %llu-%llu",
                k + 1, ntrace, r->res_w, r->res_h, util_format_short_name((enum pipe_format)r->format),
                kinds[r->kind & 3], r->shared ? " IOSurface" : "", r->level, r->width, r->height, r->extent_w,
                r->extent_h, r->draws, r->nr_cbufs, r->clear ? "cleared" : r->preload ? "preloaded" : "not loaded",
                r->reentry ? " (re-entry)" : "", "", r->writeback ? "written back" : "not written back",
+               !r->rt1 ? "none"
+               : r->clear1 ? (r->writeback1 ? "cleared, written back" : "cleared, not written back")
+               : r->preload1 ? (r->writeback1 ? "preloaded, written back" : "preloaded, not written back")
+               : (r->writeback1 ? "not loaded, written back" : "not loaded, not written back"),
                !r->zs ? "none" : r->zs_preload ? "preloaded" : "not loaded",
-               r->zs ? (r->zs_writeback ? ", written back" : ", not written back") : "", "", r->why,
+               r->zs ? (r->zs_writeback ? ", written back" : ", not written back") : "", "",
+               !(r->preload || r->preload1 || r->zs_preload) ? "none"
+               : r->always ? "over the whole drawn area (a kept clear forces ALWAYS)"
+               : "only where geometry falls (INTERSECT)",
+               r->why,
                (unsigned long long)r->first_seq, (unsigned long long)r->seq);
       return 1;
    }

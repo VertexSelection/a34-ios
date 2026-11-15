@@ -63,6 +63,9 @@ enum redwood_pan_prof_index {
    RWP_SHARED_KB,          /* preload + write-back KB of IOSurface (shared) targets */
    RWP_AFBC_KB,            /* ... of AFBC targets */
    RWP_LINEAR_KB,          /* ... of linear targets (the rest: 16x16 tiled) */
+   /* (patch 0014) Mesa's BO cache: fetches answered, refused because its oldest fitting BO was still
+    * busy on the GPU, or with no BO of that size; KB of BOs new from the kernel; KB held now */
+   RWP_CACHE_HITS, RWP_CACHE_BUSY, RWP_CACHE_NONE, RWP_FRESH_KB, RWP_CACHED_KB,
    RWP_SLOTS
 };
 
@@ -101,6 +104,12 @@ struct redwood_pan_pass {
    uint32_t draws;
    const char *why;
    uint64_t first_seq, seq;           /* its GPU jobs' numbers, first and last (redwood-drm); 0: not known */
+   /* colour attachment 1, when there is one (CoreAnimation's second attachment) */
+   uint16_t res1_w, res1_h;
+   bool rt1, preload1, writeback1, clear1;
+   /* a clean-tile write forced (a cleared attachment kept, TSIX-2033): every preload of the batch then
+    * runs over the whole drawn area (ALWAYS) instead of only the tiles geometry touches (INTERSECT) */
+   bool always;
 };
 extern bool redwood_pan_trace_on;
 extern unsigned redwood_pan_trace_n;
