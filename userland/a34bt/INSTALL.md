@@ -179,3 +179,19 @@ pointer items followed, and only above 4 GB). A crash in bluetoothd is now also 
 `a34bt-btd: bluetoothd[N]: crash: signal 11 at ...: pc IMAGE+OFF lr ... frames ...`.
 
 Same kernel and wraps; only `/a34` (`root-add-job.py --copy /mnt /a34 a34`) from the new artifact.
+
+## 9. All of bluetoothd's keychain (boot 0989-bt-a)
+
+0989-bt-a: no crash, but "Failed to set new identity root!" again (copy/update -25300, add -25291,
+"restarting { reason=130 }"), and the library had answered only one call ("copy (any) (all)").
+bluetoothd's keychain helpers take the service from their caller and default to `MobileBluetooth`
+only when it is NULL: the root keys are under `BluetoothGlobal`, LE devices under `BluetoothLE` and
+`BluetoothLESync`. Those went to securityd. Now every generic password of the four services (or of
+access group `com.apple.bluetooth` without a service) is kept by the library, keyed by service and
+account, and each call is logged:
+
+    a34bt-btd: bluetoothd[N]: keychain: copy BluetoothGlobal/Identity Root: 0 item(s), -25300 [keys: class svce acct ...]
+    a34bt-btd: bluetoothd[N]: keychain: add BluetoothGlobal/Identity Root: 1 item(s), 0 [keys: ...]
+
+Same kernel and wraps; only `/a34` from the new artifact. (A stale
+`/var/mobile/Library/Bluetooth/com.a34.keychain.plist` from earlier boots is read and rekeyed.)
