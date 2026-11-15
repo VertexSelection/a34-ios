@@ -3220,10 +3220,10 @@ index 0000000..8c9615f
 +#endif
 diff --git a/bsd/dev/a34_cellfs.c b/bsd/dev/a34_cellfs.c
 new file mode 100644
-index 0000000..566983c
+index 0000000..afbc021
 --- /dev/null
 +++ b/bsd/dev/a34_cellfs.c
-@@ -0,0 +1,1268 @@
+@@ -0,0 +1,1347 @@
 +/*
 + * A34 (0951): the modem's file server, in the kernel and read only.
 + *
@@ -3238,12 +3238,19 @@ index 0000000..566983c
 + * but into the reply to the modem, never written back: what the modem writes, deletes or renames
 + * lives in a RAM overlay for this session. The flash backup/restore operations (BIN_REGION,
 + * RESTORE) and OTP are refused with the values Android's server returns when they fail.
++ *
++ * One exception, approved for diagnosis (boot-arg a34cellmdtrace=1, off by default): the
++ * printable text the modem writes during this boot into its own boot trace and mini dump
++ * (Z:/nv_boot_trace, X:/nv_mini_dump) is logged as "A34 CELL MDTRACE:" lines, every run of 6 or
++ * more digits and every hex-like run of 8 or more characters masked with '#'. Nothing read from
++ * the flash and no other file is ever logged.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/kalloc.h>
 +#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
 +#include "a34_ccci.h"
 +#include "a34_ext4ro.h"
 +
@@ -3715,6 +3722,77 @@ index 0000000..566983c
 +	return 0;
 +}
 +
++/* ---- the modem's own boot trace text (a34cellmdtrace=1) ---- */
++
++static uint32_t mdtrace_on = 2;         /* 2: boot-arg not read yet */
++static uint32_t mdtrace_left = 48u << 10;
++
++static bool
++is_hexch(char c)
++{
++	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
++}
++
++/* Masks digit runs >= 6 and hex-like runs >= 8 (with a digit in them) in s[0..n). */
++static void
++mdtrace_mask(char *s, uint32_t n)
++{
++	for (uint32_t i = 0; i < n;) {
++		uint32_t j = i, digits = 0;
++		while (j < n && s[j] >= '0' && s[j] <= '9')
++			j++;
++		if (j - i >= 6) {
++			memset(s + i, '#', j - i);
++			i = j;
++			continue;
++		}
++		j = i;
++		while (j < n && is_hexch(s[j])) {
++			digits += s[j] >= '0' && s[j] <= '9';
++			j++;
++		}
++		if (j - i >= 8 && digits) {
++			memset(s + i, '#', j - i);
++			i = j;
++			continue;
++		}
++		i = j > i ? j : i + 1;
++	}
++}
++
++static void
++mdtrace(const char *key, const uint8_t *d, uint32_t len)
++{
++	if (mdtrace_on == 2) {
++		uint32_t v = 0;
++		(void)PE_parse_boot_argn("a34cellmdtrace", &v, (int)sizeof(v));
++		mdtrace_on = v ? 1 : 0;
++	}
++	if (!mdtrace_on || !mdtrace_left ||
++	    (strcmp(key, "Z:/nv_boot_trace") != 0 && strcmp(key, "X:/nv_mini_dump") != 0))
++		return;
++	char line[164];
++	uint32_t n = 0;
++	for (uint32_t i = 0; i <= len && mdtrace_left; i++) {
++		bool pr = i < len && d[i] >= 0x20 && d[i] < 0x7f;
++		if (pr && n < sizeof(line) - 1) {
++			line[n++] = (char)d[i];
++			continue;
++		}
++		if (n >= 4) {
++			mdtrace_mask(line, n);
++			line[n] = 0;
++			printf("A34 CELL MDTRACE: %c %s\n", key[0], line);
++			mdtrace_left = mdtrace_left > n ? mdtrace_left - n : 0;
++		}
++		n = 0;
++		if (pr)
++			line[n++] = (char)d[i];
++	}
++	if (!mdtrace_left)
++		printf("A34 CELL MDTRACE: (48 KiB logged; the rest is not)\n");
++}
++
 +static int32_t
 +do_write(struct hnd *x, const uint8_t *d, uint32_t len)
 +{
@@ -3735,6 +3813,7 @@ index 0000000..566983c
 +	if (!ov_reserve(o, x->pos + len))
 +		return E_GENERAL;
 +	memcpy(o->data + x->pos, d, len);
++	mdtrace(x->p.key, d, len);
 +	x->pos += len;
 +	if (x->pos > o->size)
 +		o->size = x->pos;
