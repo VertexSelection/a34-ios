@@ -6,6 +6,9 @@
  */
 #include "rwm.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include <stdint.h>
 #include <string.h>
 
@@ -100,6 +103,26 @@ clears_on()
 		on = !rwm_boot_arg("rwm_clears=0");
 	}
 	return on != 0;
+}
+
+extern "C" void
+rwm_render_set_label(struct rwm_render_state *s, const char *label)
+{
+	static const char *const wanted[] = { "_Tds", "_Tn1", "_Tn2", "_Tvr", "_Tcma", "_Tvcm", "_Tc3", "_Tmua", "_Tm1a",
+					      "Bpl", "_Tasg", "_Tlub" };
+
+	s->probe[0] = '\0';
+	if (label == nullptr || !rwm_blurdump_on()) {
+		return;
+	}
+	for (const char *w : wanted) {
+		if (strstr(label, w) != nullptr) {
+			const char *at = strstr(label, "coreanimation.");
+
+			snprintf(s->probe, sizeof(s->probe), "%s", at != nullptr ? at + 14 : label);
+			return;
+		}
+	}
 }
 
 extern "C" void
@@ -368,6 +391,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 		d->color_slice[i] = s->color_slice[i];
 	}
 	d->color_levels = levels_on();
+	memcpy(d->probe, s->probe, sizeof(d->probe));
 	d->clear_color_mask = s->clear_mask;
 	memcpy(d->clear_colors, s->clear_colors, sizeof(d->clear_colors));
 	memcpy(w->clear_color, s->clear_color, sizeof(w->clear_color));

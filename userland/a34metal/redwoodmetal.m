@@ -885,11 +885,159 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	return texture;
 }
 
+/*
+ * (metal-fx) Boot-arg rwm_caps=1: every capability question asked of the device (a method of it or of _MTLDevice
+ * named supports*, max*, min*, readWrite*, are*, is*, has*, argumentBuffers*, recommended*, sparse*, location*, whose
+ * arguments are integers or pointers) with this driver's answer, once per question; and every new* of the device
+ * that answers nil, with what it was asked. Lines "caps:". CoreAnimation decides how it blurs by some of them.
+ */
+static int
+rw_trace_kind(const char *name)
+{
+	static const char *const asks[] = { "supports", "max", "min", "readWrite", "are", "is", "has", "argumentBuffers",
+					    "recommended", "sparse", "location", "peer", "currentAllocated" };
+
+	if (strncmp(name, "new", 3) == 0) {
+		return 2;
+	}
+	for (size_t i = 0; i < sizeof(asks) / sizeof(asks[0]); i++) {
+		if (strncmp(name, asks[i], strlen(asks[i])) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* (once per question: the selector's name and its first argument) */
+static bool
+rw_trace_said(const char *name, uint64_t a)
+{
+	static uint64_t said[512];
+	static unsigned count;
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	uint64_t key = (uint64_t)(uintptr_t)name * 31 + a;
+	bool was = false;
+
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < count && !was; i++) {
+		was = said[i] == key;
+	}
+	if (!was && count < sizeof(said) / sizeof(said[0])) {
+		said[count++] = key;
+	} else if (!was) {
+		was = true;     /* (full: quiet) */
+	}
+	pthread_mutex_unlock(&lock);
+	return was;
+}
+
+static void
+rw_trace_nil(const char *name, uint64_t a, unsigned args)
+{
+	char what[200] = "-";
+
+	if (args >= 1 && a > 0x100000000ull) {
+		NSString *d = [(id)(uintptr_t)a description];
+
+		if (d != nil) {
+			snprintf(what, sizeof(what), "%s", [d UTF8String]);
+		}
+	}
+	rw_print("caps: -[device %s] answered nil (asked: %s)\n", name, what);
+}
+
+static void
+rw_trace_install(Class cls)
+{
+	Class walk[2] = { cls, class_getSuperclass(cls) };
+	SEL done[512];
+	unsigned done_count = 0, wrapped = 0;
+
+	for (unsigned k = 0; k < 2; k++) {
+		unsigned count = 0;
+		Method *methods = class_copyMethodList(walk[k], &count);
+
+		for (unsigned i = 0; i < count && done_count < sizeof(done) / sizeof(done[0]); i++) {
+			SEL sel = method_getName(methods[i]);
+			const char *name = sel_getName(sel);
+			int kind = rw_trace_kind(name);
+			bool seen = false;
+
+			for (unsigned j = 0; j < done_count && !seen; j++) {
+				seen = done[j] == sel;
+			}
+			if (kind == 0 || seen) {
+				continue;
+			}
+			done[done_count++] = sel;
+
+			Method on = class_getInstanceMethod(cls, sel);
+			const char *types = on != NULL ? method_getTypeEncoding(on) : NULL;
+			unsigned args = on != NULL ? method_getNumberOfArguments(on) - 2 : 9;
+			char ret = types != NULL ? types[0] : 0;
+			bool plain = args <= 3 && types != NULL;
+
+			for (unsigned a = 0; plain && a < args; a++) {
+				char *t = method_copyArgumentType(on, a + 2);
+
+				plain = t != NULL && t[0] != '\0' && strchr("QqLlIiSsCcB@^*:", t[0]) != NULL;
+				free(t);
+			}
+			if (!plain || (kind == 2 && ret != '@') || (kind == 1 && strchr("BcQqLlIi", ret) == NULL)) {
+				continue;
+			}
+
+			IMP orig = method_getImplementation(on);
+			const char *keep = name;
+			id block;
+
+			if (kind == 2) {
+				block = ^id(id me, uint64_t a, uint64_t b, uint64_t c) {
+					id made = ((id(*)(id, SEL, uint64_t, uint64_t, uint64_t))orig)(me, sel, a, b, c);
+
+					if (made == nil) {
+						rw_trace_nil(keep, a, args);
+					}
+					return made;
+				};
+			} else if (ret == 'B' || ret == 'c') {
+				block = ^BOOL(id me, uint64_t a, uint64_t b, uint64_t c) {
+					BOOL answer = ((BOOL(*)(id, SEL, uint64_t, uint64_t, uint64_t))orig)(me, sel, a, b, c);
+
+					if (!rw_trace_said(keep, args ? a : 0)) {
+						rw_print("caps: -[device %s%s%llu] = %s\n", keep, args ? " " : "",
+							 args ? (unsigned long long)a : 0ull, answer ? "YES" : "NO");
+					}
+					return answer;
+				};
+			} else {
+				block = ^uint64_t(id me, uint64_t a, uint64_t b, uint64_t c) {
+					uint64_t answer = ((uint64_t(*)(id, SEL, uint64_t, uint64_t, uint64_t))orig)(me, sel, a, b,
+														     c);
+
+					if (!rw_trace_said(keep, args ? a : 0)) {
+						rw_print("caps: -[device %s%s%llu] = %llu\n", keep, args ? " " : "",
+							 args ? (unsigned long long)a : 0ull, (unsigned long long)answer);
+					}
+					return answer;
+				};
+			}
+			class_replaceMethod(cls, sel, imp_implementationWithBlock(block), types);
+			wrapped++;
+		}
+		free(methods);
+	}
+	rw_print("caps: %u of the device's questions and makers are written down (rwm_caps=1)\n", wrapped);
+}
+
 @implementation RedwoodMetalDevice
 
 + (void)load
 {
 	ensure_spi(self);
+	if (rwm_boot_arg("rwm_caps=1")) {
+		rw_trace_install(self);
+	}
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
@@ -4057,6 +4205,9 @@ rw_core_of(id texture)
 	RedwoodMetalRenderPipeline *p = state;
 
 	rwm_render_set_pipeline(&_state, p, [p render], [p vertexStreamMask], [p vertexStreamCount], [p writesDepth]);
+	if (rwm_blurdump_on()) {        /* (metal-fx) which draws rwm_blurdump probes */
+		rwm_render_set_label(&_state, [[p label] UTF8String]);
+	}
 }
 
 /*

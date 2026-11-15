@@ -1,0 +1,1895 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4c12ac2..c44a3c4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,8 @@ bsd/dev/a34_touch.c			standard
+ bsd/dev/a34_diag.c			standard
+ bsd/dev/a34_mali.c			standard
+ bsd/dev/a34_clocks.c			standard
++bsd/dev/a34_connsys.c			standard
++bsd/dev/a34_bt.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+new file mode 100644
+index 0000000..097340f
+--- /dev/null
++++ b/bsd/dev/a34_bt.c
+@@ -0,0 +1,945 @@
++/*
++ * A34 (0939): Bluetooth, milestone 1 (docs/bluetooth-plan.md).
++ *
++ * The MT6877's Bluetooth is the BGF subsystem of CONNSYS, reached over BTIF (a UART-like FIFO at
++ * 0x1100c000) with plain H4 framing -- no STP on this "CONNAC 2" generation. This brings it up the way
++ * Android's bt_drv_6877.ko does (btmtk_set_power_on), all in the kernel log:
++ *
++ *   step 1  the firmware: /a34/firmware/soc5_0_ram_mcu_1_1_hdr.bin (BGF MCU patch) and
++ *           soc5_0_ram_bt_1_1_hdr.bin (Bluetooth RAM code), read once the root is mounted
++ *           (userland/a34bt/install-firmware.sh copies them from the phone's vendor partition)
++ *   step 2  CONNSYS's common part up (conninfra: a34_connsys.c, its own boot-args there)
++ *   step 3  conn_infra kept awake for Bluetooth, its version read (0x02060002)
++ *   step 4  both images copied into CONNSYS's memory (EMI) at the offsets their headers give
++ *   step 5  BGF powered (bgfsys_power_on), its MCU let go, waited for in its idle loop (0x1D1E)
++ *   step 6  BTIF: clock, FIFOs, PIO
++ *   step 7  "driver own": the BGF woken for the host (BGF_LPCTL)
++ *   step 8  WMT_FUNC_CTRL over HCI (01 6f fc 06 01 06 02 00 00 01), answered 04 e4 05 02 06 01 00 00
++ *   step 9  the six HCI commands a host asks first, each answered with status 0
++ *   step 10 a raw HCI channel for userland/a34bt: kernel control "com.a34.bt.hci" (root only, a datagram
++ *           per H4 packet, both ways); sysctl kern.a34bt says how far it got
++ *
++ * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
++ * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
++ * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
++ * is the step that hung); a34btlog=N packets of each direction said in the log (default 48).
++ *
++ * Register facts (not code) from Samsung's A34 kernel (github.com/Fede2782/android_kernel_samsung_a34x,
++ * branch sep-16.0/stock = A346BXXSADYG1 OSRC), vendor/mediatek/kernel_modules/connectivity/bt/mt66xx:
++ * include/btif/platform_6877.h (register map, bgfsys_power_on), btif/btmtk_mt66xx.c (btmtk_set_power_on,
++ * __download_patch_to_emi, _send_wmt_power_cmd), btif/btmtk_btif_main.c (btmtk_cif_fw_own_clr), and
++ * kernel/kernel_device_modules-6.6/drivers/misc/mediatek/btif/common/btif_plat.c (hal_btif_hw_init);
++ * the A34's device tree (bt@18000000, btif@1100c000) and clk-mt6877.c (ifrao_btif). The order of work,
++ * the six-command probe and BTIF in PIO follow HackiOS (github.com/oosexgang/hakios-xnu-kernel, branch mtk,
++ * APSL 2.0 / MIT): redwood_mtkbt_skel.c, redwood_connsys.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/proc.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_log_flush(void);              /* bsd/dev/sweet_ufs.c (0939): the log thread, now */
++
++/* bsd/dev/a34_connsys.c (0939) */
++extern int a34_connsys_on(void);
++extern bool a34_connsys_readable(const char *when);
++extern uint64_t a34_connsys_emi_pa(void);
++extern uint32_t a34_connsys_emi_size(void);
++
++void a34_bt_init(void);                         /* bsd/dev/sweet_ufs.c, at boot */
++
++/* ---- where things are (physical) ---- */
++
++#define BT_RGU_PA               0x18000000u     /* conn_infra RGU (bt@18000000 reg 0) */
++#define BT_CFG_PA               0x18001000u     /* conn_infra CFG (reg 1) */
++#define BT_SWIRQ_PA             0x1803f000u     /* BGF_SW_IRQ_STATUS +0x10, _RESET +0x14 */
++#define BT_HOSTCSR_PA           0x18060000u     /* conn_host_csr_top (reg 3, "SPM" in the driver) */
++#define BT_BGF_PA               0x18800000u     /* BGFSYS (reg 4) */
++#define BT_BGFINFO_PA           0x18812000u     /* BGFSYS info (reg 5) */
++#define BT_INFRACFG_PA          0x10001000u     /* infracfg_ao (reg 6): BTIF's clock gate */
++#define BT_CCIF_PA              0x10003000u     /* +0x204: CONSYS_BGF_PWR_ON, the modem's coexistence flag */
++#define BT_BTIF_PA              0x1100c000u     /* btif@1100c000 */
++#define BT_PAGE                 0x1000u
++
++/* conn_infra RGU */
++#define RGU_BGF_ON_PWR_CTL      0x020u          /* 0x42540080 | (keep [15:8,6:0]): power on */
++#define RGU_BGF_CPU_SW_RST      0x124u          /* bit 0: 0 holds the BGF's N10 CPU in reset */
++#define RGU_BGF_ON_PWR_ACK      0x414u          /* bits 25:24 */
++#define RGU_BGF_OFF_PWR_ACK     0x424u          /* bit 24 ack_b, bit 0 ack_s */
++/* conn_infra CFG */
++#define CFG_VERSION             0x000u
++#define CFG_VERSION_ID          0x02060002u
++#define CFG_BT_PWRCTLCR0        0x208u          /* bit 0 BT_FUNC_EN */
++#define CFG_CONN2BT_SLP_CTL     0x550u          /* bit 0 TX_EN, bit 4 RX_EN */
++#define CFG_CONN2BT_SLP_ST      0x554u          /* bit 23 TX ack, bit 22 RX ack */
++#define CFG_BT2CONN_SLP_CTL     0x560u
++#define CFG_BT2CONN_SLP_ST      0x564u
++/* conn_host_csr_top */
++#define HC_BGF_LPCTL            0x030u          /* bit 0 SET_FW_OWN, 1 CLR_FW_OWN, 2 OWNER_STATE_SYNC */
++#define HC_BGF_IRQ_STAT         0x034u          /* bit 0 FW_OWN_CLR, write 1 to clear */
++#define HC_BGF_IRQ_STAT2        0x03cu          /* bit 0 FW_OWN_SET, write 1 to clear */
++#define HC_WAKEUP_BT            0x1a8u          /* bit 0: conn_infra forced on for Bluetooth */
++#define HC_REMAP                0x1c4u          /* where CONNSYS sees its memory (read only here) */
++#define HC_MCU_PC               0x22cu
++/* BGFSYS */
++#define BGF_MCCR                0x100u          /* bit 31 con_cr_ahb_auto_dis */
++#define BGF_MCCR_SET            0x104u          /* bit 2 con_cr_ahb_stop */
++#define BGF_SW_DBG_CTL          0x16cu          /* 0x1D1E: the ROM's power-on part done */
++#define BGFINFO_IP_VERSION      0x010u
++#define BGF_IP_VERSION_ID       0x02040200u
++/* BTIF (drivers/misc/mediatek/btif/common/plat_inc/btif_priv.h) */
++#define BTIF_RBR_THR            0x00u
++#define BTIF_IER                0x04u
++#define BTIF_FIFOCTRL           0x08u           /* bit 1 clear RX, bit 2 clear TX */
++#define BTIF_FAKELCR            0x0cu
++#define BTIF_LSR                0x14u           /* bit 0 data ready, bit 5 THRE, bit 6 TEMT */
++#define BTIF_SLEEP_EN           0x48u
++#define BTIF_DMA_EN             0x4cu           /* bit 0 RX DMA, 1 TX DMA, 2 auto-reset */
++#define BTIF_TRI_LVL            0x60u
++#define BTIF_WAK                0x64u
++#define BTIF_HANDSHAKE          0x6cu
++#define BTIF_TX_FIFO            16u
++#define INFRA_CG0_CLR           0x084u          /* ifrao_btif: bit 31 */
++#define INFRA_CG0_STA           0x090u
++
++/* The EMI header of each image (struct fw_patch_emi_hdr, btmtk_mt66xx.c): 48 bytes before the image proper. */
++#define FW_HDR                  48u
++#define FW_DIR                  "/a34/firmware/"
++static const char *const bt_fw_names[2] = { "soc5_0_ram_mcu_1_1_hdr.bin", "soc5_0_ram_bt_1_1_hdr.bin" };
++
++#define BT_PKT_MAX              1100u           /* an H4 packet: ACL data of up to 1021 bytes on this controller */
++#define BT_UNITS                8u
++
++static vm_offset_t bt_rgu, bt_cfg, bt_swirq, bt_hc, bt_bgf, bt_bgfinfo, bt_infra, bt_ccif, bt_btif;
++static uint32_t bt_step_max = 99, bt_wait_s = 180, bt_sync = 1, bt_log_max = 48;
++static uint32_t bt_said_in, bt_said_out;
++
++static uint8_t *bt_fw[2];
++static uint32_t bt_fw_size[2];
++
++static char bt_state[256] = "off (boot-arg a34bt=1 to start)";
++SYSCTL_STRING(_kern, OID_AUTO, a34bt, CTLFLAG_RD | CTLFLAG_LOCKED, bt_state, sizeof(bt_state),
++    "A34 Bluetooth: how far the kernel got (0939)");
++
++static LCK_GRP_DECLARE(bt_lck_grp, "a34_bt");
++static LCK_MTX_DECLARE(bt_tx_lock, &bt_lck_grp);        /* one writer of BTIF at a time */
++static LCK_MTX_DECLARE(bt_unit_lock, &bt_lck_grp);
++static uint32_t bt_units[BT_UNITS];                     /* connected units of the raw channel (0: free) */
++static kern_ctl_ref bt_ctl_ref;
++static int bt_sleep_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++setb(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	wr(base, off, rd(base, off) | bits);
++}
++
++static void
++clrb(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	wr(base, off, rd(base, off) & ~bits);
++}
++
++static uint32_t
++bt_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++static void
++bt_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_sleep_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++bt_set_state(const char *what)
++{
++	strlcpy(bt_state, what, sizeof(bt_state));
++}
++
++/*
++ * Said before a step that can hang the bus (a read of a block that is off or asleep): the log thread is
++ * woken to write the console to the disk now, and given a second, so that the last line of a boot that
++ * hangs here is this one (tools/pull-log.sh).
++ */
++static void
++bt_checkpoint(uint32_t step, const char *what)
++{
++	printf("A34 BT: step %u: %s\n", step, what);
++	if (bt_sync) {
++		sweet_log_flush();
++		bt_sleep_ms(1000);
++	}
++}
++
++/* until (reg & mask) == want, at most tries times us apart; says what it saw when it gives up */
++static bool
++bt_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t tries, uint32_t us, const char *what)
++{
++	uint32_t v = 0;
++
++	for (uint32_t i = 0; i < tries; i++) {
++		v = rd(base, off);
++		if ((v & mask) == want) {
++			return true;
++		}
++		delay((int)us);
++	}
++	printf("A34 BT: %s: %#x after %u tries (wanted %#x under mask %#x)\n", what, v, tries, want, mask);
++	return false;
++}
++
++/* ---- step 1: the firmware ---- */
++
++static uint8_t *
++bt_file(const char *name, uint32_t *size)
++{
++	char path[96];
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	uint8_t *data = NULL;
++	int resid = 0, error;
++
++	snprintf(path, sizeof(path), "%s%s", FW_DIR, name);
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return NULL;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	error = vnode_getattr(vp, &va, ctx);
++	if (error == 0 && va.va_data_size > FW_HDR && va.va_data_size < (8u << 20)) {
++		data = kalloc_data((vm_size_t)va.va_data_size, Z_WAITOK);
++		if (data != NULL) {
++			error = vn_rdwr(UIO_READ, vp, (caddr_t)data, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (error != 0 || resid != 0) {
++				printf("A34 BT: %s: read error %d, %d bytes not read\n", path, error, resid);
++				kfree_data(data, (vm_size_t)va.va_data_size);
++				data = NULL;
++			}
++		}
++	} else {
++		printf("A34 BT: %s: getattr %d, size %llu: not a firmware image\n", path, error,
++		    (unsigned long long)va.va_data_size);
++	}
++	vnode_put(vp);
++	if (data != NULL) {
++		*size = (uint32_t)va.va_data_size;
++	}
++	return data;
++}
++
++/* where an image goes in CONNSYS's memory: the middle two bytes of its EMI address (__download_patch_to_emi) */
++static uint32_t
++bt_fw_offset(const uint8_t *hdr)
++{
++	return ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[25] << 8);
++}
++
++static bool
++bt_firmware(void)
++{
++	uint32_t waited = 0;
++
++	while (rootvnode == NULLVP && waited < bt_wait_s) {
++		bt_sleep_ms(1000);
++		waited++;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		while ((bt_fw[i] = bt_file(bt_fw_names[i], &bt_fw_size[i])) == NULL) {
++			if (waited++ >= bt_wait_s) {
++				printf("A34 BT: step 1: no %s%s after %u s (userland/a34bt/install-firmware.sh puts it there)\n",
++				    FW_DIR, bt_fw_names[i], bt_wait_s);
++				return false;
++			}
++			bt_sleep_ms(1000);
++		}
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		const uint8_t *h = bt_fw[i];
++		uint32_t off = bt_fw_offset(h), body = bt_fw_size[i] - FW_HDR;
++		char built[15];
++
++		memcpy(built, h, 14);
++		built[14] = 0;
++		printf("A34 BT: step 1: %s: %u bytes, built %s, platform %c%c%c%c, hw %02x%02x sw %02x%02x, "
++		    "EMI address %02x%02x%02x%02x -> offset %#x, subsystem %#x\n", bt_fw_names[i], bt_fw_size[i], built,
++		    h[16], h[17], h[18], h[19], h[20], h[21], h[22], h[23], h[27], h[26], h[25], h[24], off,
++		    (uint32_t)h[28] | ((uint32_t)h[29] << 8) | ((uint32_t)h[30] << 16) | ((uint32_t)h[31] << 24));
++		if (memcmp(h + 16, "ALPS", 4) != 0) {
++			printf("A34 BT: step 1: %s is not a MediaTek EMI image\n", bt_fw_names[i]);
++			return false;
++		}
++		if ((uint64_t)off + body > a34_connsys_emi_size()) {
++			printf("A34 BT: step 1: %s does not fit CONNSYS's memory (%#x + %#x > %#x)\n", bt_fw_names[i], off,
++			    body, a34_connsys_emi_size());
++			return false;
++		}
++	}
++	if (bt_fw_offset(bt_fw[0]) + bt_fw_size[0] - FW_HDR > bt_fw_offset(bt_fw[1])) {
++		printf("A34 BT: step 1: the two images overlap\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---- step 4: the images into CONNSYS's memory ---- */
++
++static bool
++bt_copy_firmware(void)
++{
++	uint64_t pa = a34_connsys_emi_pa();
++	uint32_t span = 0;
++	vm_offset_t emi;
++
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t end = bt_fw_offset(bt_fw[i]) + bt_fw_size[i] - FW_HDR;
++
++		span = end > span ? end : span;
++	}
++	span = (span + BT_PAGE - 1) & ~(BT_PAGE - 1);
++	emi = ml_io_map_wcomb((vm_offset_t)pa, span);      /* (normal memory, uncached: no faults on any width) */
++	if (emi == 0) {
++		printf("A34 BT: step 4: CONNSYS's memory %#llx + %#x could not be mapped\n", pa, span);
++		return false;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		const uint8_t *src = bt_fw[i] + FW_HDR;
++		uint32_t off = bt_fw_offset(bt_fw[i]), n = bt_fw_size[i] - FW_HDR, sum = 0, back = 0, k;
++		volatile uint8_t *dst = (volatile uint8_t *)(emi + off);
++
++		for (k = 0; k + 4 <= n; k += 4) {
++			uint32_t w = (uint32_t)src[k] | ((uint32_t)src[k + 1] << 8) | ((uint32_t)src[k + 2] << 16) |
++			    ((uint32_t)src[k + 3] << 24);
++
++			*(volatile uint32_t *)(void *)(dst + k) = w;
++			sum += w;
++		}
++		for (; k < n; k++) {
++			dst[k] = src[k];
++			sum += src[k];
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (k = 0; k + 4 <= n; k += 4) {
++			back += *(volatile uint32_t *)(void *)(dst + k);
++		}
++		for (; k < n; k++) {
++			back += dst[k];
++		}
++		printf("A34 BT: step 4: %s: %u bytes at EMI %#llx (+%#x), sum %#x, read back %#x%s\n", bt_fw_names[i], n,
++		    pa + off, off, sum, back, sum == back ? "" : " -- DIFFERENT");
++		if (sum != back) {
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		kfree_data(bt_fw[i], bt_fw_size[i]);
++		bt_fw[i] = NULL;
++	}
++	return true;
++}
++
++/* ---- step 5: BGF power on (bgfsys_power_on, platform_6877.h) ---- */
++
++static bool
++bt_bgf_on(void)
++{
++	uint32_t pc = 0, idle = 0, i;
++
++	printf("A34 BT: step 5: CONNSYS memory remap %#x, BGF CPU reset %#x, on-power %#x\n", rd(bt_hc, HC_REMAP),
++	    rd(bt_rgu, RGU_BGF_CPU_SW_RST), rd(bt_rgu, RGU_BGF_ON_PWR_CTL));
++	clrb(bt_rgu, RGU_BGF_CPU_SW_RST, 1u << 0);                             /* the N10 CPU held */
++	wr(bt_rgu, RGU_BGF_ON_PWR_CTL, 0x42540080u | (rd(bt_rgu, RGU_BGF_ON_PWR_CTL) & ~(0xffff0000u | (1u << 7))));
++	if (!bt_poll(bt_rgu, RGU_BGF_ON_PWR_ACK, 3u << 24, 3u << 24, 100, 500, "BGF on-power ack")) {
++		return false;
++	}
++	setb(bt_cfg, CFG_BT_PWRCTLCR0, 1u << 0);                               /* BT_FUNC_EN */
++	(void)a34_connsys_readable("after BT_FUNC_EN");                         /* (Linux: only a bus hang stops here) */
++	if (!bt_poll(bt_rgu, RGU_BGF_OFF_PWR_ACK, 1u << 24, 1u << 24, 100, 500, "BGF off-power ack_b") ||
++	    !bt_poll(bt_rgu, RGU_BGF_OFF_PWR_ACK, 1u << 0, 1u << 0, 100, 500, "BGF off-power ack_s")) {
++		return false;
++	}
++	/* the sleep protection between conn_infra and BGF, each way, RX then TX */
++	clrb(bt_cfg, CFG_CONN2BT_SLP_CTL, 1u << 4);
++	if (!bt_poll(bt_cfg, CFG_CONN2BT_SLP_ST, 1u << 22, 0, 100, 500, "conn2bt RX protection")) {
++		return false;
++	}
++	clrb(bt_cfg, CFG_CONN2BT_SLP_CTL, 1u << 0);
++	if (!bt_poll(bt_cfg, CFG_CONN2BT_SLP_ST, 1u << 23, 0, 100, 500, "conn2bt TX protection")) {
++		return false;
++	}
++	clrb(bt_cfg, CFG_BT2CONN_SLP_CTL, 1u << 4);
++	if (!bt_poll(bt_cfg, CFG_BT2CONN_SLP_ST, 1u << 22, 0, 100, 500, "bt2conn RX protection")) {
++		return false;
++	}
++	clrb(bt_cfg, CFG_BT2CONN_SLP_CTL, 1u << 0);
++	if (!bt_poll(bt_cfg, CFG_BT2CONN_SLP_ST, 1u << 23, 0, 100, 500, "bt2conn TX protection")) {
++		return false;
++	}
++	delay(400);
++	i = rd(bt_bgfinfo, BGFINFO_IP_VERSION);
++	printf("A34 BT: step 5: BGF powered, IP version %#x (%s)\n", i, i == BGF_IP_VERSION_ID ? "as expected" : "NOT 0x02040200");
++	if (i != BGF_IP_VERSION_ID) {
++		return false;
++	}
++	clrb(bt_bgf, BGF_MCCR, 1u << 31);                                      /* con_cr_ahb_auto_dis off */
++	wr(bt_bgf, BGF_MCCR_SET, 1u << 2);                                     /* con_cr_ahb_stop */
++	wr(bt_hc, HC_BGF_IRQ_STAT, 1u << 0);                                   /* FW own IRQs cleared */
++	wr(bt_hc, HC_BGF_IRQ_STAT2, 1u << 0);
++	setb(bt_rgu, RGU_BGF_CPU_SW_RST, 1u << 0);                             /* the N10 CPU let go */
++	for (i = 0; i < 100; i++) {                                            /* IDLE_LOOP_RTY_LMT x 5 ms */
++		if (!a34_connsys_readable("waiting for the BGF MCU")) {
++			return false;
++		}
++		pc = rd(bt_hc, HC_MCU_PC);
++		idle = rd(bt_bgf, BGF_SW_DBG_CTL);
++		if (idle == 0x1d1eu) {
++			break;
++		}
++		bt_sleep_ms(5);
++	}
++	printf("A34 BT: step 5: BGF MCU %s after %u ms: sw_dbg_ctl %#x, pc %#x\n", idle == 0x1d1eu ? "idle" : "NOT idle",
++	    i * 5, idle, pc);
++	if (idle != 0x1d1eu) {
++		return false;
++	}
++	setb(bt_swirq, 0x14, 1u << 0);                                         /* BGF_SW_IRQ reset: FW log */
++	setb(bt_swirq, 0x14, 1u << 1);                                         /* ... and subsystem reset */
++	clrb(bt_hc, HC_WAKEUP_BT, 1u << 0);                                    /* conn_infra no longer forced on */
++	return true;
++}
++
++/* ---- BTIF (hal_btif_hw_init), PIO ---- */
++
++static void
++bt_btif_init(void)
++{
++	wr(bt_infra, INFRA_CG0_CLR, 1u << 31);                                 /* ifrao_btif ungated */
++	delay(10);
++	wr(bt_btif, BTIF_FAKELCR, 0);                                          /* normal mode */
++	setb(bt_btif, BTIF_HANDSHAKE, 1u << 0);                                /* the new handshake */
++	setb(bt_btif, BTIF_FIFOCTRL, 1u << 1);
++	clrb(bt_btif, BTIF_FIFOCTRL, 1u << 1);
++	setb(bt_btif, BTIF_FIFOCTRL, 1u << 2);
++	clrb(bt_btif, BTIF_FIFOCTRL, 1u << 2);
++	wr(bt_btif, BTIF_TRI_LVL, 8u | (1u << 4));                             /* TX 8 (16 / 2), RX 1, no loopback */
++	clrb(bt_btif, BTIF_DMA_EN, (1u << 0) | (1u << 1));                     /* no DMA */
++	setb(bt_btif, BTIF_DMA_EN, 1u << 2);                                   /* auto-reset */
++	wr(bt_btif, BTIF_IER, 0);                                              /* polled: no interrupts */
++	printf("A34 BT: step 6: BTIF clock %s (CG0 %#x), LSR %#x, handshake %#x, sleep %#x, wake %#x\n",
++	    (rd(bt_infra, INFRA_CG0_STA) & (1u << 31)) ? "STILL GATED" : "on", rd(bt_infra, INFRA_CG0_STA),
++	    rd(bt_btif, BTIF_LSR), rd(bt_btif, BTIF_HANDSHAKE), rd(bt_btif, BTIF_SLEEP_EN), rd(bt_btif, BTIF_WAK));
++}
++
++/* whole packets out, 16 bytes at a time, each time the FIFO is empty; spins (BTIF empties 16 bytes in microseconds) */
++static int
++bt_btif_write(const uint8_t *b, uint32_t n)
++{
++	uint32_t at = 0;
++	uint64_t now, limit;
++	int error = 0;
++
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &limit);
++	lck_mtx_lock(&bt_tx_lock);
++	while (at < n && error == 0) {
++		now = mach_absolute_time();
++		while (!(rd(bt_btif, BTIF_LSR) & (1u << 6))) {
++			if (mach_absolute_time() - now > limit) {
++				error = ETIMEDOUT;
++				break;
++			}
++		}
++		for (uint32_t k = 0; error == 0 && k < BTIF_TX_FIFO && at < n; k++, at++) {
++			*(volatile uint32_t *)(bt_btif + BTIF_RBR_THR) = b[at];
++		}
++	}
++	lck_mtx_unlock(&bt_tx_lock);
++	if (error != 0) {
++		printf("A34 BT: BTIF write timed out at %u of %u bytes (LSR %#x)\n", at, n, rd(bt_btif, BTIF_LSR));
++	}
++	return error;
++}
++
++static void
++bt_dump(const char *dir, const uint8_t *b, uint32_t n, uint32_t *said)
++{
++	char text[3 * 32 + 1];
++	uint32_t shown = n < 32 ? n : 32;
++
++	if ((*said)++ >= bt_log_max) {
++		return;
++	}
++	for (uint32_t i = 0; i < shown; i++) {
++		snprintf(text + 3 * i, 4, " %02x", b[i]);
++	}
++	text[3 * shown] = 0;
++	printf("A34 BT: %s %u:%s%s\n", dir, n, text, n > shown ? " ..." : "");
++}
++
++static int
++bt_send(const uint8_t *b, uint32_t n)
++{
++	bt_dump("out", b, n, &bt_said_out);
++	return bt_btif_write(b, n);
++}
++
++/* the length of the H4 packet that begins b (have bytes so far): 0 while its header is not whole */
++static uint32_t
++bt_h4_length(const uint8_t *b, uint32_t have)
++{
++	switch (have >= 1 ? b[0] : 0) {
++	case 2:                                 /* ACL: handle (2), length (2) */
++	case 5:                                 /* ISO: handle (2), length (2, 14 bits) */
++		return have >= 5 ? 5u + (((uint32_t)b[3] | ((uint32_t)b[4] << 8)) & (b[0] == 5 ? 0x3fffu : 0xffffu)) : 0;
++	case 3:                                 /* SCO: handle (2), length (1) */
++		return have >= 4 ? 4u + b[3] : 0;
++	case 4:                                 /* event: code (1), length (1) */
++		return have >= 3 ? 3u + b[2] : 0;
++	default:
++		return 0;
++	}
++}
++
++/*
++ * One whole H4 packet from the controller into pkt within wait_ms: its length, or 0. Bytes that cannot
++ * begin a packet are dropped (and said, the first few times). Only one thread reads BTIF. Polled: while
++ * bytes come it spins (they come microseconds apart, and BTIF's RX FIFO is small; its handshake holds the
++ * controller back when it is full); idle, it looks every millisecond, every 4 after a quiet second.
++ */
++static uint32_t
++bt_receive(uint8_t *pkt, uint32_t wait_ms)
++{
++	static uint8_t buf[BT_PKT_MAX];
++	static uint32_t have, dropped_said, last_byte_ms;
++	uint32_t start = bt_ms(), want;
++	uint64_t spin_until, spin;
++	bool busy;
++
++	nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &spin);
++	for (;;) {
++		busy = have != 0;
++		spin_until = mach_absolute_time() + spin;
++		while (mach_absolute_time() < spin_until) {
++			if ((rd(bt_btif, BTIF_LSR) & (1u << 0)) == 0) {
++				if (!busy) {
++					break;
++				}
++				continue;
++			}
++			buf[have] = (uint8_t)rd(bt_btif, BTIF_RBR_THR);
++			busy = true;
++			spin_until = mach_absolute_time() + spin;              /* a byte came: keep reading */
++			if (have == 0 && (buf[0] < 2 || buf[0] > 5)) {
++				if (dropped_said++ < 8) {
++					printf("A34 BT: byte %02x where a packet should begin: dropped\n", buf[0]);
++				}
++				continue;
++			}
++			have++;
++			want = bt_h4_length(buf, have);
++			if (want > BT_PKT_MAX) {
++				printf("A34 BT: a packet of %u bytes (type %02x) is longer than %u: dropped\n", want, buf[0],
++				    BT_PKT_MAX);
++				have = 0;
++				continue;
++			}
++			if (want != 0 && have == want) {
++				memcpy(pkt, buf, want);
++				have = 0;
++				last_byte_ms = bt_ms();
++				return want;
++			}
++		}
++		if (busy) {
++			last_byte_ms = bt_ms();
++		}
++		if (bt_ms() - start >= wait_ms) {
++			return 0;
++		}
++		bt_sleep_ms(bt_ms() - last_byte_ms < 1000 ? 1 : 4);
++	}
++}
++
++/*
++ * A command of ours and its answer: the event `event` (0x0e Command Complete of this opcode, or 0xe4 for WMT)
++ * within ms; anything else that comes meanwhile is said. The answer's length, 0 if none came.
++ */
++static uint32_t
++bt_command(const uint8_t *cmd, uint32_t n, uint8_t event, uint8_t *answer, uint32_t ms)
++{
++	uint32_t start = bt_ms(), got;
++	uint16_t opcode = (uint16_t)(cmd[1] | (cmd[2] << 8));
++
++	if (bt_send(cmd, n) != 0) {
++		return 0;
++	}
++	while (bt_ms() - start < ms) {
++		if ((got = bt_receive(answer, 10)) == 0) {
++			continue;
++		}
++		bt_dump("in ", answer, got, &bt_said_in);
++		if (answer[0] == 0x04 && answer[1] == event &&
++		    (event != 0x0e || (got >= 7 && (answer[4] | (answer[5] << 8)) == opcode))) {
++			return got;
++		}
++		if (answer[0] == 0x04 && answer[1] == 0x0f && got >= 7 && (answer[5] | (answer[6] << 8)) == opcode) {
++			printf("A34 BT: command %04x: Command Status %#x\n", opcode, answer[3]);
++			return 0;
++		}
++	}
++	printf("A34 BT: command %04x: no answer in %u ms (LSR %#x)\n", opcode, ms, rd(bt_btif, BTIF_LSR));
++	return 0;
++}
++
++/* ---- step 7: driver own (btmtk_cif_fw_own_clr) ---- */
++
++static bool
++bt_driver_own(void)
++{
++	uint32_t lp = 0, i;
++
++	for (i = 0; i < 4096; i++) {                                           /* LPCR_POLLING_RTY_LMT, 0.5 ms each */
++		if ((i & 0xf) == 0) {
++			wr(bt_hc, HC_BGF_LPCTL, 1u << 1);                      /* CLR_FW_OWN, again every 16 tries */
++		}
++		lp = rd(bt_hc, HC_BGF_LPCTL);
++		if (!(lp & (1u << 2))) {
++			wr(bt_hc, HC_BGF_IRQ_STAT, 1u << 0);
++			printf("A34 BT: step 7: driver own after %u tries (LPCTL %#x)\n", i + 1, lp);
++			return true;
++		}
++		delay(500);
++	}
++	printf("A34 BT: step 7: driver own FAILED: LPCTL %#x, IRQ_STAT %#x, MCU pc %#x\n", lp, rd(bt_hc, HC_BGF_IRQ_STAT),
++	    rd(bt_hc, HC_MCU_PC));
++	return false;
++}
++
++/* ---- step 9: what a host asks first ---- */
++
++static uint32_t
++bt_probe(void)
++{
++	static const struct {
++		const char *what;
++		uint16_t opcode;
++	} probe[] = {
++		{ "HCI_Reset", 0x0c03 },
++		{ "Read_Local_Version_Information", 0x1001 },
++		{ "Read_BD_ADDR", 0x1009 },
++		{ "Read_Local_Supported_Features", 0x1003 },
++		{ "Read_Buffer_Size", 0x1005 },
++		{ "LE_Read_Buffer_Size", 0x2002 },
++	};
++	uint8_t a[BT_PKT_MAX], cmd[4];
++	uint32_t good = 0, n;
++	char line[200];
++
++	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
++		cmd[0] = 0x01;
++		cmd[1] = (uint8_t)probe[i].opcode;
++		cmd[2] = (uint8_t)(probe[i].opcode >> 8);
++		cmd[3] = 0;
++		n = bt_command(cmd, 4, 0x0e, a, 2000);
++		if (n < 7 || a[6] != 0) {
++			printf("A34 BT: step 9: %s: %s\n", probe[i].what, n < 7 ? "no Command Complete" : "status not 0");
++			continue;
++		}
++		good++;
++		if (probe[i].opcode == 0x1001 && n >= 15) {
++			snprintf(line, sizeof(line), "HCI %u rev %#x, LMP %u sub %#x, manufacturer %#06x", a[7],
++			    a[8] | (a[9] << 8), a[10], a[13] | (a[14] << 8), a[11] | (a[12] << 8));
++			printf("A34 BT: step 9: controller: %s\n", line);
++		} else if (probe[i].opcode == 0x1009 && n >= 13) {
++			printf("A34 BT: step 9: controller address %02x:%02x:%02x:%02x:%02x:%02x\n", a[12], a[11], a[10], a[9],
++			    a[8], a[7]);
++		} else {
++			printf("A34 BT: step 9: %s: status 0\n", probe[i].what);
++		}
++	}
++	printf("A34 BT: step 9: %u of %u HCI commands answered as a controller answers\n", good,
++	    (unsigned)(sizeof(probe) / sizeof(probe[0])));
++	return good;
++}
++
++/* ---- step 10: the raw HCI channel (kernel control com.a34.bt.hci) ---- */
++
++static errno_t
++bt_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **unitinfo)
++{
++	char name[32] = "";
++	errno_t error = EBUSY;
++
++	lck_mtx_lock(&bt_unit_lock);
++	for (unsigned i = 0; i < BT_UNITS; i++) {
++		if (bt_units[i] == 0) {
++			bt_units[i] = sac->sc_unit;
++			error = 0;
++			break;
++		}
++	}
++	lck_mtx_unlock(&bt_unit_lock);
++	proc_selfname(name, sizeof(name));
++	printf("A34 BT: raw HCI channel: unit %u opened by %s[%d]%s\n", sac->sc_unit, name, proc_selfpid(),
++	    error ? ": too many, refused" : "");
++	return error;
++}
++
++static errno_t
++bt_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
++{
++	lck_mtx_lock(&bt_unit_lock);
++	for (unsigned i = 0; i < BT_UNITS; i++) {
++		if (bt_units[i] == unit) {
++			bt_units[i] = 0;
++		}
++	}
++	lck_mtx_unlock(&bt_unit_lock);
++	return 0;
++}
++
++/* one H4 packet from user space: whole, of a type a host sends (command, ACL, SCO, ISO) */
++static errno_t
++bt_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	uint8_t pkt[BT_PKT_MAX];
++	size_t n = 0;
++	errno_t error = 0;
++
++	for (mbuf_t part = m; part != NULL && error == 0; part = mbuf_next(part)) {
++		size_t len = mbuf_len(part);
++
++		if (n + len > sizeof(pkt)) {
++			error = EMSGSIZE;
++			break;
++		}
++		memcpy(pkt + n, mbuf_data(part), len);
++		n += len;
++	}
++	mbuf_freem(m);
++	if (error == 0 && (n < 4 || pkt[0] == 4 || bt_h4_length(pkt, (uint32_t)n) != n)) {
++		error = EINVAL;
++	}
++	if (error == 0) {
++		error = bt_send(pkt, (uint32_t)n);
++	}
++	return error;
++}
++
++static void
++bt_deliver(uint8_t *pkt, uint32_t n)
++{
++	uint32_t units[BT_UNITS];
++
++	lck_mtx_lock(&bt_unit_lock);            /* (a copy: ctl_enqueuedata takes the socket's lock, not under ours) */
++	memcpy(units, bt_units, sizeof(units));
++	lck_mtx_unlock(&bt_unit_lock);
++	for (unsigned i = 0; i < BT_UNITS; i++) {
++		if (units[i] != 0) {
++			(void)ctl_enqueuedata(bt_ctl_ref, units[i], pkt, n, CTL_DATA_EOR);
++		}
++	}
++}
++
++static bool
++bt_ctl_register(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t error;
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, "com.a34.bt.hci", sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_PRIVILEGED;            /* root only; datagrams: one H4 packet each */
++	reg.ctl_sendsize = 16384;
++	reg.ctl_recvsize = 65536;
++	reg.ctl_connect = bt_ctl_connect;
++	reg.ctl_disconnect = bt_ctl_disconnect;
++	reg.ctl_send = bt_ctl_send;
++	error = ctl_register(&reg, &bt_ctl_ref);
++	printf("A34 BT: step 10: kernel control com.a34.bt.hci %s (%d)\n", error == 0 ? "registered" : "NOT REGISTERED", error);
++	return error == 0;
++}
++
++/* ---- the thread ---- */
++
++static bool
++bt_map(void)
++{
++	bt_rgu = ml_io_map(BT_RGU_PA, 0x1000);
++	bt_cfg = ml_io_map(BT_CFG_PA, 0x1000);
++	bt_swirq = ml_io_map(BT_SWIRQ_PA, 0x1000);
++	bt_hc = ml_io_map(BT_HOSTCSR_PA, 0x1000);
++	bt_bgf = ml_io_map(BT_BGF_PA, 0x1000);
++	bt_bgfinfo = ml_io_map(BT_BGFINFO_PA, 0x1000);
++	bt_infra = ml_io_map(BT_INFRACFG_PA, 0x1000);
++	bt_ccif = ml_io_map(BT_CCIF_PA, 0x1000);
++	bt_btif = ml_io_map(BT_BTIF_PA, 0x1000);
++	return bt_rgu && bt_cfg && bt_swirq && bt_hc && bt_bgf && bt_bgfinfo && bt_infra && bt_ccif && bt_btif;
++}
++
++#define STEP(n, what) do { \
++		snprintf(bt_state, sizeof(bt_state), "step %u: %s", (unsigned)(n), (what)); \
++		if ((n) > bt_step_max) { \
++			printf("A34 BT: stopping before step %u (a34btstep=%u)\n", (unsigned)(n), bt_step_max); \
++			snprintf(bt_state, sizeof(bt_state), "failed: stopped before step %u (a34btstep)", (unsigned)(n)); \
++			goto out; \
++		} \
++	} while (0)
++
++#define FAIL(n, what) do { \
++		printf("A34 BT: FAILED at step %u: %s\n", (unsigned)(n), (what)); \
++		snprintf(bt_state, sizeof(bt_state), "failed at step %u: %s", (unsigned)(n), (what)); \
++		goto out; \
++	} while (0)
++
++static void
++bt_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	static const uint8_t wmt_on[10] = { 0x01, 0x6f, 0xfc, 0x06, 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
++	static uint8_t a[BT_PKT_MAX];
++	uint32_t n, good, t0 = bt_ms();
++
++	STEP(1, "waiting for the firmware in " FW_DIR);
++	if (!bt_firmware()) {
++		FAIL(1, "no firmware (userland/a34bt/install-firmware.sh)");
++	}
++	if (!bt_map()) {
++		FAIL(1, "registers could not be mapped");
++	}
++
++	STEP(2, "CONNSYS (conninfra) power on");
++	bt_checkpoint(2, "CONNSYS power on (a34_connsys.c)");
++	if (a34_connsys_on() != 0) {
++		FAIL(2, "CONNSYS did not come up");
++	}
++
++	STEP(3, "conn_infra awake for Bluetooth");
++	bt_checkpoint(3, "conn_infra forced on for Bluetooth, its version read");
++	wr(bt_ccif, 0x204, 0);                                                 /* bgfsys_ccif_on: MD coexistence */
++	setb(bt_hc, HC_WAKEUP_BT, 1u << 0);
++	if (!bt_poll(bt_cfg, CFG_VERSION, 0xffffffffu, CFG_VERSION_ID, 10, 1000, "conn_infra version")) {
++		(void)a34_connsys_readable("conn_infra version wrong");
++		FAIL(3, "conn_infra did not answer with 0x02060002");
++	}
++	printf("A34 BT: step 3: conn_infra %#x awake for Bluetooth\n", rd(bt_cfg, CFG_VERSION));
++
++	STEP(4, "firmware into CONNSYS memory");
++	if (!bt_copy_firmware()) {
++		FAIL(4, "firmware copy");
++	}
++
++	STEP(5, "BGF power on");
++	bt_checkpoint(5, "BGF power on, its MCU let go");
++	if (!bt_bgf_on()) {
++		clrb(bt_hc, HC_WAKEUP_BT, 1u << 0);
++		FAIL(5, "BGF power on");
++	}
++
++	STEP(6, "BTIF");
++	bt_checkpoint(6, "BTIF clock and FIFOs");
++	bt_btif_init();
++	while ((n = bt_receive(a, 50)) != 0) {
++		bt_dump("in ", a, n, &bt_said_in);                             /* what the firmware said on its own */
++	}
++
++	STEP(7, "driver own");
++	bt_checkpoint(7, "driver own (BGF_LPCTL)");
++	if (!bt_driver_own()) {
++		FAIL(7, "driver own");
++	}
++
++	STEP(8, "WMT_FUNC_CTRL Bluetooth on");
++	bt_checkpoint(8, "WMT_FUNC_CTRL: Bluetooth's function on");
++	n = bt_command(wmt_on, sizeof(wmt_on), 0xe4, a, 3000);
++	if (n < 8 || a[3] != 0x02 || a[4] != 0x06) {
++		FAIL(8, n == 0 ? "no WMT answer" : "a WMT answer that is not FUNC_CTRL's");
++	}
++	printf("A34 BT: step 8: Bluetooth's function on: status %#x\n", a[7]);
++	if (a[7] != 0) {
++		FAIL(8, "WMT_FUNC_CTRL status not 0");
++	}
++
++	STEP(9, "HCI probe");
++	good = bt_probe();          /* (fewer than six: the raw channel still opens, for a34bt cmd/dump) */
++
++	STEP(10, "raw HCI channel");
++	if (!bt_ctl_register()) {
++		FAIL(10, "kernel control");
++	}
++	snprintf(bt_state, sizeof(bt_state), "up: %u of 6 HCI commands answered (%u ms); raw channel com.a34.bt.hci", good,
++	    bt_ms() - t0);
++	printf("A34 BT: UP in %u ms: %u of 6 HCI commands answered%s; com.a34.bt.hci open (userland/a34bt)\n", bt_ms() - t0,
++	    good, good == 6 ? " (milestone 1)" : "");
++	for (;;) {
++		if ((n = bt_receive(a, 1000)) != 0) {
++			bt_dump("in ", a, n, &bt_said_in);
++			bt_deliver(a, n);
++		}
++	}
++out:
++	printf("A34 BT: %s\n", bt_state);
++	(void)thread_terminate(current_thread());
++}
++
++void
++a34_bt_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a34bt", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("a34btstep", &bt_step_max, sizeof(bt_step_max));
++	(void)PE_parse_boot_argn("a34btwait", &bt_wait_s, sizeof(bt_wait_s));
++	(void)PE_parse_boot_argn("a34btsync", &bt_sync, sizeof(bt_sync));
++	(void)PE_parse_boot_argn("a34btlog", &bt_log_max, sizeof(bt_log_max));
++	bt_set_state("starting");
++	printf("A34 BT: Bluetooth milestone 1 (a34bt=%u): steps up to %u, firmware wait %u s, log sync %u\n", on,
++	    bt_step_max, bt_wait_s, bt_sync);
++	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/a34_connsys.c b/bsd/dev/a34_connsys.c
+new file mode 100644
+index 0000000..389eef7
+--- /dev/null
++++ b/bsd/dev/a34_connsys.c
+@@ -0,0 +1,885 @@
++/*
++ * A34 (0939): CONNSYS's common part ("conninfra") on the MT6877, switched on for Bluetooth.
++ *
++ * CONNSYS (Wi-Fi, Bluetooth, GPS, FM) is one block of the SoC with its own power domain, bus, clocks and
++ * an A-die (the MT6635 radio) behind an SPI master. Before any subsystem (BGF for Bluetooth: a34_bt.c)
++ * can be started, its common part is powered and configured the way MediaTek's conninfra.ko does on the
++ * first conninfra_pwr_on(CONNDRV_TYPE_BT) of a boot, with "bt_only" selections and SRCLKEN_RC ("RC
++ * mode", on in the A34's preloader) branches:
++ *
++ *   ph0  EMI MPU region 27 over CONNSYS's memory (two SiP SMCs, as Linux's emi-mpu driver; a34btmpu=0 skips)
++ *   ph1  PMIC: VCN18 1.8 V and VCN13 1.3 V on (MT6359P through the PMIC wrapper)
++ *   ph2  pinmux D-die <-> A-die (GPIO196-206 to their CONN functions, IOCFG_RT drive/pulls)
++ *   ph3  CONN power domain (SPM 0x10006E04) on, AP<->CONN bus protection released (infracfg_ao)
++ *   ph4  conn_infra answers: 0x18001000 == 0x02060002  (the first CONNSYS access)
++ *   ph5  EMI remap: where CONNSYS sees its memory (0x180601C4 = base >> 16), peripheral remaps
++ *   ph6  D-die: sysram cleared, EMI path, efuse copy, sysram power, build mode
++ *   ph7  the sleep controller's A-die command table (conn_wt_slp_ctl), Bluetooth-only values
++ *   ph8  A-die: reset released, chip id (0x6635xxxx), efuse into sysram, thermal trim, XTAL/bandgap
++ *   ph9  AFE WBG calibration, ph10 PLLs, ph11 "Bluetooth on" in sysram
++ *   ph12 PMIC: VS2 1.4625 V voted, VCN13 1.37 V (Bluetooth's raise)
++ *   ph13 conn_infra settings: A-die clock buffer, RC oscillators, EMI/bus timeouts, DCM, clocks,
++ *        and last conn_infra's hardware sleep control (a34btdeep=0 keeps it awake)
++ *   ph15 PMIC: VCN33_1 3.3 V for Bluetooth (RC mode: switched by SRCLKEN_RC; a34btvcn33=1, the default,
++ *        also switches it on by software as the non-RC path does)
++ *   (ph14, the LDOs' low-power mode, is skipped unless a34btlp=1: power-hungrier, but nothing then
++ *    depends on SRCLKEN_RC lifting them.)
++ *
++ * Other boot-args: a34btemi=PA, CONNSYS's memory (default 0x60000000; 1 MB aligned, 0x780000 bytes, below
++ * 4 GB: XNU on this phone only uses RAM from 0x1_40000000). Pre-calibration (Android powers Wi-Fi too and
++ * keeps calibration data) is not done; Bluetooth's function on calibrates by itself.
++ *
++ * Register facts (not code) from Samsung's A34 kernel (github.com/Fede2782/android_kernel_samsung_a34x,
++ * sep-16.0/stock, A346BXXSADYG1), vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2:
++ * platform/consys_hw.c (consys_hw_pwr_on), platform/mt6877/mt6877_pos.c, mt6877_pmic.c, mt6877_emi.c,
++ * mt6877_consys_reg.c and include/ (CODA); kernel_device_modules-6.6: drivers/soc/mediatek/mtk-scpsys*.c,
++ * drivers/memory/mediatek/emi_legacy/emi_legacy_v2/emi-mpu.c, drivers/regulator/mt6359p-regulator.c.
++ * The step table with file:line for every write: docs/bluetooth-plan.md, section 2.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++#include "ruby_hal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++int a34_connsys_on(void);
++bool a34_connsys_readable(const char *when);
++uint64_t a34_connsys_emi_pa(void);
++uint32_t a34_connsys_emi_size(void);
++
++#define CS_EMI_DEFAULT          0x60000000ull
++#define CS_EMI_SIZE             0x780000u
++
++/* conn_infra (CONNSYS) */
++#define CS_RGU_PA               0x18000000u
++#define CS_CFG_PA               0x18001000u
++#define CS_THERM_PA             0x18002000u
++#define CS_AFE_PA               0x18003000u
++#define CS_SPI_PA               0x18004000u
++#define CS_SLP_PA               0x18005000u
++#define CS_CLKGEN_PA            0x18009000u
++#define CS_BUSCR_PA             0x1800e000u
++#define CS_VDNR_PA              0x1800f000u
++#define CS_BCRM_PA              0x1802e000u
++#define CS_SYSRAM_PA            0x18050000u     /* 16 KB; its SW CR block at +0x2800 */
++#define CS_SYSRAM_SIZE          0x4000u
++#define CS_HC_PA                0x18060000u     /* conn_host_csr_top: on the AP side of CONNSYS's bus */
++#define CS_SEMA_PA              0x18072000u     /* semaphores, master M2 (the AP): own +4i (read), release +0x200 + 4i */
++/* AP side */
++#define CS_INFRA_PA             0x10001000u     /* infracfg_ao */
++#define CS_GPIO_PA              0x10005000u
++#define CS_SPM_PA               0x10006000u
++#define CS_TOPRGU_PA            0x10007000u
++#define CS_RC_PA                0x1000f000u     /* SRCLKEN_RC: RC_CENTRAL_CFG1 at +0x804 */
++#define CS_PWRAP_PA             0x10026000u
++#define CS_IOCFG_RT_PA          0x11ea0000u
++
++/* SPM / infracfg_ao (mtk-scpsys-mt6877.c: CONN, ctl 0xE04, status bit 1, bus protection 0x2A0/0x2A4/0x220/0x228) */
++#define SPM_POWERON_CONFIG_EN   0x000u
++#define SPM_PROJECT_CODE        0xb16u
++#define SPM_CONN_PWR_CON        0xe04u          /* bit 0 RST_B, 1 ISO, 2 PWR_ON, 3 PWR_ON_2ND, 4 CLK_DIS */
++#define SPM_PWR_STATUS          0xef0u
++#define SPM_PWR_STATUS_2ND      0xef4u
++#define INFRA_PROT_EN           0x220u
++#define INFRA_PROT_SET          0x2a0u
++#define INFRA_PROT_CLR          0x2a4u
++#define INFRA_PROT_STA1         0x228u          /* 13 AP2CONN AHB TX, 19 AP2CONN AHB RX, 14/18 CONN2AP AXI */
++#define TOPRGU_SWSYSRST         0x200u          /* key 0x88 in [31:24]; bit 9 CONNSYS ap_sw_rst, bit 12 */
++
++/* MT6359P (mt6877_pmic.h, include/linux/mfd/mt6359p/registers.h) */
++#define PMIC_VS2_CON1           0x188eu         /* VOSEL_SLEEP [6:0] */
++#define PMIC_VS2_VOTER_SET      0x18acu
++#define PMIC_VS2_ELR0           0x18b4u         /* VOSEL [6:0] */
++#define PMIC_VCN33_1_CON0       0x1be2u         /* bit 0 SW_EN (BT), bit 1 SW_LP */
++#define PMIC_VCN33_1_OP_EN_SET  0x1beau
++#define PMIC_VCN33_1_OP_CFG_SET 0x1bf0u
++#define PMIC_VCN33_1_MON        0x1be6u
++#define PMIC_VCN13_CON0         0x1c1cu
++#define PMIC_VCN13_MON          0x1c20u
++#define PMIC_VCN13_OP_EN_SET    0x1c24u
++#define PMIC_VCN13_OP_CFG_SET   0x1c2au
++#define PMIC_VCN18_CON0         0x1c2eu
++#define PMIC_VCN18_MON          0x1c32u
++#define PMIC_VCN18_OP_EN_SET    0x1c36u
++#define PMIC_VCN18_OP_CFG_SET   0x1c3cu
++#define PMIC_VCN33_1_ANA_CON0   0x1f98u         /* VOSEL [11:8]: 0xD = 3.3 V */
++#define PMIC_VCN13_ANA_CON0     0x202eu         /* VOSEL [11:8]: 4 = 1.3 V; VOCAL [3:0] */
++#define PMIC_DCXO_CW00          0x788u          /* (read only here: XO_WCN buffer mode) */
++#define PW_ACC                  0x880u
++#define PW_WDATA                0x884u
++#define PW_STA                  0x8a8u
++#define PW_INIT_DONE            (1u << 15)
++
++/* A-die (MT6635) TOP registers, over the RF-SPI master's TOP channel */
++#define ATOP_CHIP_ID            0x02cu
++#define ATOP_THADC_BG           0x034u
++#define ATOP_THADC              0x038u
++#define ATOP_WRI_CTR2           0x064u
++#define ATOP_ENCAL_WBTAC_IF_SW  0x070u
++#define ATOP_SMCTK11            0x0bcu
++#define ATOP_EFUSE_CTRL         0x108u
++#define ATOP_EFUSE_RDATA0       0x130u
++#define ATOP_WF0_TOP_01         0x380u
++#define ATOP_WF0_BG             0x384u
++#define ATOP_WF1_TOP_01         0x390u
++#define ATOP_WF1_BG             0x394u
++#define ATOP_XTAL_01            0xa18u
++#define ATOP_XTAL_02            0xa1cu
++#define SEMA_RFSPI              12u
++#define SEMA_SYSRAM             23u
++
++static vm_offset_t cs_rgu, cs_cfg, cs_therm, cs_afe, cs_spi, cs_slp, cs_clkgen, cs_buscr, cs_vdnr, cs_bcrm, cs_sysram,
++    cs_hc, cs_sema, cs_infra, cs_gpio, cs_spm, cs_toprgu, cs_rc, cs_pwrap, cs_iocfg;
++static uint64_t cs_emi_pa = CS_EMI_DEFAULT;
++static uint32_t cs_mpu = 1, cs_vcn33 = 1, cs_lp, cs_deep = 1, cs_force;
++static bool cs_up, cs_tried;
++static uint32_t cs_adie_id;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++setb(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	wr(base, off, rd(base, off) | bits);
++}
++
++static void
++clrb(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	wr(base, off, rd(base, off) & ~bits);
++}
++
++/* the field under mask (in place) set to value (already shifted) */
++static void
++field(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t value)
++{
++	wr(base, off, (rd(base, off) & ~mask) | (value & mask));
++}
++
++/* until (reg & mask) == want: tries reads, us apart; says what it saw when it gives up */
++static bool
++cs_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t tries, uint32_t us, const char *what)
++{
++	uint32_t v = 0;
++
++	for (uint32_t i = 0; i <= tries; i++) {
++		v = rd(base, off);
++		if ((v & mask) == want) {
++			return true;
++		}
++		delay((int)us);
++	}
++	printf("A34 CONNSYS: %s: %#x (wanted %#x under %#x)\n", what, v, want, mask);
++	return false;
++}
++
++/* ---- the PMIC (MT6359P), through the wrapper; a34_pmic_lock() shares it with the other drivers ---- */
++
++static bool
++cs_pwrap_idle(void)
++{
++	for (uint32_t i = 0; i < 100000u; i++) {
++		if (((rd(cs_pwrap, PW_STA) >> 1) & 7u) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++cs_pmic_read(uint16_t reg, uint16_t *val)
++{
++	int err;
++
++	a34_pmic_lock();
++	err = ruby_pwrap_read(cs_pwrap, reg, val);
++	a34_pmic_unlock();
++	return err == 0;
++}
++
++static bool
++cs_pmic_write(uint16_t reg, uint16_t val)
++{
++	bool ok = false;
++
++	a34_pmic_lock();
++	if ((rd(cs_pwrap, PW_STA) & PW_INIT_DONE) && cs_pwrap_idle()) {
++		wr(cs_pwrap, PW_WDATA, val);
++		wr(cs_pwrap, PW_ACC, (1u << 29) | reg);
++		ok = cs_pwrap_idle();
++	}
++	a34_pmic_unlock();
++	if (!ok) {
++		printf("A34 CONNSYS: PMIC write %#x = %#x failed (wrapper %#x)\n", reg, val, rd(cs_pwrap, PW_STA));
++	}
++	return ok;
++}
++
++static bool
++cs_pmic_field(uint16_t reg, uint16_t mask, uint16_t value)
++{
++	uint16_t v = 0;
++
++	return cs_pmic_read(reg, &v) && cs_pmic_write(reg, (uint16_t)((v & ~mask) | (value & mask)));
++}
++
++/* ---- the A-die: RF-SPI master's TOP channel (busy: SPI_STA bit 5), HW semaphore 12, TOP clock ---- */
++
++static bool
++cs_spi_read(uint32_t addr, uint32_t *data)
++{
++	if (!cs_poll(cs_spi, 0x000, 1u << 5, 0, 100, 50, "A-die SPI busy before a read")) {
++		return false;
++	}
++	wr(cs_spi, 0x050, 0x0000b000u | addr);
++	wr(cs_spi, 0x054, 0);
++	delay(1);
++	if (!cs_poll(cs_spi, 0x000, 1u << 5, 0, 100, 50, "A-die SPI busy after a read")) {
++		return false;
++	}
++	*data = rd(cs_spi, 0x058);
++	return true;
++}
++
++static bool
++cs_spi_write(uint32_t addr, uint32_t data)
++{
++	if (addr == ATOP_WF0_TOP_01 && data == 0) {
++		printf("A34 CONNSYS: refusing to write 0 to A-die 0x380\n");        /* (Linux: BUG_ON) */
++		return false;
++	}
++	if (!cs_poll(cs_spi, 0x000, 1u << 5, 0, 100, 50, "A-die SPI busy before a write")) {
++		return false;
++	}
++	wr(cs_spi, 0x050, 0x0000a000u | addr);
++	wr(cs_spi, 0x054, data);
++	delay(1);
++	return cs_poll(cs_spi, 0x000, 1u << 5, 0, 100, 50, "A-die SPI busy after a write");
++}
++
++/* a field of an A-die register, as consys_spi_write_offset_range_nolock does it (its value mask is one bit wider) */
++static void
++cs_spi_range(uint32_t addr, uint32_t value, uint32_t reg_offset, uint32_t value_offset, uint32_t size)
++{
++	uint32_t data = 0, v = (value >> value_offset) & ((1u << (size + 1)) - 1u), mask = ((1u << size) - 1u) << reg_offset;
++
++	if (cs_spi_read(addr, &data)) {
++		(void)cs_spi_write(addr, (data & ~mask) | (v << reg_offset));
++	}
++}
++
++static bool
++cs_sema_get(uint32_t index)
++{
++	for (uint32_t i = 0; i < 1000; i++) {
++		if (rd(cs_sema, 4 * index) & 1u) {             /* (reading takes it) */
++			return true;
++		}
++		delay(1);
++	}
++	printf("A34 CONNSYS: semaphore %u not free: M2 owns %#x\n", index, rd(cs_sema, 0x400));
++	return false;
++}
++
++static void
++cs_sema_put(uint32_t index)
++{
++	wr(cs_sema, 0x200 + 4 * index, 1);
++}
++
++static void
++cs_top_ck(bool on)
++{
++	field(cs_slp, 0x120, 1u, on ? 1u : 0u);
++	(void)cs_poll(cs_slp, 0x120, 1u << 1, 0, 100, 5, "A-die TOP clock");
++}
++
++/* ---- ph0: EMI MPU region 27 (emi-mpu.c mtk_emimpu_set_protection; MTK_SIP_EMIMPU_CONTROL, MTK_EMIMPU_SET) ---- */
++
++static uint64_t
++cs_smc(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
++{
++	register uint64_t x0 __asm__("x0") = a0;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	register uint64_t x4 __asm__("x4") = a4;
++
++	__asm__ volatile (
++	    "mov x5, xzr\n\t"
++	    "mov x6, xzr\n\t"
++	    "mov x7, xzr\n\t"
++	    "smc #0\n\t"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
++	    :
++	    : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++static void
++cs_emi_mpu(void)
++{
++	/* domains 0 (AP), 2 (CONN), 3 (SCP): no protection (0); the others forbidden (5); 3 bits each, 8 per group */
++	static const uint32_t apc[2] = { 0x00b6d028u, 0x00b6db6du };
++	uint64_t start = cs_emi_pa, end = cs_emi_pa + CS_EMI_SIZE - 1;
++	uint64_t r[2];
++
++	for (int g = 1; g >= 0; g--) {
++		r[g] = cs_smc(0xc200050bull, 0, (start >> 16) | (27ull << 24), (end >> 16) | ((uint64_t)g << 24), apc[g]);
++	}
++	printf("A34 CONNSYS: ph0: EMI MPU region 27 = [%#llx, %#llx], AP/CONN/SCP allowed: SMC answers %#llx, %#llx\n",
++	    start, end, r[1], r[0]);
++}
++
++/* ---- the guard (consys_check_reg_readable): may conn_infra's registers be read now? ---- */
++
++bool
++a34_connsys_readable(const char *when)
++{
++	uint32_t sta = rd(cs_infra, INFRA_PROT_STA1), r = 0, v;
++
++	if (sta & ((1u << 19) | (1u << 13))) {
++		printf("A34 CONNSYS: not readable (%s): AP->CONN bus protection on (STA1 %#x)\n", when, sta);
++		return false;
++	}
++	for (int i = 0; i < 4; i++) {
++		setb(cs_hc, 0x000, 1u << 0);                    /* clock detect, again */
++		delay(20);
++		r = rd(cs_hc, 0x000) & 6u;
++		if (r == 6u) {
++			break;
++		}
++		delay(1000);
++	}
++	if (r != 6u) {
++		printf("A34 CONNSYS: not readable (%s): bus/OSC clock detect %#x\n", when, rd(cs_hc, 0x000));
++		return false;
++	}
++	if ((v = rd(cs_cfg, 0x000)) != 0x02060002u) {
++		printf("A34 CONNSYS: not readable (%s): conn_infra version %#x\n", when, v);
++		return false;
++	}
++	if (!(rd(cs_hc, 0x2d4) & 1u)) {
++		printf("A34 CONNSYS: not readable (%s): conn_infra off-domain bus timeout (%#x)\n", when, rd(cs_hc, 0x2d4));
++		return false;
++	}
++	return true;
++}
++
++uint64_t
++a34_connsys_emi_pa(void)
++{
++	return cs_emi_pa;
++}
++
++uint32_t
++a34_connsys_emi_size(void)
++{
++	return CS_EMI_SIZE;
++}
++
++static bool
++cs_map(void)
++{
++	cs_rgu = ml_io_map(CS_RGU_PA, 0x1000);
++	cs_cfg = ml_io_map(CS_CFG_PA, 0x1000);
++	cs_therm = ml_io_map(CS_THERM_PA, 0x1000);
++	cs_afe = ml_io_map(CS_AFE_PA, 0x1000);
++	cs_spi = ml_io_map(CS_SPI_PA, 0x1000);
++	cs_slp = ml_io_map(CS_SLP_PA, 0x1000);
++	cs_clkgen = ml_io_map(CS_CLKGEN_PA, 0x1000);
++	cs_buscr = ml_io_map(CS_BUSCR_PA, 0x1000);
++	cs_vdnr = ml_io_map(CS_VDNR_PA, 0x1000);
++	cs_bcrm = ml_io_map(CS_BCRM_PA, 0x1000);
++	cs_sysram = ml_io_map(CS_SYSRAM_PA, CS_SYSRAM_SIZE);
++	cs_hc = ml_io_map(CS_HC_PA, 0x1000);
++	cs_sema = ml_io_map(CS_SEMA_PA, 0x1000);
++	cs_infra = ml_io_map(CS_INFRA_PA, 0x1000);
++	cs_gpio = ml_io_map(CS_GPIO_PA, 0x1000);
++	cs_spm = ml_io_map(CS_SPM_PA, 0x1000);
++	cs_toprgu = ml_io_map(CS_TOPRGU_PA, 0x1000);
++	cs_rc = ml_io_map(CS_RC_PA, 0x1000);
++	cs_pwrap = ml_io_map(CS_PWRAP_PA, 0x1000);
++	cs_iocfg = ml_io_map(CS_IOCFG_RT_PA, 0x1000);
++	return cs_rgu && cs_cfg && cs_therm && cs_afe && cs_spi && cs_slp && cs_clkgen && cs_buscr && cs_vdnr && cs_bcrm &&
++	       cs_sysram && cs_hc && cs_sema && cs_infra && cs_gpio && cs_spm && cs_toprgu && cs_rc && cs_pwrap && cs_iocfg;
++}
++
++/* ---- ph1: VCN18 and VCN13 (consys_plt_pmic_common_power_ctrl_mt6877, RC mode) ---- */
++
++static bool
++cs_ph1_pmic(void)
++{
++	uint16_t m18 = 0, m13 = 0, xo = 0;
++	bool ok = true;
++
++	for (int b = 7; b >= 4; b--) {
++		ok &= cs_pmic_write(PMIC_VCN18_OP_EN_SET, (uint16_t)(1u << b));
++		ok &= cs_pmic_write(PMIC_VCN18_OP_CFG_SET, 0);
++	}
++	ok &= cs_pmic_field(PMIC_VCN18_CON0, 1u << 1, 0);                      /* SW_LP off */
++	ok &= cs_pmic_field(PMIC_VCN18_CON0, 1u << 0, 1u << 0);                /* SW_EN (1.8 V is its only voltage) */
++	delay(300);
++	for (int b = 7; b >= 4; b--) {
++		ok &= cs_pmic_write(PMIC_VCN13_OP_EN_SET, (uint16_t)(1u << b));
++		ok &= cs_pmic_write(PMIC_VCN13_OP_CFG_SET, 0);
++	}
++	ok &= cs_pmic_field(PMIC_VCN13_CON0, 1u << 1, 0);
++	ok &= cs_pmic_field(PMIC_VCN13_ANA_CON0, 0x0f00u, 0x0400u);            /* 1.3 V */
++	ok &= cs_pmic_field(PMIC_VCN13_CON0, 1u << 0, 1u << 0);
++	delay(300);
++	(void)cs_pmic_read(PMIC_VCN18_MON, &m18);
++	(void)cs_pmic_read(PMIC_VCN13_MON, &m13);
++	(void)cs_pmic_read(PMIC_DCXO_CW00, &xo);
++	printf("A34 CONNSYS: ph1: VCN18 %s (MON %#x), VCN13 %s (MON %#x); DCXO_CW00 %#x, RC_CENTRAL_CFG1 %#x%s\n",
++	    (m18 & 1u) ? "on" : "off?", m18, (m13 & 1u) ? "on" : "off?", m13, xo, rd(cs_rc, 0x804),
++	    (rd(cs_rc, 0x804) & 1u) ? " (RC mode)" : " (RC mode OFF: the RC-mode sequence may not fit)");
++	return ok;
++}
++
++/* ---- ph2: pinmux (connsys_gpio_setting) ---- */
++
++static void
++cs_ph2_pinmux(void)
++{
++	field(cs_gpio, 0x480, 0x77770000u, 0x11110000u);       /* GPIO196-199: BT_CLK, BT_DATA, HRST_B, TOP_CLK */
++	field(cs_gpio, 0x490, 0x07777777u, 0x01111111u);       /* GPIO200-206: TOP_DATA, WB_PTA, WF_CTRL0-4 */
++	field(cs_iocfg, 0x000, 7u << 27, 0);                    /* drive 2 mA */
++	wr(cs_iocfg, 0x078, (1u << 14) | (1u << 9));            /* pull-downs off (PD_CFG0_CLR) */
++	wr(cs_iocfg, 0x094, (1u << 14) | (1u << 9));            /* pull-ups on (PU_CFG0_SET) */
++}
++
++/* ---- ph3: the CONN power domain (scpsys_power_on with mt6877's CONN data) ---- */
++
++static bool
++cs_ph3_mtcmos(void)
++{
++	uint32_t v;
++
++	if (!(rd(cs_spm, SPM_POWERON_CONFIG_EN) & 1u)) {
++		wr(cs_spm, SPM_POWERON_CONFIG_EN, (SPM_PROJECT_CODE << 16) | 1u);
++	}
++	printf("A34 CONNSYS: ph3: before: CONN_PWR_CON %#x, PWR_STATUS %#x/%#x, PROT_STA1 %#x, SWSYSRST %#x\n",
++	    rd(cs_spm, SPM_CONN_PWR_CON), rd(cs_spm, SPM_PWR_STATUS), rd(cs_spm, SPM_PWR_STATUS_2ND),
++	    rd(cs_infra, INFRA_PROT_STA1), rd(cs_toprgu, TOPRGU_SWSYSRST));
++	setb(cs_spm, SPM_CONN_PWR_CON, 1u << 2);
++	if (!cs_poll(cs_spm, SPM_PWR_STATUS, 1u << 1, 1u << 1, 10000, 100, "CONN power status")) {
++		return false;
++	}
++	delay(50);
++	setb(cs_spm, SPM_CONN_PWR_CON, 1u << 3);
++	if (!cs_poll(cs_spm, SPM_PWR_STATUS_2ND, 1u << 1, 1u << 1, 10000, 100, "CONN power status (2nd)")) {
++		return false;
++	}
++	clrb(cs_spm, SPM_CONN_PWR_CON, 1u << 4);                               /* clock on */
++	delay(1);
++	clrb(cs_spm, SPM_CONN_PWR_CON, 1u << 1);                               /* isolation off */
++	v = rd(cs_toprgu, TOPRGU_SWSYSRST);
++	if (v & (1u << 9)) {                                                    /* CONNSYS held by TOPRGU: let go */
++		wr(cs_toprgu, TOPRGU_SWSYSRST, (v & ~0xff000200u) | 0x88000000u);
++		printf("A34 CONNSYS: ph3: TOPRGU SWSYSRST %#x had CONNSYS in reset, now %#x\n", v, rd(cs_toprgu, TOPRGU_SWSYSRST));
++	}
++	setb(cs_spm, SPM_CONN_PWR_CON, 1u << 0);                               /* reset released */
++	delay(500);
++	wr(cs_infra, INFRA_PROT_CLR, (1u << 14) | (1u << 19));                  /* CONN2AP AXI RX, AP2CONN AHB RX */
++	wr(cs_infra, INFRA_PROT_CLR, (1u << 13) | (1u << 18));                  /* AP2CONN AHB TX, CONN2AP AXI TX */
++	if (!cs_poll(cs_infra, INFRA_PROT_STA1, (1u << 19) | (1u << 13), 0, 100, 500, "AP->CONN bus protection")) {
++		return false;
++	}
++	delay(5000);                                                            /* CONNSYS's XO clock */
++	printf("A34 CONNSYS: ph3: CONN powered: CONN_PWR_CON %#x, PWR_STATUS %#x/%#x, PROT_EN %#x STA1 %#x\n",
++	    rd(cs_spm, SPM_CONN_PWR_CON), rd(cs_spm, SPM_PWR_STATUS), rd(cs_spm, SPM_PWR_STATUS_2ND),
++	    rd(cs_infra, INFRA_PROT_EN), rd(cs_infra, INFRA_PROT_STA1));
++	return true;
++}
++
++/* ---- ph6 .. ph11 ---- */
++
++static void
++cs_ph6_ddie(void)
++{
++	for (uint32_t off = 0; off < CS_SYSRAM_SIZE; off += 4) {
++		*(volatile uint32_t *)(cs_sysram + off) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(cs_buscr, 0x360, 0x04000000u);                                     /* CONN2AP EMI path, CONNSYS's view */
++	wr(cs_buscr, 0x364, 0x43ffffffu);
++	wr(cs_sysram, 0x2820, rd(cs_cfg, 0x020));                              /* D-die efuse */
++	wr(cs_rgu, 0x050, 0);                                                   /* sysram HW control: no power-down */
++	wr(cs_rgu, 0x054, 1);
++	wr(cs_rgu, 0x070, 0);
++	wr(cs_rgu, 0x074, 1);
++	wr(cs_sysram, 0x2838, 3);                                               /* build mode (Samsung: user) */
++}
++
++static void
++cs_ph7_sleep_ctl(void)
++{
++	static const uint32_t bg_addr[8] = { 0xa03c, 0xa03c, 0xaa18, 0xaa18, 0xa0c8, 0xaa00, 0xa0b4, 0xa34c };
++	static const uint32_t bg[16] = {        /* ON1..8, OFF1..8; ON3/4, OFF3/4: Bluetooth only */
++		0x00000000, 0x00000000, 0x74e03f75, 0x76e83f75, 0x00000000, 0xffffffff, 0x00000019, 0x00010400,
++		0x57400000, 0x57400000, 0x44e03f75, 0x44e03f75, 0x00000001, 0x00000000, 0x00040019, 0x00410440,
++	};
++
++	field(cs_slp, 0x070, 0x00000fffu, 0xa04);
++	field(cs_slp, 0x070, 0x0fff0000u, 0xaf4u << 16);
++	field(cs_slp, 0x074, 0x00000fffu, 0x090);
++	field(cs_slp, 0x074, 0x0fff0000u, 0x0a0u << 16);
++	field(cs_slp, 0x078, 0x00000fffu, 0x08c);
++	field(cs_slp, 0x078, 0x0fff0000u, 0x09cu << 16);
++	field(cs_slp, 0x07c, 0x00000fffu, 0xa08);
++	field(cs_slp, 0x080, 0x00000fffu, 0x094);
++	field(cs_slp, 0x084, 0x00000fffu, 0x02c);
++	field(cs_slp, 0x088, 0x00000fffu, 0xa0c);
++	field(cs_slp, 0x088, 0x0fff0000u, 0xafcu << 16);
++	field(cs_slp, 0x08c, 0x00000fffu, 0x0f0);
++	field(cs_slp, 0x090, 0x00000fffu, 0x0f4);
++	field(cs_slp, 0x094, 0x00000fffu, 0x0fc);
++	field(cs_slp, 0x098, 0x00000fffu, 0x0f8);
++	field(cs_slp, 0x004, 0x1fu, 0x8);
++	for (uint32_t i = 0; i < 8; i++) {
++		field(cs_slp, 0x010 + 4 * i, 0xffffu, bg_addr[i]);
++	}
++	for (uint32_t i = 0; i < 16; i++) {
++		wr(cs_slp, 0x030 + 4 * i, bg[i]);
++	}
++}
++
++static bool
++cs_ph8_adie(void)
++{
++	uint32_t id = 0, efuse[4] = { 0 }, ctrl = 0;
++	bool valid = false;
++
++	wr(cs_gpio, 0x064, 1u << 12);                                           /* GPIO204 (WF_CTRL2) out, high */
++	wr(cs_gpio, 0x164, 1u << 12);
++	field(cs_gpio, 0x490, 0x70000u, 0);                                     /* ... as a GPIO while 26 MHz is set up */
++	cs_top_ck(true);
++	setb(cs_cfg, 0x030, 1u << 0);                                           /* A-die reset released */
++	if (!cs_sema_get(SEMA_RFSPI)) {
++		cs_top_ck(false);
++		return false;
++	}
++	if (!cs_spi_read(ATOP_CHIP_ID, &id) || (id & 0xffff0000u) != 0x66350000u) {
++		cs_sema_put(SEMA_RFSPI);
++		printf("A34 CONNSYS: ph8: A-die chip id %#x, not an MT6635\n", id);
++		return false;
++	}
++	cs_adie_id = id;
++	wr(cs_sysram, 0x2800, id);
++	(void)cs_spi_write(ATOP_WRI_CTR2, 0x00007700);
++	(void)cs_spi_write(ATOP_SMCTK11, 0x00000021);
++	field(cs_spi, 0x00c, 1u << 15, 0);                                     /* FM read extension off */
++	field(cs_spi, 0x00c, 0xffu, 0);
++	wr(cs_therm, 0x018, 0x50305a00u);
++	/* the A-die's efuse, address 0, into sysram for the firmware */
++	if (cs_spi_read(ATOP_EFUSE_CTRL, &ctrl)) {
++		(void)cs_spi_write(ATOP_EFUSE_CTRL, ctrl & ~(1u << 30));
++		(void)cs_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++		(void)cs_spi_write(ATOP_EFUSE_CTRL, (ctrl & ~0x43ff00c0u) | (1u << 30));
++		(void)cs_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++		for (int i = 0; i < 70 && (ctrl & (1u << 30)); i++) {
++			delay(30);
++			(void)cs_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++		}
++		(void)cs_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++		if (ctrl & (1u << 29)) {
++			valid = true;
++			for (uint32_t i = 0; i < 4; i++) {
++				valid &= cs_spi_read(ATOP_EFUSE_RDATA0 + 4 * i, &efuse[i]);
++				wr(cs_sysram, 0x2804 + 4 * i, efuse[i]);
++			}
++		}
++	}
++	if (valid && (efuse[1] & (1u << 7))) {                                  /* thermal trim */
++		cs_spi_range(ATOP_THADC_BG, efuse[1], 12, 3, 4);
++		cs_spi_range(ATOP_THADC, efuse[1], 23, 0, 3);
++	}
++	if (valid && (efuse[1] & (1u << 15))) {
++		cs_spi_range(ATOP_THADC, efuse[1], 26, 13, 2);
++	}
++	(void)cs_spi_write(ATOP_ENCAL_WBTAC_IF_SW, 0x80000000u);               /* WF pads high-Z */
++	(void)cs_spi_write(ATOP_WF0_TOP_01, 0x000e8002u);                      /* CAL LDOs off */
++	(void)cs_spi_write(ATOP_WF1_TOP_01, 0x000e8002u);
++	(void)cs_spi_write(ATOP_XTAL_01, 0xf6e8fff5u);
++	(void)cs_spi_write(ATOP_XTAL_02, id == 0x66358a00u ? 0xd5555fffu : 0x55555fffu);
++	(void)cs_spi_write(ATOP_WF0_BG, 0x00002008u);
++	(void)cs_spi_write(ATOP_WF1_BG, 0x00002008u);
++	cs_sema_put(SEMA_RFSPI);
++	field(cs_gpio, 0x490, 0x70000u, 0x10000u);                              /* GPIO204 back to WF_CTRL2 */
++	printf("A34 CONNSYS: ph8: A-die %#x (MT6635 %s), efuse %s %#x %#x %#x %#x\n", id,
++	    id == 0x66358a00u ? "E1" : id == 0x66358a10u ? "E2" : id == 0x66358a11u ? "E3" : "?", valid ? "valid" : "NOT VALID",
++	    efuse[0], efuse[1], efuse[2], efuse[3]);
++	return true;
++}
++
++static void
++cs_ph9_afe_cal(void)
++{
++	setb(cs_afe, 0x000, 1u << 0);                                           /* RC calibration */
++	delay(60);
++	clrb(cs_afe, 0x000, 1u << 0);
++	field(cs_afe, 0x058, 0x03c00000u, 0);                                   /* BBTX VCM 0.6 V for the DACs */
++	field(cs_afe, 0x078, 0x03c00000u, 0);
++	field(cs_afe, 0x094, 0x03c00000u, 0);
++	setb(cs_afe, 0x008, 1u << 21);                                          /* BPLL up */
++	delay(30);
++	setb(cs_afe, 0x008, 1u << 20);                                          /* WPLL up */
++	delay(60);
++	setb(cs_afe, 0x000, (1u << 21) | (1u << 20) | (1u << 19));              /* TX calibration BT, WF0, WF1 */
++	delay(800);
++	clrb(cs_afe, 0x000, (1u << 21) | (1u << 20) | (1u << 19));
++	clrb(cs_afe, 0x008, (1u << 21) | (1u << 20));
++	field(cs_afe, 0x058, 0x03c00000u, 4u << 22);                            /* VCM back to 0.65 V */
++	field(cs_afe, 0x078, 0x03c00000u, 4u << 22);
++	field(cs_afe, 0x094, 0x03c00000u, 4u << 22);
++	if (cs_sema_get(SEMA_RFSPI)) {
++		(void)cs_spi_write(ATOP_ENCAL_WBTAC_IF_SW, 0x00000005u);
++		cs_sema_put(SEMA_RFSPI);
++	}
++}
++
++static void
++cs_ph10_pll(void)
++{
++	field(cs_afe, 0x0f4, 0x7fff7fffu, 0x03140521u);                         /* BPLL 40 us, WPLL 50 us */
++	field(cs_afe, 0x004, 0x000000c0u, 1u << 6);                             /* BT: BPLL */
++	field(cs_afe, 0x004, 0x00000003u, 3u);                                  /* WF: WPLL */
++	field(cs_afe, 0x004, 0x0000000cu, 1u << 2);                             /* MCU BGF: BPLL */
++	field(cs_afe, 0x004, 0x00030000u, 3u << 16);                            /* MCU WF: BPLL + WPLL */
++	field(cs_afe, 0x00c, 0x00078000u, 0xdu << 15);
++}
++
++static void
++cs_ph11_status(void)
++{
++	if (cs_sema_get(SEMA_SYSRAM)) {
++		setb(cs_sysram, 0x2834, 1u << 0);                                   /* RADIO_STATUS: Bluetooth */
++		cs_sema_put(SEMA_SYSRAM);
++	}
++}
++
++/* ---- ph12: Bluetooth's voltage raise (consys_plt_pmic_raise_voltage_mt6877, vcn13_1_37v) ---- */
++
++static void
++cs_ph12_raise(void)
++{
++	(void)cs_pmic_field(PMIC_VS2_ELR0, 0x7f, 0x35);                         /* VS2 1.4625 V */
++	(void)cs_pmic_write(PMIC_VS2_VOTER_SET, 0x10);                          /* ... voted for by CONNSYS (bit 4) */
++	(void)cs_pmic_field(PMIC_VS2_CON1, 0x7f, 0x2e);                         /* VS2 asleep 1.375 V */
++	(void)cs_pmic_field(PMIC_VCN13_ANA_CON0, 0x0f, 0x7);                    /* VCN13 +70 mV: 1.37 V */
++	delay(50);
++}
++
++/* ---- ph13: conn_infra settings (connsys_low_power_setting_mt6877, first on, RC mode) ---- */
++
++static void
++cs_ph13_settings(void)
++{
++	uint32_t x1 = 0, x2 = 0;
++
++	/* the A-die clock buffer for Bluetooth only (E2/E3 table; E1 differs in XTAL_02) */
++	cs_top_ck(true);
++	if (cs_sema_get(SEMA_RFSPI)) {
++		if (cs_spi_read(ATOP_XTAL_01, &x1)) {
++			(void)cs_spi_write(ATOP_XTAL_01, (x1 & ~0x0000c180u) | 0x00000100u);
++		}
++		if (cs_spi_read(ATOP_XTAL_02, &x2)) {
++			(void)cs_spi_write(ATOP_XTAL_02, (x2 & ~0xf0ff0080u) | (cs_adie_id == 0x66358a00u ? 0xf0ff0000u : 0x70ff0000u));
++		}
++		cs_sema_put(SEMA_RFSPI);
++	}
++	cs_top_ck(false);
++	field(cs_cfg, 0x200, 0xf000u, 0x1000u);                                 /* PWRCTRL0 sleep-ready mask */
++	/* RC mode: the per-subsystem RC oscillator controls */
++	wr(cs_cfg, 0x394, 0x02080706u);
++	clrb(cs_cfg, 0x390, 1u << 15);
++	wr(cs_cfg, 0x3a4, 0x02080706u);
++	clrb(cs_cfg, 0x3a0, 1u << 15);
++	wr(cs_cfg, 0x3b4, 0x02080706u);
++	clrb(cs_cfg, 0x3b0, 1u << 15);
++	wr(cs_cfg, 0x3c4, 0x02080706u);
++	clrb(cs_cfg, 0x3c0, 1u << 15);
++	setb(cs_cfg, 0x388, 1u << 3);
++	delay(30);
++	setb(cs_cfg, 0x388, (1u << 0) | (1u << 1) | (1u << 2));
++	setb(cs_cfg, 0x380, (1u << 4) | (1u << 5) | (1u << 6));
++	setb(cs_cfg, 0x400, 1u << 0);
++	clrb(cs_cfg, 0x380, 1u << 31);
++	clrb(cs_cfg, 0x380, 1u << 0);
++	field(cs_cfg, 0x300, 0x00ffffffu, 0x00080706u);
++	clrb(cs_cfg, 0x304, 1u << 16);
++	setb(cs_cfg, 0x380, 1u << 30);
++	field(cs_cfg, 0x388, 0xf0u, 0xd0u);
++	setb(cs_cfg, 0x400, 1u << 16);
++	setb(cs_cfg, 0x404, 1u << 1);
++	/* common */
++	field(cs_rgu, 0x020, 0xffff0040u, 0x42540000u);                         /* (keyed writes) */
++	field(cs_rgu, 0x010, 0xffff0040u, 0x57460000u);
++	setb(cs_cfg, 0x400, 1u << 18);
++	field(cs_cfg, 0x400, 0x00007ff0u, 1023u << 4);                          /* ddr_en timeout */
++	setb(cs_cfg, 0x400, 1u << 15);
++	clrb(cs_cfg, 0x400, 1u << 15);
++	field(cs_bcrm, 0x03c, 0x00f80000u, 0x00080000u);                        /* bus DCM */
++	field(cs_bcrm, 0x040, 0x000003e0u, 0x00000020u);
++	field(cs_bcrm, 0x03c, 0x3u, 0x3u);
++	field(cs_bcrm, 0x03c, 0x18u, 0x18u);
++	setb(cs_buscr, 0x238, (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4));   /* light security */
++	field(cs_buscr, 0x300, 0x00007f80u, 0x12u << 7);                        /* conn_infra off/on bus timeouts */
++	field(cs_buscr, 0x300, 0x7u, 0x7u);
++	field(cs_buscr, 0x31c, 0x00007f80u, 0x02u << 7);
++	field(cs_buscr, 0x31c, 0x7u, 0x7u);
++	setb(cs_vdnr, 0x000, 1u << 9);                                          /* VDNR debug-ctrl bus timeout */
++	field(cs_vdnr, 0x000, 0xffff0000u, 0x07f40000u);
++	setb(cs_vdnr, 0x000, (1u << 2) | (1u << 3) | (1u << 4));
++	clrb(cs_vdnr, 0x000, 1u << 9);
++	wr(cs_toprgu, TOPRGU_SWSYSRST, (rd(cs_toprgu, TOPRGU_SWSYSRST) & ~0xff001000u) | 0x88000000u);
++	setb(cs_clkgen, 0x000, 1u << 0);                                        /* bus BPLL/WPLL dividers */
++	setb(cs_clkgen, 0x004, 1u << 0);
++	setb(cs_clkgen, 0x008, 1u << 0);
++	setb(cs_clkgen, 0x00c, 1u << 0);
++	clrb(cs_clkgen, 0x048, 1u << 7);                                        /* RF-SPI clock: BPLL / 13 */
++	setb(cs_clkgen, 0x048, 1u << 6);
++	setb(cs_clkgen, 0x048, 1u << 4);
++	field(cs_hc, 0x380, 1u << 31, 1u << 31);                                /* sleep counter */
++	field(cs_hc, 0x380, 1u << 0, 1u << 0);
++	setb(cs_clkgen, 0xa00, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) |
++	    (1u << 25) | (1u << 26) | (1u << 27));                              /* coex, PTA, UART-PTA clocks */
++	setb(cs_cfg, 0x200, 1u << 9);
++	wr(cs_rgu, 0x204, 0x6);
++	clrb(cs_clkgen, 0xa00, 1u << 23);                                       /* bus clock: hardware control */
++	printf("A34 CONNSYS: ph13: PWRCTRL0 %#x, bus timeouts %#x/%#x, OSC %#x, RC_CTL %#x/%#x; XTAL %#x %#x\n",
++	    rd(cs_cfg, 0x200), rd(cs_buscr, 0x300), rd(cs_buscr, 0x31c), rd(cs_cfg, 0x300), rd(cs_cfg, 0x380),
++	    rd(cs_cfg, 0x388), x1, x2);
++	if (cs_deep) {
++		setb(cs_cfg, 0x200, 1u << 0);                               /* conn_infra may sleep (last) */
++	}
++}
++
++/* ---- ph15: VCN33_1 for Bluetooth (consys_pmic_vcn33_1_power_ctl_mt6877, RC mode) ---- */
++
++static void
++cs_ph15_vcn33(void)
++{
++	uint16_t mon = 0;
++
++	(void)cs_pmic_write(PMIC_VCN33_1_OP_EN_SET, 1u << 6);
++	(void)cs_pmic_write(PMIC_VCN33_1_OP_CFG_SET, 0);
++	(void)cs_pmic_write(PMIC_VCN33_1_OP_EN_SET, 1u << 5);
++	(void)cs_pmic_write(PMIC_VCN33_1_OP_CFG_SET, 0);
++	(void)cs_pmic_field(PMIC_VCN33_1_CON0, 1u << 1, 0);
++	(void)cs_pmic_field(PMIC_VCN33_1_ANA_CON0, 0x0f00u, 0x0d00u);          /* 3.3 V */
++	if (cs_vcn33) {
++		(void)cs_pmic_field(PMIC_VCN33_1_CON0, 1u << 0, 1u << 0);       /* also on by software (non-RC path) */
++		delay(300);
++	}
++	(void)cs_pmic_read(PMIC_VCN33_1_MON, &mon);
++	printf("A34 CONNSYS: ph15: VCN33_1 3.3 V for Bluetooth: %s (MON %#x)\n", (mon & 1u) ? "on" : "off for now", mon);
++}
++
++int
++a34_connsys_on(void)
++{
++	uint64_t emi = 0;
++	uint32_t v;
++
++	if (cs_up) {
++		return 0;
++	}
++	if (cs_tried) {
++		return EIO;
++	}
++	cs_tried = true;
++	if (PE_parse_boot_argn("a34btemi", &emi, sizeof(emi)) && emi != 0) {
++		cs_emi_pa = emi;
++	}
++	(void)PE_parse_boot_argn("a34btmpu", &cs_mpu, sizeof(cs_mpu));
++	(void)PE_parse_boot_argn("a34btvcn33", &cs_vcn33, sizeof(cs_vcn33));
++	(void)PE_parse_boot_argn("a34btlp", &cs_lp, sizeof(cs_lp));
++	(void)PE_parse_boot_argn("a34btdeep", &cs_deep, sizeof(cs_deep));
++	(void)PE_parse_boot_argn("a34btforce", &cs_force, sizeof(cs_force));
++	if ((cs_emi_pa & 0xfffffu) != 0 || cs_emi_pa + CS_EMI_SIZE > 0x100000000ull || cs_emi_pa < 0x40000000ull) {
++		printf("A34 CONNSYS: a34btemi=%#llx is not 1 MB aligned in DRAM below 4 GB\n", cs_emi_pa);
++		return EINVAL;
++	}
++	if (!cs_map()) {
++		printf("A34 CONNSYS: registers could not be mapped\n");
++		return ENOMEM;
++	}
++	printf("A34 CONNSYS: power on for Bluetooth: EMI %#llx + %#x, MPU %u, VCN33 by software %u, LDO low power %u, "
++	    "deep sleep %u\n", cs_emi_pa, CS_EMI_SIZE, cs_mpu, cs_vcn33, cs_lp, cs_deep);
++	if ((rd(cs_spm, SPM_PWR_STATUS) & (1u << 1)) && !cs_force) {
++		printf("A34 CONNSYS: the CONN domain is already on (PWR_STATUS %#x, CONN_PWR_CON %#x): stopping "
++		    "(a34btforce=1 goes on anyway)\n", rd(cs_spm, SPM_PWR_STATUS), rd(cs_spm, SPM_CONN_PWR_CON));
++		return EBUSY;
++	}
++	if (cs_mpu) {
++		cs_emi_mpu();
++	}
++	if (!cs_ph1_pmic()) {
++		printf("A34 CONNSYS: ph1: VCN18/VCN13 did not come on\n");
++		return EIO;
++	}
++	cs_ph2_pinmux();
++	printf("A34 CONNSYS: ph2: pinmux: GPIO_MODE24 %#x, GPIO_MODE25 %#x\n", rd(cs_gpio, 0x480), rd(cs_gpio, 0x490));
++	if (!cs_ph3_mtcmos()) {
++		return EIO;
++	}
++	/* ph4: the first access to CONNSYS's own bus */
++	printf("A34 CONNSYS: ph4: reading conn_infra's version\n");
++	for (int i = 0; i < 10 && (v = rd(cs_cfg, 0x000)) != 0x02060002u; i++) {
++		delay(1000);
++	}
++	v = rd(cs_cfg, 0x000);
++	printf("A34 CONNSYS: ph4: conn_infra version %#x (%s), host CSR clock detect %#x\n", v,
++	    v == 0x02060002u ? "as expected" : "NOT 0x02060002", rd(cs_hc, 0x000));
++	if (v != 0x02060002u) {
++		return EIO;
++	}
++	field(cs_hc, 0x1c4, 0x000fffffu, (uint32_t)(cs_emi_pa >> 16));         /* ph5: CONNSYS's memory */
++	field(cs_hc, 0x1d4, 0x000fffffu, 0x01000u);                             /* WF/BT/GPS peripherals: 0x1000_0000 */
++	field(cs_hc, 0x1d8, 0x000fffffu, 0x01000u);
++	field(cs_hc, 0x1dc, 0x000fffffu, 0x01000u);
++	printf("A34 CONNSYS: ph5: EMI remap %#x\n", rd(cs_hc, 0x1c4));
++	cs_ph6_ddie();
++	cs_ph7_sleep_ctl();
++	printf("A34 CONNSYS: ph6-7: D-die and sleep controller set (efuse %#x)\n", rd(cs_sysram, 0x2820));
++	if (!cs_ph8_adie()) {
++		cs_top_ck(false);
++		return EIO;
++	}
++	cs_ph9_afe_cal();
++	cs_ph10_pll();
++	cs_ph11_status();
++	printf("A34 CONNSYS: ph9-11: AFE calibrated, PLLs %#x, radio status %#x\n", rd(cs_afe, 0x004), rd(cs_sysram, 0x2834));
++	cs_ph12_raise();
++	cs_ph13_settings();
++	if (cs_lp) {
++		(void)cs_pmic_field(PMIC_VCN18_CON0, 1u << 1, 1u << 1);         /* ph14 */
++		(void)cs_pmic_field(PMIC_VCN13_CON0, 1u << 1, 1u << 1);
++	}
++	cs_ph15_vcn33();
++	cs_up = true;
++	printf("A34 CONNSYS: up (conn_infra %s)\n", cs_deep ? "may sleep now: a34_bt.c wakes it" : "kept awake");
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9b19d93..6db7eae 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void a34_touch_init(void);
+ extern void a34_diag_init(void);
+ extern void a34_mali_init(void);
+ extern void a34_clocks_init(void);
++extern void a34_bt_init(void);           /* A34 (0939): bsd/dev/a34_bt.c, a34bt=1 */
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -712,6 +713,7 @@ sweet_ufs_init(void)
+ 	a34_clocks_init();      /* 0921: clocks and voltages as the boot loader left them; a34gpumhz */
+ 	a34_diag_init();
+ 	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
++	a34_bt_init();          /* 0939: Bluetooth milestone 1, its own thread; a34bt=1 */
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
+@@ -786,6 +788,19 @@ sweet_log_position(void)
+ 	return os_atomic_load(&sweet_log_total, relaxed);
+ }
+ 
++/*
++ * A34 (0939): the log thread writes now instead of at its next period, for a driver about to do something
++ * that may hang the machine (a34_bt.c): the line that says so reaches the disk first. Any context but an
++ * interrupt; never blocks.
++ */
++void sweet_log_flush(void);
++
++void
++sweet_log_flush(void)
++{
++	wakeup(&sweet_log_chan);
++}
++
+ struct sweet_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
