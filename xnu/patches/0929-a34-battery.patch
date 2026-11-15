@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
-index f8681db..abfba9a 100644
+index f8681db..27fde41 100644
 --- a/bsd/dev/a34_clocks.c
 +++ b/bsd/dev/a34_clocks.c
 @@ -112,6 +112,7 @@ void a34_clocks_init(void);             /* bsd/dev/sweet_ufs.c, at boot */
@@ -10,7 +10,7 @@ index f8681db..abfba9a 100644
  
  /* ---- where things are ---- */
  
-@@ -974,6 +975,149 @@ ck_gpu_report(const char *when)
+@@ -974,6 +975,153 @@ ck_gpu_report(const char *when)
  	    ruby_rd32(ck_gpupll, GPU_FHCTL_HP_EN), ruby_rd32(ck_gpupll, GPU_FHCTL0_CFG));
  }
  
@@ -55,6 +55,7 @@ index f8681db..abfba9a 100644
 +
 +static LCK_MTX_DECLARE(ck_bat_mtx, &a34_pmic_grp);     /* one conversion at a time */
 +static uint32_t ck_bat_on = 1;          /* a34bat=0: no conversion asked */
++static uint32_t ck_bat_guard;           /* a34batguard=1: no raises on a low battery (off: the user wants them always) */
 +static bool ck_bat_low_boot;
 +static uint32_t ck_bat_last_mv;
 +
@@ -121,10 +122,13 @@ index f8681db..abfba9a 100644
 +	if (mv == 0) {
 +		printf("A34 BAT: no battery reading (%s): a34cpuopp and a34gpumhz go ahead unchecked\n",
 +		    counts != 0 ? "not a cell's voltage" : "no conversion in 32 ms");
-+	} else if (mv < BAT_LOW_BOOT_MV) {
++	} else if (mv < BAT_LOW_BOOT_MV && ck_bat_guard != 0) {
 +		ck_bat_low_boot = true;
 +		printf("A34 BAT: VBAT %u mV is below %u mV at boot: a34cpuopp and a34gpumhz are NOT done this boot "
-+		    "(raised clocks on a flat battery risk a brown-out); charge it in Android or TWRP\n", mv, BAT_LOW_BOOT_MV);
++		    "(a34batguard=1; raised clocks on a flat battery risk a brown-out); charge it in Android or TWRP\n", mv, BAT_LOW_BOOT_MV);
++	} else if (mv < BAT_LOW_BOOT_MV) {
++		printf("A34 BAT: VBAT %u mV is below %u mV at boot; a34cpuopp and a34gpumhz go ahead anyway "
++		    "(a34batguard=1 would skip them): a brown-out may reset the phone\n", mv, BAT_LOW_BOOT_MV);
 +	}
 +}
 +
@@ -160,15 +164,16 @@ index f8681db..abfba9a 100644
  void
  a34_clocks_init(void)
  {
-@@ -988,6 +1132,7 @@ a34_clocks_init(void)
+@@ -988,6 +1136,8 @@ a34_clocks_init(void)
  		printf("A34 CLOCKS: nothing read or changed (a34clocks=0)\n");
  		return;
  	}
 +	(void)PE_parse_boot_argn("a34bat", &ck_bat_on, (int)sizeof(ck_bat_on));   /* A34 (0929), before ck_pwrap is set */
++	(void)PE_parse_boot_argn("a34batguard", &ck_bat_guard, (int)sizeof(ck_bat_guard));
  	ck_top = ml_io_map(CK_TOP_PA, CK_PAGE);
  	ck_spm = ml_io_map(CK_SPM_PA, CK_PAGE);
  	ck_apmixed = ml_io_map(CK_APMIXED_PA, CK_PAGE);
-@@ -1018,7 +1163,12 @@ a34_clocks_init(void)
+@@ -1018,7 +1168,12 @@ a34_clocks_init(void)
  		printf("A34 CLOCKS: a34cpufreq=%u does nothing: a34cpuopp=<L MHz>,<LL MHz> asks MCUPM's firmware, "
  		    "never the PLLs or Vproc directly\n", cpu);
  	}
