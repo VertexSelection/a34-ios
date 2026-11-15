@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
-index 398efc0..78ba13d 100644
+index 398efc0..8d745de 100644
 --- a/bsd/dev/a34_wifi.c
 +++ b/bsd/dev/a34_wifi.c
 @@ -23,6 +23,8 @@
@@ -68,16 +68,16 @@ index 398efc0..78ba13d 100644
 +static uint32_t
 +a34w_nvram_body(const uint8_t *d, uint32_t size, uint8_t *out)
 +{
-+	uint32_t at = 256u, total, start = 0, n = 0;
++	uint32_t at = 256u, end, start = 0, n = 0;
 +
 +	if (size < 262u) {
 +		return 0;
 +	}
-+	total = (uint32_t)(d[at + 4u] | d[at + 5u] << 8) + 256u;        /* the control tag says the tags' length */
-+	if (total > size) {
-+		total = size;
++	end = (uint32_t)(d[at + 4u] | d[at + 5u] << 8) + 256u;          /* the control tag says the tags' length */
++	if (end > size) {
++		end = size;
 +	}
-+	while (at + 3u <= total) {
++	while (at + 3u <= end) {
 +		uint32_t tag = d[at], length = (uint32_t)(d[at + 1u] | d[at + 2u] << 8);
 +
 +		if ((tag == 0 && length == 0) || at + 3u + length > size) {
