@@ -234,7 +234,7 @@ type 0x50): its CCB buffer manager. We had sent post_cfg_for_ccb's layout (three
 0x70000, MD_MONITOR 0x8000, META 0x104000, packed; total 0x17c000), and we never zeroed the regions Android clears at
 first boot (BOOT_WAITING_FOR_HS1: all of md1_noncacheable_tbl/md1_cacheable_tbl without
 SMF_NCLR_FIRST, incl. CCB data and CCB_CTRL). Both fixed in
-`xnu-boot-0995-cell3b`.
+`xnu-boot-0996-cell3`.
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
