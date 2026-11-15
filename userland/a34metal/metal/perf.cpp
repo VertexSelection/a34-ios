@@ -156,6 +156,7 @@ rwm_perf_report(uint64_t now)
 	static void (*profile)(uint64_t *);
 	static void (*submits)(uint64_t *);
 	static int (*binds)(char *, size_t);
+	static int (*pan)(unsigned, char *, size_t);
 	static int looked;
 
 	if (!looked) {
@@ -163,6 +164,7 @@ rwm_perf_report(uint64_t now)
 		profile = (void (*)(uint64_t *))profile_call("rwa_draw_profile");
 		submits = (void (*)(uint64_t *))profile_call("rwa_submit_profile");
 		binds = (int (*)(char *, size_t))profile_call("rwa_bind_profile");
+		pan = (int (*)(unsigned, char *, size_t))profile_call("rwa_pan_profile");
 	}
 	if (submits != nullptr) {
 		uint64_t sb[5] = { 0, 0, 0, 0, 0 };
@@ -187,6 +189,13 @@ rwm_perf_report(uint64_t now)
 	}
 	if (binds != nullptr && binds(line, sizeof(line)) != 0) {
 		say(line);
+	}
+	for (unsigned which = 0; pan != nullptr && which < 4; which++) {
+		char wide[600];
+
+		if (pan(which, wide, sizeof(wide)) != 0) {
+			say(wide);
+		}
 	}
 	memset(&p, 0, sizeof(p));
 	p.since = now;
