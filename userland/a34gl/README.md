@@ -284,6 +284,16 @@ is whole. `glseedwait=1`: on the drawing thread, as before.
 
 ### Copied surfaces: when they are copied
 
+Every layout of IOSurface a texture is made of now gets two lines the first time it is met
+(`a34gl: layout: ...`). They give the pixel format, the planes and the plane taken with its size,
+bytes a row and a pixel, the texture's format and type, and how it is used: its memory, a CPU
+copy, a GPU copy, or filled from the texture drawn into here. Rows longer than the pixels rounded
+up to 16 bytes are pointed out. The kernel's `a34surfrowfix` makes them so, and a writer that
+keeps to the row length it asked for, not `IOSurfaceGetBytesPerRow()`, shears its picture by the
+difference every row. Boot 57's Focus illustration in Settings fits: Preferences made a 1014 x 780
+'BGRA' surface asking 4064 bytes a row and was given 4096, 8 pixels more each row, so streaks at
+about 7 degrees.
+
 A surface that cannot be the texture's memory ('A008', 'LA08', 'RGhA', no format, 'BGRA' that
 the kernel or Mesa does not take) is copied: when -texImageIOSurface:/-attachImage: makes the
 texture, and again when its seed has moved or its memory adds up to something else when it is

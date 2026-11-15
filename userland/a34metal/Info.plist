@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>works.kry.a34metal</string>
+	<key>CFBundleName</key>
+	<string>A34Metal</string>
+	<key>CFBundleExecutable</key>
+	<string>A34Metal</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<!-- HackiOS's driver class (redwoodmetal.m). Kernel 0920 names MetalPluginClassName
+	     "A34MetalDevice", which -[NSBundle classNamed:] does not find in this bundle;
+	     Metal then takes -principalClass, which is this. -->
+	<key>NSPrincipalClass</key>
+	<string>RedwoodMetalDevice</string>
+</dict>
+</plist>

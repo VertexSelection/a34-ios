@@ -145,6 +145,11 @@ struct redwood_drm_wait_seq {
 
 int redwood_drm_queued(void);
 
+/* For the Metal driver (userland/a34metal, HackiOS's air_metal.c): see redwood_drm.c */
+uint64_t redwood_drm_last_seq(void);
+int redwood_drm_wait_seq(uint64_t seq, int64_t relative_ns);
+int redwood_drm_surface_seq(uint32_t surface, uint64_t seq);
+
 #ifdef __cplusplus
 }
 #endif
