@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copies MediaTek's Bluetooth firmware for the MT6877 from the phone's own vendor partition into the
-# iOS root, where the kernel (patch 0939, boot-arg a34bt=1) reads it: /a34/firmware/. Run on the PC,
+# iOS root, where the kernel (patch 0939, boot-arg a34bt=1) reads it: /a34/firmware/; and makes the
+# phone's Bluetooth address, /a34/bt-address, if there is none (patch 0970). Run on the PC,
 # as root, with the iOS root mounted read-write. Nothing is downloaded and nothing is kept in git.
 #
 #   install-firmware.sh VENDOR_FIRMWARE_DIR IOS_ROOT
@@ -38,3 +39,24 @@ for f in "${FILES[@]}"; do
 		"$built" "$emi" "$( (sha256sum "$DEST/$f" 2>/dev/null || shasum -a 256 "$DEST/$f") | cut -d' ' -f1)"
 done
 echo "installed into /a34/firmware/ of the iOS root"
+
+# The phone's Bluetooth address (kernel 0970): the controller's own is MediaTek's default, the same on every A34.
+# One random static address per phone (the two top bits 1; the low three bytes not an inquiry code
+# 0x9E8B00-0x9E8B3F), kept in /a34/bt-address; made here once, never replaced (the kernel makes one if it is missing).
+ADDR=$ROOT/a34/bt-address
+if [ -s "$ADDR" ]; then
+	echo "Bluetooth address kept: $(head -c 17 "$ADDR") ($ADDR)"
+else
+	while :; do
+		set -- $(od -A n -t x1 -N 6 /dev/urandom)
+		b0=$(printf '%02X' $(( 0x$1 | 0xc0 )))
+		lap=$(( 0x$4 << 16 | 0x$5 << 8 | 0x$6 ))
+		[ "$lap" -ge $((0x9e8b00)) ] && [ "$lap" -le $((0x9e8b3f)) ] && continue
+		[ "$b0$2$3$4$5$6" = FFffffffffff ] && continue
+		break
+	done
+	printf '%s:%s:%s:%s:%s:%s\n' "$b0" "$2" "$3" "$4" "$5" "$6" | tr 'a-f' 'A-F' >"$ADDR"
+	chown 0:0 "$ADDR" 2>/dev/null || true
+	chmod 644 "$ADDR"
+	echo "Bluetooth address made: $(head -c 17 "$ADDR") ($ADDR)"
+fi

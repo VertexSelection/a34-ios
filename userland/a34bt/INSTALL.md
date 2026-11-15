@@ -66,3 +66,48 @@ A line `A34 BT: FAILED at step N: ...` says where it stopped; a log that ends ri
 `A34 BT: step N: ...` (without its result) means that step hung the machine.
 
 `a34bt status`, `a34bt cmd OPCODE [BYTE...]` and `a34bt dump [SECS]` are for a shell, if there is one.
+
+## 5. Bluetooth for iOS (kernel 0970 + 0971, `a34bt=2`)
+
+What changes with 0970: the phone gets its own address. The firmware's is MediaTek's default
+(00:00:46:67:61:01, the same on every A34); a random static address is kept in `/a34/bt-address`
+(`install-firmware.sh` makes it if the file is missing, else the kernel does at the next boot) and set
+with MediaTek's command 0xFC1A after bring-up and after every HCI_Reset. The raw channel now takes
+commands (0939 refused them, which is why `a34bt probe` said nothing in boot 0961-radio-a), and every
+`a34bt` line goes to `/dev/console`.
+
+What 0971 adds with `a34bt=2`: the controller handed to iOS's `bluetoothd` (kernel control
+`com.apple.uart.sk.bluetooth`, the Skywalk channel, the registry's service `bluetooth` with
+`local-mac-address`, `/dev/btwake`). bluetoothd first asks BlueTool to run its "boot" script, which
+on an iPhone loads Broadcom firmware: BlueTool's job runs `a34bt-bluetool` instead, which answers.
+
+With the root at `/mnt` and the CI artifact's `a34/`:
+
+    sudo userland/a34bt/install-firmware.sh /mnt/vendor/firmware /mnt     # (once; also makes /a34/bt-address)
+    sudo python3 -I tools/root-add-job.py --copy /mnt /a34 a34
+    sudo python3 -I tools/root-add-job.py --wrap /mnt com.apple.BlueTool /a34/a34bt-bluetool
+    sudo python3 -I tools/root-add-job.py /mnt com.a34.btprobe /a34 a34 a34bt scan 60
+
+(`--unwrap /mnt com.apple.BlueTool` gives BlueTool back.) The scan job listens for 60 s: before
+bluetoothd connects it scans on its own; after, it counts what bluetoothd's scans bring in. Keep the
+AirPods Pro 2 in their case, lid open, next to the phone during the first minute.
+
+Boot-args: as now, with **`a34bt=2`** instead of `a34bt=1`.
+
+What to look for (`grep -a 'A34 BT\|a34bt' log`):
+
+    A34 BT: address C?:..:..:..:..:.. made now (random static), kept in /a34/bt-address (0)   (first boot)
+    A34 BT: address (at bring-up): C?:...  set
+    A34 BT: br: bridge to bluetoothd up: waiting for bluetoothd
+    A34 BT: the service "bluetooth" is in the registry, local-mac-address ...
+    a34bt-bluetool[N]: asked { ... "script" => "boot" ... }
+    A34 BT: br: com.apple.uart.sk.bluetooth connected by bluetoothd[N]
+    A34 BT: br: getsockopt 0x40105412 ...: the channel's UUID
+    A34 BT: channel: connected: bluetoothd's packets now go to the controller and back
+    A34 BT: br> ... / br< ... / br= ...       (bluetoothd's commands, the answers; br= answered here)
+    A34 BT: LE heard in 10 s: N reports from M devices ...; proximity pairing (AirPods/Beats): K, ... model bytes 14 20
+    a34bt: Apple: ... AirPods/Beats proximity pairing: K adverts
+
+Then Settings > Bluetooth: the switch should be on and show the phone as discoverable. If bluetoothd
+keeps restarting (`exec bluetoothd` again and again), the last `br>` before each restart is the command it
+gave up on: that is the next thing to answer.

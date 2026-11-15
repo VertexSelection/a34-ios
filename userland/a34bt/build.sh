@@ -5,7 +5,7 @@
 #   userland/a34bt/build.sh
 #
 # Makes $A34BT_OUT (default $WORK/a34bt-out):
-#   a34/          what goes into /a34 on the phone: a34bt (ad-hoc signed, arm64, iOS $IOS_MIN)
+#   a34/          what goes into /a34 on the phone: a34bt, a34bt-bluetool (ad-hoc signed, arm64, iOS $IOS_MIN)
 #   INSTALL.md    how to put it and the firmware there, and the first test
 #   install-firmware.sh
 #   BUILD_INFO.txt, dSYM/ (debug symbols, not for the phone)
@@ -33,28 +33,37 @@ echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $IOS_SDK"
 log "a34bt (a34bt.c)"
 "${CC[@]}" -o "$A/a34bt" "$HERE/a34bt.c"
 
+log "a34bt-bluetool (bluetool.c: BlueTool's stand-in for bluetoothd)"
+"${CC[@]}" -fblocks -o "$A/a34bt-bluetool" "$HERE/bluetool.c"
+
 log "package"
 mv "$A"/*.dSYM "$OUT/dSYM/" 2>/dev/null || true
 cp "$HERE/INSTALL.md" "$HERE/install-firmware.sh" "$OUT/"
-codesign -f -s - "$A/a34bt"         # (last: nothing changes a load command after this)
+for f in "$A/a34bt" "$A/a34bt-bluetool"; do
+	codesign -f -s - "$f"       # (last: nothing changes a load command after this)
+done
 
 log "check"
 bad=0
-f=$A/a34bt
-if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
-	echo "error: a34bt refers to a library outside $INSTALL_DIR and the system"
-	bad=1
-fi
-if otool -l "$f" | grep -E '^ *cmd LC_RPATH$' >/dev/null; then
-	echo "error: a34bt has an LC_RPATH"
-	bad=1
-fi
-[ "$(lipo -archs "$f")" = arm64 ] || { echo "error: a34bt is $(lipo -archs "$f"), not arm64"; bad=1; }
-codesign -v "$f" || { echo "error: a34bt: signature"; bad=1; }
-for s in com.a34.bt.hci kern.a34bt; do
-	strings "$f" | grep -x "$s" >/dev/null || { echo "error: a34bt does not name $s"; bad=1; }
+for f in "$A/a34bt" "$A/a34bt-bluetool"; do
+	name=$(basename "$f")
+	if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
+		echo "error: $name refers to a library outside $INSTALL_DIR and the system"
+		bad=1
+	fi
+	if otool -l "$f" | grep -E '^ *cmd LC_RPATH$' >/dev/null; then
+		echo "error: $name has an LC_RPATH"
+		bad=1
+	fi
+	[ "$(lipo -archs "$f")" = arm64 ] || { echo "error: $name is $(lipo -archs "$f"), not arm64"; bad=1; }
+	codesign -v "$f" || { echo "error: $name: signature"; bad=1; }
+	otool -L "$f"
 done
-otool -L "$f"
+for s in com.a34.bt.hci kern.a34bt; do
+	strings "$A/a34bt" | grep -x "$s" >/dev/null || { echo "error: a34bt does not name $s"; bad=1; }
+done
+strings "$A/a34bt-bluetool" | grep -x com.apple.BlueTool >/dev/null || { echo "error: a34bt-bluetool does not name com.apple.BlueTool"; bad=1; }
+nm -u "$A/a34bt-bluetool" | grep -q _xpc_connection_create_mach_service || { echo "error: a34bt-bluetool does not import xpc"; bad=1; }
 [ "$bad" = 0 ] && echo ok
 [ "$bad" = 0 ]
 
@@ -66,7 +75,7 @@ otool -L "$f"
 	echo "built:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	echo "install dir:   $INSTALL_DIR (ad-hoc signed)"
 	echo "iPhoneOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version); target arm64-apple-ios$IOS_MIN"
-	echo "kernel:        xnu/patches/0939-a34-bt-m1.patch, boot-arg a34bt=1"
+	echo "kernel:        xnu/patches/0939, 0970, 0971; boot-arg a34bt=1 (milestone 1) or a34bt=2 (bluetoothd's bridge)"
 	echo
 	echo "files (into $INSTALL_DIR):"
 	(cd "$A" && for f in *; do

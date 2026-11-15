@@ -16,13 +16,20 @@
  *                         scan and a classic inquiry of SECS seconds each (default 8); one line per
  *                         result and "a34bt: PASS" or "a34bt: FAIL ..." at the end
  *   a34bt dump [SECS]     print every packet the controller sends for SECS seconds (default 10)
+ *   a34bt scan [SECS]     LE for SECS seconds (default 20): how many devices, how many Apple ones, and whether
+ *                         AirPods/Beats "proximity pairing" adverts are among them (their model bytes). With
+ *                         bluetoothd holding the controller (kernel 0971, a34bt=2) the channel cannot send:
+ *                         it then counts what bluetoothd's own scans bring in
  *
- * Run as a one-shot launchd job (tools/root-add-job.py) its output lands in the kernel log.
+ * Every line goes to the console (/dev/console, so into the kernel's log, as a one-shot launchd job's stdout did
+ * not in boot 0961-radio-a) and to stdout when that is something else.
  * Addresses of other devices are never printed, only how many were heard and how strongly.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +38,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 
@@ -75,14 +83,35 @@ static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void
 say(const char *fmt, ...)
 {
+	static int console = -2;
+	static bool also_stdout = true;
+	char line[512];
 	va_list ap;
+	int n;
 
+	if (console == -2) {
+		struct stat c, o;
+
+		console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+		/* stdout already the console (a launchd job's StandardOutPath): once is enough */
+		also_stdout = !(console >= 0 && fstat(console, &c) == 0 && fstat(1, &o) == 0 && S_ISCHR(o.st_mode) &&
+		    o.st_rdev == c.st_rdev);
+	}
 	va_start(ap, fmt);
-	fputs("a34bt: ", stdout);
-	vprintf(fmt, ap);
-	fputc('\n', stdout);
-	fflush(stdout);
+	n = snprintf(line, sizeof(line), "a34bt: ");
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
 	va_end(ap);
+	if (n > (int)sizeof(line) - 2) {
+		n = (int)sizeof(line) - 2;
+	}
+	line[n++] = '\n';
+	if (console >= 0) {
+		(void)write(console, line, (size_t)n);
+	}
+	if (also_stdout || console < 0) {
+		(void)fwrite(line, 1, (size_t)n, stdout);
+		fflush(stdout);
+	}
 }
 
 static uint64_t
@@ -204,6 +233,8 @@ hci_read(int fd, uint8_t *buf, unsigned ms)
 	return (int)n;
 }
 
+static int send_errno;                  /* of the last send that failed (EBUSY: bluetoothd has the controller) */
+
 static int
 hci_send(int fd, uint16_t opcode, const uint8_t *params, uint8_t len)
 {
@@ -217,7 +248,10 @@ hci_send(int fd, uint16_t opcode, const uint8_t *params, uint8_t len)
 		memcpy(pkt + 4, params, len);
 	}
 	if (send(fd, pkt, 4u + len, 0) != (ssize_t)(4u + len)) {
-		say("send %04x: %s", opcode, strerror(errno));
+		send_errno = errno;
+		if (send_errno != EBUSY) {
+			say("send %04x: %s", opcode, strerror(send_errno));
+		}
 		return -1;
 	}
 	return 0;
@@ -281,7 +315,53 @@ struct heard {
 	uint8_t addr[64][7];            /* address type + address, only to count each device once */
 	unsigned unique, reports, inquiry, inquiry_done;
 	int best_rssi;
+	/* Apple's adverts (manufacturer data, company 0x004c), and its "proximity pairing" ones (type 0x07: AirPods, Beats) */
+	uint8_t apple_addr[32][6];
+	unsigned apple_unique, apple_reports, proximity;
+	int proximity_rssi;
+	uint8_t model[2];
 };
+
+/* one LE advert: its AD structures looked through for Apple's manufacturer data */
+static void
+heard_le_data(struct heard *h, const uint8_t *addr, const uint8_t *d, unsigned len, int rssi)
+{
+	bool apple = false;
+
+	for (unsigned at = 0; at + 1 < len; ) {
+		unsigned l = d[at];
+
+		if (l == 0 || at + 1 + l > len) {
+			break;
+		}
+		if (d[at + 1] == 0xff && l >= 3 && d[at + 2] == 0x4c && d[at + 3] == 0x00) {
+			apple = true;
+			if (l >= 8 && d[at + 4] == 0x07) {      /* 07 <length> <prefix> <model, 2 bytes> <status> ... */
+				h->proximity++;
+				if (rssi != 127 && (h->proximity_rssi == 0 || rssi > h->proximity_rssi)) {
+					h->proximity_rssi = rssi;
+					h->model[0] = d[at + 7];
+					h->model[1] = d[at + 8];
+				}
+			}
+		}
+		at += 1 + l;
+	}
+	if (apple) {
+		unsigned i;
+
+		h->apple_reports++;
+		for (i = 0; i < h->apple_unique; i++) {
+			if (memcmp(h->apple_addr[i], addr, 6) == 0) {
+				break;
+			}
+		}
+		if (i == h->apple_unique && i < 32) {
+			memcpy(h->apple_addr[i], addr, 6);
+			h->apple_unique++;
+		}
+	}
+}
 
 static void
 heard_add(struct heard *h, uint8_t type, const uint8_t *addr, int rssi)
@@ -309,7 +389,7 @@ on_event(const uint8_t *p, int n, void *ctx)
 {
 	struct heard *h = ctx;
 
-	if (n >= 4 && p[0] == 0x04 && p[1] == 0x3e && p[3] == 0x02 && n >= 5) {
+	if (n >= 5 && p[0] == 0x04 && p[1] == 0x3e && p[3] == 0x02) {          /* LE Advertising Report */
 		unsigned count = p[4], at = 5;
 
 		for (unsigned i = 0; i < count && (int)(at + 9) <= n; i++) {
@@ -319,8 +399,23 @@ on_event(const uint8_t *p, int n, void *ctx)
 				break;
 			}
 			heard_add(h, (uint8_t)(0x10 | p[at + 1]), p + at + 2, (int8_t)p[at + 9 + dlen]);
+			heard_le_data(h, p + at + 2, p + at + 9, dlen, (int8_t)p[at + 9 + dlen]);
 			h->reports++;
 			at += 10 + dlen;
+		}
+	} else if (n >= 5 && p[0] == 0x04 && p[1] == 0x3e && p[3] == 0x0d) {   /* LE Extended Advertising Report */
+		unsigned count = p[4], at = 5;
+
+		for (unsigned i = 0; i < count && (int)(at + 24) <= n; i++) {
+			unsigned dlen = p[at + 23];
+
+			if ((int)(at + 24 + dlen) > n) {
+				break;
+			}
+			heard_add(h, (uint8_t)(0x10 | p[at + 2]), p + at + 3, (int8_t)p[at + 13]);
+			heard_le_data(h, p + at + 3, p + at + 24, dlen, (int8_t)p[at + 13]);
+			h->reports++;
+			at += 24 + dlen;
 		}
 	} else if (n >= 4 && p[0] == 0x04 && (p[1] == 0x02 || p[1] == 0x22 || p[1] == 0x2f)) {
 		unsigned count = p[1] == 0x2f ? 1u : p[3];
@@ -338,6 +433,73 @@ on_event(const uint8_t *p, int n, void *ctx)
 	} else if (n >= 4 && p[0] == 0x04 && p[1] == 0x01) {
 		h->inquiry_done = 1;
 	}
+}
+
+static void
+say_apple(const struct heard *h)
+{
+	say("Apple: %u adverts from %u devices; AirPods/Beats proximity pairing: %u adverts%s", h->apple_reports, h->apple_unique,
+	    h->proximity, h->proximity ? "" : " (none: AirPods in their open case, near the phone, send them)");
+	if (h->proximity) {
+		say("the strongest proximity-pairing advert: %d dBm, model bytes %02x %02x (AirPods Pro 2: 14 20 or 24 20)",
+		    h->proximity_rssi, h->model[0], h->model[1]);
+	}
+}
+
+/*
+ * LE for secs seconds, passive. When the kernel refuses our packets (EBUSY: bluetoothd has the controller, 0971),
+ * only listens: the reports bluetoothd's own scans bring in come through the channel too.
+ */
+static int
+scan(unsigned secs)
+{
+	static const uint8_t event_mask[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x00, 0x20 };
+	static const uint8_t scan_params[7] = { 0x00, 0x60, 0x00, 0x30, 0x00, 0x00, 0x00 };
+	static const uint8_t scan_on[2] = { 0x01, 0x00 }, scan_off[2] = { 0x00, 0x00 };
+	uint8_t a[PKT_MAX];
+	int n = 0, st, fd;
+	bool ours = true;
+	struct heard h;
+	uint64_t until;
+
+	if (wait_up(120) != 0 || (fd = hci_open()) < 0) {
+		say("FAIL: no controller");
+		return 2;
+	}
+	memset(&h, 0, sizeof(h));
+	h.best_rssi = -128;
+	send_errno = 0;
+	st = hci_command(fd, 0x0c01, event_mask, sizeof(event_mask), a, &n, 3000, on_event, &h, 0);
+	if (st < 0 && send_errno == EBUSY) {
+		ours = false;
+		say("bluetoothd has the controller: listening %u s to what its scans hear", secs);
+	} else {
+		st = hci_command(fd, 0x200b, scan_params, sizeof(scan_params), a, &n, 3000, on_event, &h, 0);
+		if (st == 0) {
+			st = hci_command(fd, 0x200c, scan_on, sizeof(scan_on), a, &n, 3000, on_event, &h, 0);
+		}
+		if (st != 0) {
+			say("LE scan could not start (%d): listening anyway", st);
+		}
+	}
+	until = now_ms() + (uint64_t)secs * 1000u;
+	while (now_ms() < until) {
+		int got = hci_read(fd, a, 100);
+
+		if (got > 0) {
+			on_event(a, got, &h);
+		} else if (got < 0) {
+			break;
+		}
+	}
+	if (ours) {
+		(void)hci_command(fd, 0x200c, scan_off, sizeof(scan_off), a, &n, 3000, on_event, &h, 0);
+	}
+	close(fd);
+	say("LE %s %u s: %u advertising reports from %u devices, strongest %d dBm", ours ? "scan" : "listening", secs, h.reports,
+	    h.unique, h.unique ? h.best_rssi : 0);
+	say_apple(&h);
+	return h.reports != 0 ? 0 : 4;
 }
 
 static int
@@ -418,6 +580,7 @@ probe(unsigned secs)
 		CMD("LE_Set_Scan_Enable off", 0x200c, scan_off, sizeof(scan_off));
 		say("LE scan %u s: %u advertising reports from %u devices, strongest %d dBm", secs, h.reports, h.unique,
 		    h.unique ? h.best_rssi : 0);
+		say_apple(&h);
 	}
 
 	/* BR/EDR: a general inquiry of about secs seconds (units of 1.28 s) */
@@ -547,12 +710,15 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "probe") == 0) {
 		return probe(secs ? (secs > 60 ? 60 : secs) : 8);
 	}
+	if (strcmp(argv[1], "scan") == 0) {
+		return scan(secs ? (secs > 300 ? 300 : secs) : 20);
+	}
 	if (strcmp(argv[1], "dump") == 0) {
 		return dump(secs ? secs : 10);
 	}
 	if (strcmp(argv[1], "cmd") == 0) {
 		return command(argc - 2, argv + 2);
 	}
-	fprintf(stderr, "usage: a34bt status | wait [SECS] | probe [SECS] | dump [SECS] | cmd OPCODE [BYTE...]\n");
+	fprintf(stderr, "usage: a34bt status | wait [SECS] | probe [SECS] | scan [SECS] | dump [SECS] | cmd OPCODE [BYTE...]\n");
 	return 1;
 }

@@ -1,0 +1,270 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 097340f..b0ff996 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -19,6 +19,13 @@
+  *   step 10 a raw HCI channel for userland/a34bt: kernel control "com.a34.bt.hci" (root only, a datagram
+  *           per H4 packet, both ways); sysctl kern.a34bt says how far it got
+  *
++ * A34 (0970): the controller's own address is MediaTek's default, 00:00:46:67:61:01 on every A34. A random
++ * static address is made once per phone and kept in /a34/bt-address of the iOS root (made here when the file is
++ * missing, or by userland/a34bt/install-firmware.sh), and set after the probe and after every HCI_Reset with
++ * MediaTek's vendor command 0xFC1A (bt/mt66xx/btmtk_buffer_mode.c:90-91: 01 1a fc 06 <address, low byte first>,
++ * answered 04 0e 04 01 1a fc 00). Nothing is read from NVRAM. a34btaddr=0 keeps the firmware's. The raw
++ * channel takes HCI commands (0939 refused them: no length for packet type 1).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -43,6 +50,8 @@
+ #include <sys/kern_control.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/proc.h>
++#include <sys/fcntl.h>
++#include <sys/random.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+@@ -231,24 +240,34 @@ bt_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t t
+ 
+ /* ---- step 1: the firmware ---- */
+ 
++static uint8_t *bt_file_any(const char *path, uint32_t *size);
++
+ static uint8_t *
+ bt_file(const char *name, uint32_t *size)
+ {
+ 	char path[96];
++
++	snprintf(path, sizeof(path), "%s%s", FW_DIR, name);
++	return bt_file_any(path, size);
++}
++
++/* a whole file of the root (under 8 MB) into kernel memory, or NULL */
++static uint8_t *
++bt_file_any(const char *path, uint32_t *size)
++{
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	struct vnode_attr va;
+ 	uint8_t *data = NULL;
+ 	int resid = 0, error;
+ 
+-	snprintf(path, sizeof(path), "%s%s", FW_DIR, name);
+ 	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
+ 		return NULL;
+ 	}
+ 	VATTR_INIT(&va);
+ 	VATTR_WANTED(&va, va_data_size);
+ 	error = vnode_getattr(vp, &va, ctx);
+-	if (error == 0 && va.va_data_size > FW_HDR && va.va_data_size < (8u << 20)) {
++	if (error == 0 && va.va_data_size > 0 && va.va_data_size < (8u << 20)) {
+ 		data = kalloc_data((vm_size_t)va.va_data_size, Z_WAITOK);
+ 		if (data != NULL) {
+ 			error = vn_rdwr(UIO_READ, vp, (caddr_t)data, (int)va.va_data_size, 0, UIO_SYSSPACE, 0,
+@@ -296,6 +315,12 @@ bt_firmware(void)
+ 			bt_sleep_ms(1000);
+ 		}
+ 	}
++	for (unsigned i = 0; i < 2; i++) {
++		if (bt_fw_size[i] <= FW_HDR) {
++			printf("A34 BT: step 1: %s: %u bytes, not a firmware image\n", bt_fw_names[i], bt_fw_size[i]);
++			return false;
++		}
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		const uint8_t *h = bt_fw[i];
+ 		uint32_t off = bt_fw_offset(h), body = bt_fw_size[i] - FW_HDR;
+@@ -529,6 +554,8 @@ static uint32_t
+ bt_h4_length(const uint8_t *b, uint32_t have)
+ {
+ 	switch (have >= 1 ? b[0] : 0) {
++	case 1:                                 /* command: opcode (2), length (1) */
++		return have >= 4 ? 4u + b[3] : 0;
+ 	case 2:                                 /* ACL: handle (2), length (2) */
+ 	case 5:                                 /* ISO: handle (2), length (2, 14 bits) */
+ 		return have >= 5 ? 5u + (((uint32_t)b[3] | ((uint32_t)b[4] << 8)) & (b[0] == 5 ? 0x3fffu : 0xffffu)) : 0;
+@@ -656,6 +683,151 @@ bt_driver_own(void)
+ 	return false;
+ }
+ 
++/* ---- the address (0970) ---- */
++
++#define BT_ADDR_FILE            "/a34/bt-address"
++static uint8_t bt_addr[6];                      /* as written, most significant byte first; all 0: none */
++static bool bt_addr_ok;
++static uint32_t bt_addr_want = 1;               /* a34btaddr */
++
++/* "C2:11:22:33:44:55" (most significant first) into a[6] */
++static bool
++bt_addr_parse(const uint8_t *text, uint32_t n, uint8_t a[6])
++{
++	uint32_t i = 0, k = 0, v = 0, digits = 0;
++
++	for (; i < n && k < 6; i++) {
++		uint8_t c = text[i];
++
++		if (c >= '0' && c <= '9') {
++			v = (v << 4) | (uint32_t)(c - '0');
++		} else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') {
++			v = (v << 4) | (uint32_t)((c | 0x20) - 'a' + 10);
++		} else if (c == ':' || c == '-' || c == '\n' || c == ' ') {
++			if (digits == 0) {
++				continue;
++			}
++			if (digits != 2) {
++				return false;
++			}
++			a[k++] = (uint8_t)v;
++			v = 0;
++			digits = 0;
++			continue;
++		} else {
++			return false;
++		}
++		if (++digits > 2) {
++			return false;
++		}
++	}
++	if (k < 6 && digits == 2) {
++		a[k++] = (uint8_t)v;
++	}
++	return k == 6;
++}
++
++/*
++ * A random static address (Core 5.3 Vol 6 B 1.3.2.1: the two top bits 1, not all ones, not all zeros), whose
++ * low three bytes (the LAP of a BR/EDR address) are not the reserved inquiry codes 0x9E8B00-0x9E8B3F.
++ */
++static bool
++bt_addr_usable(const uint8_t a[6])
++{
++	uint32_t lap = ((uint32_t)a[3] << 16) | ((uint32_t)a[4] << 8) | a[5];
++	bool ones = true, zeros = true;
++
++	for (int i = 0; i < 6; i++) {
++		ones &= a[i] == 0xff;
++		zeros &= a[i] == 0;
++	}
++	return (a[0] & 0xc0) == 0xc0 && !ones && !zeros && !(lap >= 0x9e8b00 && lap <= 0x9e8b3f);
++}
++
++static int
++bt_file_put(const char *path, const char *text, int n)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0, error;
++
++	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)text, n, 0, UIO_SYSSPACE, IO_SYNC | IO_NOAUTH,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FWRITE, ctx);
++	return error != 0 ? error : (resid != 0 ? EIO : 0);
++}
++
++/* the phone's address: from /a34/bt-address, else made now and kept there */
++static void
++bt_addr_load(void)
++{
++	char text[24];
++	uint8_t *data;
++	uint32_t size = 0;
++	int error, tries = 0;
++
++	if (bt_addr_ok) {
++		return;
++	}
++	if ((data = bt_file_any(BT_ADDR_FILE, &size)) != NULL) {
++		bool parsed = bt_addr_parse(data, size, bt_addr);
++
++		kfree_data(data, size);
++		if (parsed && bt_addr_usable(bt_addr)) {
++			bt_addr_ok = true;
++			printf("A34 BT: address %02x:%02x:%02x:%02x:%02x:%02x from " BT_ADDR_FILE "\n", bt_addr[0], bt_addr[1],
++			    bt_addr[2], bt_addr[3], bt_addr[4], bt_addr[5]);
++			return;
++		}
++		printf("A34 BT: " BT_ADDR_FILE " does not hold a random static address (C0-FF:..): a new one\n");
++	}
++	do {
++		read_random(bt_addr, sizeof(bt_addr));
++		bt_addr[0] |= 0xc0;
++	} while (!bt_addr_usable(bt_addr) && ++tries < 8);
++	bt_addr_ok = bt_addr_usable(bt_addr);
++	snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X\n", bt_addr[0], bt_addr[1], bt_addr[2], bt_addr[3],
++	    bt_addr[4], bt_addr[5]);
++	error = bt_file_put(BT_ADDR_FILE, text, 18);
++	printf("A34 BT: address %02x:%02x:%02x:%02x:%02x:%02x made now (random static), %s " BT_ADDR_FILE " (%d)\n",
++	    bt_addr[0], bt_addr[1], bt_addr[2], bt_addr[3], bt_addr[4], bt_addr[5], error == 0 ? "kept in" : "NOT kept in",
++	    error);
++}
++
++/* MediaTek's "set address", then Read_BD_ADDR to see it took: true when the controller has the phone's address */
++static bool
++bt_addr_apply(const char *when)
++{
++	static const uint8_t read_addr[4] = { 0x01, 0x09, 0x10, 0x00 };
++	uint8_t cmd[10] = { 0x01, 0x1a, 0xfc, 0x06 }, a[BT_PKT_MAX];
++	uint32_t n;
++	bool same;
++
++	if (!bt_addr_want || !bt_addr_ok) {
++		return false;
++	}
++	for (int i = 0; i < 6; i++) {
++		cmd[4 + i] = bt_addr[5 - i];                                   /* low byte first */
++	}
++	n = bt_command(cmd, sizeof(cmd), 0x0e, a, 1000);
++	if (n < 7 || a[6] != 0) {
++		printf("A34 BT: address (%s): 0xFC1A %s\n", when, n < 7 ? "not answered" : "refused");
++		return false;
++	}
++	n = bt_command(read_addr, sizeof(read_addr), 0x0e, a, 1000);
++	same = n >= 13 && a[6] == 0;
++	for (int i = 0; same && i < 6; i++) {
++		same = a[7 + i] == bt_addr[5 - i];
++	}
++	printf("A34 BT: address (%s): %02x:%02x:%02x:%02x:%02x:%02x %s\n", when, bt_addr[0], bt_addr[1], bt_addr[2],
++	    bt_addr[3], bt_addr[4], bt_addr[5], same ? "set" : "NOT taken (Read_BD_ADDR differs)");
++	return same;
++}
++
+ /* ---- step 9: what a host asks first ---- */
+ 
+ static uint32_t
+@@ -902,6 +1074,8 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 
+ 	STEP(9, "HCI probe");
+ 	good = bt_probe();          /* (fewer than six: the raw channel still opens, for a34bt cmd/dump) */
++	bt_addr_load();
++	(void)bt_addr_apply("at bring-up");
+ 
+ 	STEP(10, "raw HCI channel");
+ 	if (!bt_ctl_register()) {
+@@ -914,6 +1088,14 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	for (;;) {
+ 		if ((n = bt_receive(a, 1000)) != 0) {
+ 			bt_dump("in ", a, n, &bt_said_in);
++			if (n >= 7 && a[0] == 0x04 && a[1] == 0x0e && a[4] == 0x03 && a[5] == 0x0c && a[6] == 0) {
++				/* HCI_Reset done: the phone's address again before whoever reset it is told (0970) */
++				uint8_t reset[BT_PKT_MAX];
++
++				memcpy(reset, a, n);
++				(void)bt_addr_apply("after an HCI_Reset");
++				memcpy(a, reset, n);
++			}
+ 			bt_deliver(a, n);
+ 		}
+ 	}
+@@ -935,6 +1117,7 @@ a34_bt_init(void)
+ 	(void)PE_parse_boot_argn("a34btwait", &bt_wait_s, sizeof(bt_wait_s));
+ 	(void)PE_parse_boot_argn("a34btsync", &bt_sync, sizeof(bt_sync));
+ 	(void)PE_parse_boot_argn("a34btlog", &bt_log_max, sizeof(bt_log_max));
++	(void)PE_parse_boot_argn("a34btaddr", &bt_addr_want, sizeof(bt_addr_want));
+ 	bt_set_state("starting");
+ 	printf("A34 BT: Bluetooth milestone 1 (a34bt=%u): steps up to %u, firmware wait %u s, log sync %u\n", on,
+ 	    bt_step_max, bt_wait_s, bt_sync);
