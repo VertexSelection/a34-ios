@@ -312,7 +312,17 @@ nothing (same eLNA assert). The last runtime difference: the SBP code. ccci_mdin
 out) takes the CIP file's value, else the project's MTK_MD_SBP_CUSTOM_VALUE (not set in this
 vendor), else the AP NVRAM record APCFG/APRDCL/MD_SBP (u32 at +0 for md1); we sent 0. Now that
 record is read in place from nvdata and sent (`xnu-boot-1013-cell3-sbp`); the log says its size
-and whether a value is used.
+and whether a value is used. MD_SBP is 26 bytes (the 24-byte record, then 2 bytes);
+its md1 value is 0, so Android sends 0 too (sbp2: same assert).
+
+Where the eLNA count comes from (md1rom, nanoMIPS): the type-1 eLNA table command is built in
+two places; mmrf_general.c always passes 200, the SKU manager (0x90c52a38) takes the count from
+its eLNA context (modem RAM 0x2695dd4c, field +20). That context is filled by the SKU manager's
+init (0x90c55220), which reads LIDs 0xDF14-0xDF16 (files DF0U/V/W, 16240 bytes each) through the
+NVRAM API; the DF0x LIDs are runtime-activated ("[MMRF] NVRAM RunTime Activate LID"), never
+opened through the file server, i.e. filled from the DRDI set the modem copies before it gives
+drdi_memory back. So the garbage count most likely comes from the DRDI data the modem copied.
+Next: LK's MPU table (can the AP read drdi_memory before the modem runs?), then that check.
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
