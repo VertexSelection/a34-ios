@@ -874,11 +874,14 @@ redwood_drm_trace_jobs(uint64_t first_seq, uint32_t jobs)
  *                                   synchronous (every one done when its SUBMIT returned)
  *   redwood_drm_wait_seq(seq, ns)   0 once every job up to seq is done, waiting `ns` at most
  *                                   (< 0: no limit; 0: only asked); else -1 with errno
- *   redwood_drm_surface_seq(id, s)  their kernel's 0x7c, which tells the display that a surface
- *                                   is being drawn on the driver's own thread (s = ~0) or which
- *                                   job finishes it: not here. Our kernel waits for the queued
- *                                   jobs that name a surface by itself; a frame the driver has
- *                                   not yet sent is not known to it (their rwm_async=1 only).
+ *   redwood_drm_surface_seq(id, s)  request 0x7c (kernel 0935, after HackiOS's): s = ~0 marks
+ *                                   the surface as being drawn on the driver's own thread, its
+ *                                   jobs not yet sent, and the display waits (up to a second)
+ *                                   before it scans the surface out; anything else takes the
+ *                                   mark off, and the queued jobs that name the surface are
+ *                                   waited for as for every client. The driver's worker
+ *                                   (userland/a34metal, rwm_async=1) marks at -commit and takes
+ *                                   it off once it has sent the buffer's jobs.
  */
 EXPORT uint64_t
 redwood_drm_last_seq(void)
@@ -898,7 +901,20 @@ redwood_drm_wait_seq(uint64_t seq, int64_t relative_ns)
 EXPORT int
 redwood_drm_surface_seq(uint32_t surface, uint64_t seq)
 {
-	note("surface_seq(%u, %#llx): not told to this kernel", surface, (unsigned long long)seq);
+	struct redwood_drm_surface_seq request = { .surface = surface, .pad = 0, .seq = seq };
+	static int refused;
+
+	/* (synchronous jobs: every one is done when its SUBMIT returns, so nothing is ever pending) */
+	if (!queued || surface == 0 || refused > 4) {
+		return 0;
+	}
+	if (call(REDWOOD_DRM_SURFACE_SEQ, &request, sizeof(request)) != 0) {
+		if (refused++ < 4) {
+			fprintf(stderr, "redwood-drm: %s[%d]: surface %u: the kernel refused the mark (0x7c, errno %d)%s\n",
+			    getprogname(), (int)getpid(), surface, errno, refused > 4 ? "; not asked again" : "");
+		}
+		return -1;
+	}
 	return 0;
 }
 

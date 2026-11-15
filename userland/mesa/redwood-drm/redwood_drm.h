@@ -178,6 +178,14 @@ int redwood_drm_submit_batch(const struct drm_panfrost_submit *submits, uint32_t
  */
 #define REDWOOD_DRM_TRACE_JOBS          0x79
 
+/* the surface mark (kernel 0935, request 0x7c, 16 bytes in and out): redwood_drm_surface_seq */
+#define REDWOOD_DRM_SURFACE_SEQ         0x7c
+
+struct redwood_drm_surface_seq {
+	uint32_t surface, pad;
+	uint64_t seq;
+};
+
 struct redwood_drm_trace_jobs {
 	uint64_t first_seq;
 	uint32_t count, pad;

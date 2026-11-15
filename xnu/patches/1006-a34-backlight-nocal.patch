@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bdb7cfd..f485e72 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2502,8 +2502,19 @@ sweet_fb_backlight_publish(AppleCLCD *fb)
+ 	 * LminProduct 2 nits.) Every key must be there: CoreBrightness reads them
+ 	 * without checking. Here the curve's own points, product = panel, and
+ 	 * currents that never limit (20 mA at max, 5 at mid, limit 40).
++	 *
++	 * A34 (1006): off unless a34blcal=1. With it (1005's boot) CoreBrightness
++	 * changed course: no DisplayBrightness dictionaries came here any more,
++	 * CoreAnimation still ran its luma boost, and flicking the slider
++	 * killed backboardd: its lux statistics code (frontLux/rearLux,
++	 * RLuxStats) asks CoreBrightness's own DisplayBrightness property for
++	 * NitsPhysical and got a number ("-[__NSCFNumber objectForKey:]"). The
++	 * luma boost is better turned off in backboardd's environment:
++	 * CA_DISABLE_LUMA_BOOST=1 (and CA_DISABLE_DISPLAY_OVERDRIVE_FIX=1).
+ 	 */
+-	OSDictionary *calibration = OSDictionary::withCapacity(9);
++	uint32_t cal = 0;
++	(void)PE_parse_boot_argn("a34blcal", &cal, sizeof(cal));
++	OSDictionary *calibration = cal != 0 ? OSDictionary::withCapacity(9) : NULL;
+ 	if (calibration != NULL) {
+ 		sweet_fb_set_number(calibration, "current-for-max-backlight", 20u << 16);
+ 		sweet_fb_set_number(calibration, "current-for-mid-backlight", 5u << 16);
+@@ -2529,7 +2540,7 @@ sweet_fb_backlight_publish(AppleCLCD *fb)
+ 			backlight->registerService();
+ 			IOLog("A34 BL: AppleARMBacklight published (IODisplayParameters 0..%u, marketing table and calibration "
+ 			    "%u..%u nits: a34blmin, a34blmax%s); CA's luma boost runs under 20 nits\n", SWEET_FB_BL_MAX, fb->fBLMin,
+-			    fb->fBLMax, calibration != NULL && calibration->getCount() == 9 ? "" : ", NO calibration");
++			    fb->fBLMax, calibration != NULL && calibration->getCount() == 9 ? ", a34blcal=1" : ", no calibration");
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(calibration);

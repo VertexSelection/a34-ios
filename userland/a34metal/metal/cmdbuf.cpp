@@ -177,8 +177,8 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 {
 	static __thread bool bound;
 
+	c->made_cpu = rwm_thread_cpu_ns() - c->born_cpu;      /* (A34: the burst record's, with the worker too) */
 	if (!rwm_worker_on()) {
-		c->made_cpu = rwm_thread_cpu_ns() - c->born_cpu;
 		rwm_perf.made_cbs++;
 		rwm_perf.made_ns += rwm_ns() - c->born;
 		rwm_perf.made_cpu += c->made_cpu;
