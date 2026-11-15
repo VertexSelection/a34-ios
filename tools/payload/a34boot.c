@@ -273,8 +273,11 @@ static int adt_patch(u8 *adt, u64 *off, u64 end, int depth)
             reg = val;
         if (name_is(name, "stride") && len == 4)
             stride = val;
-        if (adt_dram_size && name_is(name, "dram-size") && len == 8)
-            *(u64 *)val = adt_dram_size;    // trimmed around LK's reserved memory (0950)
+        if (adt_dram_size && name_is(name, "dram-size") && len == 8) {
+            volatile u32 *d = (volatile u32 *)val;  // 32-bit stores, like the fbcon patch
+            d[0] = (u32)adt_dram_size;              // trimmed around LK's reserved memory (0950)
+            d[1] = (u32)(adt_dram_size >> 32);
+        }
         *off += 36 + ((len + 3) & ~3u);
     }
     if (is_fbcon && reg && stride) {
