@@ -68,6 +68,7 @@
 #include "util/half_float.h"
 #include "util/os_time.h"
 #include "util/u_inlines.h"
+#include "util/u_framebuffer.h"
 #include "util/u_gen_mipmap.h"
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -171,6 +172,27 @@ struct rwa_device {
     * construction: a buffer joins only when something is encoded into it.
     */
    struct rwa_buffer *encoded;
+
+   /* What this library last set on the context, so that a draw sets only what changed --
+    * which is what OpenGL's state tracker does through cso_context. panfrost takes a set
+    * framebuffer as a pass to look up again and marks EVERY piece of state dirty
+    * (panfrost_get_render_batch), and each bind marks its own: with all of it set for every
+    * draw, and the framebuffer emptied after each, every descriptor of every draw was emitted
+    * again -- draw_vbo 217 us a draw against OpenGL's 70 (boot 68). The framebuffer is kept
+    * with references of its own (util_copy_framebuffer_state) and let go when a texture in it
+    * is destroyed (rwa_texture_destroy). Every bind of NULL before a delete goes through the
+    * same record, so a state freed and another made at its address is never taken for the
+    * one still bound. RWA_REBIND_ALL=1 (boot-arg rwm_rebind=all) sets everything for every
+    * draw, as before.
+    */
+   struct pipe_framebuffer_state fb;
+   bool fb_bound;
+   void *bound_blend, *bound_dsa, *bound_rast, *bound_vs, *bound_fs, *bound_velem;
+   bool bound_fixed;              /* the three below hold what the context has */
+   struct pipe_stencil_ref bound_stencil_ref;
+   float bound_viewport[6];       /* scale, translate */
+   struct pipe_scissor_state bound_scissor;
+   bool bound_scissor_set;
 };
 
 /*
@@ -567,6 +589,74 @@ static uint64_t rwa_pipelines_made, rwa_pipelines_translate_ns, rwa_pipelines_co
 #define RWA_GUARD() \
    int rwa_held __attribute__((cleanup(rwa_unlock_at_return), unused)) = pthread_mutex_lock(&rwa_lock)
 
+/*
+ * The context's state, set only when it changes (struct rwa_device, bound_*). Counted for
+ * the profile ("rwm draw state", rwa_bind_profile): framebuffers set, the draws that came
+ * after one -- panfrost emits all of a draw's state again then -- and their draw_vbo time.
+ */
+static uint64_t rwa_bind_fb_sets, rwa_bind_sets, rwa_bind_skips, rwa_bind_flushes;
+static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, rwa_bind_steady_ns;
+
+static bool
+rebind_all(void)
+{
+   static int all = -1;
+   if (all < 0) {
+      const char *v = getenv("RWA_REBIND_ALL");
+      all = v != NULL && strcmp(v, "0") != 0;
+   }
+   return all;
+}
+
+/* true if it was set (it differed from the one bound) */
+static bool
+bind_framebuffer(struct rwa_device *device, const struct pipe_framebuffer_state *fb)
+{
+   if (device->fb_bound && !rebind_all() && util_framebuffer_state_equal(&device->fb, fb))
+      return false;
+   device->pipe->set_framebuffer_state(device->pipe, fb);
+   util_copy_framebuffer_state(&device->fb, fb);
+   device->fb_bound = true;
+   rwa_bind_fb_sets++;
+   return true;
+}
+
+static void
+unbind_framebuffer(struct rwa_device *device)
+{
+   device->pipe->set_framebuffer_state(device->pipe, &(struct pipe_framebuffer_state){ 0 });
+   util_unreference_framebuffer_state(&device->fb);
+   device->fb_bound = false;
+}
+
+/* whether the framebuffer the context holds has this resource in it */
+static bool
+framebuffer_holds(const struct rwa_device *device, const struct pipe_resource *res)
+{
+   if (!device->fb_bound || !res)
+      return false;
+   for (unsigned i = 0; i < device->fb.nr_cbufs; i++) {
+      if (device->fb.cbufs[i].texture == res)
+         return true;
+   }
+   return device->fb.zsbuf.texture == res || device->fb.resolve == res;
+}
+
+/* One CSO slot: the call made only when the state is not the one the context holds. A NULL
+ * bound before a delete goes through here too (rwa_render_destroy, rwa_depth_stencil_destroy),
+ * so the record is never left naming freed memory. */
+#define RWA_BIND(device, slot, cso, call)                                      \
+   do {                                                                        \
+      void *rwa_cso = (void *)(cso);                                           \
+      if ((device)->slot != rwa_cso || rwa_cso == NULL || rebind_all()) {     \
+         (device)->pipe->call((device)->pipe, rwa_cso);                        \
+         (device)->slot = rwa_cso;                                             \
+         rwa_bind_sets++;                                                      \
+      } else {                                                                 \
+         rwa_bind_skips++;                                                     \
+      }                                                                        \
+   } while (0)
+
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
 {
@@ -765,6 +855,8 @@ rwa_device_close(struct rwa_device *device)
    RWA_GUARD();
    if (!device)
       return;
+   if (device->fb_bound)
+      unbind_framebuffer(device);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    for (unsigned t = 0; t < PIPE_MAX_TEXTURE_TYPES; t++) {
@@ -1681,6 +1773,29 @@ rwa_draw_profile(uint64_t out[7])
    memset(rwa_draw_ns, 0, sizeof(rwa_draw_ns));
 }
 
+/* The state the draws set and skipped since the last call (bind_framebuffer, RWA_BIND), as
+ * one line for the plug-in's profile; 0 when there were no draws */
+int
+rwa_bind_profile(char *line, size_t size)
+{
+   RWA_GUARD();
+   uint64_t draws = rwa_bind_fresh_draws + rwa_bind_steady_draws;
+   if (!draws || !line || !size)
+      return 0;
+   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch; "
+            "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu); "
+            "states set %llu, skipped %llu%s",
+            (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
+            (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
+            (unsigned long long)rwa_bind_fresh_draws,
+            (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
+            (unsigned long long)rwa_bind_steady_draws, (unsigned long long)rwa_bind_sets,
+            (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "");
+   rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = 0;
+   rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
+   return 1;
+}
+
 struct rwa_texture *
 rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *shape,
                    char *why, size_t why_size)
@@ -1773,6 +1888,11 @@ rwa_texture_destroy(struct rwa_texture *texture)
    if (!texture)
       return;
    argbuf_scrub(texture->device, NULL, texture, NULL);
+   /* A draw leaves its framebuffer bound for the next one (bind_framebuffer); one with this
+    * texture in it is let go here, so that the resource goes when its last reference does
+    * rather than at the next pass into other attachments. */
+   if (framebuffer_holds(texture->device, texture->res))
+      unbind_framebuffer(texture->device);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
     * be unbound here, because rwa_dispatch unbinds every texture it bound once its
     * fence has come back -- a context left holding this would be holding freed memory
@@ -2078,7 +2198,7 @@ render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsign
       mask |= PIPE_CLEAR_DEPTH;
    if (clear_stencil && fb.zsbuf.texture && format_has_stencil(depth->res->format))
       mask |= PIPE_CLEAR_STENCIL;
-   pipe->set_framebuffer_state(pipe, &fb);
+   bind_framebuffer(device, &fb);
    if (clear_color_mask && clear_colors) {
       for (unsigned i = 0; i < fb.nr_cbufs; i++) {
          union pipe_color_union one;
@@ -5509,7 +5629,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     * leaves the context pointing at freed memory until something else is bound over it
     * -- the same trap delete_compute_state is about.
     */
-   state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
+   RWA_BIND(state->device, bound_dsa, NULL, bind_depth_stencil_alpha_state);
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
    free(state);
 }
@@ -7403,24 +7523,25 @@ rwa_render_destroy(struct rwa_render *render)
     * it, and softpipe's delete is a plain FREE, so a state deleted while bound leaves
     * the context holding freed memory until something is bound over it.
     */
+   struct rwa_device *device = render->device;
    if (render->vs_cso) {
-      pipe->bind_vs_state(pipe, NULL);
+      RWA_BIND(device, bound_vs, NULL, bind_vs_state);
       pipe->delete_vs_state(pipe, render->vs_cso);
    }
    if (render->fs_cso) {
-      pipe->bind_fs_state(pipe, NULL);
+      RWA_BIND(device, bound_fs, NULL, bind_fs_state);
       pipe->delete_fs_state(pipe, render->fs_cso);
    }
    if (render->blend) {
-      pipe->bind_blend_state(pipe, NULL);
+      RWA_BIND(device, bound_blend, NULL, bind_blend_state);
       pipe->delete_blend_state(pipe, render->blend);
    }
    if (render->dsa) {
-      pipe->bind_depth_stencil_alpha_state(pipe, NULL);
+      RWA_BIND(device, bound_dsa, NULL, bind_depth_stencil_alpha_state);
       pipe->delete_depth_stencil_alpha_state(pipe, render->dsa);
    }
    if (render->rast) {
-      pipe->bind_rasterizer_state(pipe, NULL);
+      RWA_BIND(device, bound_rast, NULL, bind_rasterizer_state);
       pipe->delete_rasterizer_state(pipe, render->rast);
       if (render->rast_scissor)
          pipe->delete_rasterizer_state(pipe, render->rast_scissor);
@@ -7430,7 +7551,7 @@ rwa_render_destroy(struct rwa_render *render)
        * a reference of its own to whatever is bound there (set_vertex_buffers took it),
        * and a draw does not clear it afterwards, so this is where it goes.
        */
-      pipe->bind_vertex_elements_state(pipe, NULL);
+      RWA_BIND(device, bound_velem, NULL, bind_vertex_elements_state);
       pipe->set_vertex_buffers(pipe, 0, NULL);
       pipe->delete_vertex_elements_state(pipe, render->velem);
    }
@@ -7885,13 +8006,17 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    if (flush_on_switch) {
       static struct pipe_surface *last_cbuf, *last_zs;
       if ((fb.nr_cbufs ? surf[0] : NULL) != last_cbuf || zsurf != last_zs) {
-         if (last_cbuf || last_zs)
+         if (last_cbuf || last_zs) {
             pipe->flush(pipe, NULL, 0);
+            rwa_bind_flushes++;
+         }
          last_cbuf = fb.nr_cbufs ? surf[0] : NULL;
          last_zs = zsurf;
       }
    }
-   pipe->set_framebuffer_state(pipe, &fb);
+   /* Set only when it changed: kept from the last draw into the same attachments, which
+    * keeps panfrost's pass and every descriptor of it that is still right (bind_framebuffer). */
+   bool fresh = bind_framebuffer(device, &fb);
 
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
@@ -7905,7 +8030,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    /* -setViewport:'s rectangle where one was given (Metal's: origin top left, y down) */
    float vx = draw->viewport ? draw->viewport[0] : 0.0f, vy = draw->viewport ? draw->viewport[1] : 0.0f;
    float vw = draw->viewport ? draw->viewport[2] : (float)w, vh = draw->viewport ? draw->viewport[3] : (float)h;
-   pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+   struct pipe_viewport_state vp = {
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
        * y = +1 belongs in memory row 0; a positive y scale puts clip y = -1 there, which is
@@ -7919,31 +8044,62 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
       .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
-      .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
-   if (draw->scissor) {
-      unsigned x0 = MIN2(draw->scissor[0], w), y0 = MIN2(draw->scissor[1], h);
-      unsigned x1 = MIN2(draw->scissor[0] + draw->scissor[2], w), y1 = MIN2(draw->scissor[1] + draw->scissor[3], h);
-
-      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
-         .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 });
-   }
-
-   pipe->bind_blend_state(pipe, render->blend);
-   /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
-    * behaviour with no MTLDepthStencilState set: no test and no write.
-    */
-   pipe->bind_depth_stencil_alpha_state(pipe, draw->depth_stencil ? draw->depth_stencil->cso
-                                                                  : render->dsa);
+      .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } };
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
     */
-   pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
+   struct pipe_stencil_ref sref = {
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
-                     (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   pipe->bind_rasterizer_state(pipe, draw->scissor && render->rast_scissor ? render->rast_scissor : render->rast);
-   pipe->bind_vs_state(pipe, render->vs_cso);
-   pipe->bind_fs_state(pipe, render->fs_cso);
+                     (uint8_t)(draw->stencil_reference[1] & 0xff) } };
+   /* ...and each of them, and each state object below, set only when it is not what the
+    * context already holds (struct rwa_device, bound_*) */
+   bool all = rebind_all() || !device->bound_fixed;
+   if (all || memcmp(device->bound_viewport, vp.scale, sizeof(float) * 3) != 0 ||
+       memcmp(device->bound_viewport + 3, vp.translate, sizeof(float) * 3) != 0) {
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      memcpy(device->bound_viewport, vp.scale, sizeof(float) * 3);
+      memcpy(device->bound_viewport + 3, vp.translate, sizeof(float) * 3);
+      rwa_bind_sets++;
+   } else {
+      rwa_bind_skips++;
+   }
+   if (all || memcmp(&device->bound_stencil_ref, &sref, sizeof(sref)) != 0) {
+      pipe->set_stencil_ref(pipe, sref);
+      device->bound_stencil_ref = sref;
+      rwa_bind_sets++;
+   } else {
+      rwa_bind_skips++;
+   }
+   device->bound_fixed = true;
+   if (draw->scissor) {
+      unsigned x0 = MIN2(draw->scissor[0], w), y0 = MIN2(draw->scissor[1], h);
+      unsigned x1 = MIN2(draw->scissor[0] + draw->scissor[2], w), y1 = MIN2(draw->scissor[1] + draw->scissor[3], h);
+      struct pipe_scissor_state scis = { .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 };
+
+      if (all || !device->bound_scissor_set || device->bound_scissor.minx != scis.minx ||
+          device->bound_scissor.miny != scis.miny || device->bound_scissor.maxx != scis.maxx ||
+          device->bound_scissor.maxy != scis.maxy) {
+         pipe->set_scissor_states(pipe, 0, 1, &scis);
+         device->bound_scissor = scis;
+         device->bound_scissor_set = true;
+         rwa_bind_sets++;
+      } else {
+         rwa_bind_skips++;
+      }
+   }
+
+   RWA_BIND(device, bound_blend, render->blend, bind_blend_state);
+   /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
+    * behaviour with no MTLDepthStencilState set: no test and no write.
+    */
+   RWA_BIND(device, bound_dsa, draw->depth_stencil ? draw->depth_stencil->cso : render->dsa,
+            bind_depth_stencil_alpha_state);
+   RWA_BIND(device, bound_rast,
+            draw->scissor && render->rast_scissor ? render->rast_scissor : render->rast,
+            bind_rasterizer_state);
+   RWA_BIND(device, bound_vs, render->vs_cso, bind_vs_state);
+   RWA_BIND(device, bound_fs, render->fs_cso, bind_fs_state);
 
    /*
     * The vertex state, bound on BOTH paths and never NULL.
@@ -8014,7 +8170,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * set_vertex_buffers rather than in draw_vbo. Neither driver here does, so the
     * other order worked; it worked by permission and not by contract.
     */
-   pipe->bind_vertex_elements_state(pipe, render->velem);
+   RWA_BIND(device, bound_velem, render->velem, bind_vertex_elements_state);
    pipe->set_vertex_buffers(pipe, nvb, vbs);
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
@@ -8114,6 +8270,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       t5 = os_time_get_nano();
       rwa_draw_ns[3] += t4 - t3;
       rwa_draw_ns[4] += t5 - t4;
+      /* a draw after a framebuffer set, which panfrost answers by emitting all its state */
+      if (fresh) {
+         rwa_bind_fresh_draws++;
+         rwa_bind_fresh_ns += t5 - t4;
+      } else {
+         rwa_bind_steady_draws++;
+         rwa_bind_steady_ns += t5 - t4;
+      }
    }
 
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn
@@ -8132,12 +8296,16 @@ unbind:
    unbind_stage(device, MESA_SHADER_FRAGMENT, &fbound);
    if (!render->generated_vertex)
       unbind_stage(device, MESA_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the caller's next call, which may be
+   /* The framebuffer was released here, before the caller's next call, which may be
     * rwa_texture_destroy on one of these attachments: a context still holding a surface
     * of a freed resource is the same trap as a bound sampler state (rwa_sampler_destroy).
-    * The surfaces themselves are the textures' own (rwa_texture.rt) and stay.
+    * It is kept now, for the next draw into the same attachments (bind_framebuffer), and
+    * rwa_texture_destroy lets it go when it holds the texture going. The context's copy
+    * holds references of its own (util_copy_framebuffer_state), so nothing it names is
+    * freed under it in between. RWA_REBIND_ALL=1 releases it here, as before.
     */
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+   if (rebind_all())
+      unbind_framebuffer(device);
    rwa_draw_ns[5] += os_time_get_nano() - t5;
    rwa_draw_ns[6]++;
    return rc;

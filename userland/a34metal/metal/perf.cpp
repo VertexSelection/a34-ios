@@ -155,12 +155,14 @@ rwm_perf_report(uint64_t now)
 
 	static void (*profile)(uint64_t *);
 	static void (*submits)(uint64_t *);
+	static int (*binds)(char *, size_t);
 	static int looked;
 
 	if (!looked) {
 		looked = 1;
 		profile = (void (*)(uint64_t *))profile_call("rwa_draw_profile");
 		submits = (void (*)(uint64_t *))profile_call("rwa_submit_profile");
+		binds = (int (*)(char *, size_t))profile_call("rwa_bind_profile");
 	}
 	if (submits != nullptr) {
 		uint64_t sb[5] = { 0, 0, 0, 0, 0 };
@@ -182,6 +184,9 @@ rwm_perf_report(uint64_t now)
 				 d[4] / 1000 / d[6], d[5] / 1000 / d[6], d[6]);
 			say(line);
 		}
+	}
+	if (binds != nullptr && binds(line, sizeof(line)) != 0) {
+		say(line);
 	}
 	memset(&p, 0, sizeof(p));
 	p.since = now;

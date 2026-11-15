@@ -43,6 +43,11 @@ load()
 	if (rwm_boot_arg("rwm_area=strict")) {
 		setenv("RWA_RENDER_AREA", "strict", 1);
 	}
+	/* boot-arg rwm_rebind=all: every state set for every draw and the framebuffer let go after
+	 * each, as before the library kept what was bound (air_metal.c, bind_framebuffer) */
+	if (rwm_boot_arg("rwm_rebind=all")) {
+		setenv("RWA_REBIND_ALL", "1", 1);
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),

@@ -640,6 +640,8 @@ int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 /* where the draws' time went since the last call, in ns: validation, binding checks, fixed
  * state, the stages' resources, draw_vbo, unbinding; then the number of draws */
 void rwa_draw_profile(uint64_t out[7]);
+/* the state the draws set and skipped since the last call, as one line; 0 if no draws */
+int rwa_bind_profile(char *line, size_t size);
 
 /* The work so far sent off without waiting, and the number of its last job; a wait for it. */
 uint64_t rwa_flush_seq(struct rwa_device *device);
