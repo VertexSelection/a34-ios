@@ -502,6 +502,32 @@ int main(int argc, char **argv)
 		printf("0965 interface data path: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
+	/* ---- 0966: PHY_ACTION out of the vendor's default NVRAM image (FW_DIR/WIFI), as wlanPreCal builds it ---- */
+	{
+		static const uint8_t head[] = { 0xaa, 0x89, 0x67, 0x55, 0x03, 0x01, 0x7c, 0x01, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00,
+			                        0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x07 };
+		uint32_t slot = a34w_tx_cidx, size = 0;
+		const uint8_t *f = (const uint8_t *)a34w_dma + DMA_TX17_BUFS + slot * SLOT_SIZE, *pay = f + 64;
+		uint8_t *image = a34w_file("WIFI", 512u, "-", &size);
+		int failed = image == NULL;
+
+		(void)a34w_phy_action();                /* (no answer here: the frame is what is checked) */
+		if (image != NULL) {
+			uint32_t length = (a34w_le32(f) & 0xffffu) - 64u, at = 256, start = 0;
+			while (at + 3 <= size && image[at] != 10) {          /* tag 10's offset: the NVRAM part ends there */
+				if (image[at] == 7) start = at;
+				at += 3u + (uint32_t)(image[at + 1] | image[at + 2] << 8);
+			}
+			printf("0966 PHY_ACTION: %u bytes, command 0x%02x, NVRAM tags 7-9 %u bytes (file %u..%u)\n", length, f[36],
+			    pay[18] | pay[19] << 8, start, at);
+			failed |= length != 388 || f[36] != 8 || memcmp(pay, head, sizeof(head)) != 0 || (pay[18] | pay[19] << 8) != 260 ||
+			    memcmp(pay + 20, image + start, at - start) != 0 || pay[280] != 2 || pay[282] != 104;
+			for (uint32_t i = 284; i < 388; i++) failed |= pay[i] != 0;
+			kfree_data(image, size);
+		}
+		printf("0966 PHY_ACTION frame: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
 	printf("log:\n%s", a34w_log);
 	return bad;
 }

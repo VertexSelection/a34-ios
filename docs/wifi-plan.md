@@ -431,8 +431,19 @@ are under `connectivity/wlan/core/gen4m_s1/`) and done the same way, host side w
   tree's FEM pin groups are reference-board leftovers (GPIO188 is the GPS LNA, GPIO195 the
   vibrator) and must not be applied, and the firmware has fallbacks for both ("NVRAM control is
   invalid, FW will use default", "Rom cal unfinish, do SW ch cal"). If the AP never acknowledges
-  our frames (`NOT acknowledged` TX statuses), PHY_ACTION's force-calibration with the vendor's
-  default `/vendor/firmware/WIFI` (never the phone's `nvdata`) is the next patch.
+  our frames (`NOT acknowledged` TX statuses), 0966 is the next try, without a new kernel.
+
+### 0966: PHY_ACTION, opt-in
+
+Boot-arg `a34wifiphy=1`, or `kern.a34wifi.phyaction=1` before step 5 (`a34wifi` sets it when the
+job has `A34WIFI_PHYACTION=1`): between the ROM's ACCESS_REG and the RAM code, INIT command 8 as
+Android's `wlanPreCal` sends it when it has no calibration of its own to give back
+(`chips/common/pre_cal.c:576-645`, layout `include/nic_init_cmd_event.h:239-291`): `{0x556789aa,
+3 tags, version 1, length}`, CAL `{force calibration}`, NVRAM (tags 7-9 of the vendor's default
+`/vendor/firmware/WIFI` -- installed by `tools/wifi-fw.sh`, never the phone's `nvdata` copy --
+cut as `wlanGetEpaElnaFromNvram` cuts them: 260 bytes) and COM_FEM (104 zero bytes, as Android's
+own on this phone); 388 bytes in all, answered by INIT event 5 (event 0x81 status 0: calibrated).
+The step goes on either way. Off by default: steps 1-7 ran without it.
 
 ### 0965: the data path (step 9)
 
@@ -447,7 +458,7 @@ message 20011, as HakiOS's `net_test.m`, MIT), which also publishes the router a
 the rest of iOS; it needs `com.apple.configd` running. `a34wifi tcp HOST [PORT]` then tries a TCP
 connection and an HTTP HEAD.
 
-**The M3 test** (kernel with 0963-0965 on top of main's patches; `a34bt=1` may stay):
+**The M3 test** (kernel with 0963-0966 on top of main's patches, 0966 off; `a34bt=1` may stay):
 
 1. On the host, once: write the network file and install it readable by root only, e.g.
    `printf 'ssid=Name\npsk=passphrase\n' > network; sudo install -m 600 -o 0 -g 0 network
@@ -461,6 +472,8 @@ connection and an HTTP HEAD.
    reason follows); `ASSOCIATED, AID n`; for WPA2 `EAPOL: message 1 of 4`, `EAPOL out on TX ring 0`,
    the token report's first line, `message 3 of 4`, `the four-way handshake is done`; `JOINED`;
    step 9 `enN attached`; every 30 s a `carried:` line with frame counts.
+4. If the TX statuses say `NOT acknowledged`: boot again with `a34wifiphy=1` (or the job's
+   `A34WIFI_PHYACTION=1`); step 5 then says `PHY_ACTION ... event 0x81 status 0`.
 
 ### Biggest unknowns
 

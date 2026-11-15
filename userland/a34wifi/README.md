@@ -74,6 +74,14 @@ sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi /tmp/a34wifi a34wifi conn
 (`up 7` stops after the scan; `up 9` and `connect` need the network file; `connect` also needs
 `com.apple.configd` running for DHCP.)
 
+If the log says the AP never acknowledges our frames (`TX status N: NOT acknowledged`), the next
+boot can try PHY_ACTION (0966: calibration with the vendor's default NVRAM tags before the RAM
+code), either with boot-arg `a34wifiphy=1` or for the job:
+
+```sh
+sudo tools/root-add-job.py --env /mnt com.a34.wifi A34WIFI_PHYACTION=1
+```
+
 The job runs once at boot with its output on `/dev/console`, so it lands in the kernel's
 persistent log (`tools/pull-log.sh`). Asking for fewer steps (`a34wifi up 1`) is the cautious
 first test.

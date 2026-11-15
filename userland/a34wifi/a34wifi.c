@@ -28,6 +28,10 @@
  *   9  (0965) the data path: the network interface (kern.a34wifi.ifname, "enN") attached and
  *      its frames carried over the radio's data rings; then "a34wifi dhcp" for an address
  *
+ * Environment (0966): A34WIFI_PHYACTION=1 has "up" set kern.a34wifi.phyaction=1 before asking for
+ * step 5 or more: PHY_ACTION (calibration with the vendor's default NVRAM tags) before the RAM code.
+ * The same as boot-arg a34wifiphy=1; off by default. For a job: root-add-job.py --env ... .
+ *
  * The network to join (0964): /a34/wifi/network, written by the phone's owner and by no one
  * else -- it is never in the repository, and nothing here prints the passphrase:
  *
@@ -320,6 +324,12 @@ up(int step, int seconds)
 	}
 	if (step >= 6) {
 		(void)keep_mac();       /* step 6 reads it; without it the kernel uses a random one for this boot */
+	}
+	if (step >= 5 && getenv("A34WIFI_PHYACTION") != NULL && strcmp(getenv("A34WIFI_PHYACTION"), "1") == 0) {
+		int one = 1;
+
+		printf("a34wifi: kern.a34wifi.phyaction=1 (A34WIFI_PHYACTION): %s\n",
+		    sysctlbyname("kern.a34wifi.phyaction", NULL, NULL, &one, sizeof(one)) == 0 ? "set" : strerror(errno));
 	}
 	if (step >= 8 && check_network() != 0) {
 		printf("a34wifi: step 8 needs %s: asking for step 7 only\n", NETWORK_FILE);
