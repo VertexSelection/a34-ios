@@ -1,0 +1,290 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 931f886..851f2ba 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -360,6 +360,7 @@ struct a34_bo {
+ #define A34_BO_MAPPED           1u      /* the program has had it mapped: the CPU may write and read it */
+ #define A34_BO_LISTED           4u      /* named by the SUBMIT being run */
+ #define A34_BO_WC               8u      /* A34 (0918): no cacheable mapping of its pages exists for a program: no upkeep */
++#define A34_BO_LAZY             16u     /* A34 (0936): a tiler heap with one page so far (heapGrow()) */
+ 
+ /* A34 (0914): a handle that is a buffer, of its own memory or a surface's. */
+ static inline bool
+@@ -398,6 +399,15 @@ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+ static uint64_t gA34MaliWiredMax = 1024ull << 20;
+ static uint64_t gA34MaliHeapBacked = 64ull << 20;
++/*
++ * A34 (0936): boot-arg a34maliheaplazy (default 1): a tiler heap (PANFROST_BO_HEAP,
++ * Mesa makes one per screen as it opens the GPU) gets one page at GEM_CREATE and
++ * its a34maliheap MB only before the client's first job (heapGrow()): every
++ * process that opens the GPU wired 64 MB at once (0909), whether it drew or not
++ * (y2sios, MIT, makes Mesa's heap lazily for the same reason:
++ * research/metal/leads.md c2). 0: backed at GEM_CREATE, as before.
++ */
++static uint32_t gA34MaliHeapLazy = 1;
+ static uint32_t gA34MaliClients;
+ static uint32_t gA34MaliSurfaces = 1;           /* A34 (0914): boot-arg a34malisurf=0: request 0x7e refuses every surface */
+ /*
+@@ -669,6 +679,7 @@ RedwoodMaliStart(void)
+ 	(void)PE_parse_boot_argn("a34maliwc", &gA34MaliWC, sizeof(gA34MaliWC));
+ 	(void)PE_parse_boot_argn("a34maliasync", &gA34MaliAsync, sizeof(gA34MaliAsync));
+ 	(void)PE_parse_boot_argn("a34maliscan", &gA34MaliScan, sizeof(gA34MaliScan));     /* A34 (0928) */
++	(void)PE_parse_boot_argn("a34maliheaplazy", &gA34MaliHeapLazy, sizeof(gA34MaliHeapLazy));        /* A34 (0936) */
+ 	(void)PE_parse_boot_argn("a34malicpu", &gA34MaliCPU, sizeof(gA34MaliCPU));
+ 	if (gA34MaliAsync != 0 && gA34MaliQLock == NULL) {
+ 		/* A34 (0919): the queue and the thread that runs it */
+@@ -705,6 +716,8 @@ RedwoodMaliStart(void)
+ 		return false;
+ 	}
+ 	gpu->release();                 /* the registry holds it */
++	IOLog("A34 MALI UC: tiler heaps backed %s (a34maliheaplazy)\n", gA34MaliHeapLazy ? "at the client's first job" :
++	    "at GEM_CREATE");
+ 	IOLog("A34 MALI UC: RedwoodMali published (panfrost %d.%d, heaps backed %llu MB, buffers at most %llu MB, "
+ 	    "IOSurfaces %s, buffers %s)\n", A34_DRIVER_MAJOR, A34_DRIVER_MINOR, (unsigned long long)(gA34MaliHeapBacked >> 20),
+ 	    (unsigned long long)(gA34MaliWiredMax >> 20), gA34MaliSurfaces ? "shared" : "not shared (a34malisurf=0)",
+@@ -835,6 +848,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	uint32_t fUpkeepCount;
+ 	bool fUpkeepStale;
+ 	uint32_t fWinQSame;                     /* A34 (0928): window's queued jobs on the slot of the job before */
++	uint32_t fLazyHeaps, fHeapsGrown;       /* A34 (0936), with gA34MaliLock: heaps with one page so far; backed later */
+ 	uint32_t fNappedSeen;
+ 
+ 	struct a34_bo *lookup(uint32_t handle);
+@@ -854,6 +868,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	void releaseAll(void);
+ 	void describeFault(uint64_t va);
+ 	IOReturn createBo(struct a34_create_bo *req);
++	bool heapGrow(void);
+ 	IOReturn surfaceBo(struct a34_redwood_surface *req);
+ 	IOReturn request(uint32_t selector, union a34_request *r);
+ 
+@@ -892,7 +907,8 @@ RedwoodMaliUserClient::start(IOService *provider)
+ 	fOpen = true;
+ 	clients = ++gA34MaliClients;
+ 	IOLockUnlock(gA34MaliLock);
+-	IOLog("A34 MALI UC: %s opened the GPU (%u clients)\n", fName, clients);
++	IOLog("A34 MALI UC: %s opened the GPU (%u clients; GPU buffers of all of them %llu MB)\n", fName, clients,
++	    (unsigned long long)(gA34MaliWired >> 20));
+ 	return true;
+ }
+ 
+@@ -1083,13 +1099,13 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 		absolutetime_to_nanoseconds((uint64_t)sweet_surface_sync_stats[3], &surf);
+ 		IOLog("A34 MALI UC: %s: %u jobs in %llu ms: cache upkeep %llu us a job (most %llu us), %llu KB a job; "
+ 		    "jobs %llu us each (longest %llu us); surfaces at lock/unlock so far: %lld invalidated, %lld cleaned, %lld MB, "
+-		    "%llu ms; it holds %u buffers (%llu MB of its own), %u of them surfaces\n",
++		    "%llu ms; it holds %u buffers (%llu MB of its own), %u of them surfaces; all clients' GPU buffers %llu MB\n",
+ 		    fName, fWinJobs, (unsigned long long)(window / NSEC_PER_MSEC), (unsigned long long)(all / 1000 / fWinJobs),
+ 		    (unsigned long long)(most / 1000), (unsigned long long)((fWinBytes >> 10) / fWinJobs),
+ 		    (unsigned long long)(fWinJobNs / 1000 / fWinJobs), (unsigned long long)(fWinJobNsMax / 1000),
+ 		    (long long)sweet_surface_sync_stats[0], (long long)sweet_surface_sync_stats[1],
+ 		    (long long)(sweet_surface_sync_stats[2] >> 20), (unsigned long long)(surf / NSEC_PER_MSEC), fBoCount,
+-		    (unsigned long long)(fWired >> 20), fSurfaceBos);
++		    (unsigned long long)(fWired >> 20), fSurfaceBos, (unsigned long long)(gA34MaliWired >> 20));
+ 		if (fWinQJobs != 0) {
+ 			uint64_t qwait, qmost;
+ 
+@@ -1288,6 +1304,9 @@ RedwoodMaliUserClient::queueSubmit(struct a34_submit *req)
+ 	if (req->jc == 0 || (req->requirements & ~(PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (fLazyHeaps != 0 && !heapGrow()) {
++		return kIOReturnNoMemory;       /* A34 (0936) */
++	}
+ 	j = IONewZero(struct a34_qjob, 1);
+ 	if (j == NULL) {
+ 		return kIOReturnNoMemory;
+@@ -1622,6 +1641,9 @@ RedwoodMaliUserClient::detachBo(struct a34_bo *b)
+ 	a34_mali_unmap(b->va, b->backed);
+ 	a34_mali_va_free(b->va, b->vasize);
+ 	fUpkeepStale = true;            /* A34 (0928): the handle is cleared after this, still with the lock held */
++	if ((b->state & A34_BO_LAZY) != 0) {
++		fLazyHeaps--;           /* A34 (0936): closed before it was ever needed */
++	}
+ 	fBoCount--;
+ 	if (b->surface != NULL) {
+ 		fSurfaceBos--;
+@@ -1703,13 +1725,16 @@ RedwoodMaliUserClient::closeBo(uint32_t handle)
+ void
+ RedwoodMaliUserClient::releaseAll(void)
+ {
+-	uint32_t freed = 0, clients = 0;
++	uint32_t freed = 0, clients = 0, lazy = 0;
++	uint64_t wired = 0;
+ 	bool was = false;
+ 
+ 	dropQueued();                   /* A34 (0919): no job of this client is queued or running after this */
+ 	a34_gpu_lock();
+ 	if (fOpen && !fClosed) {
+ 		was = true;
++		wired = fWired;                 /* A34 (0936): for the line below */
++		lazy = fLazyHeaps;
+ 		for (uint32_t i = 0; i < A34_BOS; i++) {
+ 			if (a34_bo_used(&fBos[i])) {
+ 				detachBo(&fBos[i]);
+@@ -1727,8 +1752,10 @@ RedwoodMaliUserClient::releaseAll(void)
+ 			}
+ 		}
+ 		IOLog("A34 MALI UC: %s closed the GPU: %u buffers freed (%u made, %u write-combined, %u cacheable for want of "
+-		    "memory, %u surfaces taken, %u refused), %u job chains, %u failed, %u errors; %u clients left\n", fName, freed,
+-		    fBoMade, fWcMade, fWcFallbacks, fSurfacesTaken, fSurfacesRefused, fSubmits, fFailed, fErrors, clients);
++		    "memory, %u surfaces taken, %u refused), %u job chains, %u failed, %u errors; %u clients left; %llu MB of "
++		    "GPU buffers let go of, %u tiler heaps backed, %u never needed (A34 0936); all clients' now %llu MB\n", fName,
++		    freed, fBoMade, fWcMade, fWcFallbacks, fSurfacesTaken, fSurfacesRefused, fSubmits, fFailed, fErrors, clients,
++		    (unsigned long long)(wired >> 20), fHeapsGrown, lazy, (unsigned long long)(gA34MaliWired >> 20));
+ 	}
+ }
+ 
+@@ -1752,6 +1779,112 @@ RedwoodMaliUserClient::describeFault(uint64_t va)
+ 	IOLog("A34 MALI UC: %s: the fault at 0x%llx is in none of its %u buffers\n", fName, (unsigned long long)va, fBoCount);
+ }
+ 
++/*
++ * A34 (0936): the client's lazy tiler heaps backed (a34maliheap MB each, or all
++ * of the heap if smaller), before a job of it can use them: SUBMIT calls this
++ * first while fLazyHeaps says there is one. Takes the lock itself, as
++ * createBo(): memory is got and cleaned before it. The heap's one page is
++ * replaced in the GPU's tables (no job of the client has run: the GPU has not
++ * used it) and let go of. False: no memory for it (the SUBMIT fails).
++ */
++bool
++RedwoodMaliUserClient::heapGrow(void)
++{
++	for (;;) {
++		IOBufferMemoryDescriptor *mem, *old = NULL;
++		struct a34_bo *b;
++		uint64_t want = 0, off;
++		uint32_t handle = 0;
++		bool ok = false;
++
++		a34_gpu_lock();
++		for (uint32_t i = 0; fBos != NULL && fOpen && !fClosed && i < A34_BOS; i++) {
++			if (fBos[i].mem != NULL && (fBos[i].state & A34_BO_LAZY) != 0) {
++				handle = i + 1;
++				want = fBos[i].vasize > gA34MaliHeapBacked ? gA34MaliHeapBacked : fBos[i].vasize;
++				break;
++			}
++		}
++		IOLockUnlock(gA34MaliLock);
++		if (handle == 0) {
++			return true;
++		}
++		if (gA34MaliWired + want > gA34MaliWiredMax) {
++			IOLog("A34 MALI UC: %s: its tiler heap of %llu MB would make more than %llu MB of GPU buffers (a34malimem)\n",
++			    fName, (unsigned long long)(want >> 20), (unsigned long long)(gA34MaliWiredMax >> 20));
++			return false;
++		}
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++		    (vm_size_t)want, PAGE_SIZE);
++		if (mem == NULL) {
++			IOLog("A34 MALI UC: %s: no memory for its tiler heap of %llu MB\n", fName, (unsigned long long)(want >> 20));
++			return false;
++		}
++		a34_mali_cpu_flush((uintptr_t)mem->getBytesNoCopy(), want);
++		a34_gpu_lock();
++		b = (fBos != NULL && fOpen && !fClosed) ? lookup(handle) : NULL;
++		if (b == NULL || (b->state & A34_BO_LAZY) == 0) {
++			ok = true;                      /* (closed, or backed by another thread of the client) */
++		} else {
++			for (off = 0; off < want;) {
++				IOByteCount seglen = 0;
++				addr64_t pa = mem->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++				uint64_t len = seglen;
++
++				if (len > want - off) {
++					len = want - off;
++				}
++				len &= ~0xfffull;
++				if (pa == 0 || len == 0 || !a34_mali_map(b->va + off, pa, len)) {
++					break;
++				}
++				off += len;
++			}
++			if (off < want) {
++				/* back to the one page: nothing of the new memory is left in the tables */
++				a34_mali_unmap(b->va, want);
++				off = 0;
++				while (off < b->backed) {
++					IOByteCount seglen = 0;
++					addr64_t pa = b->mem->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++					uint64_t len = seglen > b->backed - off ? b->backed - off : seglen;
++
++					len &= ~0xfffull;
++					if (pa == 0 || len == 0 || !a34_mali_map(b->va + off, pa, len)) {
++						break;
++					}
++					off += len;
++				}
++			} else {
++				old = b->mem;
++				gA34MaliWired += want - b->backed;
++				fWired += want - b->backed;
++				b->mem = mem;
++				mem = NULL;
++				b->backed = want;
++				b->state &= ~A34_BO_LAZY;
++				fLazyHeaps--;
++				fHeapsGrown++;
++				ok = true;
++			}
++		}
++		IOLockUnlock(gA34MaliLock);
++		if (old != NULL) {
++			IOLog("A34 MALI UC: %s: tiler heap (buffer %u) backed before its first job: %llu MB (GPU buffers of all "
++			    "clients now %llu MB)\n", fName, handle, (unsigned long long)(want >> 20),
++			    (unsigned long long)(gA34MaliWired >> 20));
++		} else if (!ok) {
++			IOLog("A34 MALI UC: %s: its tiler heap of %llu MB would not go into the GPU's tables\n", fName,
++			    (unsigned long long)(want >> 20));
++		}
++		OSSafeReleaseNULL(mem);
++		OSSafeReleaseNULL(old);
++		if (!ok) {
++			return false;
++		}
++	}
++}
++
+ /*
+  * panfrost_ioctl_create_bo(): the buffer, its handle and GPU address. A34
+  * (0918): takes the lock itself, and only to enter the buffer into the GPU's
+@@ -1779,6 +1912,10 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	backed = heap && vasize > gA34MaliHeapBacked ? gA34MaliHeapBacked : vasize;
++	if (heap && gA34MaliHeapLazy != 0) {
++		backed = A34_UNIT;              /* A34 (0936): one page now, the rest before the first job (heapGrow()) */
++		state = A34_BO_LAZY;
++	}
+ 	if (gA34MaliWired + backed > gA34MaliWiredMax) {        /* (a look without the lock; again below, with it) */
+ 		IOLog("A34 MALI UC: %s: a buffer of %llu KB would make more than %llu MB of GPU buffers (a34malimem)\n", fName,
+ 		    (unsigned long long)(backed >> 10), (unsigned long long)(gA34MaliWiredMax >> 20));
+@@ -1817,7 +1954,7 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t)backed, PAGE_SIZE);
+ 	}
+ 	if (mem != NULL) {
+-		state = A34_BO_WC;
++		state = A34_BO_WC;              /* (never a heap: a heap is not write-combined) */
+ 		fWcMade++;
+ 	} else {
+ 		if (wantWC && fWcFallbacks++ < A34_LOGGED_WC_FALLBACKS) {
+@@ -1898,6 +2035,9 @@ RedwoodMaliUserClient::createBo(struct a34_create_bo *req)
+ 	b->flags = req->flags;
+ 	b->state = state;
+ 	fUpkeepStale = true;            /* A34 (0928) */
++	if ((state & A34_BO_LAZY) != 0) {
++		fLazyHeaps++;           /* A34 (0936) */
++	}
+ 	mem = NULL;                     /* (the handle's now) */
+ 	wc = NULL;
+ 	fNextBo = handle % A34_BOS;
+@@ -2313,6 +2453,8 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			if (ret != kIOReturnSuccess && fErrors++ < A34_LOGGED_ERRORS) {
+ 				IOLog("A34 MALI UC: %s: request 0x%02x (%u bytes) -> 0x%x\n", fName, selector, insize, ret);
+ 			}
++		} else if (selector == kA34PanfrostSubmit && fLazyHeaps != 0 && !heapGrow()) {
++			ret = kIOReturnNoMemory;        /* A34 (0936): its tiler heaps first, without the lock held */
+ 		} else {
+ 			if (selector == kA34PanfrostWaitBO && r.wait.timeout_ns <= 0) {
+ 				/* only a look: a job of another thread or program still running is "busy" */
