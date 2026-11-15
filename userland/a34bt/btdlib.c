@@ -503,7 +503,52 @@ my_SecItemDelete(CFDictionaryRef query)
 
 static unsigned log_said;
 
-/* the format with its arguments: buf is __builtin_os_log_format's (summary, count, then descriptor, size, data each) */
+/*
+ * The format with its arguments. buf is __builtin_os_log_format's: a summary byte, a count, then per item a descriptor
+ * (high nibble its type: 0 scalar, 1 count (a precision), 2 string, 3 pointer (data), 4 object, 5 wide string,
+ * 6 errno, 7 mask; low nibble privacy flags), a size and the data. A mask item -- "%{private, mask.hash}s" puts one
+ * holding "hash" ahead of its string -- belongs to no conversion and is skipped (boot 0988-btkc-a: taken for the
+ * string, it made "hash" a pointer, and bluetoothd crashed at 0x68736160). Only a string, an object or a pointer
+ * item is followed, and only when it points above 4 GB (iOS user space starts after __PAGEZERO).
+ */
+#define LOG_ITEM_SCALAR 0
+#define LOG_ITEM_COUNT  1
+#define LOG_ITEM_STRING 2
+#define LOG_ITEM_POINTER 3
+#define LOG_ITEM_OBJECT 4
+#define LOG_ITEM_MASK   7
+
+struct log_item {
+	uint8_t type, size;
+	const uint8_t *data;
+	uint64_t value;
+};
+
+/* the next item that is an argument (masks skipped); false when there is none */
+static bool
+log_next(const uint8_t *buf, uint32_t size, uint32_t *pos, uint32_t *left, struct log_item *it)
+{
+	while (*left > 0 && *pos + 2 <= size && *pos + 2u + buf[*pos + 1] <= size) {
+		it->type = buf[*pos] >> 4;
+		it->size = buf[*pos + 1];
+		it->data = buf + *pos + 2;
+		it->value = 0;
+		memcpy(&it->value, it->data, it->size <= 8 ? it->size : 8);
+		*pos += 2u + it->size;
+		(*left)--;
+		if (it->type != LOG_ITEM_MASK) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+log_pointer_ok(const struct log_item *it)
+{
+	return it->size == 8 && it->value >= 0x100000000ull && it->value < 0x1000000000000ull;
+}
+
 static void
 log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint32_t size)
 {
@@ -513,9 +558,7 @@ log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint3
 
 #define PUT(...) do { if (o < room) { int k_ = snprintf(out + o, room - o, __VA_ARGS__); if (k_ > 0) { o += (size_t)k_; } } } while (0)
 	for (const char *p = format; *p != 0 && o + 1 < room; p++) {
-		const uint8_t *d;
-		uint8_t sz;
-		uint64_t v = 0;
+		struct log_item it;
 		bool star = false;
 		char conv;
 
@@ -558,37 +601,24 @@ log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint3
 			break;
 		}
 		if (star) {                                            /* the precision, an argument of its own */
-			if (left == 0 || pos + 2 > size) {
+			if (!log_next(buf, size, &pos, &left, &it)) {
 				break;
 			}
-			sz = buf[pos + 1];
-			d = buf + pos + 2;
-			v = 0;
-			memcpy(&v, d, sz <= 8 ? sz : 8);
-			precision = (long)v;
-			pos += 2u + sz;
-			left--;
+			precision = (long)it.value;
 		}
-		if (left == 0 || pos + 2 > size || pos + 2u + buf[pos + 1] > size) {
+		if (!log_next(buf, size, &pos, &left, &it)) {
 			PUT("<?>");
 			continue;
 		}
-		sz = buf[pos + 1];
-		d = buf + pos + 2;
-		pos += 2u + sz;
-		left--;
-		memcpy(&v, d, sz <= 8 ? sz : 8);
-		switch (conv) {
-		case 's':
-			if (sz == 8 && v != 0) {
-				PUT("%.200s", (const char *)(uintptr_t)v);
+		if (it.type == LOG_ITEM_STRING) {
+			if (log_pointer_ok(&it)) {
+				PUT("%.200s", (const char *)(uintptr_t)it.value);
 			} else {
-				PUT("(null)");
+				PUT(it.value == 0 ? "(null)" : "<string>");
 			}
-			break;
-		case '@':
-			if (sz == 8 && v != 0) {
-				CFStringRef text = CFCopyDescription((CFTypeRef)(uintptr_t)v);
+		} else if (it.type == LOG_ITEM_OBJECT) {
+			if (log_pointer_ok(&it)) {
+				CFStringRef text = CFCopyDescription((CFTypeRef)(uintptr_t)it.value);
 				char c[300];
 
 				if (text != NULL && CFStringGetCString(text, c, sizeof(c), kCFStringEncodingUTF8)) {
@@ -600,12 +630,11 @@ log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint3
 					CFRelease(text);
 				}
 			} else {
-				PUT("(null)");
+				PUT(it.value == 0 ? "(null)" : "<object>");
 			}
-			break;
-		case 'P':
-			if (sz == 8 && v != 0 && precision > 0) {
-				const uint8_t *b = (const uint8_t *)(uintptr_t)v;
+		} else if (it.type == LOG_ITEM_POINTER) {
+			if (log_pointer_ok(&it) && precision > 0) {
+				const uint8_t *b = (const uint8_t *)(uintptr_t)it.value;
 
 				for (long i = 0; i < precision && i < 32; i++) {
 					PUT("%02x", b[i]);
@@ -613,29 +642,33 @@ log_format(char *out, size_t room, const char *format, const uint8_t *buf, uint3
 			} else {
 				PUT("<data>");
 			}
-			break;
-		case 'd': case 'i':
-			PUT("%lld", sz == 1 ? (long long)(int8_t)v : sz == 2 ? (long long)(int16_t)v :
-			    sz == 4 ? (long long)(int32_t)v : (long long)v);
-			break;
-		case 'x': case 'X': case 'p':
-			PUT("%#llx", (unsigned long long)v);
-			break;
-		case 'c':
-			PUT("%c", (int)(v & 0xff));
-			break;
-		case 'f': case 'g': case 'e': {
-			double f = 0;
+		} else if (it.type != LOG_ITEM_SCALAR && it.type != LOG_ITEM_COUNT) {
+			PUT("<%u>", it.type);                          /* wide string, errno: not followed */
+		} else {
+			switch (conv) {
+			case 'd': case 'i':
+				PUT("%lld", it.size == 1 ? (long long)(int8_t)it.value : it.size == 2 ? (long long)(int16_t)it.value :
+				    it.size == 4 ? (long long)(int32_t)it.value : (long long)it.value);
+				break;
+			case 'x': case 'X': case 'p':
+				PUT("%#llx", (unsigned long long)it.value);
+				break;
+			case 'c':
+				PUT("%c", (int)(it.value & 0xff));
+				break;
+			case 'f': case 'g': case 'e': {
+				double f = 0;
 
-			if (sz == 8) {
-				memcpy(&f, d, 8);
+				if (it.size == 8) {
+					memcpy(&f, it.data, 8);
+				}
+				PUT("%g", f);
+				break;
 			}
-			PUT("%g", f);
-			break;
-		}
-		default:                                               /* u, o, !, and the formatters of {bluetooth:...} */
-			PUT("%llu", (unsigned long long)v);
-			break;
+			default:                                       /* u, o, !, and the formatters of {bluetooth:...} */
+				PUT("%llu", (unsigned long long)it.value);
+				break;
+			}
 		}
 	}
 	out[o < room ? o : room - 1] = 0;
