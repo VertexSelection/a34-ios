@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..fdd2f38
+index 0000000..84a2cac
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1146 @@
+@@ -0,0 +1,1527 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -688,39 +688,413 @@ index 0000000..fdd2f38
 +	}
 +}
 +
-+/* RPC (port_rpc.c): {op, argc, {len, data pad 4}...}; reply op|0xFFFF0000 on channel 33. */
++/*
++ * RPC (Android's port_rpc.c, served in the kernel there too): {op, argc, {len, data pad 4}...}
++ * on channel 32, the answer {op|0xFFFF0000, argc, args} on 33 with the same header.reserved.
++ * The answers come from what Android reads for them: LK's device tree (gpio_usage_mapping,
++ * MD1-SIMn-HOT-PLUG-EINT, md_attr_node, md-auxadc), the GPIO input levels and the SoC AUXADC
++ * channel of the modem -- all read only; nothing of any identity is involved.
++ */
++extern bool a34_cell_fdt_prop(const char *node_name, const char *compat, const char *prop,
++    const uint8_t **val, uint32_t *len);
++
++#define RPC_FS_PARAM_ERROR      (-2)
++#define RPC_FS_FUNC_FAIL        (-5)
++#define RPC_ERR_SIM_QUERY_TYPE  (-12)
++#define RPC_ERR_SIM_QUERY_STR   (-11)
++
++static struct {
++	uint8_t buf[2048];
++	uint32_t len, argc;
++} ro;
++
++static void
++ro_init(uint32_t op)
++{
++	uint32_t v = op | 0xFFFF0000u;
++	memcpy(ro.buf, &v, 4);
++	ro.len = 8;
++	ro.argc = 0;
++}
++
++static void
++ro_arg(const void *d, uint32_t len)
++{
++	uint32_t padded = (len + 3) & ~3u;
++	if (ro.len + 4 + padded > sizeof(ro.buf))
++		return;
++	memcpy(ro.buf + ro.len, &len, 4);
++	if (len)
++		memcpy(ro.buf + ro.len + 4, d, len);
++	memset(ro.buf + ro.len + 4 + len, 0, padded - len);
++	ro.len += 4 + padded;
++	ro.argc++;
++}
++
++static void
++ro_u32(uint32_t v)
++{
++	ro_arg(&v, 4);
++}
++
++static uint32_t
++be32c(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++/* cell idx of a device-tree property (big endian), or false */
++static bool
++dt_cell(const char *node, const char *compat, const char *prop, uint32_t idx, uint32_t *v)
++{
++	const uint8_t *p;
++	uint32_t l = 0;
++	if (!a34_cell_fdt_prop(node, compat, prop, &p, &l) || 4 * (idx + 1) > l)
++		return false;
++	*v = be32c(p + 4 * idx);
++	return true;
++}
++
++/* port_rpc.c gpio_mapping_table: the modem's names -> the device tree's (underscore style) */
++static const struct { const char *md, *dts; } gpio_names[] = {
++	{ "GPIO_FDD_Band_Support_Detection_1", "GPIO_FDD_BAND_SUPPORT_DETECT_1ST_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_2", "GPIO_FDD_BAND_SUPPORT_DETECT_2ND_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_3", "GPIO_FDD_BAND_SUPPORT_DETECT_3RD_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_4", "GPIO_FDD_BAND_SUPPORT_DETECT_4TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_5", "GPIO_FDD_BAND_SUPPORT_DETECT_5TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_6", "GPIO_FDD_BAND_SUPPORT_DETECT_6TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_7", "GPIO_FDD_BAND_SUPPORT_DETECT_7TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_8", "GPIO_FDD_BAND_SUPPORT_DETECT_8TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_9", "GPIO_FDD_BAND_SUPPORT_DETECT_9TH_PIN" },
++	{ "GPIO_FDD_Band_Support_Detection_A", "GPIO_FDD_BAND_SUPPORT_DETECT_ATH_PIN" },
++	{ "GPIO_RF_PWREN_RST_PIN", "GPIO_RF_PWREN_RST_PIN" },
++	{ "GPIO_SIM1_HOT_PLUG", "GPIO_SIM1_HOT_PLUG" },
++	{ "GPIO_SIM2_HOT_PLUG", "GPIO_SIM2_HOT_PLUG" },
++	{ "GPIO_SIM2_SCLK", "GPIO_SIM2_SCLK" },
++	{ "GPIO_SIM2_SRST", "GPIO_SIM2_SRST" },
++	{ "GPIO_SIM2_SIO", "GPIO_SIM2_SIO" },
++	{ "GPIO_SIM1_SIO", "GPIO_SIM1_SIO" },
++	{ "GPIO_SIM1_SRST", "GPIO_SIM1_SRST" },
++	{ "GPIO_SIM1_SCLK", "GPIO_SIM1_SCLK" },
++};
++
++/* The modem's GPIO number for a name (gpio_usage_mapping <&pio pin md-pin>), -1 if none. */
++static int
++md_gpio(const uint8_t *name, uint32_t len, uint32_t *ap_pin)
++{
++	char n[64];
++	uint32_t k = 0;
++	for (; k < len && k + 1 < sizeof(n) && name[k]; k++)
++		n[k] = (char)name[k];
++	n[k] = 0;
++	const char *prop = n;
++	for (size_t i = 0; i < sizeof(gpio_names) / sizeof(gpio_names[0]); i++)
++		if (strcmp(n, gpio_names[i].md) == 0)
++			prop = gpio_names[i].dts;
++	uint32_t pin;
++	if (!dt_cell(NULL, "mediatek,gpio_usage_mapping", prop, 1, &pin))
++		return -1;
++	if (ap_pin)
++		*ap_pin = pin;
++	return (int)pin;
++}
++
++static vm_offset_t gpio_base, adc_base;
++
++static uint32_t
++gpio_in(uint32_t pin)
++{
++	if (!gpio_base)
++		gpio_base = ml_io_map(0x10005000, PAGE_SIZE);
++	if (!gpio_base || pin > 255)
++		return 0;
++	return (rd32(gpio_base, 0x200 + (pin / 32) * 0x10) >> (pin % 32)) & 1;   /* DIN */
++}
++
++/* SoC AUXADC channel ch, raw 12 bits, as mt6577_auxadc_read; -1 on a timeout. */
++static int
++auxadc_raw(uint32_t ch)
++{
++	if (!adc_base)
++		adc_base = ml_io_map(0x11001000, PAGE_SIZE);
++	if (!adc_base || ch > 15)
++		return -1;
++	uint32_t dat = 0x14 + 4 * ch;
++	wr32(adc_base, 0x94, rd32(adc_base, 0x94) | (1u << 14));        /* MISC: PDN_EN, power */
++	wr32(adc_base, 0x0C, 1u << ch);                                 /* CON1_CLR */
++	for (int i = 0; i < 100 && (rd32(adc_base, dat) & (1u << 12)); i++)
++		delay(100);
++	wr32(adc_base, 0x08, 1u << ch);                                 /* CON1_SET: sample */
++	delay(25);
++	for (int i = 0; i < 100 && (rd32(adc_base, 0x10) & 1); i++)     /* CON2 STA: busy */
++		delay(100);
++	for (int i = 0; i < 100; i++) {
++		uint32_t v = rd32(adc_base, dat);
++		if (v & (1u << 12))
++			return (int)(v & 0xFFF);
++		delay(100);
++	}
++	return -1;
++}
++
++static int adc_num = -1, adc_val = -1;
++
++static void
++adc_probe(void)
++{
++	static bool done;
++	uint32_t ch;
++	if (done)
++		return;
++	done = true;
++	if (dt_cell(NULL, "mediatek,md_auxadc", "io-channels", 1, &ch)) {
++		adc_num = (int)ch;
++		adc_val = auxadc_raw(ch);       /* Android reads it once at probe, too */
++	}
++	printf("A34 CELL: RPC: modem ADC channel %d, raw %d\n", adc_num, adc_val);
++}
++
++/* EINT attribute of SIM n's hot-plug interrupt (port_rpc.c get_eint_attr_val), < 0 if none. */
++static int
++sim_eint_attr(uint32_t sim, uint32_t type)
++{
++	char node[32];
++	uint32_t v;
++	snprintf(node, sizeof(node), "MD1-SIM%u-HOT-PLUG-EINT", sim);
++	switch (type) {
++	case 0: return dt_cell(node, NULL, "interrupts", 0, &v) ? (int)v : RPC_ERR_SIM_QUERY_TYPE;
++	case 1: return dt_cell(node, NULL, "debounce", 1, &v) ? (int)(v / 1000) : RPC_ERR_SIM_QUERY_TYPE;
++	case 2: case 3:
++		if (!dt_cell(node, NULL, "interrupts", 1, &v))
++			return RPC_ERR_SIM_QUERY_TYPE;
++		if (v != 1 && v != 2 && v != 4 && v != 8)
++			return -1;
++		return type == 2 ? ((v & 5) ? 1 : 0) : ((v & 3) ? 1 : 0);
++	case 4: return dt_cell(node, NULL, "sockettype", 1, &v) ? (int)v : RPC_ERR_SIM_QUERY_TYPE;
++	case 5: return dt_cell(node, NULL, "dedicated", 1, &v) ? (int)v : RPC_ERR_SIM_QUERY_TYPE;
++	case 6: return (dt_cell(node, NULL, "src-pin", 1, &v) || dt_cell(node, NULL, "src_pin", 1, &v)) ?
++		    (int)v : RPC_ERR_SIM_QUERY_TYPE;
++	default: return RPC_ERR_SIM_QUERY_TYPE;
++	}
++}
++
++static void
++gpio_adc(const uint8_t *in, uint32_t inlen, uint8_t *out, uint32_t *outlen)
++{
++	bool v2 = inlen == 425;
++	uint32_t count = v2 ? 10 : 3;
++	uint32_t req = v2 ? (uint32_t)(in[0] | in[1] << 8) : in[0];
++	uint32_t valid = v2 ? (uint32_t)(in[2] | in[3] << 8) : in[1];
++	const uint8_t *names = in + (v2 ? 4 : 2);
++	const uint8_t *pinnum = names + count * 34;
++	const uint8_t *adcname = pinnum + count * 4;
++	uint32_t adcchnum = le32(adcname + 33), meas = le32(adcname + 37);
++	uint32_t *o_num = (uint32_t *)out, *o_val = o_num + count, *o_adc = o_val + count;
++
++	*outlen = (2 * count + 2) * 4;
++	memset(out, 0x0F, *outlen);             /* 0xF for failure, as Android */
++	for (uint32_t i = 0; i < count; i++) {
++		if (!(valid & (1u << i)))
++			continue;
++		uint32_t ap_pin;
++		if ((req & 3) == 3 || (req & 1)) {
++			int md = md_gpio(names + 34 * i, 34, &ap_pin);
++			if (md >= 0) {
++				o_num[i] = (uint32_t)md;
++				if ((req & 3) == 3)
++					o_val[i] = gpio_in(ap_pin);
++			}
++		} else if (req & 2) {
++			o_val[i] = gpio_in(le32(pinnum + 4 * i));
++		}
++	}
++	if (req & 0x30) {
++		adc_probe();
++		if ((req & 0x30) == 0x30 || (req & 0x10)) {
++			if (adc_num >= 0)
++				o_adc[0] = (uint32_t)adc_num;
++		}
++		if ((req & 0x30) == 0x30 ? adc_num >= 0 : (req & 0x20) != 0) {
++			o_adc[1] = 0;
++			for (uint32_t k = 0; k < meas && k < 64; k++)
++				o_adc[1] += (uint32_t)adc_val;
++		}
++		(void)adcchnum;
++	}
++}
++
 +static void
 +rpc_rx(const uint8_t *pkt, uint32_t len)
 +{
 +	struct ccci_hdr h;
-+	uint8_t out[64];
-+	uint32_t op, n = 0, v;
++	const uint8_t *arg[6];
++	uint32_t alen[6], argc, op, off = 24;
 +
 +	if (len < 24)
 +		return;
 +	memcpy(&h, pkt, 16);
 +	op = le32(pkt + 16);
-+	v = op | 0xFFFF0000u;
-+	memcpy(out, &v, 4);
-+	if (op == 0x4012) {                     /* TRNG: {0, random} */
-+		uint32_t rnd = 0, two = 2, four = 4, zero = 0;
-+		read_random(&rnd, sizeof(rnd));
-+		memcpy(out + 4, &two, 4);
-+		memcpy(out + 8, &four, 4);
-+		memcpy(out + 12, &zero, 4);
-+		memcpy(out + 16, &four, 4);
-+		memcpy(out + 20, &rnd, 4);
-+		n = 24;
-+	} else {                                /* not served: FS_NO_OP (-1) */
-+		uint32_t one = 1, four = 4, neg = 0xFFFFFFFFu;
-+		memcpy(out + 4, &one, 4);
-+		memcpy(out + 8, &four, 4);
-+		memcpy(out + 12, &neg, 4);
-+		n = 16;
++	argc = le32(pkt + 20);
++	if (argc > 6)
++		argc = 0;
++	for (uint32_t i = 0; i < argc; i++) {
++		if (off + 4 > len)
++			break;
++		alen[i] = le32(pkt + off);
++		arg[i] = pkt + off + 4;
++		if (off + 4 + alen[i] > len) {
++			argc = i;
++			break;
++		}
++		off += 4 + ((alen[i] + 3) & ~3u);
 +	}
-+	printf("A34 CELL: RPC op 0x%x %s\n", op, op == 0x4012 ? "answered" : "not served (-1)");
-+	h.data1 = n + 16;
-+	(void)a34_ccci_send(CH_RPC_TX, &h, out, n);
++	ro_init(op);
++	switch (op) {
++	case 0x4002: {                                  /* GET_GPIO_NUM */
++		int n = argc >= 2 && alen[0] ? md_gpio(arg[0], alen[0], NULL) : -1;
++		int32_t r = argc < 2 ? RPC_FS_PARAM_ERROR : n < 0 ? RPC_FS_FUNC_FAIL : n;
++		ro_u32((uint32_t)r);
++		ro_u32((uint32_t)r);
++		char nm[40];
++		uint32_t k = 0;
++		for (; argc && k < alen[0] && k + 1 < sizeof(nm) && arg[0][k]; k++)
++			nm[k] = (char)arg[0][k];
++		nm[k] = 0;
++		printf("A34 CELL: RPC GET_GPIO_NUM %s -> %d\n", nm, r);
++		break;
++	}
++	case 0x4005: {                                  /* GET_EINT_ATTR */
++		int32_t r = RPC_ERR_SIM_QUERY_STR;
++		uint32_t type = argc >= 3 && alen[2] >= 4 ? le32(arg[2]) : 0xFF;
++		char nm[40];
++		uint32_t k = 0;
++		for (; argc && k < alen[0] && k + 1 < sizeof(nm) && arg[0][k]; k++)
++			nm[k] = (char)arg[0][k];
++		nm[k] = 0;
++		if (argc < 3) {
++			r = RPC_FS_PARAM_ERROR;
++		} else if (type >= 7) {
++			r = RPC_ERR_SIM_QUERY_TYPE;
++		} else {
++			for (uint32_t sim = 1; sim <= 4; sim++) {
++				char a[32], b[32];
++				snprintf(a, sizeof(a), "MD1_SIM%u_HOT_PLUG_EINT", sim);
++				snprintf(b, sizeof(b), "MD1-SIM%u-HOT-PLUG-EINT", sim);
++				if (strcmp(nm, a) == 0 || strcmp(nm, b) == 0) {
++					int v = sim_eint_attr(sim, type);
++					r = v >= 0 ? 0 : RPC_ERR_SIM_QUERY_STR;
++					if (v >= 0) {
++						ro_u32(0);
++						ro_u32((uint32_t)v);
++						printf("A34 CELL: RPC GET_EINT_ATTR %s type %u -> %d\n", nm, type, v);
++					}
++					break;
++				}
++			}
++		}
++		if (r != 0) {
++			ro_u32((uint32_t)r);
++			ro_u32((uint32_t)r);
++			printf("A34 CELL: RPC GET_EINT_ATTR %s type %u -> error %d\n", nm, type, r);
++		}
++		break;
++	}
++	case 0x400E: {                                  /* DTSI_QUERY: md_attr_node */
++		uint8_t o[68];
++		memset(o, 0x0F, sizeof(o));
++		if (argc != 1 || alen[0] < 3) {
++			ro_u32((uint32_t)RPC_FS_PARAM_ERROR);
++			ro_u32((uint32_t)RPC_FS_PARAM_ERROR);
++			break;
++		}
++		char nm[66];
++		uint32_t k = 0;
++		for (; 2 + k < alen[0] && k + 1 < sizeof(nm) && arg[0][2 + k]; k++)
++			nm[k] = (char)arg[0][2 + k];
++		nm[k] = 0;
++		uint32_t v;
++		if (arg[0][0] == 1 && dt_cell(NULL, "mediatek,md_attr_node", nm, 0, &v))
++			memcpy(o, &v, 4);
++		ro_u32(0);
++		ro_arg(o, sizeof(o));
++		printf("A34 CELL: RPC DTSI_QUERY %s -> 0x%x\n", nm, le32(o));
++		break;
++	}
++	case 0x4009: {                                  /* GET_GPIO_ADC */
++		uint32_t o32[24];
++		uint8_t *o = (uint8_t *)o32;
++		uint32_t olen = 0;
++		if (argc != 1 || (alen[0] != 157 && alen[0] != 425)) {
++			ro_u32((uint32_t)RPC_FS_PARAM_ERROR);
++			ro_u32((uint32_t)RPC_FS_PARAM_ERROR);
++			printf("A34 CELL: RPC GET_GPIO_ADC: input of %u bytes not understood\n", argc ? alen[0] : 0);
++			break;
++		}
++		gpio_adc(arg[0], alen[0], o, &olen);
++		ro_u32(0);
++		ro_arg(o, olen);
++		printf("A34 CELL: RPC GET_GPIO_ADC (v%d, request 0x%x) answered\n", alen[0] == 425 ? 2 : 1, arg[0][0]);
++		break;
++	}
++	case 0x4012: {                                  /* TRNG */
++		uint32_t rnd = 0;
++		read_random(&rnd, sizeof(rnd));
++		ro_u32(0);
++		ro_u32(rnd);
++		printf("A34 CELL: RPC TRNG answered\n");
++		break;
++	}
++	default:                                        /* not served: FS_NO_OP (-1), as Android */
++		ro_u32(0xFFFFFFFFu);
++		printf("A34 CELL: RPC op 0x%x not served (-1)\n", op);
++		break;
++	}
++	memcpy(ro.buf + 4, &ro.argc, 4);
++	h.data1 = ro.len + 16;
++	(void)a34_ccci_send(CH_RPC_TX, &h, ro.buf, ro.len);
++}
++
++/* The modem's exception overview at the start of RAW_MDSS_DBG (mdee_dumper_v5.h ex_overview_t,
++ * gen97): offending core, exception class, assert file/line or fatal codes. Firmware
++ * diagnostics only. */
++static void
++md_exception_report(void)
++{
++	vm_offset_t b = rva(R_MDSS_DBG);
++	uint8_t ov[448];
++
++	if (!b || rg[R_MDSS_DBG].size < sizeof(ov)) {
++		printf("A34 CELL: modem exception: MDSS_DBG not mapped\n");
++		return;
++	}
++	dm_get(ov, b, 0, sizeof(ov));
++	uint32_t verno = le32(ov), cores = le32(ov + 4);
++	char offender[64] = "";
++	for (uint32_t c = 0; c < 12; c++) {
++		const uint8_t *r = ov + 8 + 12 * c;
++		if (r[11]) {
++			size_t o = strlen(offender);
++			for (int k = 0; k < 11 && r[k] && o + 2 < sizeof(offender); k++)
++				offender[o++] = (r[k] >= 0x20 && r[k] < 0x7f) ? (char)r[k] : '.';
++			offender[o++] = ' ';
++			offender[o] = 0;
++		}
++	}
++	const uint8_t *ex = ov + 152;
++	uint32_t ex_type = (uint32_t)(ex[0] | ex[1] << 8), content = ex[3];
++	const uint8_t *in = ex + 8;
++	char file[257];
++	uint32_t k = 0;
++	for (; k < 256 && in[k]; k++)
++		file[k] = (in[k] >= 0x20 && in[k] < 0x7f) ? (char)in[k] : '.';
++	file[k] = 0;
++	printf("A34 CELL: modem exception: overview v%u, %u cores, offender %s, type 0x%x, class %u\n",
++	    verno, cores, offender[0] ? offender : "?", ex_type, content);
++	printf("A34 CELL: modem exception: assert %s line %u (p1 0x%x p2 0x%x p3 0x%x lr 0x%x)\n",
++	    file[0] ? file : "(none)", le32(in + 256), le32(in + 260), le32(in + 264), le32(in + 268),
++	    le32(in + 272));
++	printf("A34 CELL: modem exception: as fatal: code1 0x%x code2 0x%x code3 0x%x\n", le32(in),
++	    le32(in + 4), le32(in + 8));
 +}
 +
 +static void
@@ -829,7 +1203,8 @@ index 0000000..fdd2f38
 +	(void)wr;
 +	uint64_t start = mach_absolute_time(), last_report = start, hz;
 +	uint32_t exc_seen = 0;
-+	bool timeout_said = false;
++	uint64_t exc_at = 0;
++	bool timeout_said = false, exc_said = false;
 +
 +	nanoseconds_to_absolutetime(NSEC_PER_SEC, &hz);
 +	for (;;) {
@@ -841,12 +1216,18 @@ index 0000000..fdd2f38
 +			if ((ch >> 16) & ~exc_seen) {
 +				printf("A34 CELL: CCIF exception/peer bits 0x%x from the modem\n", ch >> 16);
 +				exc_seen |= ch >> 16;
++				if ((exc_seen & 1) && !exc_at)
++					exc_at = mach_absolute_time();
 +			}
 +		}
 +		for (int i = 0; i < 16; i++)
 +			if (q[i].rxlen)
 +				ring_rx(i);
 +		uint64_t now = mach_absolute_time();
++		if (exc_at && !exc_said && ((exc_seen & 2) || now - exc_at > 2 * hz)) {
++			exc_said = true;
++			md_exception_report();
++		}
 +		if (state == ST_WAIT_HS2 && !timeout_said && now - start > 30 * hz) {
 +			printf("A34 CELL: no HS2 within 30 s\n");
 +			a34_cellfs_report();
@@ -1215,10 +1596,10 @@ index 0000000..c4d51a4
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..e870091
+index 0000000..22c93f7
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,973 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -1364,6 +1745,8 @@ index 0000000..e870091
 +#define FDT_END         9
 +
 +static int ac_lk_md = -1;       /* -1 unknown, 0 not loaded, 1 loaded */
++static uint8_t *ac_fdt;         /* LK's device tree, a copy kept for the modem's RPC queries */
++static uint32_t ac_fdt_struct, ac_fdt_strings, ac_fdt_struct_size, ac_fdt_strings_size;
 +static uint64_t ac_xnu_base, ac_xnu_size;       /* XNU's memory: ADT /chosen dram-base, dram-size */
 +static uint8_t *ac_tags;        /* LK's tag table, kept for a34_ccci.c (0951) */
 +static uint32_t ac_tags_size;
@@ -1597,13 +1980,95 @@ index 0000000..e870091
 +			break;  /* FDT_END or garbage */
 +		}
 +	}
-+	kfree_data(f, total);
++	ac_fdt = f;                     /* kept (read only): the modem's RPC answers read it (a34_ccci.c) */
++	ac_fdt_struct = off_struct;
++	ac_fdt_strings = off_strings;
++	ac_fdt_struct_size = size_struct;
++	ac_fdt_strings_size = size_strings;
 +	printf("A34 CELL: LK modem regions in reserved-memory: %d; all reserved regions: %u, overlapping XNU's 0x%llx-0x%llx: %u\n",
 +	    nregions, ac_resv, ac_xnu_base, ac_xnu_base + ac_xnu_size, ac_resv_hits);
 +	AC_NOTE("resv=%u overlap=%u", ac_resv, ac_resv_hits);
 +	ac_lk_tags();
 +	AC_NOTE("lk=%s mdregions=%d", ac_lk_md == 1 ? "loaded" : ac_lk_md == 0 ? "notloaded" : "noinfo",
 +	    nregions);
++}
++
++/*
++ * A34 (0950): a property of LK's device tree (the kept copy, read only): the first node whose
++ * name is node_name (any depth) or, if node_name is NULL, whose "compatible" is compat. For
++ * the modem's RPC answers (GPIO and EINT tables, md_attr_node, md-auxadc), as Android's
++ * port_rpc.c reads them from the same tree.
++ */
++bool a34_cell_fdt_prop(const char *node_name, const char *compat, const char *prop,
++    const uint8_t **val, uint32_t *len);
++
++static const uint8_t *
++fdt_props(const uint8_t *s, const uint8_t *end, const char *prop, uint32_t *len)
++{
++	/* direct properties of the node whose body starts at s (they come before subnodes) */
++	while (s + 4 <= end) {
++		uint32_t tok = be32(s);
++		if (tok == FDT_NOP) {
++			s += 4;
++			continue;
++		}
++		if (tok != FDT_PROP || s + 12 > end)
++			return NULL;
++		uint32_t l = be32(s + 4), no = be32(s + 8);
++		if (no < ac_fdt_strings_size && strcmp((const char *)ac_fdt + ac_fdt_strings + no, prop) == 0) {
++			*len = l;
++			return s + 12;
++		}
++		s += 12 + ((l + 3) & ~3u);
++	}
++	return NULL;
++}
++
++bool
++a34_cell_fdt_prop(const char *node_name, const char *compat, const char *prop,
++    const uint8_t **val, uint32_t *len)
++{
++	if (!ac_fdt)
++		return false;
++	const uint8_t *s = ac_fdt + ac_fdt_struct, *end = s + ac_fdt_struct_size;
++	while (s + 4 <= end) {
++		uint32_t tok = be32(s);
++		s += 4;
++		if (tok == FDT_BEGIN_NODE) {
++			const char *nm = (const char *)s;
++			size_t l = 0;
++			while (s + l < end && nm[l])
++				l++;
++			s += (l + 1 + 3) & ~(size_t)3;
++			bool match = false;
++			if (node_name) {
++				match = strcmp(nm, node_name) == 0;
++			} else {
++				uint32_t cl = 0;
++				const uint8_t *c = fdt_props(s, end, "compatible", &cl);
++				for (uint32_t o = 0; c && o < cl; o += (uint32_t)strlen((const char *)c + o) + 1)
++					if (strcmp((const char *)c + o, compat) == 0)
++						match = true;
++			}
++			if (match) {
++				const uint8_t *v = fdt_props(s, end, prop, len);
++				if (v) {
++					*val = v;
++					return true;
++				}
++				return false;
++			}
++		} else if (tok == FDT_PROP) {
++			if (s + 8 > end)
++				return false;
++			s += 8 + ((be32(s) + 3) & ~3u);
++		} else if (tok == FDT_END_NODE || tok == FDT_NOP) {
++			continue;
++		} else {
++			return false;
++		}
++	}
++	return false;
 +}
 +
 +/* ---- 2..4. power, clocks, boot status ---- */
@@ -2110,10 +2575,10 @@ index 0000000..e870091
 +#endif
 diff --git a/bsd/dev/a34_cellfs.c b/bsd/dev/a34_cellfs.c
 new file mode 100644
-index 0000000..b952e63
+index 0000000..566983c
 --- /dev/null
 +++ b/bsd/dev/a34_cellfs.c
-@@ -0,0 +1,1256 @@
+@@ -0,0 +1,1268 @@
 +/*
 + * A34 (0951): the modem's file server, in the kernel and read only.
 + *
@@ -2976,23 +3441,35 @@ index 0000000..b952e63
 +			break;
 +		}
 +		r = conv_path(a.p[0], a.len[0], &p);
++		if (!r && op == 0x1018 && (arg_u32(&a, 1) & ~0x1cu))
++			r = E_PARAM;            /* Android's XDELETE takes only the 0x04/0x08/0x10 bits */
 +		if (!r) {
-+			int i = ov_new(p.key);
-+			if (i < 0)
-+				r = E_TOO_MANY;
-+			else if (op == 0x1007) {
-+				ov[i].isdir = true;
++			struct node n;
++			bool exists = resolve(&p, &n) == 0;
++			if (op == 0x1007) {
++				/* mkdir: as Android's (EEXIST is a general failure there) */
++				int i = exists ? -1 : ov_new(p.key);
++				if (exists)
++					r = E_GENERAL;
++				else if (i < 0)
++					r = E_TOO_MANY;
++				else
++					ov[i].isdir = true;
++			} else if (!exists) {
++				r = E_NOT_FOUND;        /* unlink/rmdir of nothing: ENOENT, as Android's */
 +			} else {
-+				struct node n;
-+				ov[i].deleted = false;
-+				ov_drop_data(&ov[i]);
-+				ov[i].deleted = true;
-+				(void)n;
++				int i = ov_new(p.key);
++				if (i < 0) {
++					r = E_TOO_MANY;
++				} else {
++					ov_drop_data(&ov[i]);
++					ov[i].deleted = true;
++				}
 +			}
 +		}
 +		if (verbose_left) {
 +			verbose_left--;
-+			printf("A34 CELL FS: %s %s (in RAM only)\n", op == 0x1007 ? "mkdir" : "delete", p.key);
++			printf("A34 CELL FS: %s %s -> %d (in RAM only)\n", op == 0x1007 ? "mkdir" : "delete", p.key, r);
 +		}
 +		rep_s32(r);
 +		break;
