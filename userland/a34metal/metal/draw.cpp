@@ -659,6 +659,24 @@ glyph_read(struct rwa_texture *t, unsigned level, unsigned slice, unsigned &w, u
 	return all;
 }
 
+/* the targets the probed draws of an offscreen mask wrote (a colour matrix of attachment 1, Tc4p): a draw that then
+ * reads one of them is probed whatever its pipeline -- where the mask made of the glyphs is used */
+const struct rwa_texture *glyph_masks[16];
+unsigned glyph_mask_count;
+
+bool
+glyph_reads_mask(const struct rwm_draw *d)
+{
+	for (unsigned i = 0; i < d->texture_count && i < RWM_MAX_BUFFERS; i++) {
+		for (unsigned k = 0; d->textures[i] != nullptr && k < glyph_mask_count; k++) {
+			if (glyph_masks[k] == d->textures[i]) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool
 glyph_before(const struct rwm_draw *d, glyph_probe &p)
 {
@@ -667,8 +685,18 @@ glyph_before(const struct rwm_draw *d, glyph_probe &p)
 		return false;
 	}
 	p.label = d->label[0] ? (strncmp(d->label, "draw.", 5) == 0 ? d->label + 5 : d->label) : "(none)";
-	if (!glyph_wanted(p.label)) {
+	if (!glyph_wanted(p.label) && !glyph_reads_mask(d)) {
 		return false;
+	}
+	if (strstr(p.label, "_Tc4p") != nullptr && d->color[0] != nullptr) {
+		bool known = false;
+
+		for (unsigned k = 0; k < glyph_mask_count; k++) {
+			known = known || glyph_masks[k] == d->color[0];
+		}
+		if (!known && glyph_mask_count < sizeof(glyph_masks) / sizeof(glyph_masks[0])) {
+			glyph_masks[glyph_mask_count++] = d->color[0];
+		}
 	}
 
 	const uint64_t now = rwm_ns();
