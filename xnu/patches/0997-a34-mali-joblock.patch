@@ -1,0 +1,195 @@
+diff --git a/bsd/dev/a34_mali.c b/bsd/dev/a34_mali.c
+index 9c29069..f3146a8 100644
+--- a/bsd/dev/a34_mali.c
++++ b/bsd/dev/a34_mali.c
+@@ -98,6 +98,13 @@ struct a34_mali_job {
+ 	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
+ 	uint32_t pad;
+ 	uint64_t started;               /* out, A34 (0992): mach time of JS_COMMAND_START */
++	/*
++	 * in, A34 (0997): if not NULL, called once the job is started and again
++	 * when it is seen done (A34Mali.cpp: gA34MaliLock let go of while the GPU
++	 * works, so buffers are made, mapped and closed meanwhile).
++	 */
++	void (*wait_begin)(void);
++	void (*wait_end)(void);
+ };
+ bool a34_mali_ready(void);
+ bool a34_mali_param(uint32_t param, uint64_t *value);
+@@ -1618,8 +1625,14 @@ a34_mali_submit(struct a34_mali_job *job)
+ 	start = mach_absolute_time();
+ 	job->started = start;           /* A34 (0992) */
+ 	am_wr(am_gpu, base + JS_COMMAND_NEXT, JS_COMMAND_START);
++	if (job->wait_begin != NULL) {
++		job->wait_begin();      /* A34 (0997) */
++	}
+ 	raw = am_wait_job(want, &mmu);
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &job->ns);
++	if (job->wait_end != NULL) {
++		job->wait_end();
++	}
+ 	if (counted) {
+ 		am_wr(am_gpu, GPU_CMD, GPU_CMD_CYCLE_COUNT_STOP);
+ 	}
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index 85f1c9b..1a84c11 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -173,6 +173,13 @@ struct a34_mali_job {
+ 	uint32_t flush_id;              /* in, A34 (0989): GPU_LATEST_FLUSH at its SUBMIT (a34_mali_flush_id()) */
+ 	uint32_t pad;
+ 	uint64_t started;               /* out, A34 (0992): mach time of JS_COMMAND_START */
++	/*
++	 * in, A34 (0997): if not NULL, called once the job is started and again
++	 * when it is seen done (A34Mali.cpp: gA34MaliLock let go of while the GPU
++	 * works, so buffers are made, mapped and closed meanwhile).
++	 */
++	void (*wait_begin)(void);
++	void (*wait_end)(void);
+ };
+ 
+ extern "C" {
+@@ -477,6 +484,22 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_KEEP_BYTES          (96ull << 20)           /* ... or when the kept ones of a client are more than this */
+ 
+ static IOLock *gA34MaliLock;
++/*
++ * A34 (0997): who runs a job holds gA34MaliJobLock for the whole of it (taken
++ * before gA34MaliLock), and lets gA34MaliLock go while the GPU works
++ * (a34_mali_job wait_begin/wait_end): a buffer is made, mapped, imported or
++ * closed meanwhile instead of after the job (boot 0994: maps of new buffers
++ * 2-6 ms on average, up to 46 ms, CREATE_BO ~1 ms, nearly all of it waiting
++ * for the running job's lock while the GPU was 75 % busy). Nothing done
++ * meanwhile touches the running job: its buffers stay mapped (GEM_CLOSE waits
++ * for the queued jobs that name a buffer; a closing client for its job), new
++ * pages go into the tables at addresses no job has used (the address space
++ * is flushed before the next job, am_pt_dirty), and only the job's thread
++ * touches the GPU's registers. Boot-arg a34malijoblock=0: the lock held for
++ * the whole job, as before.
++ */
++static IOLock *gA34MaliJobLock;
++static uint32_t gA34MaliJobLockOn = 1;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+ static uint64_t gA34MaliWiredMax = 1024ull << 20;
+ static uint64_t gA34MaliHeapBacked = 64ull << 20;
+@@ -895,6 +918,10 @@ RedwoodMaliStart(void)
+ 	if (gA34MaliLock == NULL) {
+ 		gA34MaliLock = IOLockAlloc();
+ 	}
++	(void)PE_parse_boot_argn("a34malijoblock", &gA34MaliJobLockOn, sizeof(gA34MaliJobLockOn));     /* A34 (0997) */
++	if (gA34MaliJobLock == NULL && gA34MaliJobLockOn != 0) {
++		gA34MaliJobLock = IOLockAlloc();
++	}
+ 	mb = 0;
+ 	if (PE_parse_boot_argn("a34maliheap", &mb, sizeof(mb)) && mb >= 2 && mb <= 1024) {
+ 		gA34MaliHeapBacked = (uint64_t)mb << 20;
+@@ -1508,6 +1535,19 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 	}
+ }
+ 
++/* A34 (0997): a34_mali_job's wait hooks: gA34MaliLock let go of while the GPU runs the job (the caller holds gA34MaliJobLock) */
++static void
++a34_mali_wait_begin(void)
++{
++	IOLockUnlock(gA34MaliLock);
++}
++
++static void
++a34_mali_wait_end(void)
++{
++	IOLockLock(gA34MaliLock);
++}
++
+ /* A34 (0992), with the lock held: one ring record as an "A34 MALI JOB" line, times from t0. */
+ static void
+ a34_job_say(const struct a34_jobrec *r, uint64_t t0, const char *why)
+@@ -1698,6 +1738,10 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ 			gA34MaliWinIdle += subAt - ready;       /* the GPU idle with this job ready */
+ 		}
+ 	}
++	if (gA34MaliJobLock != NULL) {
++		job->wait_begin = a34_mali_wait_begin;  /* A34 (0997): every caller of runChain() holds gA34MaliJobLock */
++		job->wait_end = a34_mali_wait_end;
++	}
+ 	done = a34_mali_submit(job);
+ 	t0 = mach_absolute_time();
+ 	gpuWindow(job, t0);                     /* A34 (0991) */
+@@ -1765,6 +1809,9 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ void
+ RedwoodMaliUserClient::runQueued(struct a34_qjob *j)
+ {
++	if (gA34MaliJobLock != NULL) {
++		IOLockLock(gA34MaliJobLock);    /* A34 (0997) */
++	}
+ 	IOLockLock(gA34MaliLock);       /* (not a34_gpu_lock(): the worker is who those go before) */
+ 	if (fBos != NULL && fOpen && !fClosed) {
+ 		uint64_t t0 = mach_absolute_time();
+@@ -1784,6 +1831,9 @@ RedwoodMaliUserClient::runQueued(struct a34_qjob *j)
+ 		j->failed = true;
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
++	if (gA34MaliJobLock != NULL) {
++		IOLockUnlock(gA34MaliJobLock);
++	}
+ }
+ 
+ /*
+@@ -2578,6 +2628,9 @@ RedwoodMaliUserClient::releaseAll(void)
+ 	bool was = false;
+ 
+ 	dropQueued();                   /* A34 (0919): no job of this client is queued or running after this */
++	if (gA34MaliJobLock != NULL) {
++		IOLockLock(gA34MaliJobLock);    /* A34 (0997): nor a synchronous SUBMIT of another of its threads */
++	}
+ 	a34_gpu_lock();
+ 	if (fOpen && !fClosed) {
+ 		was = true;
+@@ -2593,6 +2646,9 @@ RedwoodMaliUserClient::releaseAll(void)
+ 		clients = --gA34MaliClients;
+ 	}
+ 	IOLockUnlock(gA34MaliLock);
++	if (gA34MaliJobLock != NULL) {
++		IOLockUnlock(gA34MaliJobLock);  /* A34 (0997) */
++	}
+ 	if (was) {
+ 		for (uint32_t i = 0; i < A34_BOS; i++) {
+ 			if (a34_bo_used(&fBos[i])) {
+@@ -3407,12 +3463,28 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		} else if (selector == kA34PanfrostSubmit && fLazyHeaps != 0 && !heapGrow()) {
+ 			ret = kIOReturnNoMemory;        /* A34 (0936): its tiler heaps first, without the lock held */
+ 		} else {
++			/*
++			 * A34 (0997): a synchronous SUBMIT runs a job, and a synchronous
++			 * WAIT_BO waits for the one running: both hold gA34MaliJobLock,
++			 * taken first (the lock order: gA34MaliJobLock, gA34MaliLock).
++			 */
++			bool job = gA34MaliJobLock != NULL && (selector == kA34PanfrostSubmit || selector == kA34PanfrostWaitBO);
++
+ 			if (selector == kA34PanfrostWaitBO && r.wait.timeout_ns <= 0) {
+ 				/* only a look: a job of another thread or program still running is "busy" */
++				if (job && !IOLockTryLock(gA34MaliJobLock)) {
++					return kIOReturnBusy;
++				}
+ 				if (!IOLockTryLock(gA34MaliLock)) {
++					if (job) {
++						IOLockUnlock(gA34MaliJobLock);
++					}
+ 					return kIOReturnBusy;
+ 				}
+ 			} else {
++				if (job) {
++					IOLockLock(gA34MaliJobLock);
++				}
+ 				a34_gpu_lock();
+ 			}
+ 			ret = request(selector, &r);
+@@ -3421,6 +3493,9 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				    fErrors == A34_LOGGED_ERRORS ? " (no more errors logged for this client)" : "");
+ 			}
+ 			IOLockUnlock(gA34MaliLock);
++			if (job) {
++				IOLockUnlock(gA34MaliJobLock);
++			}
+ 		}
+ 		if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+ 			outsize = args->structureOutputSize < sizeof(r) ? args->structureOutputSize : (uint32_t)sizeof(r);
