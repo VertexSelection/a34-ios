@@ -690,6 +690,32 @@ rw_function_constants(id function, struct rwa_constant *out, unsigned max)
 	return n;
 }
 
+#include "camtl.inc"
+
+/* A34: which programs get the device besides backboardd (see -initWithAcceleratorPort:) */
+static BOOL
+rw_client_allowed(void)
+{
+	const char *me = getprogname();
+	FILE *list;
+	char line[128];
+	BOOL named = NO;
+
+	if (rwm_boot_arg("a34metalall=1") || strcmp(me, "metal-probe") == 0 || strcmp(me, "metal_drv_test") == 0 ||
+	    strncmp(me, "a34metal-", 9) == 0) {
+		return YES;
+	}
+	if ((list = fopen("/a34/A34Metal.clients", "r")) == NULL) {
+		return NO;
+	}
+	while (!named && fgets(line, sizeof(line), list) != NULL) {
+		line[strcspn(line, " \t\r\n")] = '\0';
+		named = line[0] != '#' && (strcmp(line, "*") == 0 || strcmp(line, me) == 0);
+	}
+	fclose(list);
+	return named;
+}
+
 /* whether the lookup below may settle for a pipeline that differs by a blend mode: only once
  * QuartzCore's own shader, specialized with the pipeline's constants, has failed to build
  * (newRenderPipelineStateWithDescriptor:error: tries without it first) */
@@ -903,11 +929,26 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		rw_print("no device for backboardd (CoreAnimation stays on OpenGL ES; camtl=1 to give it Metal)\n");
 		return nil;
 	}
+	/*
+	 * A34: and with the kernel naming this plug-in (a34metal=1), every other program that asks
+	 * Metal would load it. Until the driver has been through more than its tests, it serves:
+	 * its tests (metal-probe, metal_drv_test, a34metal-*), backboardd with camtl=1, programs named
+	 * one a line in /a34/A34Metal.clients, and everybody with boot-arg a34metalall=1.
+	 */
+	if (strcmp(getprogname(), "backboardd") != 0 && !rw_client_allowed()) {
+		rw_print("no device for this program (not a test, not in /a34/A34Metal.clients; a34metalall=1 for all)\n");
+		return nil;
+	}
 	if (strcmp(getprogname(), "chronod") == 0 || strstr(getprogname(), "Widget") != NULL) {
 		rw_print("no device for %s (RenderBox draws with the processor then)\n", getprogname());
 		return nil;
 	}
 	ensure_spi([self class]);
+	/* A34: CoreAnimation's Metal renderer (camtl.inc), only where it is asked for */
+	if ((strcmp(getprogname(), "backboardd") == 0 && rwm_boot_arg("camtl=1")) ||
+	    (getenv("A34METAL_SPECIALIZE") != NULL && strcmp(getenv("A34METAL_SPECIALIZE"), "1") == 0)) {
+		rw_camtl_install();
+	}
 
 	self = [super init];
 	if (self == nil) {

@@ -93,6 +93,31 @@ What a good run puts in the kernel log (stdout of both jobs goes to the console)
   or `signal N` at the end. Boot 31 and 54: silent for 30-40 s inside or right after
   `MTLCreateSystemDefaultDevice()`; the backtraces say where.
 
+## CoreAnimation on Metal (camtl=1): the first boot
+
+What it takes, ported from HackiOS (`camtl.inc`, from their `inject.c`): CoreAnimation specializes
+QuartzCore's uber shaders with function constants, which Metal would send to Apple's compiler
+service; the plug-in, in backboardd with `camtl=1`, answers the plain function and keeps the
+values on it for the compiler library (`rwa_render_constants`). Nothing else of their `camtl`
+is needed here: our root has QuartzCore's own `default.metallib`, and the plug-in itself keeps
+backboardd off Metal without `camtl=1`. On the host (Mesa 26.3, AIR frontend to validated NIR):
+QuartzCore's `default.metallib` 137 of 141 functions; the 4 others are `tile_downsample_*`
+(imageblocks), which CoreAnimation asks for only of a device with tile shaders (Apple4 and up;
+this one claims Apple3). RenderBox's 19 of 47 (struct-valued instructions: later). Whether
+panfrost compiles them for the G68 is the phone's to say, first with
+`metal_drv_test --bundle --draw-all /System/Library/Frameworks/QuartzCore.framework/default.metallib`.
+
+The boot: the artifact installed as above (`A34Metal.bundle`, `a34/`), boot-args as today plus
+`a34metal=1 camtl=1 rwm_finish=1`, and `REDWOOD_DRM_ASYNC=0` in `/a34/backboardd.env`
+(HackiOS's known-good was synchronous). a34gl stays installed and injected: if CoreAnimation
+cannot make its Metal context it falls back to OpenGL ES; if a pipeline fails, backboardd ends
+(HackiOS) and the way back is a boot without `camtl=1`. The plug-in's lines are in the kernel log
+as `|backboardd| redwoodmetal[backboardd N]: ...` (the devnull tee); `camtl=1: ... hooks` says
+the specialization is in place, every pipeline it cannot build is named. With `a34metal=1` the
+device is served to backboardd (`camtl=1`), the tests, programs named in
+`/a34/A34Metal.clients`, and everyone only with `a34metalall=1`; never to SpringBoard (`sbmtl=1`)
+or chronod/widgets.
+
 ## Credits and licence
 
 HackiOS (OOSEX GANG) wrote everything here but `metal-probe.m` and `a34_watch.c`, and the

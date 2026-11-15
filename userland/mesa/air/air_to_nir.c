@@ -162,7 +162,9 @@ scalar_known(nir_def *d, nir_const_value *out, unsigned depth)
          values[i][k] = v;
       srcs[i] = values[i];
    }
-   nir_const_value dest[NIR_MAX_VEC_COMPONENTS];
+   /* (A34, Mesa 26: zeroed -- an 8- or 16-bit result fills only its low bits, and nir_validate
+    * wants a load_const's unused bits zero) */
+   nir_const_value dest[NIR_MAX_VEC_COMPONENTS] = { 0 };
    /* the size an unsized type has here, as nir_opt_constant_folding takes it: the result's,
     * or for a comparison (a sized result) its first unsized source's */
    unsigned bit_size = 0;
@@ -174,7 +176,8 @@ scalar_known(nir_def *d, nir_const_value *out, unsigned depth)
    if (!bit_size)
       bit_size = 32;
    nir_eval_const_opcode(alu->op, dest, NULL, 1, bit_size, srcs, 0);
-   *out = dest[0];
+   /* canonical in the def's own size (a comparison's result is a bool of d->bit_size) */
+   *out = nir_const_value_for_raw_uint(nir_const_value_as_uint(dest[0], d->bit_size), d->bit_size);
    return true;
 }
 

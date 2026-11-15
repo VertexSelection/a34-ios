@@ -23,6 +23,10 @@
  *                          clears and draws a34_tri_vs/a34_tri_fs's red triangle, checked at
  *                          places inside and outside it
  *
+ *   metal-probe --time [N]   then N times (default 30) a full-screen pass (1125x2436 BGRA IOSurface:
+ *                          clear + the triangle), each committed and waited for: milliseconds
+ *                          a pass, min / average / max, and the same for a clear alone (uses LIB)
+ *
  * exit 0 PASS, 1 no device, 2 a device of another class, 3 the device is not as Metal wants it,
  * 4 a --compute or --draw check failed.
  */
@@ -41,6 +45,7 @@
 
 #include "a34metal_iokit.h"
 #include <IOSurface/IOSurfaceRef.h>
+#include <mach/mach_time.h>
 
 #define DEFAULT_TESTS "/a34/a34metal-tests.metallib"
 
@@ -421,6 +426,97 @@ draw_test(id<MTLDevice> device, const char *path)
 	return ok;
 }
 
+/* ---- what a full-screen pass costs, end to end (commit to completion) ---- */
+
+static double
+ms_between(uint64_t a, uint64_t b)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return (double)(b - a) * tb.numer / tb.denom / 1e6;
+}
+
+static bool
+time_test(id<MTLDevice> device, const char *path, unsigned repeats)
+{
+	const unsigned width = 1125, height = 2436, bpr = 4544;    /* the panel; rows a multiple of 64 */
+	NSDictionary *properties = @{
+		(id)kIOSurfaceWidth: @(width), (id)kIOSurfaceHeight: @(height), (id)kIOSurfaceBytesPerElement: @4,
+		(id)kIOSurfaceBytesPerRow: @(bpr), (id)kIOSurfaceAllocSize: @(bpr * height),
+		(id)kIOSurfacePixelFormat: @(0x42475241),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)properties);
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	id<MTLLibrary> library = tests_library(device, path);
+	MTLTextureDescriptor *td;
+	MTLRenderPipelineDescriptor *pd;
+	MTLRenderPassDescriptor *pass;
+	id<MTLRenderPipelineState> pipeline;
+	id<MTLTexture> texture;
+	NSError *error = nil;
+
+	if (surface == NULL || queue == nil || library == nil) {
+		say("FAIL: time: IOSurface %p, queue %p, library %p", (void *)surface, (void *)queue, (void *)library);
+		return false;
+	}
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height
+							    mipmapped:NO];
+	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	[td setStorageMode:MTLStorageModeShared];
+	texture = [device newTextureWithDescriptor:td iosurface:surface plane:0];
+	pd = [[MTLRenderPipelineDescriptor alloc] init];
+	pd.vertexFunction = [library newFunctionWithName:@"a34_tri_vs"];
+	pd.fragmentFunction = [library newFunctionWithName:@"a34_tri_fs"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (texture == nil || pipeline == nil) {
+		say("FAIL: time: texture %p, pipeline %p (%s)", (void *)texture, (void *)pipeline,
+		    error != nil ? [[error localizedDescription] UTF8String] : "");
+		return false;
+	}
+	pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = texture;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 1.0, 1.0);
+	for (int draw = 0; draw <= 1; draw++) {
+		double min = 1e9, max = 0, sum = 0;
+
+		for (unsigned i = 0; i < repeats + 1; i++) {
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLRenderCommandEncoder> encoder = [cb renderCommandEncoderWithDescriptor:pass];
+			uint64_t began;
+			double ms;
+
+			if (draw) {
+				[encoder setRenderPipelineState:pipeline];
+				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			}
+			[encoder endEncoding];
+			began = mach_absolute_time();
+			[cb commit];
+			[cb waitUntilCompleted];
+			ms = ms_between(began, mach_absolute_time());
+			if (!completed(cb, "time")) {
+				return false;
+			}
+			if (i == 0) {
+				continue;       /* (the first: anything made on first use) */
+			}
+			min = ms < min ? ms : min;
+			max = ms > max ? ms : max;
+			sum += ms;
+		}
+		say("time: %s at %ux%u, %u passes: %.2f / %.2f / %.2f ms (min / average / max), commit to completion",
+		    draw ? "clear + triangle" : "clear", width, height, repeats, min, sum / repeats, max);
+	}
+	CFRelease(surface);
+	return true;
+}
+
 static const char *
 yes_no(BOOL value)
 {
@@ -432,6 +528,7 @@ main(int argc, char **argv)
 {
 	@autoreleasepool {
 		bool want_direct = false, any = false, next = false, compute = false, draw = false;
+		unsigned timing = 0;
 		const char *tests_lib = DEFAULT_TESTS;
 		const char *bundle = DEFAULT_BUNDLE;
 		io_service_t accelerator;
@@ -469,11 +566,16 @@ main(int argc, char **argv)
 				if (i + 1 < argc && argv[i + 1][0] != '-') {
 					tests_lib = argv[++i];
 				}
+			} else if (strcmp(argv[i], "--time") == 0) {
+				timing = 30;
+				if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+					timing = (unsigned)strtoul(argv[++i], NULL, 10);
+				}
 			} else if (strcmp(argv[i], "--next") == 0) {
 				next = true;
 			} else {
 				fprintf(stderr, "usage: metal-probe [--direct [BUNDLE]] [--any] [--next] [--compute [LIB]] "
-				    "[--draw [LIB]]\n");
+				    "[--draw [LIB]] [--time [N]]\n");
 				return 64;
 			}
 		}
@@ -563,7 +665,7 @@ main(int argc, char **argv)
 				say("next: exception %s: %s", [[exception name] UTF8String], [[exception reason] UTF8String]);
 			}
 		}
-		if (compute || draw) {
+		if (compute || draw || timing) {
 			int failed = 0;
 
 			@try {
@@ -571,6 +673,9 @@ main(int argc, char **argv)
 					failed++;
 				}
 				if (draw && !draw_test(device, tests_lib)) {
+					failed++;
+				}
+				if (timing && !time_test(device, tests_lib, timing)) {
 					failed++;
 				}
 			} @catch (NSException *exception) {
