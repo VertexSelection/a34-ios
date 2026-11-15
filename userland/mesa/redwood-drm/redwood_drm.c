@@ -914,6 +914,10 @@ redwood_drm_afbc_scanout(void)
 	return on;
 }
 
+#ifndef kIOReturnNoSpace
+#define kIOReturnNoSpace ((kern_return_t)0xe00002db)    /* iokit_common_err(0x2db), XNU's IOReturn.h: "no space for data" */
+#endif
+
 /* SURFACE_LAYOUT (0x78, redwood_drm.h): the request comes back with `size` filled in */
 EXPORT int
 redwood_drm_surface_layout(struct redwood_drm_surface_layout *request)
