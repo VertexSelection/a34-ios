@@ -223,7 +223,7 @@ main(int argc, char **argv)
 	int fd = open(port, O_RDWR | O_NOCTTY);
 	if (fd < 0) {
 		fprintf(stderr, "a34cell: no modem port %s (%s): the kernel's CCCI stage is not running "
-		    "(needs a34cell=2 and a modem the boot loader started); nothing to do\n", port,
+		    "(needs a34cell=3 on a boot from `boot`, and the modem's HS2); nothing to do\n", port,
 		    strerror(errno));
 		publish();
 		return 0;

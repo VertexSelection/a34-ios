@@ -76,7 +76,7 @@ On the host, with the iOS root image mounted read-write at /mnt (as for the othe
 
 That installs /a34/a34cell and a launchd job that runs it once at boot, output on the console
 (so in the kernel's persistent log, tools/pull-log.sh). With no modem port (/dev/a34at0, made by
-the kernel's CCCI stage, a34cell=2) it prints the kernel's cellular state and exits 0; nothing
+the kernel's CCCI stage, a34cell=3) it prints the kernel's cellular state and exits 0; nothing
 else is touched. The transmitter stays off unless "-radio" is added to the job's arguments AND
 the modem reports a well-formed identity of its own; the identity is never printed or stored.
 
