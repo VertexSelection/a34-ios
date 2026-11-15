@@ -1389,6 +1389,67 @@ surface_name(IOSurfaceRef surface, char *text, size_t size)
 	snprintf(text, size, name[0] ? " \"%s\"" : "", name);
 }
 
+/*
+ * Every layout of IOSurface a texture is made of (-texImageIOSurface:, -attachImage:), a line the
+ * first time it is met (a layout: pixel format, planes, the plane taken, its size, bytes a row and
+ * a pixel, the texture's format and type, and how: its memory, a copy, the GPU's copy into it, or
+ * filled from the texture drawn into here). Rows longer than the pixels rounded up to 16 bytes are
+ * pointed out: the kernel's a34surfrowfix makes them so, and a writer that keeps to the row
+ * length it asked for rather than IOSurfaceGetBytesPerRow() then shears its picture a little more
+ * every row (Settings' Focus illustration, boot 57: 1014 x 780, asked 4064, given 4096).
+ */
+static void
+surface_layout_note(struct image *image, const char *how)
+{
+	static struct {
+		uint32_t pixels, plane, planes, width, height, row, format, type;
+		bool target, shared;
+	} seen[192];
+	static unsigned seen_count, told;
+	IOSurfaceRef surface = image->surface;
+	uint32_t pixels = IOSurfaceGetPixelFormat(surface), shown = __builtin_bswap32(pixels);
+	size_t planes = IOSurfaceGetPlaneCount(surface), plane = image->plane;
+	size_t width = planes > 0 ? IOSurfaceGetWidthOfPlane(surface, plane) : IOSurfaceGetWidth(surface);
+	size_t height = planes > 0 ? IOSurfaceGetHeightOfPlane(surface, plane) : IOSurfaceGetHeight(surface);
+	size_t row = planes > 0 ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t element = planes > 0 ? IOSurfaceGetBytesPerElementOfPlane(surface, plane) : IOSurfaceGetBytesPerElement(surface);
+	size_t least = (width * (element ? element : 1) + 15) & ~(size_t)15;
+	char name[80], note[120] = "";
+
+	for (unsigned i = 0; i < seen_count; i++) {
+		if (seen[i].pixels == pixels && seen[i].plane == plane && seen[i].planes == planes && seen[i].width == width &&
+		    seen[i].height == height && seen[i].row == row && seen[i].format == image->format && seen[i].type == image->type &&
+		    seen[i].target == image->target && seen[i].shared == image->shared) {
+			return;
+		}
+	}
+	if (seen_count < sizeof(seen) / sizeof(seen[0])) {
+		seen[seen_count].pixels = pixels;
+		seen[seen_count].plane = (uint32_t)plane;
+		seen[seen_count].planes = (uint32_t)planes;
+		seen[seen_count].width = (uint32_t)width;
+		seen[seen_count].height = (uint32_t)height;
+		seen[seen_count].row = (uint32_t)row;
+		seen[seen_count].format = image->format;
+		seen[seen_count].type = image->type;
+		seen[seen_count].target = image->target;
+		seen[seen_count].shared = image->shared;
+		seen_count++;
+	} else if (told++ != 0) {
+		return;                 /* (a table full: one line more, then quiet) */
+	}
+	if (row > least) {
+		snprintf(note, sizeof(note), "; rows %zu bytes longer than the pixels rounded to 16 (%zu)", row - least, least);
+	}
+	surface_name(surface, name, sizeof(name));
+	say_always("a34gl: layout: IOSurface %u%s '%.4s' %zu x %zu, plane %zu of %zu: %zu x %zu, %zu bytes a row, %zu a pixel%s\n",
+	    IOSurfaceGetID(surface), name, (const char *)&shown, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), plane, planes,
+	    width, height, row, element, note);
+	say_always("a34gl:   as texture %u (%s, %d x %d, internal %#x, format %#x, type %#x%s): %s\n", image->texture,
+	    image->target ? "drawn into" : "shown", image->width, image->height, image->internal, image->format, image->type,
+	    image->invert ? ", inverted" : "", how);
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -5915,6 +5976,8 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 			surface_to_texture(e, image);
 		}
 	}
+	surface_layout_note(image, image->shared ? "its memory" : image->source != 0 ? "filled by the GPU from the texture drawn "
+	    "into here" : "a copy, by the CPU");
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
@@ -5997,6 +6060,8 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		}
 		surface_to_texture(e, image);
 	}
+	surface_layout_note(image, image->shared ? "its memory" : image->mirror != 0 ? "a texture, copied into its memory by the GPU" :
+	    "a texture, read back into its memory by the CPU");
 	e->attaching += now_us() - began;
 	if (attached++ < 24) {
 		say("a34gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
