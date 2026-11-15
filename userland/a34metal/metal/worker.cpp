@@ -275,6 +275,10 @@ rwm_on_big_stack(void (*fn)(void *context), void *context)
 
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 16 << 20);
+	/* A34: at the asking thread's class (a compile for CoreAnimation's render thread is as urgent as
+	 * that thread; without one it ran at the default class behind everything else) */
+	pthread_attr_set_qos_class_np(&attr, qos_class_self() != QOS_CLASS_UNSPECIFIED ? qos_class_self()
+	    : QOS_CLASS_USER_INITIATED, 0);
 	if (pthread_create(&thread, &attr, big_stack_main, &call) != 0) {
 		pthread_attr_destroy(&attr);
 		fn(context);

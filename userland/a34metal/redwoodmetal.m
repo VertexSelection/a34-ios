@@ -3894,7 +3894,10 @@ rw_core_of(id texture)
 		static dispatch_once_t once;
 
 		dispatch_once(&once, ^{
-			completions = dispatch_queue_create("redwood.metal.completed", DISPATCH_QUEUE_SERIAL);
+			/* A34: at Apple's own class for it (y2sios, viva: at QoS 0 the completed handlers
+			 * waited 2-7 s behind busy processors, and CoreAnimation's frames with them) */
+			completions = dispatch_queue_create("redwood.metal.completed",
+			    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
 		});
 		[self retain];
 		[scheduled release];

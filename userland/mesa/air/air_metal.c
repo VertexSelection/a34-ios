@@ -3996,9 +3996,13 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
             if (direct_buffer_offset(r, bindings, table, table_count, name, &moffset, why,
                                      why_size) != 0)
                return -1;
-            snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
-            if (buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size) != 0)
+            /* (A34: the label only for a refusal -- an snprintf per buffer per draw was 18% of
+             * the library's time in y2sios's profile; buffer_offset_ok only checks) */
+            if (buffer_offset_ok(b->device, r, b, moffset, name, "", NULL, 0) != 0) {
+               snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
+               buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size);
                return -1;
+            }
          }
          /* `r->size` is air.buffer_size, which a member never carries: the frontend
           * adds a member's resource with a size of zero because the nested descriptor
