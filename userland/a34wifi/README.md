@@ -17,6 +17,8 @@ The kernel does nothing for Wi-Fi until it is asked, by boot-arg `a34wifi=N` or 
 | 5 | driver own, the command/event DMA rings, the ROM's versions, `WIFI_RAM_CODE_soc5_0_1_1.bin` loaded, FW_FINISH | `the ROM answers: TOP_HVR ...`, `THE WI-FI FIRMWARE IS READY` |
 | 6 | (M2, 0961) the running firmware's command mailbox: NIC capability (versions, MAC), BASIC_CONFIG | `the firmware answers: NIC_CAPABILITY_V2`, `MAC ...` |
 | 7 | (M2) one **passive** scan (nothing transmitted) of 2.4 GHz 1-13 and 5 GHz 36-48, 149-165 | `SCAN_DONE in N ms`, then one line per network: BSSID, channel, dBm, security, SSID |
+| 8 | (M3, 0964) join the network of `/a34/wifi/network`: the loudest BSS of its name, channel, authentication, association, for WPA2 the four-way handshake and the keys | `TX status N: acknowledged`, `ASSOCIATED, AID n`, `the four-way handshake is done`, `JOINED` |
+| 9 | (0965) the network interface `enN` on the data rings, its link up | `step 9: enN attached`; then `a34wifi dhcp` |
 
 ## Use
 
@@ -26,6 +28,35 @@ a34wifi up 7 [SECONDS]  # steps up to 7, following the log until the kernel is d
 a34wifi scan [SECONDS]  # once step 7 is done: one scan more (kern.a34wifi.rescan)
 a34wifi log             # the log only
 a34wifi files           # the firmware files in /a34/wifi
+a34wifi mac             # the phone's Wi-Fi address (made once and kept in /a34/wifi/mac)
+a34wifi join [SECONDS]  # step 8 (or, once done, join again after the link was lost)
+a34wifi dhcp [SECONDS]  # after step 9: DHCP by configd's IPConfiguration, waits for the address
+a34wifi tcp HOST [PORT] # a TCP connection and an HTTP HEAD: does the data path carry anything
+a34wifi connect [HOST [PORT]]  # all of it for a boot job: up 9, dhcp, tcp (default 1.1.1.1 80)
+```
+
+### The phone's MAC address (0963)
+
+The chip's efuse holds none, and Samsung's is in `/efs`, which nothing here reads. `a34wifi`
+makes a random locally administered address the first time (`mac`, or `up N` with N >= 6) and
+keeps it in `/a34/wifi/mac`; the kernel uses it from step 6 on. Delete the file for a new one.
+
+### The network to join (0964)
+
+`/a34/wifi/network`, written by the phone's owner -- it is never in this repository, and neither
+the kernel nor `a34wifi` ever prints the passphrase:
+
+```
+ssid=Name Of The Network
+psk=the passphrase
+```
+
+`psk=` is 8 to 63 characters or 64 hex digits; without it the network must be open. An optional
+`bssid=xx:xx:xx:xx:xx:xx` picks one access point. Everything after `=` counts, spaces too. Install
+it readable by root only, not with `root-add-job.py` (which makes every file 0755):
+
+```sh
+sudo install -m 600 -o 0 -g 0 network /mnt/a34/wifi/network
 ```
 
 ## Install (from the host, into the iOS root)
@@ -37,8 +68,11 @@ mounted at `/mnt` and the a34wifi artifact unpacked:
 ```sh
 tools/wifi-fw.sh .../A346EXXSADYG1/super.img /tmp/a34wifi
 cp a34wifi-artifact/a34/wifi/a34wifi /tmp/a34wifi/
-sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi /tmp/a34wifi a34wifi up 7
+sudo tools/root-add-job.py /mnt com.a34.wifi /a34/wifi /tmp/a34wifi a34wifi connect
 ```
+
+(`up 7` stops after the scan; `up 9` and `connect` need the network file; `connect` also needs
+`com.apple.configd` running for DHCP.)
 
 The job runs once at boot with its output on `/dev/console`, so it lands in the kernel's
 persistent log (`tools/pull-log.sh`). Asking for fewer steps (`a34wifi up 1`) is the cautious

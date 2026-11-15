@@ -40,6 +40,7 @@ typedef uint64_t addr64_t;
 #define EFBIG 27
 #define ETIMEDOUT 60
 #define EBUSY 16
+#define EALREADY 37
 #define __unused __attribute__((unused))
 #define __printflike(a, b) __attribute__((format(printf, a, b)))
 #define LCK_GRP_DECLARE(n, s) lck_grp_t *n

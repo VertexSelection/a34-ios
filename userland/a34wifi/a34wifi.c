@@ -51,9 +51,14 @@
  *   a34wifi log             the kernel's Wi-Fi log only
  *   a34wifi files           the firmware files in /a34/wifi: present, sizes, what they say
  *   a34wifi mac             the phone's Wi-Fi address, made and kept first if there is none
- *   a34wifi join [SECONDS]  check /a34/wifi/network, then ask for step 8 (as "up 8")
+ *   a34wifi join [SECONDS]  check /a34/wifi/network, then ask for step 8 (as "up 8"); once step
+ *                           8 has been done, join again (kern.a34wifi.rejoin) if the link was lost
  *   a34wifi dhcp [SECONDS]  (0965) once step 9 is done: have configd's IPConfiguration run DHCP
  *                           on the interface, and wait (default 60 s) for its IPv4 address
+ *   a34wifi tcp HOST [PORT] connect to HOST (a name or an address; port 80), send an HTTP HEAD
+ *                           request, print the first line of the answer
+ *   a34wifi connect [HOST [PORT]]  all of it, for a boot job: "up 9", "dhcp", then "tcp" to
+ *                           HOST (default 1.1.1.1, port 80: no name server needed)
  *                           ("up" does that too, before it asks the kernel for anything)
  *
  * Output goes to stdout; as a launchd job (tools/root-add-job.py) that is /dev/console, so it
@@ -62,6 +67,7 @@
 #include <errno.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -111,6 +117,16 @@ state(void)
 	(void)get_int("kern.a34wifi.done", &done);
 	(void)get_int("kern.a34wifi.busy", &busy);
 	printf("a34wifi: asked for step %d, step %d done%s\n", want, done, busy ? ", working" : "");
+	if (done >= 8) {
+		int joined = 0;
+		char ifname[16] = "";
+		size_t len = sizeof(ifname) - 1;
+
+		(void)get_int("kern.a34wifi.joined", &joined);
+		(void)sysctlbyname("kern.a34wifi.ifname", ifname, &len, NULL, 0);
+		printf("a34wifi: %s%s%s\n", joined ? "joined" : "NOT joined (a34wifi join: again)", ifname[0] ? ", interface " : "",
+		    ifname);
+	}
 	return 0;
 }
 
@@ -441,6 +457,29 @@ files(void)
 	return bad;
 }
 
+/* step 8, or (once step 8 has been done) step 8 again: kern.a34wifi.rejoin */
+static int
+join(int seconds)
+{
+	int done = 0, joined = 0, rc;
+
+	if (get_int("kern.a34wifi.done", &done) != 0 || done < 8) {
+		return up(8, seconds);
+	}
+	(void)get_int("kern.a34wifi.joined", &joined);
+	if (joined) {
+		printf("a34wifi: joined already\n");
+		return 0;
+	}
+	if (check_network() != 0) {
+		return 1;
+	}
+	rc = ask("kern.a34wifi.rejoin", 1, done, seconds);
+	(void)get_int("kern.a34wifi.joined", &joined);
+	printf("a34wifi: %s\n", joined ? "joined again" : "NOT joined");
+	return rc != 0 || !joined;
+}
+
 /* ---- an address by DHCP (0965) ---- */
 
 #if defined(__APPLE__)
@@ -596,6 +635,54 @@ dhcp(int seconds)
 	return 1;
 }
 
+/* connect, an HTTP HEAD request, the first line of the answer: does the data path carry anything */
+static int
+tcp(const char *host, const char *port)
+{
+	struct addrinfo hints, *list = NULL;
+	char request[256], answer[512], address[INET6_ADDRSTRLEN] = "?", *end;
+	ssize_t n;
+	int s, error;
+	time_t t0 = time(NULL);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	error = getaddrinfo(host, port, &hints, &list);
+	if (error != 0) {
+		printf("a34wifi: tcp %s: %s\n", host, gai_strerror(error));
+		return 1;
+	}
+	if (list->ai_family == AF_INET) {
+		inet_ntop(AF_INET, &((struct sockaddr_in *)(void *)list->ai_addr)->sin_addr, address, sizeof(address));
+	} else if (list->ai_family == AF_INET6) {
+		inet_ntop(AF_INET6, &((struct sockaddr_in6 *)(void *)list->ai_addr)->sin6_addr, address, sizeof(address));
+	}
+	s = socket(list->ai_family, SOCK_STREAM, 0);
+	if (s < 0 || connect(s, list->ai_addr, list->ai_addrlen) != 0) {
+		printf("a34wifi: tcp %s (%s) port %s: %s\n", host, address, port, strerror(errno));
+		if (s >= 0) {
+			close(s);
+		}
+		freeaddrinfo(list);
+		return 1;
+	}
+	snprintf(request, sizeof(request), "HEAD / HTTP/1.0\r\nHost: %s\r\nUser-Agent: a34wifi\r\n\r\n", host);
+	if (write(s, request, strlen(request)) < 0) {
+		printf("a34wifi: tcp %s: write: %s\n", host, strerror(errno));
+	}
+	n = read(s, answer, sizeof(answer) - 1);
+	answer[n > 0 ? n : 0] = '\0';
+	if ((end = strpbrk(answer, "\r\n")) != NULL) {
+		*end = '\0';
+	}
+	printf("a34wifi: tcp %s (%s) port %s: connected; the answer begins \"%s\" (%ld s)\n", host, address, port, answer,
+	    (long)(time(NULL) - t0));
+	close(s);
+	freeaddrinfo(list);
+	return n > 0 ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -621,12 +708,27 @@ main(int argc, char **argv)
 		return keep_mac();
 	}
 	if (strcmp(argv[1], "join") == 0) {
-		return up(8, argc >= 3 ? atoi(argv[2]) : 180);
+		return join(argc >= 3 ? atoi(argv[2]) : 180);
+	}
+	if (strcmp(argv[1], "tcp") == 0 && argc >= 3) {
+		return tcp(argv[2], argc >= 4 ? argv[3] : "80");
+	}
+	if (strcmp(argv[1], "connect") == 0) {
+		int rc = up(9, 240);
+
+		if (rc == 0) {
+			rc = dhcp(60);
+		}
+		if (rc == 0) {
+			rc = tcp(argc >= 3 ? argv[2] : "1.1.1.1", argc >= 4 ? argv[3] : "80");
+		}
+		(void)state();
+		return rc;
 	}
 	if (strcmp(argv[1], "dhcp") == 0) {
 		return dhcp(argc >= 3 ? atoi(argv[2]) : 60);
 	}
 	fprintf(stderr, "usage: a34wifi [up N [SECONDS] | scan [SECONDS] | log | files | mac | join [SECONDS] | "
-	    "dhcp [SECONDS]]\n");
+	    "dhcp [SECONDS] | tcp HOST [PORT] | connect [HOST [PORT]]]\n");
 	return 2;
 }

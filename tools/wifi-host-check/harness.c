@@ -72,6 +72,18 @@ vm_offset_t ml_io_map_unmappable(vm_offset_t pa, vm_size_t size, uint32_t flags)
 	return (vm_offset_t)regions[nregions++].mem;
 }
 
+/* (0965) bsd/dev/a34_wifi_net.c, the network interface, stood in for: what reaches it is recorded */
+static uint8_t net_got[2048];
+static uint32_t net_got_len, net_got_count;
+static bool net_link;
+int a34_wifi_net_attach(const uint8_t address[6], bool (*tx)(const uint8_t *, uint32_t));
+void a34_wifi_net_input(const uint8_t *frame, uint32_t length);
+void a34_wifi_net_link(bool up);
+const char *a34_wifi_net_name(void);
+int a34_wifi_net_attach(const uint8_t address[6], bool (*tx)(const uint8_t *, uint32_t)) { (void)address; (void)tx; return 0; }
+void a34_wifi_net_input(const uint8_t *frame, uint32_t length) { if (length <= sizeof(net_got)) { memcpy(net_got, frame, length); net_got_len = length; } net_got_count++; }
+void a34_wifi_net_link(bool up) { net_link = up; }
+const char *a34_wifi_net_name(void) { return "en9"; }
 #include "a34_wifi.c"     /* (run.sh puts it beside ruby_hal.h) */
 #include "a34_wpa.c"      /* (0964) */
 
@@ -450,6 +462,44 @@ int main(int argc, char **argv)
 		(void)a34w_data_poll();
 		failed |= (a34w_tokens_busy & 1u) != 0 || a34w_tokens_back != 1;
 		printf("0964 data path (EAPOL out on TX ring 0, the token back on ring 4): %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+	/* ---- 0965: step 9, the interface: an 802.11 data frame up (not translated: LLC/SNAP), an IP frame down ---- */
+	{
+		uint8_t f[512], ip[100];
+		int failed = 0;
+		const uint8_t *tok;
+		uint32_t at;
+
+		a34w_joined = true;
+		a34w_keys_in = true;
+		failed |= !a34w_step9() || !net_link;
+		bzero(f, sizeof(f));
+		put32(f, (2u << 27) | (24u + 24u + 8u + 20u));
+		put32(f + 4, AP_WLAN_INDEX);
+		put32(f + 8, 12u << 8);                         /* header length 24 (12 words of 2), not translated */
+		f[24] = 0x08; f[25] = 0x02;                     /* data, FromDS: A1 DA, A2 BSSID, A3 SA */
+		memcpy(f + 24 + 4, a34w_mac, 6); memcpy(f + 24 + 10, a34w_target.bssid, 6);
+		memcpy(f + 24 + 16, "\x02\x99\x88\x77\x66\x55", 6);
+		memcpy(f + 48, "\xaa\xaa\x03\x00\x00\x00\x08\x00", 8);
+		memset(f + 56, 0x45, 20);
+		rx_put(2, f, 24u + 24u + 8u + 20u);
+		(void)a34w_data_poll();
+		printf("0965 up: %u frames to the interface, %u bytes: to %02x:..:%02x from %02x:..:%02x type %02x%02x\n", net_got_count,
+		    net_got_len, net_got[0], net_got[5], net_got[6], net_got[11], net_got[12], net_got[13]);
+		failed |= net_got_count != 1 || net_got_len != 14 + 20 || memcmp(net_got, a34w_mac, 6) != 0 ||
+		    memcmp(net_got + 6, "\x02\x99\x88\x77\x66\x55", 6) != 0 || net_got[12] != 0x08 || net_got[13] != 0x00 || net_got[14] != 0x45;
+		/* down: an IPv4 frame from the stack, ciphered (keys in): token 1 (0 is busy again? it came back), protected bit */
+		bzero(ip, sizeof(ip));
+		memcpy(ip, a34w_target.bssid, 6); memcpy(ip + 6, a34w_mac, 6); ip[12] = 0x08; ip[14] = 0x45;
+		at = a34w_dtx_cidx;
+		failed |= !a34w_net_tx(ip, sizeof(ip));
+		tok = (const uint8_t *)a34w_dma + DMA_TOKENS;     /* token 0 was given back: it is used again */
+		printf("0965 down: TX0 cidx %u -> %u, TXD DW0 0x%08x DW1 0x%08x DW3 0x%08x DW5 0x%08x\n", at, a34w_dtx_cidx, a34w_le32(tok),
+		    a34w_le32(tok + 4), a34w_le32(tok + 12), a34w_le32(tok + 20));
+		failed |= a34w_le32(tok) != (0x020a0000u | (32u + sizeof(ip))) || a34w_le32(tok + 4) != 0x80008405u ||
+		    a34w_le32(tok + 12) != 0x0000f002u || a34w_le32(tok + 20) != 0 || memcmp(tok + 64, ip, sizeof(ip)) != 0;
+		printf("0965 interface data path: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 	printf("log:\n%s", a34w_log);

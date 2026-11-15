@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/tree"
 git -C "$TMP/tree" init -q
 for p in "$ROOT"/xnu/patches/*.patch; do
-	for f in a34_wifi.c a34_connsys.c a34_wpa.c a34_wpa.h; do
+	for f in a34_wifi.c a34_connsys.c a34_wpa.c a34_wpa.h a34_wifi_net.h; do
 		if grep -q "^+++ b/bsd/dev/$f" "$p"; then
 			git -C "$TMP/tree" apply --include="bsd/dev/$f" "$p"
 			echo "$f: applied $(basename "$p")"
@@ -30,7 +30,8 @@ for p in "$ROOT"/xnu/patches/*.patch; do
 	done
 done
 cp "$TMP/tree/bsd/dev/a34_wifi.c" "$TMP/tree/bsd/dev/a34_connsys.c" "$TMP/"
-cp "$TMP/tree/bsd/dev/a34_wpa.c" "$TMP/tree/bsd/dev/a34_wpa.h" "$TMP/" 2>/dev/null || true
+cp "$TMP/tree/bsd/dev/a34_wpa.c" "$TMP/tree/bsd/dev/a34_wpa.h" "$TMP/tree/bsd/dev/a34_wifi_net.h" "$TMP/" 2>/dev/null || true
+# (a34_wifi_net.c, 0965, is XNU's network KPI and nothing else: CI's kernel build checks it, harness.c stands in for it)
 echo "a34_wifi.c: $(wc -l <"$TMP/a34_wifi.c") lines, a34_connsys.c: $(wc -l <"$TMP/a34_connsys.c") lines"
 cp "$HERE/ruby_hal.h" "$TMP/"
 # the XNU headers it includes, each standing for xnu_mock.h (ahead of the host's own on the -I path)

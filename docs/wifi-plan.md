@@ -1,6 +1,8 @@
 # Wi-Fi on the Galaxy A34: what it takes, and milestone 1
 
-Written 15 November 2026 from files alone. **Nothing in this document has run on the phone.**
+Written 15 November 2026 from files alone. **M1 and M2 have since run on the phone** (0961, with
+`a34bt=1` in the same boot: section 3, "M2 on the phone"); 0963-0965 (the MAC address, joining,
+the data path) are built and host-checked, not yet run.
 Sources, all read on the host:
 
 - the phone's own firmware, A346EXXSADYG1 (`firmware/A346EXXSADYG1_TUR`, gitignored): `vendor`
@@ -351,6 +353,115 @@ and 0961; the `com.a34.wifi` job running `a34wifi up 7`; then `grep 'A34 WIFI\|A
   (the doorbell or the mailbox offset); with `fw 1` and no event: the answer path (RX ring 0).
   If `SCAN_DONE` comes with nothing heard: PHY_ACTION/NVRAM (below) are next.
 
+### M2 on the phone (kernel 0961-radio, `a34bt=1` in the same boot, `a34wifi up 7`)
+
+From `build/logs/0961-radio-a` (`grep 'A34 WIFI'`): CONNSYS was already up for Bluetooth, step 2
+only added Wi-Fi's VCN33_1/VCN33_2 (both "on" in step 3's report); the A-die read `0x66358a11`
+(MT6635 E3); WM MCU ROM done 62 ms after its release; the mailbox at EMI +0x713400 (the ROM's);
+FW_FINISH answered and **the firmware ready 780 ms after it**; NIC_CAPABILITY_V2 answered (20
+elements, 492 bytes) -- its hardware/firmware-version tags read as zeros (the same TLV layout as
+`nic_cmd_event.c` parses; the firmware leaves them empty), **the efuse MAC is 00:00:00:00:00:00**;
+the passive scan of 22 channels finished in 1149 ms with **7 networks heard on 2.4 and 5 GHz**
+(-70 to -97 dBm, RSN and open). So the firmware receives without PHY_ACTION and NVRAM.
+
+### 0963: the phone's own MAC address
+
+The efuse has none and Android's comes from `/efs` (`.mac.info`), which we never read. Each phone
+now keeps its own on its iOS root: `/a34/wifi/mac`, one line `xx:xx:xx:xx:xx:xx`, a random
+locally administered unicast address that `a34wifi` makes the first time (`a34wifi mac`, and
+`a34wifi up N` for N >= 6) and never changes; the kernel reads it in step 6 (`a34w_mac_choose`:
+the file, else the efuse's, else a random one for that boot only, said so in the log). Two A34s on
+one network no longer share `02:41:33:34:57:46`. `root-add-job.py` never deletes files in
+`/a34/wifi`, so the address survives reinstalls.
+
+### 0964: milestone 3, joining (step 8)
+
+What gen4m_s1 does on soc5_0 to join as a station, read in the source (file:line references
+are under `connectivity/wlan/core/gen4m_s1/`) and done the same way, host side where Android is:
+
+- **The network**: `/a34/wifi/network`, written by the phone's owner (`ssid=`, `psk=` a
+  passphrase of 8-63 characters or 64 hex digits, optional `bssid=`); never in the repository;
+  the passphrase never reaches the log (only its length) and is wiped once the PMK is made.
+- **The target**: step 7's passive scan, run with the BSS kept active (HakiOS run 457: a scan
+  that deactivated BSS 0 killed a connection); the loudest BSS of that SSID wins; its beacon's
+  elements are kept (rates, RSN, TIM). WPA2-PSK needs CCMP for both keys and AKM 2 without
+  "PMF required" (a WPA2/WPA3 transition network is fine).
+- **Channel**: `CH_PRIVILEGE` (0x1c, 24 bytes: JOIN, 4000 ms, DBDC auto) and its grant
+  `EVENT_ID_CH_PRIVILEGE` (0x10), token matched; a new token per request (HakiOS run 449). Held
+  through the handshake and given back after it (ais_fsm.c holds it until the port is authorized).
+- **The AP's station record**: `UPDATE_STA_RECORD` (0x13) is **168 bytes, version 0** -- the
+  A34's module is built without 802.11ax (soc5_0 never sets `CONFIG_MTK_WIFI_11AX_SUPPORT`;
+  `cnmStaSendUpdateCmd` in the shipped .ko moves 0xa8) --, type 0x41 (legacy AP), **WTBL 5**
+  (0-3 are BIP's, 4 the broadcast entry, `privacy.c:808-842`), broadcast field 0xff, legacy rates
+  only (no HT/VHT elements are sent: 54 Mb/s at most, enough for a first connection).
+- **Authentication and association**: 802.11 frames built here, sent as `nicTxCmd` sends
+  `COMMAND_TYPE_MANAGEMENT_FRAME` on soc5_0: **a CONNAC2X TXD and the frame in the SW-WFDMA
+  mailbox** (not a ring: `soc5_0.c:419`; HakiOS's MT6768 used HW ring 15). TXD: byte count, EtherType
+  offset 16, packet format 2, MCU queue 1; WTBL 5, VTA, 802.11 header of 24, long format; lifetime
+  2 s, 30 tries, a sequence number, the BSS's lowest basic rate fixed (CCK 1 M / OFDM 6 M), its TX
+  status asked for (PID). The host check holds the Authentication TXD against
+  `nic_txd_v2_compose`'s byte for byte (`0310003e 80026405 801e000b 8001f000 0 00000201 0 000bc000`).
+  The answers come forwarded on RX ring 0 (0x3801), and `EVENT_ID_TX_DONE` (0x0f) says whether the
+  AP acknowledged each frame (`TX status N: acknowledged` in the log) -- the first proof that the
+  radio transmits.
+- **Connected**: `SET_BSS_INFO` (0x12, 116 bytes: connected, BSSID, rates, open 0/1 or WPA2-PSK
+  7/CCMP 6, BMC WTBL 4, its RLM part for 20 MHz), the station record again in state 3 with the AID
+  (answered by sequence), `INDICATE_PM_BSS_CONNECTED` (0x16), `POWER_SAVE_MODE` CAM (0x05; HakiOS
+  run 459: without it the AP thinks the station asleep after ~80 s), the RX filter (0x0a: directed,
+  multicast, broadcast).
+- **WPA2**: the four-way and group handshakes on the host -- the firmware has no 4-way offload
+  (`gl_init.c`) -- with `bsd/dev/a34_wpa.c`, HakiOS's `lx_wpa.c` (MIT; its tests, against the
+  standards' vectors and an independent Python access point, run in `tools/wifi-host-check`: 195
+  checks). **EAPOL goes as data on TX ring 0**, not by command (`gl_kal.c:4161`: "No more sending
+  via cmd"), at the lowest basic rate, never protected for pairwise messages; message 1 comes on RX
+  ring 2 (data). Keys: `ADD_REMOVE_KEY` (0x07, 64 bytes, no answer): pairwise to WTBL 5 with TX,
+  group to WTBL 4 with its index, CCMP (4), 16 bytes.
+- **Data rings** (needed for EAPOL): step 5 now sets up, before the DMA is on, TX ring 0 (64
+  slots), RX rings 2/3 (64 x 2352) and 4/5 (16 x 3840, the token reports), and the DMA scheduler
+  as `soc5_0DmashdlInit` does (PLE max 1 page, groups 0-2 quota 0x10..0x200 with refill, the
+  queue-to-group map, ack threshold 3). A frame on TX ring 0 is a token buffer -- TXD, TXP
+  (`fillTxDescAppendByHostV2`: the token, the frame's address and length) and the Ethernet frame,
+  the descriptor pointing at the first 64 bytes --; the token stays the DMA's until its report
+  (RX ring 4, `HW_MAC_MSDU_REPORT` version 3) gives it back.
+- **After joining** the thread services RX ring 0 and the data rings every 2 ms (rekeys, the AP's
+  deauthentication, data). A failed join can be asked for again (`a34wifi join`); after the link
+  is lost, `kern.a34wifi.rejoin` (also `a34wifi join`) joins again.
+- **Not sent, on purpose**: PHY_ACTION, NVRAM (0x48), domain info. On this phone Android's own
+  COM_FEM tag is all zeros (connfem never binds on MT6877, `connfem.cfg` is empty), the device
+  tree's FEM pin groups are reference-board leftovers (GPIO188 is the GPS LNA, GPIO195 the
+  vibrator) and must not be applied, and the firmware has fallbacks for both ("NVRAM control is
+  invalid, FW will use default", "Rom cal unfinish, do SW ch cal"). If the AP never acknowledges
+  our frames (`NOT acknowledged` TX statuses), PHY_ACTION's force-calibration with the vendor's
+  default `/vendor/firmware/WIFI` (never the phone's `nvdata`) is the next patch.
+
+### 0965: the data path (step 9)
+
+`bsd/dev/a34_wifi_net.c`: an Ethernet interface made with XNU's interface KPI (legacy model, no
+Skywalk nexus, family Ethernet, subfamily Wi-Fi, media IEEE 802.11, link events to configd),
+the shape of HackiOS's `redwood_net.c` (APSL), named `enN` with the first free unit
+(`kern.a34wifi.ifname`). Frames from the stack go to TX ring 0 (ciphered once the keys are in);
+data from RX ring 2 -- header-translated by the hardware, or 802.11 + LLC/SNAP turned into
+Ethernet here -- go up; the link follows the join. An address comes from user space: `a34wifi
+dhcp` asks configd's IPConfiguration plugin to run DHCP on the interface (`ipconfig_set_service`,
+message 20011, as HakiOS's `net_test.m`, MIT), which also publishes the router and DNS servers to
+the rest of iOS; it needs `com.apple.configd` running. `a34wifi tcp HOST [PORT]` then tries a TCP
+connection and an HTTP HEAD.
+
+**The M3 test** (kernel with 0963-0965 on top of main's patches; `a34bt=1` may stay):
+
+1. On the host, once: write the network file and install it readable by root only, e.g.
+   `printf 'ssid=Name\npsk=passphrase\n' > network; sudo install -m 600 -o 0 -g 0 network
+   /mnt/a34/wifi/network` (not through `root-add-job.py`, which makes every file 0755).
+2. The `com.a34.wifi` job runs `a34wifi connect` (= `up 9`, `dhcp`, `tcp 1.1.1.1 80`; it makes
+   `/a34/wifi/mac` first and checks the network file; DHCP needs `com.apple.configd` running).
+3. `grep 'A34 WIFI'`: step 6's MAC line says "kept in /a34/wifi/mac"; step 8 says `network
+   "..."`, the target (BSSID, channel, dBm), `channel N granted`, `Authentication sent`, then
+   either `TX status 1: acknowledged` and `authenticated` -- the radio transmits -- or `NOT
+   acknowledged` (TX: PHY_ACTION next) / `no answer` with acknowledged (the AP refused us: its
+   reason follows); `ASSOCIATED, AID n`; for WPA2 `EAPOL: message 1 of 4`, `EAPOL out on TX ring 0`,
+   the token report's first line, `message 3 of 4`, `the four-way handshake is done`; `JOINED`;
+   step 9 `enN attached`; every 30 s a `carried:` line with frame counts.
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
@@ -380,8 +491,8 @@ user-space piece; each is held against what Android's driver does on this phone.
 | | Goal | Kernel | User space | Size (new lines) | Main risks |
 | --- | --- | --- | --- | --- | --- |
 | **M1** | CONNSYS powered, A-die found, the Wi-Fi MCU running Samsung's firmware (its ready bits), all in the log | 0940, 0960 (`a34_wifi.c` steps 1-5) | `a34wifi` (sysctl), `tools/wifi-fw.sh` | ~1 900 (built) | see section 3 |
-| **M2** | scan results in the kernel log -- **built (0961), not yet run** | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
-| **M3** | join an open network, then WPA2-PSK; an IP by DHCP; apps reach the internet | steps 8-9: BSS/STA records, channel privilege, auth/assoc frames, EAPOL through the command ring, keys (`ADD_REMOVE_KEY`), data TX/RX descriptors (connac2x TXD/RXD), an Ethernet `ifnet` (HackiOS `redwood_net.c`), WPA2 four-way/group handshake in the kernel (`redwood_wpa.c`) | `a34wifi join SSID [PASS]`, then the IPConfiguration `setservice` call (HackiOS `net_test.m`, MIT) | ~2 000 + ~900 ported | MediaTek firmware quirks HackiOS hit (runs 448-459) on a different firmware generation; the WPA2 offload settings of this firmware; MAC address source (eFuse may be empty: a fixed locally administered address, never NVRAM writes) |
+| **M2** | scan results in the kernel log -- **passed on the phone (0961)** | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
+| **M3** | join an open network, then WPA2-PSK; an IP by DHCP; apps reach the internet -- **built (0963-0965), not yet run** | steps 8-9 (0964, 0965): channel privilege, the AP's STA record, BSS info, auth/assoc frames through the mailbox, EAPOL as data on TX ring 0, keys (`ADD_REMOVE_KEY`), the data rings and DMASHDL, an Ethernet `ifnet` (`a34_wifi_net.c`, after HackiOS's `redwood_net.c`), the WPA2 handshake in the kernel (`a34_wpa.c` = HakiOS's `lx_wpa.c`); the MAC kept on the root (0963) | `a34wifi up 9` / `join` (network from `/a34/wifi/network`), `a34wifi dhcp` (IPConfiguration's `setservice`, HakiOS `net_test.m`, MIT), `a34wifi tcp` | ~1 900 + ~550 ported | whether the radio transmits without PHY_ACTION/NVRAM (the TX statuses say); the management-frame TXD on the mailbox; the WTBL numbering (5 for the AP) |
 | **M4** | Settings' Wi-Fi: networks listed, password typed, joined | the wifid layer (section 2): `IO80211Controller`/`IONetworkInterface`, Apple80211 ioctls and events, `IONetworkStack`; ADT `wlan` node with `local-mac-address` | wifid, configd, mDNSResponder, trustd, securityd, nsurlsessiond, CFNetworkAgent enabled in the root | ~1 100 ported + ~200 | boot stalls if IOKit never quiesces (ios-topaz 0128) or InterfaceNamer never reports quiet; wifid holding SpringBoard (ios-sapphire); the 16.7.16 structure layouts (sizes match, field offsets to confirm from the log) |
 
 **The smallest path to a scan, then a join**, as the sources show it: M1's firmware start, then

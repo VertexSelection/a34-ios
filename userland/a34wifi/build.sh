@@ -35,7 +35,7 @@ log "host check of the same source (macOS: it builds and says what it is without
 xcrun --sdk macosx clang -std=gnu11 -O2 -Wall -Wextra -Werror -o "$WORK/a34wifi-host" "$HERE/a34wifi.c" \
 	-framework CoreFoundation
 # (no kern.a34wifi and no /a34/wifi on a Mac: each must say so and fail, not crash)
-for args in "" "files" "log" "up 3 1" "scan 1" "mac" "join 1" "dhcp 1" "bogus"; do
+for args in "" "files" "log" "up 3 1" "scan 1" "mac" "join 1" "dhcp 1" "tcp 127.0.0.1 9" "connect" "bogus"; do
 	rc=0
 	# shellcheck disable=SC2086
 	"$WORK/a34wifi-host" $args || rc=$?
