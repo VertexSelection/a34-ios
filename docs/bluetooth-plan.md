@@ -222,6 +222,11 @@ publish it as `local-mac-address`.
 | `xnu/patches/0939-a34-bt-m1.patch` | against the reference tree at `543f537` (0938): new `bsd/dev/a34_connsys.c`, `bsd/dev/a34_bt.c`, two lines in `bsd/conf/files`, `a34_bt_init()` and `sweet_log_flush()` in `bsd/dev/sweet_ufs.c`. Nothing runs without `a34bt=1` |
 | `userland/a34bt/` | `a34bt` (status, wait, probe, dump, cmd), `install-firmware.sh`, `INSTALL.md`; CI `.github/workflows/a34bt.yml` |
 
+Checked: the kernel compiles and links with 0939 (`xnu-a34` run
+[43677958340](https://github.com/VertexSelection/a34-ios/actions/runs/43677958340), branch
+`bluetooth` = 0938 + 0939; warnings only, none of them errors; the artifact's kernel carries both
+drivers); `a34bt` builds with `-Wall -Wextra -Werror` (`a34bt` workflow). Nothing has run on the phone.
+
 Kernel steps (each logs `A34 BT: step N: ...` / `A34 CONNSYS: phN: ...`; the steps that can hang
 a bus first write the log to disk and wait a second, `a34btsync=1`):
 
