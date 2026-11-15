@@ -577,6 +577,253 @@ scene_surfaces_of(const struct rwm_draw *d)
 
 } // namespace
 
+/*
+ * (metal-fx) Boot-arg rwm_glyphs=N: for N draws of the kinds that draw Control Center's glyphs and the edit mode's
+ * texts -- a mask texture of one channel (Igrn, Ired, Ialp), a programmable or additive blend (Bcbn, Bpld, Bvcm, Bdso,
+ * Badd), the rounded mask of a group (Tbds) or a colour matrix of the second attachment (Tc4p) -- at most three a
+ * pipeline in each five seconds: the WHOLE target it draws into read back before and after it (lines "glyph:"), how
+ * many pixels it changed and where, their mean before and after; how many bytes of each texture it reads are not
+ * zero (the whole texture); and the first bytes of its fragment buffers 0 and 1 (CoreAnimation's per-draw config and
+ * uniforms). The rwm_scene probe looked at sixteen texels of the scissor, which is the whole screen for these, and
+ * could not see a glyph. Each probe reads the target twice (write-combined memory under direct scan-out: slow).
+ */
+static long glyph_left = -1;
+
+extern "C" bool
+rwm_glyphs_on(void)
+{
+	if (glyph_left < 0) {
+		const char *at = strstr(rwm_boot_args(), "rwm_glyphs=");
+
+		glyph_left = at != nullptr ? atol(at + 11) : 0;
+	}
+	return glyph_left > 0;
+}
+
+namespace {
+
+struct glyph_label {
+	char label[64];
+	unsigned probed;
+};
+
+glyph_label glyph_labels[96];
+unsigned glyph_label_count;
+uint64_t glyph_began;
+
+struct glyph_probe {
+	unsigned dst, w, h, bytes;
+	uint8_t *before;
+	const char *label;
+};
+
+bool
+glyph_wanted(const char *label)
+{
+	static const char *const keys[] = { "Igrn", "Ired", "Ialp", "Bcbn", "Bpld", "Bvcm", "Bdso", "Badd", "_Tbds",
+					    "_Tc4p" };
+
+	for (const char *k : keys) {
+		if (strstr(label, k) != nullptr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+uint8_t *
+glyph_read(struct rwa_texture *t, unsigned level, unsigned slice, unsigned &w, unsigned &h, unsigned &bytes)
+{
+	const struct rwm_air *air = rwm_air();
+	uint8_t texel[16];
+	char why[96];
+
+	if (t == nullptr || air->texture_probe == nullptr || air->texture_read == nullptr) {
+		return nullptr;
+	}
+	const int b = air->texture_probe(t, level, slice, texel, &w, &h, why, sizeof(why));
+
+	if (b <= 0 || w == 0 || h == 0) {
+		return nullptr;
+	}
+	bytes = (unsigned)b;
+
+	uint8_t *all = (uint8_t *)malloc((size_t)w * h * bytes);
+	const unsigned origin[3] = { 0, 0, 0 }, size[3] = { w, h, 1 };
+
+	if (all != nullptr && air->texture_read(t, level, slice, origin, size, all, (size_t)w * bytes, why,
+						sizeof(why)) != 0) {
+		free(all);
+		return nullptr;
+	}
+	return all;
+}
+
+bool
+glyph_before(const struct rwm_draw *d, glyph_probe &p)
+{
+	p.before = nullptr;
+	if (!rwm_glyphs_on() || d->color_count == 0) {
+		return false;
+	}
+	p.label = d->label[0] ? (strncmp(d->label, "draw.", 5) == 0 ? d->label + 5 : d->label) : "(none)";
+	if (!glyph_wanted(p.label)) {
+		return false;
+	}
+
+	const uint64_t now = rwm_ns();
+
+	if (glyph_began == 0 || now - glyph_began > 5000000000ull) {
+		glyph_began = now;
+		glyph_label_count = 0;
+	}
+
+	glyph_label *l = nullptr;
+
+	for (unsigned i = 0; i < glyph_label_count && l == nullptr; i++) {
+		if (strcmp(glyph_labels[i].label, p.label) == 0) {
+			l = &glyph_labels[i];
+		}
+	}
+	if (l == nullptr && glyph_label_count < sizeof(glyph_labels) / sizeof(glyph_labels[0])) {
+		l = &glyph_labels[glyph_label_count++];
+		snprintf(l->label, sizeof(l->label), "%s", p.label);
+		l->probed = 0;
+	}
+	if (l == nullptr || l->probed >= 3) {
+		return false;
+	}
+	p.dst = strstr(p.label, "A2S1") != nullptr && d->color_count > 1 ? 1 : 0;
+	if (d->color[p.dst] == nullptr) {
+		return false;
+	}
+	p.before = glyph_read(d->color[p.dst], d->color_levels ? d->color_level[p.dst] : 0,
+			      d->color_levels ? d->color_slice[p.dst] : 0, p.w, p.h, p.bytes);
+	if (p.before == nullptr) {
+		return false;
+	}
+	l->probed++;
+	glyph_left--;
+	return true;
+}
+
+void
+glyph_after(const struct rwm_draw *d, glyph_probe &p)
+{
+	unsigned w = 0, h = 0, bytes = 0;
+	uint8_t *after = glyph_read(d->color[p.dst], d->color_levels ? d->color_level[p.dst] : 0,
+				    d->color_levels ? d->color_slice[p.dst] : 0, w, h, bytes);
+	char line[480];
+	size_t used;
+
+	if (after == nullptr || w != p.w || h != p.h || bytes != p.bytes) {
+		free(after);
+		free(p.before);
+		return;
+	}
+
+	unsigned long changed = 0;
+	unsigned x0 = w, y0 = h, x1 = 0, y1 = 0;
+	unsigned long long sb[4] = {}, sa[4] = {};
+
+	for (unsigned y = 0; y < h; y++) {
+		const uint8_t *a = p.before + (size_t)y * w * bytes, *b = after + (size_t)y * w * bytes;
+
+		for (unsigned x = 0; x < w; x++) {
+			if (memcmp(a + (size_t)x * bytes, b + (size_t)x * bytes, bytes) == 0) {
+				continue;
+			}
+			changed++;
+			x0 = x < x0 ? x : x0;
+			y0 = y < y0 ? y : y0;
+			x1 = x > x1 ? x : x1;
+			y1 = y > y1 ? y : y1;
+			for (unsigned c = 0; c < 4 && c < bytes; c++) {
+				sb[c] += a[(size_t)x * bytes + c];
+				sa[c] += b[(size_t)x * bytes + c];
+			}
+		}
+	}
+	used = (size_t)snprintf(line, sizeof(line), "glyph: %s a%u #%04x %ux%u%s: %lu px changed", p.label, p.dst,
+				(unsigned)((uintptr_t)d->color[p.dst] >> 4 & 0xffff), w, h,
+				d->color_surface[p.dst] ? " (a surface)" : "", changed);
+	if (changed != 0) {
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " in [%u,%u %ux%u], mean before", x0, y0,
+					 x1 - x0 + 1, y1 - y0 + 1);
+		for (unsigned c = 0; c < 4 && c < bytes; c++) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%02llx", c ? "" : " ", sb[c] / changed);
+		}
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " after");
+		for (unsigned c = 0; c < 4 && c < bytes; c++) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%02llx", c ? "" : " ", sa[c] / changed);
+		}
+	}
+	if (d->scissor != nullptr) {
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "; scissor %u,%u %ux%u", d->scissor[0],
+					 d->scissor[1], d->scissor[2], d->scissor[3]);
+	}
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "; %u vertices%s", d->vertex_count,
+				 d->index_bound ? " (indexed)" : "");
+	rwm_print("%s\n", line);
+	free(after);
+	free(p.before);
+
+	/* the textures it reads, whole */
+	used = (size_t)snprintf(line, sizeof(line), "glyph:   reads");
+	for (unsigned i = 0, n = 0; i < d->texture_count && i < RWM_MAX_BUFFERS && n < 3 && used < sizeof(line) - 100; i++) {
+		unsigned tw = 0, th = 0, tb = 0;
+		uint8_t *all = d->textures[i] != nullptr ? glyph_read(d->textures[i], 0, 0, tw, th, tb) : nullptr;
+
+		if (all == nullptr) {
+			continue;
+		}
+		unsigned long lit = 0;
+		unsigned top = 0;
+
+		for (size_t k = 0; k < (size_t)tw * th * tb; k++) {
+			lit += all[k] != 0;
+			top = all[k] > top ? all[k] : top;
+		}
+		free(all);
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s t%u #%04x %ux%u %ub: %lu of %lu bytes not "
+					 "zero, top %02x", n++ ? ";" : "", i,
+					 (unsigned)((uintptr_t)d->textures[i] >> 4 & 0xffff), tw, th, tb, lit,
+					 (unsigned long)tw * th * tb, top);
+		if (d->texture_surface[i] != 0) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " (%s %u)",
+						 d->texture_surface[i] & 0x80000000u ? "copied" : "surface",
+						 d->texture_surface[i] & 0x7fffffffu);
+		}
+	}
+	rwm_print("%s\n", line);
+
+	/* CoreAnimation's per-draw words: fragment buffers 0 (config) and 1 (uniforms), as far as 64 and 176 bytes */
+	const struct rwm_air *air = rwm_air();
+
+	for (unsigned b = 0; b < 2 && b < d->fragment_count_bound && air->buffer_map != nullptr; b++) {
+		const uint8_t *base = d->fragment[b] != nullptr ? (const uint8_t *)air->buffer_map(d->fragment[b]) : nullptr;
+		const size_t size = d->fragment[b] != nullptr && air->buffer_size != nullptr ? air->buffer_size(d->fragment[b])
+											   : 0;
+
+		if (base == nullptr || d->fragment_offset[b] >= size) {
+			continue;
+		}
+		const size_t n = size - d->fragment_offset[b] < (b == 0 ? 64u : 176u) ? size - d->fragment_offset[b]
+										      : (b == 0 ? 64u : 176u);
+
+		used = (size_t)snprintf(line, sizeof(line), "glyph:   b%u+%zu:", b, d->fragment_offset[b]);
+		for (size_t k = 0; k < n && used < sizeof(line) - 4; k += 4) {
+			uint32_t word;
+
+			memcpy(&word, base + d->fragment_offset[b] + k, 4);
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " %08x", word);
+		}
+		rwm_print("%s\n", line);
+	}
+}
+
+} // namespace
+
 /* (metal-fx) rwm_scene: a texture-to-texture copy of 600 pixels or wider (a snapshot, a backdrop), the first 60: what
  * the source holds and what the destination holds after */
 extern "C" void
@@ -730,12 +977,18 @@ rwm_run_draw(const struct rwm_draw *d, char *why, size_t why_size)
 
 	scene_probe probe;
 	const bool probing = scene_before(d, probe);
+	glyph_probe gprobe;
+	const bool gprobing = glyph_before(d, gprobe);
 
 	if (air->render_draw(d->render, &draw, why, why_size) != 0) {
+		free(gprobing ? gprobe.before : nullptr);
 		return -2;
 	}
 	if (probing) {
 		scene_after(d, probe);
+	}
+	if (gprobing) {
+		glyph_after(d, gprobe);
 	}
 	scene_surfaces_of(d);
 	blur_dump(d);

@@ -443,6 +443,7 @@ void rwm_render_store_action(struct rwm_render_state *state, unsigned index, uns
 bool rwm_blurdump_on(void);
 bool rwm_framedump_on(void);           /* (metal-fx) rwm_framedump=N */
 bool rwm_scene_on(void);               /* (metal-fx) rwm_scene=N: what is drawn, and whether it draws anything */
+bool rwm_glyphs_on(void);              /* (metal-fx) rwm_glyphs=N: what a glyph draw changes in its whole target */
 void rwm_scene_copy(struct rwa_texture *from, unsigned from_level, struct rwa_texture *to, unsigned to_level,
 		    const unsigned size[3]);
 void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */

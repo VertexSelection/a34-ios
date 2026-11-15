@@ -229,6 +229,14 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   from a buffer, a copy-in) into a texture of one or two bytes a texel or of at most 160x160
   (lines `rwa upload:`): how many bytes given are not zero, how many read back from the texture
   are, and its modifier (AFBC or not). Each one waits for the GPU.
+- **`rwm_glyphs=N`**: boot 0991-all-a (`rwm_uploads`) showed every glyph and mask upload landing
+  (bytes given = bytes read back, no AFBC on them), so the glyphs go missing in the draws. For N
+  draws of the kinds that draw them -- a one-channel mask (`Igrn`, `Ired`, `Ialp`), a programmable
+  or additive blend (`Bcbn`, `Bpld`, `Bvcm`, `Bdso`, `Badd`), a group's rounded mask (`_Tbds`), a
+  colour matrix of attachment 1 (`_Tc4p`), three a pipeline per 5 s -- the WHOLE target read back
+  before and after (lines `glyph:`): pixels changed, where, their mean before and after; the bytes
+  not zero in each texture it reads (whole); and fragment buffers 0 and 1 (CoreAnimation's config
+  and uniforms). Each probe reads the target twice.
 - **`rwm_scene=N`**: N windows of 5 s (lines `scene`): every pipeline drawn with and how often; for
   the first two draws a window of each pipeline that clips (`Ccl`), draws into the second attachment
   (`A2S1`), reads an attachment (`M0`, `M1`), blends other than source-over (`Badd`, `Bpld`, `Bcbn`,

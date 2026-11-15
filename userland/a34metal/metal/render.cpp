@@ -139,7 +139,7 @@ rwm_render_set_label(struct rwm_render_state *s, const char *label)
 
 	s->probe[0] = '\0';
 	s->label[0] = '\0';
-	if (label != nullptr && (rwm_framedump_on() || rwm_scene_on())) {
+	if (label != nullptr && (rwm_framedump_on() || rwm_scene_on() || rwm_glyphs_on())) {
 		const char *at = strstr(label, "coreanimation.");
 
 		snprintf(s->label, sizeof(s->label), "%s", at != nullptr ? at + 14 : label);
