@@ -11,7 +11,7 @@
 # computer, as Samsung asks on this generation) -> `recovery`; keep Volume Up held through our
 # loader's white bar if `recovery` holds an xnu-recovery image, or flash plain TWRP there.
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=${A34_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}   # A34_ROOT: the checkout with adb, build/, firmware/
 A="$ROOT/tools/platform-tools/adb"
 IMG=${1:?usage: run-boot-test.sh IMAGE}
 DEV=/dev/block/by-name/boot

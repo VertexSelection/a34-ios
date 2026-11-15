@@ -8,7 +8,7 @@
 # SHA-1 on the phone equal to the copy's; says whether it is the stock A346EXXSADYG1 boot.img.
 # Restore with: tools/run-boot-test.sh build/boot-backup-XXXXXXXX.img
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=${A34_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}   # A34_ROOT: the checkout with adb, build/, firmware/
 A="$ROOT/tools/platform-tools/adb"
 DEV=/dev/block/by-name/boot
 STOCK="$ROOT/firmware/A346EXXSADYG1_TUR/flash/boot.img"

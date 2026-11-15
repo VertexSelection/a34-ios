@@ -158,16 +158,36 @@ First phone test (ready, not flashed):
   then `no modem port /dev/a34at0 ... nothing to do`. If anything hangs, the last `A34 CELL`
   line names the step (it only reads SPM/infracfg status registers, LK's DTB and md1img).
 
-### Stage 1a -- boot so that LK loads the modem (needs the user's decision)
+### Stage 1a -- XNU from `boot`, so that LK loads the modem (approved 2026-11-15)
 
-LK loads and verifies md1img only when it boots normally, i.e. from `boot`. Replicating its
-loader (signature check, EMI MPU through ATF, the tag table) from XNU is not realistic. So XNU has
-to start from `boot`: our loader as the kernel of a boot image v4 (A34's stock `boot` is v4 with
-`vendor_boot`/`init_boot`; `recovery` keeps our current image with the TWRP escape). That
-replaces Android's kernel (Android cannot start until stock `boot.img` is flashed back) and is
-untested: the next step is a v4 packer (`tools/mkboot-v4.py`) and one boot to see LK hand over
-(`A34 CELL: ... modem LOADED by LK`, the regions, MD1 on after BROM). Rescue stays: Vol Up+Power
-to `recovery`, download mode for stock `boot.img`. Same switch will be needed for audio (ADSP).
+- Format: Android boot image v4 like the stock `boot` (page 4096, header 1584 bytes, stock
+  os_version 0x1e000197), kernel = gzip of our loader + XNU payload (no TWRP kernel: on a normal
+  boot LK hands over vendor_boot's/init_boot's ramdisk, so the loader's Volume Up escape finds
+  nothing and goes on to XNU), no ramdisk, "SEANDROIDENFORCE", AVB hash footer for the 32 MiB
+  partition (LK's GPT log: `boot` 0x2000 sectors of 4 KiB) with AOSP's test key. vbmeta keeps
+  flags=3 (Magisk's), so LK does not verify it; vendor_boot, init_boot and vbmeta are not
+  touched. `tools/build-xnu-boot.sh KERNEL "ARGS" OUT.img` builds it (temporary directory, checks
+  32 MiB, header and footer).
+- TWRP: `recovery` keeps whatever it holds (an xnu-recovery image: hold Volume Up through the
+  white bar; or plain TWRP). Get there with the phone off: Volume Up + Power with the USB cable in
+  (Samsung's recovery combo); download mode stays Volume Up + Volume Down.
+- Images (kernel `build/kernel-0961-cell.development.sweet` = main 0961 + 0950, xnu-a34 run
+  43713846188; boot-args = the 0961-base set + `a34cell=N`, 526 characters):
+  `build/xnu-boot-0961-cell1.img` (`a34cell=1`, read only) and
+  `build/xnu-boot-0961-cell2.img` (`a34cell=2`: also the first contact, below).
+- Write steps (from TWRP; `A34_ROOT=/home/vertex/a34-ios`, scripts from this branch):
+  1. `tools/backup-boot.sh` -- reads `boot` only into `build/boot-backup-<sha1>.img` (32 MiB,
+     header v4, SHA-1 checked against the phone; says whether it is stock DYG1).
+  2. `tools/run-boot-test.sh build/xnu-boot-0961-cell1.img` -- refuses without a backup or for
+     anything but a 32 MiB v4 image; writes `boot` only, checks SHA-1, clears a boot-recovery
+     note in misc, plain reboot.
+  3. Pull the log from TWRP as usual (`tools/pull-log.sh`).
+  4. Back to Android: `tools/run-boot-test.sh build/boot-backup-<sha1>.img`.
+- Success: `A34 CELL: LK /chosen ccci,modem_info_v2: ... -> modem LOADED by LK`, the modem regions
+  (`md_mem_usage`, `ap_md_c_smem`, `ap_md_nc_smem`, `ccci_tag_mem`), ~20 `LK tag` lines (the
+  shared-memory layout), `MD1 power domain ON`, `MD boot ROM check ... = BROM PASS`, md1img.
+  Then cell2: `SMC MD_KERNEL_BOOT_UP`, `CCIF from the modem: RCHNUM ...`, and
+  `HS1 -- the modem is running and asks for the AP's features` with its 64 feature bytes.
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
