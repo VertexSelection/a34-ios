@@ -1,0 +1,536 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 530392f..4fa71d3 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -613,12 +613,19 @@ a34w_step3(void)
+ #define DMA_TOKENS                      0x140000u       /* DATA_TX_SLOTS token buffers (1010: after RX ring 5's buffers) */
+ #define DMA_RX2_BUFS                    0x70000u        /* ring n's buffers at 0x70000 + 0x40000 * (n - 2), 4 KB apart */
+ #define DMA_RXN_DESC(n)                 (DMA_RX2_DESC + 0x1000u * ((n) - 2u))
+-#define DMA_RXN_BUFS(n)                 (DMA_RX2_BUFS + 0x40000u * ((n) - 2u))
+-#define DMA_USED_END                    (DMA_TOKENS + DATA_TX_SLOTS * DATA_TOKEN_SIZE)
++/*
++ * (1011) RX ring 2 (band 0's data: all of ours) has 256 slots, as Android's: at 300 Mbit/s 50 frames
++ * come between two of our 2 ms polls, and a late poll overflowed 64. Its buffers after the tokens.
++ */
++#define DATA_RX2_SLOTS                  256u
++#define DMA_RX2_BIG                     (DMA_TOKENS + DATA_TX_SLOTS * DATA_TOKEN_SIZE)
++#define DMA_RXN_BUFS(n)                 ((n) == 2u ? DMA_RX2_BIG : DMA_RX2_BUFS + 0x40000u * ((n) - 2u))
++#define DMA_USED_END                    (DMA_RX2_BIG + DATA_RX2_SLOTS * SLOT_SIZE)
+ #define DMASHDL                         0x26000u        /* WF_HIF_DMASHDL_TOP (0x7c026000 = AP 0x18026000) */
+ _Static_assert(DMA_USED_END <= A34W_DMA_SIZE, "the rings fit in the DMA memory");
+ _Static_assert(DMA_TOKENS >= DMA_RXN_BUFS(5u) + FREE_RX_SLOTS * SLOT_SIZE, "the token buffers after the RX buffers");
+ _Static_assert(DMA_TX0_DESC + DATA_TX_SLOTS * 16u <= DMA_RX2_DESC, "TX ring 0's descriptors fit");
++_Static_assert(DMA_RX2_DESC + DATA_RX2_SLOTS * 16u <= DMA_RXN_DESC(3u), "RX ring 2's descriptors fit");
+ 
+ static vm_offset_t a34w_wf, a34w_emi, a34w_dma;
+ static uint64_t a34w_emi_pa;
+@@ -926,7 +933,7 @@ a34w_data_rings_init(void)
+ 	for (uint32_t n = 2; n <= 5u; n++) {
+ 		struct a34w_rx_ring *r = &a34w_drx[n - 2u];
+ 
+-		r->slots = n <= 3u ? DATA_RX_SLOTS : FREE_RX_SLOTS;
++		r->slots = n == 2u ? DATA_RX2_SLOTS : n == 3u ? DATA_RX_SLOTS : FREE_RX_SLOTS;
+ 		r->buf_size = n <= 3u ? DATA_RX_BUF_SIZE : FREE_RX_BUF_SIZE;
+ 		r->cidx = r->slots - 1u;
+ 		for (uint32_t s = 0; s < r->slots; s++) {
+@@ -1030,8 +1037,8 @@ a34w_wfdma_init(void)
+ 	v = a34w_rd(a34w_conn, WFDMA_PAUSE_RX_Q_TH10);
+ 	a34w_wr(a34w_conn, WFDMA_PAUSE_RX_Q_TH10, (v & 0x0fff0000u) + 4u);
+ 	a34w_set(a34w_wf, WF_WFDMA_DUMMY_CR, 1u << 1);
+-	a34w_say("step 5: data rings (0964): TX0 %u slots, RX2/3 %u, RX4/5 %u; DMASHDL group 0 0x%08x, queues 0x%08x, "
+-	    "control 0x%08x", DATA_TX_SLOTS, DATA_RX_SLOTS, FREE_RX_SLOTS, a34w_rd(a34w_conn, DMASHDL + 0x20u),
++	a34w_say("step 5: data rings (0964): TX0 %u slots, RX2 %u, RX3 %u, RX4/5 %u; DMASHDL group 0 0x%08x, queues 0x%08x, "
++	    "control 0x%08x", DATA_TX_SLOTS, DATA_RX2_SLOTS, DATA_RX_SLOTS, FREE_RX_SLOTS, a34w_rd(a34w_conn, DMASHDL + 0x20u),
+ 	    a34w_rd(a34w_conn, DMASHDL + 0x60u), a34w_rd(a34w_conn, DMASHDL + 0x08u));
+ 	a34w_say("step 5: WFDMA: GLO_CFG 0x%08x, TX17 at 0x%x (%u slots) cidx/didx %u/%u, RX0 at 0x%x cidx/didx %u/%u",
+ 	    a34w_rd(a34w_conn, WFDMA_GLO_CFG), (uint32_t)A34W_DMA_PA + DMA_TX17_DESC, RING_SLOTS,
+@@ -1605,6 +1612,9 @@ a34w_heard_report(const char *what)
+ #define TAG_CAP_SW_VERSION              0x6u
+ #define TAG_CAP_MAC_ADDR                0x7u
+ #define TAG_CAP_HW_ADIE_VERSION         0x14u
++#define TAG_CAP_PHY                     0x8u            /* (1011) ucHt, ucVht, uc5gBand, ucMaxBandwidth, ucNss, ucDbdc, ... */
++static uint8_t a34w_cap_nss = 1, a34w_cap_bw;     /* (1011) what the chip says it can: streams; 0 20 .. 2 80 MHz */
++static bool a34w_cap_vht;
+ #define CMD_BAND_2G4                    1u
+ #define CMD_BAND_5G                     2u
+ 
+@@ -1973,6 +1983,13 @@ a34w_step6(void)
+ 			}
+ 		} else if (tag == TAG_CAP_HW_ADIE_VERSION && length >= 4u) {
+ 			a34w_say("step 6: A-die 0x%04x ECO %u", (unsigned)(b[0] | b[1] << 8), (unsigned)(b[2] | b[3] << 8));
++		} else if (tag == TAG_CAP_PHY && length >= 11u) {   /* (1011) nic_cmd_event.c nicCfgChipCapPhyCap */
++			a34w_cap_vht = b[1] != 0;
++			a34w_cap_bw = b[3];
++			a34w_cap_nss = b[4] != 0 ? b[4] : 1;
++			a34w_say("step 6: PHY: HT %u VHT %u 5 GHz %u, widest %u (0 20, 1 40, 2 80, 3 160 MHz), %u streams, DBDC %u, "
++			    "LDPC TX/RX %u/%u, STBC TX/RX %u/%u, paths 0x%x", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
++			    b[10]);
+ 		}
+ 		at += 8u + length;
+ 	}
+@@ -2200,6 +2217,14 @@ static int a34w_auth_status = -1, a34w_assoc_status = -1;
+ /* (0968) joined as Android joins: an HT (20 MHz, one stream) and WMM (QoS) station that can be told to move */
+ static int a34w_legacy;                         /* kern.a34wifi.legacy=1: as 0964, no HT, no WMM */
+ static int a34w_join_error;                     /* (0969) why the last join failed: an errno */
++/* (1011) how wide and how many streams this join is: as wide as the AP, the chip and kern.a34wifi.width allow */
++static int a34w_width_max = 80, a34w_nss_max = 2;
++static uint8_t a34w_bw, a34w_nss = 1, a34w_sco, a34w_s1, a34w_s2;     /* bw: 0 20, 1 40, 2 80 MHz */
++static bool a34w_vht;
++static uint8_t a34w_vht_streams(uint16_t map);
++static void a34w_ro_start(uint32_t tid, uint16_t ssn, uint32_t size);   /* (1011) RX reordering, below */
++static void a34w_ro_stop(uint32_t tid);
++static void a34w_ro_reset(void);
+ static bool a34w_ht, a34w_qos;                  /* what this join is */
+ static uint8_t a34w_assoc_ies[512];             /* the Association Response's elements */
+ static uint32_t a34w_assoc_ies_length;
+@@ -3040,6 +3065,19 @@ a34w_event_note(uint8_t eid, const uint8_t *body, uint32_t length)
+ 		a34w_lost("beacon timeout");
+ 		return true;
+ 	}
++	if (eid == EVENT_ID_RX_ADDBA && length >= 8u) {         /* (1011) que_mgt.h EVENT_RX_ADDBA */
++		uint32_t param = (uint32_t)(body[2] | body[3] << 8), tid = (param >> 2) & 0xfu;
++		uint16_t ssn = (uint16_t)((body[6] | body[7] << 8) >> 4);
++
++		a34w_ro_start(tid, ssn, param >> 6);
++		a34w_say("block ack: the AP sends A-MPDUs on TID %u (window %u, from %u): reordered", tid, param >> 6, ssn);
++		return true;
++	}
++	if (eid == EVENT_ID_RX_DELBA && length >= 2u) {
++		a34w_ro_stop(body[1]);
++		a34w_say("block ack on TID %u ended", body[1] & 0xfu);
++		return true;
++	}
+ 	if (eid == EVENT_ID_RX_ADDBA || eid == EVENT_ID_RX_DELBA || eid == EVENT_ID_TX_ADDBA) {
+ 		char bytes[3 * 16 + 4];
+ 
+@@ -3074,6 +3112,167 @@ a34w_lost(const char *why)
+ 
+ static void a34w_eapol_in(const uint8_t *frame, uint32_t length);
+ 
++/*
++ * ---- (1011) RX reordering ----
++ * With a block ack agreement (the firmware takes the AP's ADDBA itself and says so with
++ * EVENT_ID_RX_ADDBA: TID, window, starting sequence number) the AP's A-MPDUs can arrive with
++ * frames out of order or retried late; they go up in sequence order, as que_mgt.c does it: a
++ * frame inside the window is held until the ones before it have come, one beyond it moves the
++ * window on (handing up what it passes), an old one is dropped; a hole is given up after 100 ms.
++ * The sequence number is in RX group 4 (frame control, TA, sequence control), the TID in RXD DW2.
++ */
++#define REORDER_SLOTS                   64u
++#define REORDER_HOLD_MS                 100u
++
++struct a34w_reorder {
++	bool active;
++	uint16_t head;                  /* the sequence number to hand up next */
++	uint16_t size;                  /* the window (ADDBA's buffer size, at most 64) */
++	uint16_t held;
++	uint64_t since;                 /* when the oldest frame held now came */
++	uint8_t *frames;                /* REORDER_SLOTS frames of FRAME_MOST bytes, made at the first ADDBA */
++	uint16_t length[REORDER_SLOTS];
++	bool have[REORDER_SLOTS];
++};
++static struct a34w_reorder a34w_ro[8];
++static uint64_t a34w_ro_late, a34w_ro_timeouts, a34w_ro_reordered;
++
++static void
++a34w_up(const uint8_t *eth, uint32_t length)
++{
++	if (a34w_eth_input != NULL && a34w_joined) {
++		a34w_eth_input(eth, length);
++	}
++}
++
++/* the held frame of sequence number r->head, if any, up; the head on */
++static void
++a34w_ro_step(struct a34w_reorder *r)
++{
++	uint32_t slot = r->head % REORDER_SLOTS;
++
++	if (r->have[slot]) {
++		a34w_up(r->frames + slot * FRAME_MOST, r->length[slot]);
++		r->have[slot] = false;
++		r->held--;
++	}
++	r->head = (uint16_t)((r->head + 1u) & 0xfffu);
++}
++
++/* everything held from the head on that is in order, up */
++static void
++a34w_ro_release(struct a34w_reorder *r)
++{
++	while (r->have[r->head % REORDER_SLOTS]) {
++		a34w_ro_step(r);
++	}
++	r->since = r->held != 0 ? a34w_ms() : 0;
++}
++
++static void
++a34w_ro_start(uint32_t tid, uint16_t ssn, uint32_t size)
++{
++	struct a34w_reorder *r = &a34w_ro[tid & 7u];
++
++	if (r->frames == NULL) {
++		r->frames = kalloc_data(REORDER_SLOTS * FRAME_MOST, Z_WAITOK);
++		if (r->frames == NULL) {
++			return;
++		}
++	}
++	while (r->active && r->held != 0) {             /* (an agreement again: what is held goes up first) */
++		a34w_ro_step(r);
++	}
++	bzero(r->have, sizeof(r->have));
++	r->held = 0;
++	r->since = 0;
++	r->head = ssn & 0xfffu;
++	r->size = (uint16_t)(size == 0 || size > REORDER_SLOTS ? REORDER_SLOTS : size);
++	r->active = true;
++}
++
++static void
++a34w_ro_stop(uint32_t tid)
++{
++	struct a34w_reorder *r = &a34w_ro[tid & 7u];
++
++	while (r->active && r->held != 0) {
++		a34w_ro_step(r);
++	}
++	r->active = false;
++}
++
++/* (link lost) nothing held goes up any more */
++static void
++a34w_ro_reset(void)
++{
++	for (uint32_t t = 0; t < 8u; t++) {
++		bzero(a34w_ro[t].have, sizeof(a34w_ro[t].have));
++		a34w_ro[t].held = 0;
++		a34w_ro[t].active = false;
++	}
++}
++
++/*
++ * `follows`: a later subframe of an A-MSDU (RXD DW3 payload format 1 or 2), with the sequence number
++ * of the first: it goes up as it is, after or (rarely, if the first is held) before its first
++ * (we tell the firmware no A-MSDU in A-MPDU, so these should not come under an agreement at all).
++ */
++static void
++a34w_ro_in(uint32_t tid, uint16_t sn, bool follows, const uint8_t *eth, uint32_t length)
++{
++	struct a34w_reorder *r = &a34w_ro[tid & 7u];
++	uint32_t d = (uint32_t)(sn - r->head) & 0xfffu, slot = sn % REORDER_SLOTS;
++
++	if (follows && (d >= 2048u || r->have[slot])) {
++		a34w_up(eth, length);
++		return;
++	}
++	if (d >= 2048u) {                               /* behind the window: late or a retry already handed up */
++		a34w_ro_late++;
++		return;
++	}
++	if (d >= r->size) {                             /* beyond it: the window moves on, what it passes goes up */
++		uint16_t to = (uint16_t)((sn - r->size + 1u) & 0xfffu);
++
++		while (r->head != to) {
++			a34w_ro_step(r);
++		}
++	}
++	if (r->have[slot]) {
++		a34w_ro_late++;                         /* (the same frame twice) */
++		return;
++	}
++	if (sn != r->head) {
++		a34w_ro_reordered++;
++	}
++	memcpy(r->frames + slot * FRAME_MOST, eth, length);
++	r->length[slot] = (uint16_t)length;
++	r->have[slot] = true;
++	r->held++;
++	if (r->since == 0) {
++		r->since = a34w_ms();
++	}
++	a34w_ro_release(r);
++}
++
++/* (the thread, every 2 ms) a hole held for longer than REORDER_HOLD_MS is given up */
++static void
++a34w_ro_timeouts_check(void)
++{
++	for (uint32_t t = 0; t < 8u; t++) {
++		struct a34w_reorder *r = &a34w_ro[t];
++
++		if (r->active && r->held != 0 && a34w_ms() - r->since >= REORDER_HOLD_MS) {
++			while (!r->have[r->head % REORDER_SLOTS]) {
++				r->head = (uint16_t)((r->head + 1u) & 0xfffu);
++			}
++			a34w_ro_timeouts++;
++			a34w_ro_release(r);
++		}
++	}
++}
++
+ /*
+  * A data frame (RXD packet type 2, or forwarded with its header translated): an Ethernet frame
+  * out of it -- as the hardware made it, or out of the 802.11 header and LLC/SNAP -- for EAPOL
+@@ -3124,8 +3323,21 @@ a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated)
+ 	}
+ 	if ((eth[12] << 8 | eth[13]) == ETHERTYPE_EAPOL) {
+ 		a34w_eapol_in(eth, length);
+-	} else if (a34w_eth_input != NULL && a34w_joined) {
+-		a34w_eth_input(eth, length);
++	} else {
++		/* (1011) unicast QoS data under an agreement: in order. Group 4 (first after the RXD): frame
++		 * control, TA, sequence control, QoS control; RXD DW3: A1 type (1: to us), payload format */
++		uint32_t dw3, vld = (dw1 >> 11) & 0x1fu, tid = RXD_SIZE + 16u <= count ? rxd[RXD_SIZE + 10] & 7u : 0;
++
++		memcpy(&dw3, rxd + 12, 4);
++		if ((vld & 8u) != 0 && RXD_SIZE + 16u <= count && (rxd[RXD_SIZE] & 0x8cu) == 0x88u && a34w_ro[tid].active &&
++		    ((dw3 >> 16) & 3u) == 1u) {
++			uint16_t seqctl = (uint16_t)(rxd[RXD_SIZE + 8] | rxd[RXD_SIZE + 9] << 8);
++			uint32_t format = (dw3 >> 22) & 3u;
++
++			a34w_ro_in(tid, (uint16_t)(seqctl >> 4), format == 1u || format == 2u, eth, length);
++		} else {
++			a34w_up(eth, length);
++		}
+ 	}
+ }
+ 
+@@ -3420,7 +3632,7 @@ a34w_sta_record(uint8_t state, bool need_response)
+ 
+ 		c[13] |= 0x10u;                         /* ucDesiredPhyTypeSet: + HT */
+ 		if (ht != NULL && ht[1] >= 26u) {
+-			uint16_t info = (uint16_t)((ht[2] | ht[3] << 8) & ~0x0042u);     /* no 40 MHz, no SGI40: we are at 20 */
++			uint16_t info = (uint16_t)((ht[2] | ht[3] << 8) & (a34w_bw != 0 ? 0xffffu : ~0x0042u));  /* 40 MHz bits at 40+ */
+ 
+ 			c[21] = ht[5];                  /* ucMcsSet: MCS 0-7 */
+ 			c[22] = (uint8_t)((ht[9] & 1u) != 0);   /* ucSupMcs32 */
+@@ -3442,6 +3654,25 @@ a34w_sta_record(uint8_t state, bool need_response)
+ 		c[92] = 64;                             /* rBaSize: TX 64, RX 64; no A-MSDU in A-MPDU (+128 stay 0) */
+ 		c[93] = 64;
+ 	}
++	if (a34w_vht) {                                 /* (1011) the AP's VHT Capabilities, as they are */
++		const uint8_t *v = a34w_ap_ie(191, -1);
++
++		c[13] |= 0x20u;                         /* ucDesiredPhyTypeSet: + VHT */
++		if (v != NULL && v[1] >= 12u) {
++			memcpy(c + 56, v + 2, 4);       /* u4VhtCapInfo */
++			memcpy(c + 60, v + 6, 8);       /* RX MCS map, RX highest, TX MCS map, TX highest */
++			c[69] = (uint8_t)(a34w_bw | ((a34w_vht_streams((uint16_t)(v[6] | v[7] << 8)) - 1u) << 4));   /* ucVhtOpMode */
++			if (a34w_nss < 2u) {
++				c[60] |= 0xfcu;         /* (kern.a34wifi.nss 1) no stream 2.. towards the AP */
++				c[61] = 0xff;
++				c[64] |= 0xfcu;
++				c[65] = 0xff;
++			}
++		}
++	}
++	if (a34w_ht && a34w_nss < 2u) {
++		c[25] = c[26] = c[27] = 0;              /* (1011) aucRxMcsBitmask: one stream, MCS 0-7 */
++	}
+ 	return a34w_cmd(CMD_ID_UPDATE_STA_RECORD, CMD_SET, c, sizeof(c));
+ }
+ 
+@@ -3481,7 +3712,7 @@ a34w_bss_info(bool connected)
+ 
+ 		c[55] |= 0x10u;                         /* ucPhyTypeSet: + HT */
+ 		if (op != NULL && op[1] >= 22u) {
+-			rlm[12] = op[3] & (uint8_t)~0x07u;      /* ucHtOpInfo1 without SCO and STA width: 20 MHz */
++			rlm[12] = a34w_bw != 0 ? op[3] : op[3] & (uint8_t)~0x07u;    /* ucHtOpInfo1 (SCO, width: 0 at 20 MHz) */
+ 			rlm[10] = op[4];                /* u2HtOpInfo2 */
+ 			rlm[11] = op[5];
+ 			rlm[8] = op[6];                 /* u2HtOpInfo3 */
+@@ -3496,10 +3727,21 @@ a34w_bss_info(bool connected)
+ 	rlm[2] = a34w_target.channel;                   /* ucPrimaryChannel; SCO 0: 20 MHz, no HT/VHT */
+ 	rlm[13] = (a34w_target.capability & 0x0020u) ? 1u : 0u;        /* ucUseShortPreamble */
+ 	rlm[14] = five || (a34w_target.capability & 0x0400u) ? 1u : 0u;/* ucUseShortSlotTime */
+-	rlm[20] = 1;                                    /* ucTxNss */
+-	rlm[21] = 1;                                    /* ucRxNss */
++	rlm[3] = a34w_sco;                              /* (1011) ucRfSco */
++	if (a34w_vht) {
++		uint16_t vbasic = basic;
++
++		c[55] |= 0x20u;                         /* ucPhyTypeSet: + VHT */
++		rlm[15] = (uint8_t)(a34w_bw == 2u ? 1u : 0u);   /* ucVhtChannelWidth */
++		rlm[16] = a34w_s1;                      /* ucVhtChannelFrequencyS1, S2 */
++		rlm[17] = a34w_s2;
++		rlm[18] = (uint8_t)vbasic;              /* u2VhtBasicMcsSet: the basic rate set, as rlm.c fills it */
++		rlm[19] = (uint8_t)(vbasic >> 8);
++	}
++	rlm[20] = a34w_nss;                             /* ucTxNss */
++	rlm[21] = a34w_nss;                             /* ucRxNss */
+ 	c[90] = DBDC_BAND_AUTO;                         /* ucDBDCBand */
+-	c[93] = 1;                                      /* ucNss */
++	c[93] = a34w_nss;                               /* ucNss */
+ 	return a34w_cmd(CMD_ID_SET_BSS_INFO, CMD_SET, c, sizeof(c));
+ }
+ 
+@@ -3518,8 +3760,12 @@ a34w_ch_privilege(bool request)
+ 	c[1] = a34w_ch_token;                           /* ucTokenID (a new one for each request: HakiOS run 449) */
+ 	c[2] = (uint8_t)(request ? 0u : 1u);                   /* ucAction: REQ / ABORT */
+ 	if (request) {
+-		c[3] = a34w_target.channel;             /* ucPrimaryChannel; SCO 0, 20/40 MHz width 0 */
++		c[3] = a34w_target.channel;             /* ucPrimaryChannel */
++		c[4] = a34w_sco;                        /* (1011) ucRfSco: 1 above, 3 below, 0 none */
+ 		c[5] = a34w_target.channel > 14u ? CMD_BAND_5G : CMD_BAND_2G4;  /* ucRfBand */
++		c[6] = (uint8_t)(a34w_bw == 2u ? 1u : 0u);      /* ucRfChannelWidth: 0 20/40, 1 80 */
++		c[7] = a34w_s1;                         /* ucRfCenterFreqSeg1, Seg2 */
++		c[8] = a34w_s2;
+ 		c[9] = 0;                               /* ucReqType: JOIN */
+ 		a34w_put32(c + 12, 4000);               /* u4MaxInterval, ms (AIS_JOIN_CH_REQUEST_INTERVAL) */
+ 	}
+@@ -3568,13 +3814,44 @@ a34w_frame_assoc(uint8_t *f, uint32_t room)
+ 		n += (uint32_t)sizeof(a34w_own_rsn);
+ 	}
+ 	if (a34w_ht && n + sizeof(a34w_own_ht) <= room) {         /* (0968) */
++		uint16_t info = (uint16_t)(a34w_own_ht[2] | a34w_own_ht[3] << 8);
++
+ 		memcpy(f + n, a34w_own_ht, sizeof(a34w_own_ht));
++		if (a34w_nss >= 2u) {                   /* (1011) two streams: MCS 8-15, TX STBC (rlm.c) */
++			f[n + 6] = 0xff;
++			info |= 0x0080u;
++		}
++		if (a34w_bw != 0) {                     /* 40 MHz: the width bit, short GI 40, MCS 32 */
++			info |= 0x0042u;
++			f[n + 9] |= 0x01u;
++		}
++		f[n + 2] = (uint8_t)info;
++		f[n + 3] = (uint8_t)(info >> 8);
+ 		n += (uint32_t)sizeof(a34w_own_ht);
+ 	}
+ 	if (!a34w_legacy && n + sizeof(a34w_own_ext_cap) <= room) {
+ 		memcpy(f + n, a34w_own_ext_cap, sizeof(a34w_own_ext_cap));
+ 		n += (uint32_t)sizeof(a34w_own_ext_cap);
+ 	}
++	if (a34w_vht && n + 14u <= room) {
++		/* (1011) VHT Capabilities: max A-MPDU 2^20-1, RX LDPC, RX STBC 1, TX STBC (two streams), short GI 80;
++		 * no beamformee (no sounding asked of us); MCS 0-9 on each of our streams */
++		uint32_t info = (7u << 23) | 0x100u | 0x10u | (a34w_nss >= 2u ? 0x80u : 0u) | (a34w_bw == 2u ? 0x20u : 0u);
++		uint16_t map = a34w_nss >= 2u ? 0xfffau : 0xfffeu;
++
++		f[n++] = 191;
++		f[n++] = 12;
++		a34w_put32(f + n, info);
++		n += 4u;
++		f[n++] = (uint8_t)map;                  /* RX MCS map, highest rate 0 */
++		f[n++] = (uint8_t)(map >> 8);
++		f[n++] = 0;
++		f[n++] = 0;
++		f[n++] = (uint8_t)map;                  /* TX MCS map, highest rate 0 */
++		f[n++] = (uint8_t)(map >> 8);
++		f[n++] = 0;
++		f[n++] = 0;
++	}
+ 	if (a34w_qos && n + sizeof(a34w_own_wmm) <= room) {
+ 		memcpy(f + n, a34w_own_wmm, sizeof(a34w_own_wmm));
+ 		n += (uint32_t)sizeof(a34w_own_wmm);
+@@ -3622,6 +3899,59 @@ a34w_unjoin(bool deauth)
+ 	a34w_joined = false;
+ 	a34w_associated = false;
+ 	a34w_keys_in = false;
++	a34w_ro_reset();                                /* (1011) */
++}
++
++/*
++ * (1011) The streams: as many as the chip has (capability tag 8), kern.a34wifi.nss allows and the
++ * AP receives (its HT MCS set). The width, on 5 GHz only (2.4 GHz stays 20 MHz, gen4m's default):
++ * 40 MHz when the AP's HT Operation has a secondary channel and its STA channel width bit, 80 MHz
++ * when it also has VHT Operation at 80 and we have VHT -- as far as kern.a34wifi.width (20/40/80)
++ * allows. CH_PRIVILEGE, the AP's record and BSS info are then filled from these (nic.c, rlm.c).
++ */
++static void
++a34w_plan_width(void)
++{
++	const uint8_t *ht = a34w_target_ie(45), *op = a34w_target_ie(61), *vcap = a34w_target_ie(191), *vop = a34w_target_ie(192);
++	uint8_t ap_nss = 0;
++
++	a34w_bw = a34w_sco = a34w_s1 = a34w_s2 = 0;
++	a34w_vht = false;
++	a34w_nss = 1;
++	if (!a34w_ht) {
++		return;
++	}
++	for (uint32_t i = 0; ht != NULL && ht[1] >= 26u && i < 4u; i++) {
++		ap_nss = (uint8_t)(ht[5u + i] != 0 ? i + 1u : ap_nss);
++	}
++	a34w_nss = (uint8_t)(a34w_cap_nss < 2u || a34w_nss_max < 2 || ap_nss < 2u ? 1u : 2u);
++	if (a34w_target.channel <= 14u) {
++		return;
++	}
++	a34w_vht = a34w_cap_vht && vcap != NULL && vcap[1] >= 12u && vop != NULL && vop[1] >= 5u;
++	if (a34w_width_max < 40 || a34w_cap_bw < 1u || op == NULL || op[1] < 22u) {
++		return;
++	}
++	if (((op[3] & 3u) == 1u || (op[3] & 3u) == 3u) && (op[3] & 0x04u) != 0) {
++		a34w_bw = 1;
++		a34w_sco = op[3] & 3u;
++	}
++	if (a34w_vht && a34w_bw == 1 && a34w_width_max >= 80 && a34w_cap_bw >= 2u && vop[2] >= 1u && vop[3] != 0) {
++		a34w_bw = 2;
++		a34w_s1 = vop[3];                       /* the 80 MHz channel's centre */
++	}
++}
++
++/* (1011) the AP's spatial streams as its VHT RX MCS map says (2 bits each, 3: not supported) */
++static uint8_t
++a34w_vht_streams(uint16_t map)
++{
++	uint8_t n = 0;
++
++	for (uint32_t i = 0; i < 8u && ((map >> (2u * i)) & 3u) != 3u; i++) {
++		n++;
++	}
++	return n != 0 ? n : 1u;
+ }
+ 
+ /* authentication, association, (WPA2) the handshake: with the channel held; true when JOINED */
+@@ -3641,8 +3971,11 @@ a34w_connect(void)
+ 	a34w_assoc_ies_length = 0;
+ 	a34w_ht = !a34w_legacy && a34w_target_ie(45) != NULL;     /* (0968) as the AP is */
+ 	a34w_qos = !a34w_legacy && (a34w_ie_in(a34w_target.ies, a34w_target.ies_length, 221, 1) != NULL || a34w_ht);
+-	a34w_say("step 8: joining as %s%s", a34w_ht ? "an HT (20 MHz, one stream) " : a34w_legacy ? "a legacy (kern.a34wifi.legacy) " :
+-	    "a legacy ", a34w_qos ? "QoS (WMM) station that takes BSS transition requests" : "station");
++	a34w_plan_width();
++	a34w_say("step 8: joining as %s%s%s, %u stream%s, %u MHz%s", a34w_vht ? "a VHT " : a34w_ht ? "an HT " :
++	    a34w_legacy ? "a legacy (kern.a34wifi.legacy) " : "a legacy ", a34w_qos ? "QoS (WMM) station that takes BSS "
++	    "transition requests" : "station", a34w_sco != 0 ? (a34w_sco == 1 ? " (secondary above)" : " (secondary below)") : "",
++	    a34w_nss, a34w_nss > 1 ? "s" : "", 20u << a34w_bw, a34w_bw == 2 ? " (VHT80)" : a34w_bw == 1 ? " (HT40)" : "");
+ 	if (a34w_ch_privilege(true) == 0 || !a34w_wait_status(&a34w_ch_status, 2000)) {
+ 		a34w_say("step 8: channel %u NOT GRANTED (CH_PRIVILEGE, token %u)", a34w_target.channel, a34w_ch_token);
+ 		(void)a34w_ch_privilege(false);
+@@ -3858,6 +4191,7 @@ a34w_service(void)
+ 	}
+ 	for (uint32_t i = 0; i < 8u && a34w_data_poll(); i++) {
+ 	}
++	a34w_ro_timeouts_check();                       /* (1011) */
+ 	if (a34w_joined) {                              /* (1010) power save, when it is time or asked for */
+ 		int want = a34w_powersave >= 0 ? a34w_powersave : a34w_ps_at != 0 && a34w_ms() >= a34w_ps_at ? 2 : 0;
+ 
+@@ -3880,6 +4214,8 @@ a34w_service(void)
+ 		    (unsigned long long)a34w_data_bytes_in, (unsigned long long)a34w_data_dropped_out,
+ 		    (unsigned long long)a34w_drop_no_token, (unsigned long long)a34w_drop_ring_full,
+ 		    (unsigned long long)a34w_tx_waits, (unsigned long long)a34w_data_dropped_in, a34w_tokens_back);
++		a34w_say("  reordered %llu, late or twice %llu, holes given up %llu; the AP at %d dBm", (unsigned long long)a34w_ro_reordered,
++		    (unsigned long long)a34w_ro_late, (unsigned long long)a34w_ro_timeouts, a34w_link_rssi);
+ 	}
+ }
+ 
+@@ -4421,6 +4757,10 @@ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_bus
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_legacy, 0,
+     "(0968) 1: join as a legacy station (no HT, no WMM), as 0964 did");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, width, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_width_max, 0,
++    "(1011) the widest channel a join may use: 20, 40 or 80 MHz (5 GHz; from the next join)");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, nss, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_nss_max, 0,
++    "(1011) the most spatial streams a join may use: 1 or 2 (from the next join)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, powersave, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_powersave, 0,
+     "(1010) -1 automatic (FAST_PSP 15 s after a join), 0 CAM, 1 MAX_PSP, 2 FAST_PSP");
+ SYSCTL_UINT(_kern_a34wifi, OID_AUTO, trace, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_trace_left, 0,
+@@ -4513,6 +4853,8 @@ a34_wifi_init(void)
+ 	(void)PE_parse_boot_argn("a34wifiphy", &a34w_phyaction, sizeof(a34w_phyaction));       /* (0966) */
+ 	(void)PE_parse_boot_argn("a34wifilegacy", &a34w_legacy, sizeof(a34w_legacy));         /* (0968) */
+ 	(void)PE_parse_boot_argn("a34wifips", &a34w_powersave, sizeof(a34w_powersave));       /* (1010) */
++	(void)PE_parse_boot_argn("a34wifiwidth", &a34w_width_max, sizeof(a34w_width_max));    /* (1011) */
++	(void)PE_parse_boot_argn("a34wifinss", &a34w_nss_max, sizeof(a34w_nss_max));
+ 	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
+ 		return;
+ 	}

@@ -765,3 +765,35 @@ WFDMA are new work here; everything above the radio is not.
 - iOS: strings and disassembly of 16.7.16's `wifid`, `configd`, IPConfiguration, IO80211 and
   SystemConfiguration (root image and dyld cache); `com.apple.wifid.plist` from the root.
 - XNU interfaces: xnu-8796.141.3 headers (the version CI builds for macOS 13.5).
+
+## 1011: faster
+
+0999-wifi-a joined as an HT 20 MHz, one-stream station (MCS 7: 72 Mbit/s on the air at best).
+1011 joins as wide and with as many streams as the chip, the AP and two switches allow:
+
+- **The chip's PHY**: the NIC capability's tag 8 (ucHt, ucVht, uc5gBand, ucMaxBandwidth, ucNss,
+  ...; nic_cmd_event.c) is read at step 6 and logged ("step 6: PHY: ..."). Android shows the A34 at
+  two streams (MCS 15).
+- **Two streams** when the chip has them and the AP receives MCS 8-15: the request advertises MCS
+  0-15 and TX STBC, BSS info's NSS 2; with one stream the AP's record is masked to MCS 0-7.
+- **Width, 5 GHz only**: 40 MHz when the AP's HT Operation has a secondary channel and the width
+  bit; 80 MHz when it also has VHT Operation at 80 and the chip has VHT. CH_PRIVILEGE gets the SCO,
+  channel width and centre segment, BSS info's RLM the same (and u2VhtBasicMcsSet = the basic rate
+  set, as rlm.c fills it), the AP's record its VHT capabilities as they are and ucVhtOpMode
+  (width | (AP's streams - 1) << 4); the request carries VHT Capabilities (MCS 0-9 per stream,
+  RX LDPC, short GI 80, max A-MPDU 2^20-1, no beamformee). 2.4 GHz stays at 20 MHz (gen4m's
+  default; 40 MHz there collides with the neighbours).
+- **Switches**, read at the next join: `kern.a34wifi.width` / boot-arg `a34wifiwidth` (20, 40, 80;
+  default 80) and `kern.a34wifi.nss` / `a34wifinss` (1, 2; default 2). If a wide join misbehaves on
+  a given AP, `a34wifiwidth=20 a34wifinss=1` is 0968's join.
+- **RX reordering**: the firmware takes the AP's ADDBA and reports it (EVENT_ID_RX_ADDBA: TID,
+  window, SSN). From then unicast QoS data of that TID goes up in sequence order (group 4's sequence
+  control and QoS control), as que_mgt.c does: held inside the window, the window moved by a frame
+  beyond it, late/duplicate frames dropped, a hole given up after 100 ms; DELBA ends it. A-MSDU
+  subframes after the first go straight up. Counters in the carried line: "reordered, late or twice,
+  holes given up".
+- **RX ring 2** (all our data) has 256 slots instead of 64 (Android's size): at 300 Mbit/s about
+  50 frames arrive between two 2 ms polls.
+- **Measuring**: `a34wifi get [URL] [SECONDS]` (default http://speedtest.tele2.net/10MB.zip, at most
+  30 s) prints the bytes each second and the Mbit/s at the end.
+
