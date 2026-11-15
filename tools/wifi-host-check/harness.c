@@ -502,6 +502,63 @@ int main(int argc, char **argv)
 		printf("0965 interface data path: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
+	/* ---- 0967: an ADDBA request declined, a DHCP DISCOVER out with its TX status, the AP letting go ---- */
+	{
+		uint8_t f[64], dhcp[14 + 20 + 8 + 240 + 4];
+		const uint8_t *t, *tok;
+		int failed = 0;
+		uint32_t n0, l4 = 14 + 20;
+
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1;
+		a34w_joined = true; a34w_keys_in = true;
+		bzero(f, sizeof(f));
+		f[0] = 0xd0; memcpy(f + 4, a34w_mac, 6); memcpy(f + 10, a34w_target.bssid, 6); memcpy(f + 16, a34w_target.bssid, 6);
+		f[24] = 3; f[25] = 0; f[26] = 7;                /* block ack, ADDBA Request, token 7 */
+		f[27] = 0x02; f[28] = 0x10;                     /* BA parameter set: immediate, TID 0, 64 frames */
+		a34w_mgmt_in(f, 33, -60, 48);
+		firmware_sim();
+		t = sent[0];
+		printf("0967 ADDBA: %u frames to the firmware; the first: subtype %u, category %u action %u token %u status %u\n", nsent,
+		    t[32] >> 4, t[32 + 24], t[32 + 25], t[32 + 26], t[32 + 27] | t[32 + 28] << 8);
+		failed |= nsent != 1 || (t[32] >> 4) != 13 || t[32 + 24] != 3 || t[32 + 25] != 1 || t[32 + 26] != 7 || t[32 + 27] != 37 ||
+		    (dw_of(t, 2) & 0xfu) != 13u;
+		/* DHCP DISCOVER from the stack: UDP 68 -> 67, option 53 = 1 */
+		bzero(dhcp, sizeof(dhcp));
+		memset(dhcp, 0xff, 6); memcpy(dhcp + 6, a34w_mac, 6); dhcp[12] = 0x08; dhcp[14] = 0x45; dhcp[14 + 9] = 17;
+		memset(dhcp + 14 + 16, 0xff, 4);
+		dhcp[l4 + 1] = 68; dhcp[l4 + 3] = 67;
+		dhcp[l4 + 8 + 236] = 99; dhcp[l4 + 8 + 237] = 130; dhcp[l4 + 8 + 238] = 83; dhcp[l4 + 8 + 239] = 99;
+		dhcp[l4 + 8 + 240] = 53; dhcp[l4 + 8 + 241] = 1; dhcp[l4 + 8 + 242] = 1; dhcp[l4 + 8 + 243] = 255;
+		n0 = a34w_dtx_cidx;
+		failed |= !a34w_net_tx(dhcp, sizeof(dhcp));
+		tok = (const uint8_t *)a34w_dma + DMA_TOKENS;
+		for (uint32_t k = 0; k < DATA_TX_SLOTS; k++) {         /* the token buffer that holds it */
+			const uint8_t *b = (const uint8_t *)a34w_dma + DMA_TOKENS + k * DATA_TOKEN_SIZE;
+			if (memcmp(b + 64, dhcp, sizeof(dhcp)) == 0) { tok = b; break; }
+		}
+		printf("0967 DHCP out: TX0 %u -> %u, DW3 0x%08x (protected bit %u), DW5 0x%08x (TX status asked for: %s)\n", n0, a34w_dtx_cidx,
+		    a34w_le32(tok + 12), (a34w_le32(tok + 12) >> 1) & 1u, a34w_le32(tok + 20), (a34w_le32(tok + 20) & 0x200u) ? "yes" : "no");
+		failed |= memcmp(tok + 64, dhcp, sizeof(dhcp)) != 0 || (a34w_le32(tok + 12) & 2u) == 0 || (a34w_le32(tok + 20) & 0x2ffu) == 0 ||
+		    strstr(a34w_log, "DHCP DISCOVER") == NULL;
+		/* the AP disassociates us: the firmware's side undone, a join again in 3 s */
+		nsent = 0;
+		bzero(f, sizeof(f));
+		f[0] = 0xa0; memcpy(f + 4, a34w_mac, 6); memcpy(f + 10, a34w_target.bssid, 6); memcpy(f + 16, a34w_target.bssid, 6);
+		f[24] = 37;
+		a34w_mgmt_in(f, 26, -60, 48);
+		firmware_sim();
+		printf("0967 LEFT: joined %d, rejoin in %lld ms, %u commands (", a34w_joined,
+		    (long long)a34w_auto_rejoin_at - (long long)a34w_ms(), nsent);
+		for (uint32_t i = 0; i < nsent; i++) printf(" 0x%02x", sent[i][36]);
+		printf(" )\n");
+		failed |= a34w_joined || a34w_auto_rejoin_at == 0 || nsent < 3 || sent[0][36] != 0x17 || sent[1][36] != 0x12 || sent[2][36] != 0x14 ||
+		    net_link;
+		sim_on = 0;
+		printf("0967 action frames, DHCP TX status, leaving: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
 	/* ---- 0966: PHY_ACTION out of the vendor's default NVRAM image (FW_DIR/WIFI), as wlanPreCal builds it ---- */
 	{
 		static const uint8_t head[] = { 0xaa, 0x89, 0x67, 0x55, 0x03, 0x01, 0x7c, 0x01, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00,

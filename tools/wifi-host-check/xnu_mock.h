@@ -61,6 +61,10 @@ extern void thread_wakeup(event_t);
 extern int PE_parse_boot_argn(const char *, void *, int);
 extern void *kalloc_data(size_t, int);
 extern void read_random(void *, unsigned int);        /* bsd/sys/random.h */
+/* globals XNU's headers declare, so that -Wshadow here sees what CI's build sees (0967) */
+extern char version[];                  /* sys/systm.h */
+extern struct vmtotal_mock { int t; } total;     /* sys/vmmeter.h */
+extern int hz, tick, boothowto;
 extern void kfree_data(void *, size_t);
 #define Z_WAITOK 0
 #define Z_ZERO 0
@@ -86,6 +90,7 @@ struct sysctl_req { int x; };
 #define SYSCTL_PROC(parent, nbr, name, access, ptr, arg, handler, fmt, descr) \
 	static int (*sysctl_proc_##name)SYSCTL_HANDLER_ARGS __attribute__((used)) = handler
 #define SYSCTL_INT(parent, nbr, name, access, ptr, val, descr) static int *sysctl_int_##name __attribute__((used)) = ptr
+#define SYSCTL_UINT(parent, nbr, name, access, ptr, val, descr) static unsigned int *sysctl_uint_##name __attribute__((used)) = ptr
 #define SYSCTL_OUT(r, p, l) ((void)(r), (void)(p), (int)(l) * 0)
 extern int sysctl_io_number(struct sysctl_req *req, long long bigValue, size_t valueSize, void *pValue, int *changed);
 #define CTLTYPE_INT 2
