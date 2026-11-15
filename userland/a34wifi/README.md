@@ -86,6 +86,19 @@ The job runs once at boot with its output on `/dev/console`, so it lands in the 
 persistent log (`tools/pull-log.sh`). Asking for fewer steps (`a34wifi up 1`) is the cautious
 first test.
 
+### iOS's Wi-Fi side (0969)
+
+From 0969 the interface appears as a Wi-Fi interface in the registry (`A34WLAN`) as soon as the
+firmware is up, and the kernel answers wifid's Apple80211 requests. wifid's job asks for a
+device-tree node our tree does not have; remove that condition once:
+
+```sh
+sudo tools/root-add-job.py --unlimit /mnt com.apple.wifid
+```
+
+`a34wifi up 7` (or `connect`) brings the firmware up; Settings > Wi-Fi then lists and joins
+networks. `a34wifi dhcp` waits 10 s for configd's own DHCP before asking for a service of its own.
+
 ## Build
 
 `userland/a34wifi/build.sh` on a Mac with Xcode (`.github/workflows/a34wifi.yml`): arm64,

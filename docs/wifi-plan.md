@@ -485,6 +485,95 @@ and AP, EAPOL and data both ways, the token reports, PHY_ACTION from the real `W
 4. If the TX statuses say `NOT acknowledged`: boot again with `a34wifiphy=1` (or the job's
    `A34WIFI_PHYACTION=1`); step 5 then says `PHY_ACTION ... event 0x81 status 0`.
 
+### The first join on the phone (kernel 0988, `a34wifi connect`; `build/logs/0988-all-a`)
+
+Step 8 joined veryCoolNetwork's 5 GHz BSS (channel 48, -74 dBm) as a **legacy** station: channel
+granted in 340 ms, Authentication and Association acknowledged at the first try, AID 20, the
+four-way handshake done (pairwise key WTBL 5, group key 2 WTBL 4), JOINED (WPA2-PSK, CCMP) in
+2794 ms, en0 attached. Then **the AP disassociated us, reason 37** ("the peer does not want to use
+the mechanism"), before any DHCP frame went out (the DHCP request came 60 s later, after the
+loss). Nothing before it was in the log: action frames were dropped unread. What the sources say
+(`gen4m_s1`): the firmware answers ADDBA itself and, for a station record without HT, drops the
+AP's request (`que_mgt.c:7810-7817`, the RAM code's `mqm_ba` strings); and this AP steers its
+clients on a ~60 s cycle with 802.11v BSS transition requests (Android's dmesg: three, all answered
+"no suitable candidate", never thrown out). A legacy, non-QoS client that cannot be asked to move
+is what such an AP throws out. So 0967 (see what the AP does) and 0968 (join as Android does).
+
+### 0967: what the AP does after the join, said; leaving and coming back
+
+- Every action frame from the AP is said (category, action, its first 24 bytes; BSS transition
+  requests decoded), the disassociation/deauthentication frame whole, ADDBA/DELBA/beacon-timeout
+  events, the target's element list at the join. An ADDBA request that reaches the host is
+  declined (status 37), as mac80211 does without aggregation.
+- The first 48 data frames either way are traced: EtherType, IP protocol and ports, the DHCP
+  message type, ciphered or not (`kern.a34wifi.trace` for more); ARP and DHCP go out with their TX
+  status asked for, so "TX status N: acknowledged" says the AP took them.
+- When the AP lets go (or the beacons stop), the firmware's side is undone as Android's disconnect
+  does it (PM abort, BSS info disconnected, STA record removed) and the network is joined again by
+  itself after 3 s, 5 times a boot at most; the BSS that let us go scores 20 dB less for 5 minutes
+  (this AP is dual-band and steers). Step 8 always scans twice (one scan missed the 2.4 GHz BSS).
+
+### 0968: an HT and WMM station that can be asked to move
+
+As Android joins (`assoc.c`, `rlm.c`, `cnm_mem.c`, `que_mgt.c`, `wnm.c`), each part only if the AP
+has it: the Association Request carries HT Capabilities (HT20, one stream: LDPC, SM power save
+off, short GI 20, RX STBC; A-MPDU 64 KB; MCS 0-7), Extended Capabilities with BSS transition (bit
+19) and the WMM Information element; the AP's station record is HT and QoS (its own HT
+capabilities from its Association Response, the 40 MHz bits cleared; A-MPDU both ways, block ack
+64/64, no A-MSDU in A-MPDU; RTS policy legacy); SET_BSS_INFO is QBSS and HT, its RLM part from the
+AP's HT Operation at 20 MHz; the AP's WMM parameters go by `UPDATE_WMM_PARMS` (0x1d) before it. A
+BSS transition request is answered with status 7 (no suitable candidate), with an MBO rejection
+reason when it carried MBO -- what Android answered this AP. The firmware now has an HT record for
+the AP, so it takes the AP's block ack requests itself. `kern.a34wifi.legacy=1` (boot-arg
+`a34wifilegacy=1`) joins as 0964 did, for comparison. Not yet: VHT/80 MHz and two streams.
+
+### 0969: iOS's Wi-Fi side (milestone 4)
+
+What wifid (and through it Settings and the status bar) needs, after HackiOS (`redwood_apple80211.c`,
+`RedwoodWLAN.cpp`, `MiniIONetworkStack.cpp`, APSL 2.0), on our own station boundary (`a34_sta.h`):
+
+- `iokit/Kernel/arm/A34WLAN.cpp`: an `IO80211Controller` (IOMACAddress) under the platform, below
+  it an `IONetworkInterface` with `IOInterfaceName`/`BSD Name` = the interface and
+  `IO80211InterfaceRole` = Infrastructure, without a user client (IO80211.framework then falls
+  back to ioctls); and `IOResources/IONetworkStack` with a user client that can be opened, which
+  configd's interface namer waits for before it says the registry is quiet (until then
+  `SCNetworkInterfaceCopyAll`, wifid and SpringBoard wait up to five minutes). Made when the
+  interface is, which is now as soon as the firmware is up (after step 7), joined or not.
+- `bsd/dev/a34_apple80211.c`: the Apple80211 ioctls (`SIOCGA80211`/`SIOCSA80211`, reaching the
+  interface's ioctl): card capabilities (WPA2, WME, AES-CCM), power, op mode, channels (ours),
+  scan request and results (one per request, with the beacon's elements: wifid reads the
+  protection out of them), associate (the name and the passphrase as typed, or the key), the
+  association result (1, 21 wrong passphrase, 9 timeout, 2 else), disassociate, state, SSID,
+  BSSID, channel, RSSI, the current network; and the kernel events (class 6, subclass 1: power,
+  SSID/BSSID/link changed, association done, scan done). Every request is said in the log (who,
+  which, the length; never the name or the key).
+- `a34_wifi.c`: the station boundary: requests queued to its thread (a scan, a join -- the same
+  join as step 8's, of the network iOS names --, leaving, power), the last scan's results kept
+  with their elements, and every link change told to both the interface and iOS. A join that is
+  lost is joined again (0967) with the network last asked for, whoever asked.
+- wifid's job names a device-tree node (`_LimitLoadToDeviceTree`: wlan, marconi-wifi) that our
+  ADT does not have: `tools/root-add-job.py --unlimit ROOT com.apple.wifid` removes it (HackiOS's
+  `mkjobs.py` does the same). HackiOS's Settings join also needed configd, mDNSResponder (+Helper),
+  trustd, securityd, nsurlsessiond and CFNetworkAgent running.
+- The host check runs wifid's side end to end: the capabilities, power, a scan through the
+  simulated firmware and its results, a join with the name alone, ASSOCIATE_RESULT 1, STATE 4,
+  the events in order.
+
+**The next test** (kernel with 0963-0969 and the rest of main; network file as before):
+
+1. Job `a34wifi connect` as before. Expect at step 8 `joining as an HT (20 MHz, one stream) QoS
+   (WMM) station ...`, `its elements: ...`, then JOINED; then `the AP sent an action frame ...`
+   lines -- a BSS transition request should be answered (`BSS Transition Management Response
+   sent`) -- and no `LEFT the network`; `out ... DHCP DISCOVER (ciphered ...)`, `TX status N:
+   acknowledged`, `in ... DHCP OFFER`, `en0: IPv4 address ...`, then `a34wifi: tcp 1.1.1.1 ...
+   connected`. If the AP still lets go, the frame and what came before are in the log, and it
+   comes back by itself 3 s later.
+2. With that working, iOS: `root-add-job.py --unlimit /mnt com.apple.wifid` and the jobs above;
+   grep `A34 WIFI: apple80211` for wifid's requests, `A34WLAN` and `IONetworkStack opened by
+   configd`; Settings > Wi-Fi should list the networks, show the joined one, and join another
+   with a typed passphrase (`iOS asks us to join`).
+3. If 0968 makes things worse: boot-arg `a34wifilegacy=1` is 0967's behaviour.
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
@@ -516,7 +605,7 @@ user-space piece; each is held against what Android's driver does on this phone.
 | **M1** | CONNSYS powered, A-die found, the Wi-Fi MCU running Samsung's firmware (its ready bits), all in the log | 0940, 0960 (`a34_wifi.c` steps 1-5) | `a34wifi` (sysctl), `tools/wifi-fw.sh` | ~1 900 (built) | see section 3 |
 | **M2** | scan results in the kernel log -- **passed on the phone (0961)** | steps 6-7: PHY_ACTION before the download if M1 shows it is needed; the running firmware's command channel -- the SW-WFDMA mailbox in the EMI (offset from `0x180537fc`, 4 x 1600 bytes, `drv_idx`/`fw_idx`, CCIF `0x1803d00c` = 3) with answers on RX ring 0 --; `GET_NIC_CAPABILITY_V2` (0x8a: firmware version, MAC address tag 7), `BASIC_CONFIG`, the front-end GPIO modes (connfem pinctrl), `BSS_ACTIVATE_CTRL` (0x11) for the station's BSS 0, `SCAN_REQ_V2` (0x03); RX rings 2/3 (beacons/probe responses as RX data) and event `SCAN_DONE` (0x0d) on ring 0; SSID, BSSID, channel, RSSI parsed | `a34wifi scan` | ~900 | the connac2x command/event layouts (gen4m's v2 structures, HackiOS's connac1 ones as a guide); whether the firmware transmits probes without NVRAM data (the default `WIFI` image, never the phone's `nvdata`) and without country/power-limit commands |
 | **M3** | join an open network, then WPA2-PSK; an IP by DHCP; apps reach the internet -- **built (0963-0965), not yet run** | steps 8-9 (0964, 0965): channel privilege, the AP's STA record, BSS info, auth/assoc frames through the mailbox, EAPOL as data on TX ring 0, keys (`ADD_REMOVE_KEY`), the data rings and DMASHDL, an Ethernet `ifnet` (`a34_wifi_net.c`, after HackiOS's `redwood_net.c`), the WPA2 handshake in the kernel (`a34_wpa.c` = HakiOS's `lx_wpa.c`); the MAC kept on the root (0963) | `a34wifi up 9` / `join` (network from `/a34/wifi/network`), `a34wifi dhcp` (IPConfiguration's `setservice`, HakiOS `net_test.m`, MIT), `a34wifi tcp` | ~1 900 + ~550 ported | whether the radio transmits without PHY_ACTION/NVRAM (the TX statuses say); the management-frame TXD on the mailbox; the WTBL numbering (5 for the AP) |
-| **M4** | Settings' Wi-Fi: networks listed, password typed, joined | the wifid layer (section 2): `IO80211Controller`/`IONetworkInterface`, Apple80211 ioctls and events, `IONetworkStack`; ADT `wlan` node with `local-mac-address` | wifid, configd, mDNSResponder, trustd, securityd, nsurlsessiond, CFNetworkAgent enabled in the root | ~1 100 ported + ~200 | boot stalls if IOKit never quiesces (ios-topaz 0128) or InterfaceNamer never reports quiet; wifid holding SpringBoard (ios-sapphire); the 16.7.16 structure layouts (sizes match, field offsets to confirm from the log) |
+| **M4** | Settings' Wi-Fi: networks listed, password typed, joined -- **built (0969), not yet run** | the wifid layer (section 2): `IO80211Controller`/`IONetworkInterface`, Apple80211 ioctls and events, `IONetworkStack`; ADT `wlan` node with `local-mac-address` | wifid, configd, mDNSResponder, trustd, securityd, nsurlsessiond, CFNetworkAgent enabled in the root | ~1 100 ported + ~200 | boot stalls if IOKit never quiesces (ios-topaz 0128) or InterfaceNamer never reports quiet; wifid holding SpringBoard (ios-sapphire); the 16.7.16 structure layouts (sizes match, field offsets to confirm from the log) |
 
 **The smallest path to a scan, then a join**, as the sources show it: M1's firmware start, then
 everything on the mailbox -- NIC capability, basic configuration, BSS 0 activated, one scan

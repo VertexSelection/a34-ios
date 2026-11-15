@@ -84,8 +84,19 @@ int a34_wifi_net_attach(const uint8_t address[6], bool (*tx)(const uint8_t *, ui
 void a34_wifi_net_input(const uint8_t *frame, uint32_t length) { if (length <= sizeof(net_got)) { memcpy(net_got, frame, length); net_got_len = length; } net_got_count++; }
 void a34_wifi_net_link(bool up) { net_link = up; }
 const char *a34_wifi_net_name(void) { return "en9"; }
+/* (0969) the registry entries (iokit/Kernel/arm/A34WLAN.cpp) and the kernel's KPIs a34_apple80211.c uses, stood in for */
+static char wlan_registered[16];
+void a34_wlan_registry(const char *interface, const uint8_t *address);
+void a34_wlan_registry(const char *interface, const uint8_t *address) { (void)address; snprintf(wlan_registered, sizeof(wlan_registered), "%s", interface); }
+int copyout(const void *k, user_addr_t u, size_t n) { memcpy((void *)(uintptr_t)u, k, n); return 0; }
+int copyin(user_addr_t u, void *k, size_t n) { memcpy(k, (const void *)(uintptr_t)u, n); return 0; }
+void proc_selfname(char *b, int n) { snprintf(b, (size_t)n, "wifid"); }
+static uint32_t kev_codes[64], kev_count;
+int kev_post_msg(struct kev_msg *m) { if (kev_count < 64) kev_codes[kev_count++] = m->event_code; return 0; }
+size_t strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { size_t c = l < n - 1 ? l : n - 1; memcpy(d, s, c); d[c] = 0; } return l; }
 #include "a34_wifi.c"     /* (run.sh puts it beside ruby_hal.h) */
 #include "a34_wpa.c"      /* (0964) */
+#include "a34_apple80211.c"   /* (0969) */
 
 /*
  * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
@@ -155,7 +166,19 @@ static void sim_react(const uint8_t *t)
 	bool cmd = ((dw_of(t, 1) >> 16) & 3u) == 1u;
 	if (!sim_ap) return;
 	bzero(ev, sizeof(ev)); bzero(fr, sizeof(fr));
-	if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
+	if (cmd && t[36] == 0x03) {                     /* (0969) a scan: the AP's beacon, then SCAN_DONE */
+		uint8_t b[160], done[16];
+		uint32_t k = 36;
+		bzero(b, sizeof(b)); bzero(done, sizeof(done));
+		b[0] = 0x80; memset(b + 4, 0xff, 6); memcpy(b + 10, sim_ap_addr, 6); memcpy(b + 16, sim_ap_addr, 6);
+		b[32] = 100; b[34] = 0x01;
+		b[k++] = 0; b[k++] = 9; memcpy(b + k, "Sim Open", 9); k += 9;      /* (9 bytes: "Sim Open" and a 0) */
+		b[k++] = 1; b[k++] = 4; memcpy(b + k, "\x82\x84\x8b\x96", 4); k += 4;
+		b[k++] = 3; b[k++] = 1; b[k++] = 6;
+		rx_mgmt(b, k, 6);
+		done[0] = t[64]; done[4] = 22;
+		rx_event(EVENT_ID_SCAN_DONE, 0, done, 16);
+	} else if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
 		ev[0] = 0; ev[1] = t[64 + 1]; ev[2] = 0; ev[3] = t[64 + 3];
 		rx_event(EVENT_ID_CH_PRIVILEGE, 0, ev, 24);
 	} else if (!cmd && (t[32] >> 4) == 11) {
@@ -650,6 +673,83 @@ int main(int argc, char **argv)
 		failed |= nsent != 1 || sent[0][32 + 24] != 10 || sent[0][32 + 25] != 8 || sent[0][32 + 26] != 1 || sent[0][32 + 27] != 7 ||
 		    sent_len[0] - 32 != 24 + 5 + 9 || sent[0][32 + 29] != 221;
 		printf("0968 HT and WMM station, BSS transition answered: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0969: iOS's Wi-Fi side: the interface in the registry, Apple80211 requests as wifid makes them ---- */
+	{
+		static const uint8_t ap[6] = { 0x02, 0x51, 0x4d, 0x00, 0x00, 0x01 };
+		struct apple80211req rq;
+		static struct apple80211_scan_request scan;
+		static struct apple80211_scan_result result;
+		static struct apple80211_assoc assoc;
+		uint8_t caps[13];
+		struct { uint32_t version, radios, state[4]; } power;
+		int failed = 0, e;
+
+		a34w_joined = false; a34w_attached = false; a34w_done = 9; a34w_sta_off = false;
+		/* the domain on and reachable, the firmware's ready bits: what a scan checks first */
+		a34w_wr(a34w_ap, SPM_PWR_STATUS, CONN_PWR_STA); a34w_wr(a34w_ap, SPM_PWR_STATUS_2ND, CONN_PWR_STA);
+		a34w_wr(a34w_ap, SPM_CONN_PWR_CON, PWR_RST_B); a34w_wr(a34w_ap, INFRA_PROTECTEN_STA1, 0);
+		a34w_wr(a34w_conn, HOST_SW_SYNC0, 3);
+		failed |= !a34w_attach() || strcmp(wlan_registered, "en9") != 0;
+		/* CARD_CAPABILITIES (WPA2 bit 14), POWER */
+		bzero(&rq, sizeof(rq)); rq.req_type = 12; rq.req_len = sizeof(caps); rq.req_data = (user_addr_t)(uintptr_t)caps;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != 0 || (caps[1] & 0x40u) == 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 19; rq.req_len = sizeof(power); rq.req_data = (user_addr_t)(uintptr_t)&power;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != 0 || power.state[0] != 1;
+		/* a scan: asked, done by the thread (here inline), its results one by one, then EIO */
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		sim_on = 1; sim_ap = 1; memcpy(sim_ap_addr, ap, 6); kev_count = 0;
+		bzero(&scan, sizeof(scan)); scan.scan_type = 1;
+		bzero(&rq, sizeof(rq)); rq.req_type = 10; rq.req_len = sizeof(scan); rq.req_data = (user_addr_t)(uintptr_t)&scan;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_scan != 1;
+		a34w_sta_scan = 0;
+		a34w_sta_do(false, NULL, true);
+		bzero(&result, sizeof(result)); result.elements_length = 1024;
+		bzero(&rq, sizeof(rq)); rq.req_type = 11; rq.req_len = sizeof(result); rq.req_data = (user_addr_t)(uintptr_t)&result;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		printf("0969 scan: SCAN_DONE posted %d; first result: %d, \"%.*s\" ch %u %d dBm, %u elements bytes, %u rates\n",
+		    kev_count > 0 && kev_codes[kev_count - 1] == 10, e, result.ssid_length, result.ssid, result.channel.channel, result.rssi,
+		    result.elements_length, result.rate_count);
+		failed |= e != 0 || result.ssid_length != 9 || memcmp(result.ssid, "Sim Open", 8) != 0 || result.channel.channel != 6 ||
+		    result.rate_count != 4 || kev_count == 0 || kev_codes[kev_count - 1] != 10;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != EIO;
+		/* a join from Settings: the name and nothing else (open), done by the thread, ASSOCIATE_RESULT 1, STATE 4, SSID */
+		bzero(&assoc, sizeof(assoc)); assoc.ssid_length = 9; memcpy(assoc.ssid, "Sim Open", 9);
+		bzero(&rq, sizeof(rq)); rq.req_type = 20; rq.req_len = sizeof(assoc); rq.req_data = (user_addr_t)(uintptr_t)&assoc;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_join_asked != 1;
+		{
+			struct a34_sta_join what = a34w_sta_join_what;
+			a34w_sta_join_asked = 0;
+			kev_count = 0;
+			a34w_sta_do(false, &what, false);
+		}
+		firmware_sim();
+		sim_on = 0; sim_ap = 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 21;
+		(void)a34_apple80211_ioctl(SIOCGA80211, &rq);
+		{
+			int32_t result21 = rq.req_val;
+			char name[33] = "";
+			bzero(&rq, sizeof(rq)); rq.req_type = 13;
+			(void)a34_apple80211_ioctl(SIOCGA80211, &rq);
+			printf("0969 join: joined %d, ASSOCIATE_RESULT %d, STATE %d, events:", a34w_joined, result21, rq.req_val);
+			for (uint32_t i = 0; i < kev_count; i++) printf(" %u", kev_codes[i]);
+			failed |= !a34w_joined || result21 != 1 || rq.req_val != 4;
+			bzero(&rq, sizeof(rq)); rq.req_type = 1; rq.req_len = 32; rq.req_data = (user_addr_t)(uintptr_t)name;
+			e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+			printf("; SSID \"%s\" (%u bytes)\n", name, rq.req_len);
+			failed |= e != 0 || strcmp(name, "Sim Open") != 0;
+		}
+		/* the link events: SSID (2), BSSID (3), LINK (4) changed, then ASSOC_DONE (9) */
+		failed |= kev_count < 4 || kev_codes[kev_count - 1] != 9;
+		printf("0969 iOS's Wi-Fi side (registry, Apple80211 scan and join): %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
 

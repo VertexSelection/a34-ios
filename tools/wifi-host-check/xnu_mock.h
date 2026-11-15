@@ -41,6 +41,26 @@ typedef uint64_t addr64_t;
 #define ETIMEDOUT 60
 #define EBUSY 16
 #define EALREADY 37
+#define ENXIO 6
+#define EOPNOTSUPP 45
+#define ENETDOWN 50
+#define ECONNREFUSED 61
+#define EPROTONOSUPPORT 43
+#define EAUTH 80
+/* (0969) what a34_apple80211.c uses */
+typedef uint64_t user_addr_t;
+#define USER_ADDR_NULL ((user_addr_t)0)
+extern int copyout(const void *, user_addr_t, size_t);
+extern int copyin(user_addr_t, void *, size_t);
+extern void proc_selfname(char *, int);
+struct kev_d_vectors { uint32_t data_length; void *data_ptr; };
+struct kev_msg { uint32_t vendor_code, kev_class, kev_subclass, event_code; struct kev_d_vectors dv[5]; };
+#define KEV_VENDOR_APPLE 1
+extern int kev_post_msg(struct kev_msg *);
+#ifndef __DECONST
+#define __DECONST(type, var) ((type)(uintptr_t)(const void *)(var))
+#endif
+extern size_t strlcpy(char *, const char *, size_t);
 #define __unused __attribute__((unused))
 #define __printflike(a, b) __attribute__((format(printf, a, b)))
 #define LCK_GRP_DECLARE(n, s) lck_grp_t *n
