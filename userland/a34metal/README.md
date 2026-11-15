@@ -161,8 +161,23 @@ device for three things this driver did not do. QuartzCore's own selectors list 
   too. Boot-arg `rwm_views=0`: nil as before. The first eight views are logged ("a texture
   view: pixel format N as M").
 
+- **Apple's extended-range formats.** CoreAnimation draws blur and material steps into 550/551
+  (RGB10A8_2P_XR10) and 554/555 (BGR10_XR) targets; all were stored as BGRA8. BGR10_XR has no
+  alpha, so on Apple a sample reads 1, while a BGRA8 target kept what was written there (a clear's
+  0: transparent or black where opaque is meant). 554/555 are now B8G8R8X8 (alpha reads 1), and an
+  attachment of BGRA8 and a pipeline made for B8G8R8X8 (or the other way round) go together. A
+  texture over an IOSurface of those formats is BGRA8 as before. Boot-arg `rwm_xr=bgra`: all
+  BGRA8 as before. `rwm_xr=f16`: 550-553 RGBA16Float (experimental: an IOSurface target of those
+  would no longer match its pipeline).
+- **Copied-in surfaces.** 'LA08' (RG8) and 'A008' (R8) surfaces whose rows are not 64-byte
+  aligned are copied in (since the port). The first twelve are now logged ("surface 'LA08' WxH
+  ... is copied into a texture of format 30"). Boot-arg `rwm_copyin=always` copies every one
+  before every command buffer that reads it, also when its seed has not moved (a program's
+  memory written without a lock keeps its seed).
+
 Files: `userland/mesa/air/air_metal.[ch]` (the library), `metal/render.cpp`, `draw.cpp`,
-`blit.cpp`, `texture.cpp`, `air.cpp`, `rwm.h`, `redwoodmetal.m` (attachments and views only).
+`blit.cpp`, `texture.cpp`, `import.cpp`, `air.cpp`, `rwm.h`, `redwoodmetal.m` (attachments, views
+and formats only).
 
 ## Credits and licence
 

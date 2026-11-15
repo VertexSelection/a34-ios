@@ -84,14 +84,37 @@ rwm_known_format(unsigned format)
 	static uint8_t told[8];
 
 	if (format >= 550 && format <= 555) {
+		/*
+		 * (metal-fx) Boot-arg rwm_xr: "bgrx" (the default) keeps 554/555 (BGR10_XR, no alpha), which the
+		 * compiler library makes B8G8R8X8 -- the alpha reads 1, as on Apple's GPU; a BGRA8 target kept
+		 * whatever alpha was written (a clear's 0: transparent or black where CoreAnimation means
+		 * opaque). "f16" makes 550-553 RGBA16Float (the extended range kept, twice the memory) and
+		 * 554/555 B8G8R8X8. "bgra": every one BGRA8Unorm, as before.
+		 */
+		static int mode = -1;
+
+		if (mode < 0) {
+			mode = rwm_boot_arg("rwm_xr=bgra") ? 0 : rwm_boot_arg("rwm_xr=f16") ? 2 : 1;
+		}
+		unsigned made = mode == 0 ? 80 : format >= 554 ? format : mode == 2 ? 115 : 80;
+
 		if (!told[format - 550]) {
 			told[format - 550] = 1;
-			rwm_print("pixel format %u is taken as BGRA8Unorm (80): an extended-range format of Apple's own, "
-				  "for an 8-bit panel\n", format);
+			rwm_print("pixel format %u is taken as %s (%u): an extended-range format of Apple's own, for an "
+				  "8-bit panel (rwm_xr=bgra: all BGRA8, as before)\n", format,
+				  made == 80 ? "BGRA8Unorm" : made == 115 ? "RGBA16Float" : "B8G8R8X8, alpha 1", made);
 		}
-		return 80;
+		return made;
 	}
 	return format;
+}
+
+/* (metal-fx) The same for a texture over an IOSurface: an XR surface is laid in place as BGRA8, as before (its
+ * memory is four bytes a pixel whatever the name says) */
+extern "C" unsigned
+rwm_surface_format(unsigned format)
+{
+	return format >= 550 && format <= 555 ? 80 : rwm_known_format(format);
 }
 
 extern "C" struct rwm_texture *
@@ -164,6 +187,18 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 			if (copy != nullptr) {
 				rwm_texture_copy_in_from(copy, s, false);
 				road->kind = RWM_IMPORT_COPY_IN;
+
+				/* (metal-fx) which surfaces take this road ('LA08' as RG8, 'A008' as R8): said */
+				static unsigned said;
+				const uint32_t fourcc = IOSurfaceGetPixelFormat(s);
+
+				if (said++ < 12) {
+					rwm_print("surface '%c%c%c%c' %zux%zu (%zu bytes a row) is copied into a texture of "
+						  "format %u before the command buffers that read it\n",
+						  (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8),
+						  (char)fourcc, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+						  IOSurfaceGetBytesPerRow(s), shape.pixel_format);
+				}
 			}
 			return copy;
 		}

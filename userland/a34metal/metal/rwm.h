@@ -601,6 +601,7 @@ typedef struct rwa_texture *(*rwm_in_place_fn)(void *context, struct rwa_device 
 
 /* Apple's extended-range 550-555 taken as BGRA8Unorm (80) for this 8-bit panel, said once; others as they are */
 unsigned rwm_known_format(unsigned format);
+unsigned rwm_surface_format(unsigned format);    /* (metal-fx) the same, for a texture over an IOSurface */
 struct rwm_texture *rwm_surface_import(struct rwa_device *device, IOSurfaceRef surface, unsigned plane,
 				       const struct rwa_texture_shape *shape, rwm_in_place_fn in_place, void *context,
 				       struct rwm_import *road, char *why, size_t why_size);
