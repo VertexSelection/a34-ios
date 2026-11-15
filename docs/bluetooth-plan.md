@@ -35,6 +35,22 @@ Status (2026-11-15):
   Write_Default_Erroneous_Data_Reporting itself (status 628): the MT6635's supported-commands mask lacks it
   (octet 18 bit 3), and bluetoothd checks the mask first (descriptor table `+0x8448e0`). 0973 advertises
   and answers 0x0C5A, 0x0C5B, 0x0C84 in the kernel.
+- **Boot 0994-all-a (kernel 0994 with 0973)**: HCI init finished ("Stack initialization complete"); the
+  Settings switch shows Off and never turns on. The first frame longer than BTIF's 16-byte FIFO,
+  Change_Local_Name (252 bytes; every earlier frame was 12 bytes or less), got no answer, and no byte
+  ever came from the controller again: Write_EIR timed out, bluetoothd aborted, and every restarted
+  bluetoothd's HCI_Reset went out (`br> 01 03 0c 00`) unanswered (STATUS 621, "HCI initialization
+  failed", reason 108). The channel was not closed or reopened around it, BlueTool's `boot`/`init` are
+  answered in-process, and only `/dev/btwake` is opened: nothing powers or resets the chip. The
+  `0xcafebabe` power state is not uninitialized: bluetoothd maps PowerManager state 2 to it (table at
+  `+0x67c030`: 0, -1, 0xcafebabe, 0xdeadbeef, 0xbd15dead; "Transitioning" in its own name table at
+  `+0x2771c`). HackiOS saw the same on this BTIF IP: PIO frames of more than one 16-byte burst lose bytes
+  (loopback 0 of 20), the AP DMA sends them whole (20 of 20), as Android does. 0974: BTIF's TX through
+  its AP DMA channel (`0x10221200`, ring at `a34btvff`, default `0x5ff00000`), a long-frame test at
+  bring-up (Change_Local_Name of 252 bytes, then Read_Local_Name's 255-byte answer compared), paced PIO
+  (`a34btpace`) if the DMA fails it, long commands answered in the kernel if both fail; and when a
+  command of bluetoothd's stays unanswered for 2 s, BTIF/DMA state, the BGF MCU's pc, BGF_SW_IRQ and the
+  firmware's coredump text (EMI `+0x43C00`) are logged.
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
@@ -341,8 +357,9 @@ and the last `br>` before each), ComputerName, power-off.
    enough; Linux's other EMI MPU region (31, CONN forbidden over all DRAM) is never programmed under
    XNU, so the MPU call may be redundant (`a34btmpu=0` drops it).
 4. **No pre-calibration**: BT-only calibration may fail or be poor; RF range unknown until M1's scan.
-5. **BTIF in PIO, polled.** Enough for commands and a scan; ACL throughput (audio) may need AP-DMA RX
-   (channels 0x10221200/0x10221280) or the BTIF interrupt (SPI 202) later.
+5. **BTIF polled.** TX in PIO broke the controller on the first frame over 16 bytes (boot 0994-all-a);
+   0974 sends through the AP DMA's TX channel (0x10221200). RX stays PIO; ACL throughput (audio) may need
+   the RX channel (0x10221280) or the BTIF interrupt (SPI 202) later.
 6. **Firmware expectations not replayed**: Linux also sends UTC sync, screen state, connfem (skipped
    when the BT FEM is 0/0) and sets "FW own" sleep; M1 sends none and keeps the controller awake.
 7. **M2**: the vendor commands 16.7.16's bluetoothd sends to this firmware and the answers it needs;

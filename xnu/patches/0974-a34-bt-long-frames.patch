@@ -1,0 +1,592 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 840a532..9aab476 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -52,10 +52,30 @@
+  * gates on the LE feature bits. Also: once bluetoothd has connected, the raw channel only listens (0989-dbe-a: a34bt's
+  * scan-off went out while bluetoothd was restarting, between its connections).
+  *
++ * A34 (0974): frames longer than BTIF's 16-byte FIFO. Boot 0994-all-a: bluetoothd's HCI init went through (every
++ * frame of it 12 bytes or less), then its first long one, Change_Local_Name (252 bytes, PIO in 16-byte bursts on
++ * TEMT), was never answered, nor anything after it -- Write_EIR, then each restarted bluetoothd's HCI_Reset (STATUS
++ * 621, "HCI initialization failed", the switch stuck "Transitioning": PowerManager state 2, which bluetoothd reports
++ * as 0xcafebabe). Not a single byte came from the controller again; most likely bytes of the long frame were lost
++ * and its H4 parser waits for them still (the report below tells a stopped firmware apart). HackiOS measured the
++ * same on this BTIF IP (MT6768, runs 392-398): PIO loopback frames of 64 bytes 0 of 20 whole, through the AP DMA 20
++ * of 20; Android sends BTIF's TX through the AP DMA too (ENABLE_BTIF_TX_DMA). So now: BTIF's TX goes through its AP DMA channel (btif@1100c000 reg 1: 0x10221200; clock
++ * ifrao_apdma, infracfg_ao CG2 bit 18) out of an 8 KB ring at a34btvff (default 0x5ff00000: RAM below 4 GB, which
++ * XNU does not use, clear of the TWRP ramdisk, Wi-Fi's DMA memory, CONNSYS's memory and the scan-out buffers),
++ * polled as hal_dma_send_data and the TX interrupt handler do it (btif_dma_plat.c): the frame in, the write pointer
++ * moved, the last bytes short of 8 flushed. At bring-up a long frame is tried before anything else may send one:
++ * Change_Local_Name of 252 bytes and Read_Local_Name, whose 255-byte answer must hold the same name. If the DMA does
++ * not pass, PIO with a pause between bursts (a34btpace, us) is tried; if neither, commands over 16 bytes are
++ * answered here and longer data dropped (said in the log), so that bluetoothd can still come up. When a command of
++ * bluetoothd's is unanswered for 2 s, the BTIF, DMA, BGF MCU (pc twice) and SW IRQ state and the firmware's
++ * coredump text (EMI +0x43C00, Android's "BTSYS" area, cleared at step 4 as Android clears it) are said.
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+- * is the step that hung); a34btlog=N packets of each direction said in the log (default 48).
++ * is the step that hung); a34btlog=N packets of each direction said in the log (default 48); (0974) a34bttx=0 the
++ * old PIO bursts and no long-frame test, 1 the AP DMA (default), 2 paced PIO; a34btpace=US between PIO bursts
++ * (default 50); a34btvff=PA the DMA's ring (4 KB aligned, below 4 GB).
+  *
+  * Register facts (not code) from Samsung's A34 kernel (github.com/Fede2782/android_kernel_samsung_a34x,
+  * branch sep-16.0/stock = A346BXXSADYG1 OSRC), vendor/mediatek/kernel_modules/connectivity/bt/mt66xx:
+@@ -127,6 +147,12 @@ extern bool a34_bt_registry(const uint8_t *address);  /* iokit/Kernel/arm/A34Blu
+ #define BT_INFRACFG_PA          0x10001000u     /* infracfg_ao (reg 6): BTIF's clock gate */
+ #define BT_CCIF_PA              0x10003000u     /* +0x204: CONSYS_BGF_PWR_ON, the modem's coexistence flag */
+ #define BT_BTIF_PA              0x1100c000u     /* btif@1100c000 */
++#define BT_APDMA_PA             0x10221000u     /* (0974) AP DMA: BTIF's TX channel at +0x200 (btif@1100c000 reg 1) */
++#define BT_APDMA_TX             0x200u
++#define BT_VFF_PA               0x5ff00000ull   /* (0974) the TX channel's ring, RAM below 4 GB that nothing uses */
++#define BT_VFF_SIZE             8192u           /* TX_DMA_VFF_SIZE */
++#define BT_DUMP_OFFSET          0x43c00u        /* (0974) Bluetooth's coredump area in EMI (mt6877_coredump.c, BTSYS) */
++#define BT_DUMP_SIZE            0x18000u
+ #define BT_PAGE                 0x1000u
+ 
+ /* conn_infra RGU */
+@@ -169,6 +195,24 @@ extern bool a34_bt_registry(const uint8_t *address);  /* iokit/Kernel/arm/A34Blu
+ #define BTIF_TX_FIFO            16u
+ #define INFRA_CG0_CLR           0x084u          /* ifrao_btif: bit 31 */
+ #define INFRA_CG0_STA           0x090u
++#define INFRA_CG2_CLR           0x0a8u          /* (0974) ifrao_apdma: bit 18 (clk-mt6877.c, ifrao2_cg_regs) */
++#define INFRA_CG2_STA           0x0acu
++/* (0974) an AP DMA channel (btif/common/plat_inc/btif_dma_priv.h) */
++#define APDMA_INT_FLAG          0x00u
++#define APDMA_INT_EN            0x04u
++#define APDMA_EN                0x08u           /* bit 0; the channel clears it after a flush */
++#define APDMA_RST               0x0cu           /* bit 0 warm, bit 1 hard */
++#define APDMA_STOP              0x10u
++#define APDMA_FLUSH             0x14u           /* bit 0: the last bytes short of 8 out now */
++#define APDMA_VFF_ADDR          0x1cu
++#define APDMA_VFF_LEN           0x24u
++#define APDMA_VFF_THRE          0x28u
++#define APDMA_VFF_WPT           0x2cu           /* bits 15:0 the offset, bit 16 the wrap */
++#define APDMA_VFF_RPT           0x30u
++#define APDMA_INT_BUF           0x38u           /* bytes in the channel's own buffer */
++#define APDMA_VFF_VALID         0x3cu           /* bytes in the ring not yet taken */
++#define APDMA_VFF_LEFT          0x40u           /* room in the ring */
++#define APDMA_VFF_ADDR_H        0x54u
+ 
+ /* The EMI header of each image (struct fw_patch_emi_hdr, btmtk_mt66xx.c): 48 bytes before the image proper. */
+ #define FW_HDR                  48u
+@@ -184,6 +228,15 @@ static uint32_t bt_level;                       /* a34bt: 1 milestone 1, 2 also
+ static bool br_ever;                            /* (0973) bluetoothd has connected once: the raw channel only listens */
+ static uint32_t bt_said_in, bt_said_out;
+ 
++/* (0974) how BTIF's TX goes: a34bttx */
++#define BT_TX_PIO               0u              /* 16 bytes each time the FIFO is empty (0939) */
++#define BT_TX_DMA               1u              /* the AP DMA, as Android */
++#define BT_TX_PACED             2u              /* PIO, a34btpace us between bursts */
++static uint32_t bt_tx = BT_TX_DMA, bt_pace_us = 50;
++static uint64_t bt_vff_pa = BT_VFF_PA;
++static vm_offset_t bt_apdma, bt_vff, bt_emi;
++static bool bt_dma_on, bt_dma_moved, bt_long_broken;
++
+ static uint8_t *bt_fw[2];
+ static uint32_t bt_fw_size[2];
+ 
+@@ -411,6 +464,13 @@ bt_copy_firmware(void)
+ 		printf("A34 BT: step 4: CONNSYS's memory %#llx + %#x could not be mapped\n", pa, span);
+ 		return false;
+ 	}
++	if (span >= BT_DUMP_OFFSET + BT_DUMP_SIZE) {
++		/* (0974) Bluetooth's coredump area, cleared as Android clears it (connsys_coredump_clean), for bt_dump_say */
++		for (uint32_t k = 0; k < BT_DUMP_SIZE; k += 4) {
++			*(volatile uint32_t *)(emi + BT_DUMP_OFFSET + k) = 0;
++		}
++		bt_emi = emi;
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		const uint8_t *src = bt_fw[i] + FW_HDR;
+ 		uint32_t off = bt_fw_offset(bt_fw[i]), n = bt_fw_size[i] - FW_HDR, sum = 0, back = 0, k;
+@@ -539,7 +599,169 @@ bt_btif_init(void)
+ 	    rd(bt_btif, BTIF_LSR), rd(bt_btif, BTIF_HANDSHAKE), rd(bt_btif, BTIF_SLEEP_EN), rd(bt_btif, BTIF_WAK));
+ }
+ 
+-/* whole packets out, 16 bytes at a time, each time the FIFO is empty; spins (BTIF empties 16 bytes in microseconds) */
++/*
++ * (0974) BTIF's TX through its AP DMA channel, as Android sends it (ENABLE_BTIF_TX_DMA): a frame is put in a ring in
++ * RAM and the write pointer moved; the channel feeds BTIF's FIFO as it empties. The channel set up as
++ * hal_btif_dma_hw_init does (TX): reset, ring, length, pointers, threshold (length - 7), no interrupt (polled
++ * here); then BTIF_DMA_EN bit 1 (hal_btif_tx_mode_ctrl).
++ */
++static void
++bt_dma_say(const char *what)
++{
++	printf("A34 BT: TX DMA %s: EN %#x, STOP %#x, FLUSH %#x, LEN %u, VALID %u, LEFT %u, INT_BUF %u, WPT %#x, RPT %#x; "
++	    "BTIF LSR %#x, DMA_EN %#x\n", what, rd(bt_apdma, APDMA_EN), rd(bt_apdma, APDMA_STOP), rd(bt_apdma, APDMA_FLUSH),
++	    rd(bt_apdma, APDMA_VFF_LEN), rd(bt_apdma, APDMA_VFF_VALID), rd(bt_apdma, APDMA_VFF_LEFT),
++	    rd(bt_apdma, APDMA_INT_BUF), rd(bt_apdma, APDMA_VFF_WPT), rd(bt_apdma, APDMA_VFF_RPT), rd(bt_btif, BTIF_LSR),
++	    rd(bt_btif, BTIF_DMA_EN));
++}
++
++static bool
++bt_dma_setup(void)
++{
++	uint64_t emi = a34_connsys_emi_pa();
++	vm_offset_t page;
++	uint32_t i;
++
++	if ((bt_vff_pa & 0xfffull) != 0 || bt_vff_pa < 0x40000000ull || bt_vff_pa + BT_VFF_SIZE > 0x100000000ull ||
++	    (bt_vff_pa < emi + a34_connsys_emi_size() && bt_vff_pa + BT_VFF_SIZE > emi)) {
++		printf("A34 BT: TX DMA: a34btvff=%#llx is not 4 KB aligned RAM below 4 GB outside CONNSYS's memory\n",
++		    bt_vff_pa);
++		return false;
++	}
++	wr(bt_infra, INFRA_CG2_CLR, 1u << 18);                                 /* ifrao_apdma ungated */
++	delay(10);
++	if (rd(bt_infra, INFRA_CG2_STA) & (1u << 18)) {
++		printf("A34 BT: TX DMA: the AP DMA's clock is still gated (CG2 %#x)\n", rd(bt_infra, INFRA_CG2_STA));
++		return false;
++	}
++	if (bt_apdma == 0 && (page = ml_io_map(BT_APDMA_PA, BT_PAGE)) != 0) {
++		bt_apdma = page + BT_APDMA_TX;
++	}
++	if (bt_vff == 0) {
++		bt_vff = ml_io_map_wcomb((vm_offset_t)bt_vff_pa, BT_VFF_SIZE);  /* normal memory, uncached */
++	}
++	if (bt_apdma == 0 || bt_vff == 0) {
++		printf("A34 BT: TX DMA: the channel or its ring %#llx could not be mapped\n", bt_vff_pa);
++		return false;
++	}
++	setb(bt_apdma, APDMA_RST, 1u << 0);                                    /* warm reset */
++	for (i = 0; i < 10 && (rd(bt_apdma, APDMA_EN) & 1u); i++) {
++		delay(100);
++	}
++	if (rd(bt_apdma, APDMA_EN) & 1u) {
++		setb(bt_apdma, APDMA_RST, 1u << 1);                            /* hard reset */
++		clrb(bt_apdma, APDMA_RST, 1u << 1);
++	}
++	for (i = 0; i < BT_VFF_SIZE; i += 4) {
++		*(volatile uint32_t *)(bt_vff + i) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(bt_apdma, APDMA_VFF_ADDR, (uint32_t)bt_vff_pa);
++	wr(bt_apdma, APDMA_VFF_ADDR_H, (uint32_t)(bt_vff_pa >> 32));
++	wr(bt_apdma, APDMA_VFF_LEN, BT_VFF_SIZE);
++	wr(bt_apdma, APDMA_VFF_WPT, 0);
++	wr(bt_apdma, APDMA_VFF_RPT, 0);
++	wr(bt_apdma, APDMA_VFF_THRE, BT_VFF_SIZE - 7);                         /* DMA_TX_THRE */
++	clrb(bt_apdma, APDMA_INT_FLAG, 1u << 0);
++	wr(bt_apdma, APDMA_INT_EN, 0);
++	bt_dma_say("set up");
++	if (rd(bt_apdma, APDMA_VFF_LEN) != BT_VFF_SIZE || rd(bt_apdma, APDMA_VFF_VALID) != 0 ||
++	    rd(bt_apdma, APDMA_VFF_LEFT) < BT_PKT_MAX) {
++		printf("A34 BT: TX DMA: the channel did not take its ring\n");
++		return false;
++	}
++	for (i = 0; i < 1000 && !(rd(bt_btif, BTIF_LSR) & (1u << 6)); i++) {
++		delay(10);
++	}
++	setb(bt_btif, BTIF_DMA_EN, 1u << 1);                                   /* BTIF's TX FIFO fed by the channel */
++	bt_dma_on = true;
++	printf("A34 BT: TX DMA: on, ring at %#llx\n", bt_vff_pa);
++	return true;
++}
++
++/* back to PIO: the channel stopped (btif_tx_dma_ctrl, DMA_CTRL_DISABLE), BTIF's TX no longer fed by it */
++static void
++bt_dma_off(void)
++{
++	for (uint32_t i = 0; i < 100; i++) {
++		setb(bt_apdma, APDMA_STOP, 1u << 0);
++		if (!(rd(bt_apdma, APDMA_STOP) & 1u)) {
++			break;
++		}
++		delay(10);
++	}
++	clrb(bt_btif, BTIF_DMA_EN, 1u << 1);
++	bt_dma_on = false;
++	bt_dma_say("off");
++}
++
++/* one frame through the channel, and out of BTIF (the caller holds bt_tx_lock); bt_dma_moved: anything left the ring */
++static int
++bt_dma_write(const uint8_t *b, uint32_t n)
++{
++	static uint32_t said;
++	uint64_t start = mach_absolute_time(), limit;
++	uint32_t w, wpt, wrap, valid, least = n;
++
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &limit);
++	bt_dma_moved = false;
++	while (rd(bt_apdma, APDMA_FLUSH) & 1u) {                               /* a flush still going */
++		if (mach_absolute_time() - start > limit) {
++			goto stuck;
++		}
++	}
++	if (rd(bt_apdma, APDMA_VFF_LEFT) < n) {
++		goto stuck;
++	}
++	w = rd(bt_apdma, APDMA_VFF_WPT);
++	wpt = w & 0xffffu;
++	wrap = w & 0x10000u;
++	for (uint32_t i = 0; i < n; i++) {
++		*(volatile uint8_t *)(bt_vff + wpt) = b[i];
++		if (++wpt == BT_VFF_SIZE) {
++			wpt = 0;
++			wrap ^= 0x10000u;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	setb(bt_apdma, APDMA_EN, 1u << 0);
++	wr(bt_apdma, APDMA_VFF_WPT, wpt | wrap);
++	for (;;) {
++		valid = rd(bt_apdma, APDMA_VFF_VALID);
++		least = valid < least ? valid : least;
++		if (valid == 0 && rd(bt_apdma, APDMA_INT_BUF) == 0) {
++			break;
++		}
++		if (valid > 0 && valid < 8 && !(rd(bt_apdma, APDMA_FLUSH) & 1u) && !(rd(bt_apdma, APDMA_STOP) & 1u)) {
++			setb(bt_apdma, APDMA_FLUSH, 1u << 0);                  /* the last bytes short of 8 */
++		}
++		if (mach_absolute_time() - start > limit) {
++			goto stuck;
++		}
++	}
++	bt_dma_moved = true;
++	while (!(rd(bt_btif, BTIF_LSR) & (1u << 6))) {
++		if (mach_absolute_time() - start > limit) {
++			goto stuck;
++		}
++	}
++	return 0;
++stuck:
++	bt_dma_moved = bt_dma_moved || least < n;
++	if (said++ < 8) {
++		char what[64];
++
++		snprintf(what, sizeof(what), "stuck with a %u-byte frame (%s)", n, bt_dma_moved ? "some of it went" :
++		    "none of it went");
++		bt_dma_say(what);
++	}
++	return ETIMEDOUT;
++}
++
++/*
++ * Whole packets out: through the AP DMA once it is set up (0974), else 16 bytes at a time, each time the FIFO is
++ * empty, with a34btpace us between bursts when paced; spins (BTIF empties 16 bytes in microseconds).
++ */
+ static int
+ bt_btif_write(const uint8_t *b, uint32_t n)
+ {
+@@ -549,6 +771,11 @@ bt_btif_write(const uint8_t *b, uint32_t n)
+ 
+ 	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &limit);
+ 	lck_mtx_lock(&bt_tx_lock);
++	if (bt_dma_on) {
++		error = bt_dma_write(b, n);
++		lck_mtx_unlock(&bt_tx_lock);
++		return error;
++	}
+ 	while (at < n && error == 0) {
+ 		now = mach_absolute_time();
+ 		while (!(rd(bt_btif, BTIF_LSR) & (1u << 6))) {
+@@ -560,6 +787,9 @@ bt_btif_write(const uint8_t *b, uint32_t n)
+ 		for (uint32_t k = 0; error == 0 && k < BTIF_TX_FIFO && at < n; k++, at++) {
+ 			*(volatile uint32_t *)(bt_btif + BTIF_RBR_THR) = b[at];
+ 		}
++		if (error == 0 && at < n && bt_tx == BT_TX_PACED) {
++			delay((int)bt_pace_us);                 /* (0974) the controller's side catches up */
++		}
+ 	}
+ 	lck_mtx_unlock(&bt_tx_lock);
+ 	if (error != 0) {
+@@ -709,6 +939,154 @@ bt_command(const uint8_t *cmd, uint32_t n, uint8_t event, uint8_t *answer, uint3
+ 	return 0;
+ }
+ 
++/*
++ * (0974) A frame longer than BTIF's FIFO, as bluetoothd's first long one (Change_Local_Name, 252 bytes), and the name
++ * read back (Read_Local_Name, a 255-byte event): whole and unchanged, or not. bluetoothd sets its own name later.
++ */
++static bool
++bt_long_test(const char *how)
++{
++	static uint8_t cmd[4 + 248], ans[BT_PKT_MAX];
++	static const uint8_t read_name[4] = { 0x01, 0x14, 0x0c, 0x00 };
++	static const char tag[] = "A34 BTIF long frame test ";
++	uint32_t n, i, start = bt_ms();
++
++	cmd[0] = 0x01;
++	cmd[1] = 0x13;
++	cmd[2] = 0x0c;
++	cmd[3] = 248;
++	for (i = 0; i < 248; i++) {
++		cmd[4 + i] = i < sizeof(tag) - 1 ? (uint8_t)tag[i] : i < 240 ? (uint8_t)('a' + i % 26) : 0;
++	}
++	n = bt_command(cmd, sizeof(cmd), 0x0e, ans, 1000);
++	if (n < 7 || ans[6] != 0) {
++		printf("A34 BT: step 9: long frames (%s): the 252-byte Change_Local_Name %s\n", how,
++		    n == 0 ? "was not answered" : "failed");
++		return false;
++	}
++	n = bt_command(read_name, sizeof(read_name), 0x0e, ans, 1000);
++	if (n != 7 + 248 || ans[6] != 0) {
++		printf("A34 BT: step 9: long frames (%s): Read_Local_Name: %u bytes back, status %#x\n", how, n,
++		    n >= 7 ? ans[6] : 0xffu);
++		return false;
++	}
++	for (i = 0; i < 248 && ans[7 + i] == cmd[4 + i]; i++) {
++	}
++	if (i < 248) {
++		printf("A34 BT: step 9: long frames (%s): the name read back differs from byte %u on (%02x, not %02x)\n",
++		    how, i, ans[7 + i], cmd[4 + i]);
++		return false;
++	}
++	printf("A34 BT: step 9: long frames (%s): a 252-byte command and a 255-byte answer, whole (%u ms)\n", how,
++	    bt_ms() - start);
++	return true;
++}
++
++static const char *
++bt_tx_name(void)
++{
++	return bt_dma_on ? "AP DMA" : bt_tx == BT_TX_PACED ? "PIO, paced" : "PIO";
++}
++
++/* (0974) how frames go out: the AP DMA if it sends a long frame whole, else paced PIO if that does, else neither */
++static void
++bt_long_setup(void)
++{
++	if (bt_tx == BT_TX_PIO) {
++		printf("A34 BT: step 9: TX in 16-byte bursts (a34bttx=0), no long-frame test\n");
++		return;
++	}
++	if (bt_tx == BT_TX_DMA && !bt_dma_setup()) {
++		bt_tx = BT_TX_PACED;
++	}
++	if (bt_long_test(bt_tx_name())) {
++		return;
++	}
++	if (bt_dma_on) {
++		bool moved = bt_dma_moved;
++
++		bt_dma_off();
++		bt_tx = BT_TX_PACED;
++		printf("A34 BT: step 9: the AP DMA %s: PIO with %u us between bursts instead\n",
++		    moved ? "sent, but not whole" : "sent nothing", bt_pace_us);
++		if (bt_long_test(bt_tx_name())) {
++			return;
++		}
++	}
++	bt_long_broken = true;
++	printf("A34 BT: step 9: LONG FRAMES DO NOT GET THROUGH: commands over 16 bytes are answered here, longer data "
++	    "is dropped\n");
++}
++
++/* (0974) what the firmware left in its coredump area (EMI +0x43C00: control block, then its text from +0x100) */
++static void
++bt_dump_say(void)
++{
++	const volatile uint8_t *text;
++	uint32_t state, print, any = 0, k, j = 0, lines = 0;
++	char line[121];
++
++	if (bt_emi == 0) {
++		return;
++	}
++	state = *(volatile uint32_t *)(bt_emi + BT_DUMP_OFFSET + 0x4);
++	print = *(volatile uint32_t *)(bt_emi + BT_DUMP_OFFSET + 0xc);
++	for (k = 0; k < 0x200; k += 4) {
++		any |= *(volatile uint32_t *)(bt_emi + BT_DUMP_OFFSET + k);
++	}
++	if (any == 0) {
++		printf("A34 BT: the firmware's coredump area (EMI +%#x) is still clear: no assert written\n", BT_DUMP_OFFSET);
++		return;
++	}
++	printf("A34 BT: the firmware's coredump area (EMI +%#x): state %#x, text index %#x, dump index %#x\n",
++	    BT_DUMP_OFFSET, state, print, *(volatile uint32_t *)(bt_emi + BT_DUMP_OFFSET + 0x10));
++	text = (const volatile uint8_t *)(bt_emi + BT_DUMP_OFFSET + 0x100);
++	for (k = 0; k < 0x7f00 && lines < 6; k++) {
++		uint8_t c = text[k];
++
++		if (c >= 0x20 && c < 0x7f) {
++			line[j++] = (char)c;
++		}
++		if ((c < 0x20 || c >= 0x7f || j == sizeof(line) - 1) && j > 0) {
++			line[j] = 0;
++			if (j >= 4 || c >= 0x20) {
++				printf("A34 BT: coredump: %s\n", line);
++				lines++;
++			}
++			j = 0;
++		}
++	}
++}
++
++/* (0974) the state of everything between bluetoothd and the controller, when the controller stays silent */
++static void
++bt_wedge_say(const char *why)
++{
++	uint32_t pc0 = 0, pc1 = 0, swirq = 0;
++	bool readable;
++
++	printf("A34 BT: %s: BTIF LSR %#x, DMA_EN %#x, TX by %s; last byte from the controller %u ms ago\n", why,
++	    rd(bt_btif, BTIF_LSR), rd(bt_btif, BTIF_DMA_EN), bt_tx_name(), bt_ms() - bt_last_rx_ms());
++	if (bt_dma_on) {
++		bt_dma_say("now");
++	}
++	setb(bt_hc, HC_WAKEUP_BT, 1u << 0);                                    /* conn_infra on, to be read */
++	delay(1000);
++	readable = a34_connsys_readable("Bluetooth's state");
++	if (readable) {
++		pc0 = rd(bt_hc, HC_MCU_PC);
++		delay(200);
++		pc1 = rd(bt_hc, HC_MCU_PC);
++		swirq = rd(bt_swirq, 0x10);
++	}
++	clrb(bt_hc, HC_WAKEUP_BT, 1u << 0);
++	if (readable) {
++		printf("A34 BT: BGF MCU pc %#x, 200 us later %#x (%s); BGF_SW_IRQ status %#x%s\n", pc0, pc1,
++		    pc0 == pc1 ? "not moving" : "running", swirq, swirq != 0 ? " (the firmware asks for the host)" : "");
++	}
++	bt_dump_say();
++}
++
+ /* ---- step 7: driver own (btmtk_cif_fw_own_clr) ---- */
+ 
+ static bool
+@@ -1039,6 +1417,9 @@ static uint8_t br_txq[BR_TXQ];
+ static unsigned br_txq_count;
+ static uint32_t br_txq_dropped, br_log_max = 600, br_said;
+ static kern_ctl_ref br_ctl_ref;
++static bool br_waiting;                         /* (0974) a command of bluetoothd's went to the controller ... */
++static uint16_t br_wait_op;                     /* ... this one, br_wait_n bytes, at br_wait_ms: not answered yet */
++static uint32_t br_wait_ms, br_wait_n;
+ 
+ /* what bluetoothd wrote (the Skywalk channel's TX, or the control socket): queued, cut into packets by the bridge */
+ void
+@@ -1183,6 +1564,65 @@ br_standard_here(const uint8_t *cmd, uint32_t n)
+ 	return true;
+ }
+ 
++/*
++ * (0974) When long frames do not get through (bt_long_setup): a command over 16 bytes answered here, Command
++ * Complete with status 0 (and LE_Set_Extended_Advertising_Parameters' selected TX power, 0 dBm); data dropped.
++ */
++static void
++br_long_here(const uint8_t *pkt, uint32_t n)
++{
++	static uint32_t said, dropped;
++	uint16_t op = (uint16_t)(pkt[1] | (pkt[2] << 8));
++	uint8_t ev[8] = { 0x04, 0x0e, 4, 1, pkt[1], pkt[2], 0, 0 };
++	uint32_t len = 7;
++
++	if (pkt[0] != 0x01) {
++		if (dropped++ < 8) {
++			printf("A34 BT: br: a %u-byte packet of type %u dropped: long frames do not get through\n", n, pkt[0]);
++		}
++		return;
++	}
++	if (op == 0x2036) {
++		ev[2] = 5;
++		len = 8;
++	}
++	if (said++ < 16) {
++		printf("A34 BT: br: command %04x (%u bytes) answered here: long frames do not get through\n", op, n - 4);
++	}
++	br_dump("br=", ev, len);
++	bt_deliver(ev, len);
++	a34_btsk_deliver(ev, len);
++}
++
++/* (0974) a command of bluetoothd's unanswered for 2 s: said, with the state of everything (the first 6) */
++static void
++br_watch(void)
++{
++	static uint32_t said;
++	char why[80];
++
++	if (!br_waiting || bt_ms() - br_wait_ms < 2000) {
++		return;
++	}
++	br_waiting = false;
++	if (said++ >= 6) {
++		return;
++	}
++	snprintf(why, sizeof(why), "br: command %04x (%u bytes) unanswered for 2 s", br_wait_op, br_wait_n);
++	bt_wedge_say(why);
++}
++
++/* the answer to the command being waited for (Command Complete or Command Status of its opcode) */
++static void
++br_answered(const uint8_t *p, uint32_t n)
++{
++	if (br_waiting && n >= 7 && p[0] == 0x04 &&
++	    ((p[1] == 0x0e && (uint16_t)(p[4] | (p[5] << 8)) == br_wait_op) ||
++	    (p[1] == 0x0f && (uint16_t)(p[5] | (p[6] << 8)) == br_wait_op))) {
++		br_waiting = false;
++	}
++}
++
+ /* bluetoothd's packets out, whole; true if any went */
+ static bool
+ br_drain(void)
+@@ -1229,8 +1669,17 @@ br_drain(void)
+ 		if (pkt[0] == 0x01 && br_standard_here(pkt, n)) {
+ 			continue;
+ 		}
++		if (bt_long_broken && n > BTIF_TX_FIFO) {
++			br_long_here(pkt, n);
++			continue;
++		}
+ 		br_dump("br>", pkt, n);
+-		(void)bt_btif_write(pkt, n);
++		if (bt_btif_write(pkt, n) == 0 && pkt[0] == 0x01) {
++			br_waiting = true;
++			br_wait_op = (uint16_t)(pkt[1] | (pkt[2] << 8));
++			br_wait_n = n;
++			br_wait_ms = bt_ms();
++		}
+ 	}
+ 	return did;
+ }
+@@ -1677,6 +2126,7 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	good = bt_probe();          /* (fewer than six: the raw channel still opens, for a34bt cmd/dump) */
+ 	bt_addr_load();
+ 	(void)bt_addr_apply("at bring-up");
++	bt_long_setup();            /* (0974) frames over 16 bytes: the AP DMA, else paced PIO, else answered here */
+ 
+ 	STEP(10, "raw HCI channel");
+ 	if (!bt_ctl_register()) {
+@@ -1696,6 +2146,7 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 
+ 		if ((n = bt_receive(a, bt_level >= 2 ? 0 : 1000)) != 0) {
+ 			busy = true;
++			br_answered(a, n);
+ 			if (bt_level >= 2) {
+ 				if (n >= 4 && a[0] == 0x04 && a[1] == 0x3e && (a[3] == 0x02 || a[3] == 0x0d)) {
+ 					br_le_heard(a, n);              /* (counted every 10 s, not each in the log) */
+@@ -1721,6 +2172,7 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 		}
+ 		if (bt_level >= 2) {
+ 			br_le_say();
++			br_watch();
+ 			if (!busy) {
+ 				bt_idle(bt_ms() - bt_last_rx_ms() < 1000 ? 1 : 4);
+ 			}
+@@ -1747,9 +2199,18 @@ a34_bt_init(void)
+ 	(void)PE_parse_boot_argn("a34btsync", &bt_sync, sizeof(bt_sync));
+ 	(void)PE_parse_boot_argn("a34btlog", &bt_log_max, sizeof(bt_log_max));
+ 	(void)PE_parse_boot_argn("a34btaddr", &bt_addr_want, sizeof(bt_addr_want));
++	(void)PE_parse_boot_argn("a34bttx", &bt_tx, sizeof(bt_tx));
++	(void)PE_parse_boot_argn("a34btpace", &bt_pace_us, sizeof(bt_pace_us));
++	(void)PE_parse_boot_argn("a34btvff", &bt_vff_pa, sizeof(bt_vff_pa));
++	if (bt_tx > BT_TX_PACED) {
++		bt_tx = BT_TX_DMA;
++	}
++	if (bt_pace_us > 5000) {
++		bt_pace_us = 5000;
++	}
+ 	bt_set_state("starting");
+-	printf("A34 BT: Bluetooth milestone 1 (a34bt=%u): steps up to %u, firmware wait %u s, log sync %u\n", on,
+-	    bt_step_max, bt_wait_s, bt_sync);
++	printf("A34 BT: Bluetooth milestone 1 (a34bt=%u): steps up to %u, firmware wait %u s, log sync %u, TX %s\n", on,
++	    bt_step_max, bt_wait_s, bt_sync, bt_tx == BT_TX_DMA ? "AP DMA" : bt_tx == BT_TX_PACED ? "paced PIO" : "PIO");
+ 	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
