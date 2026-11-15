@@ -243,7 +243,7 @@ rwm_perf_report(uint64_t now)
 		say(line);
 	}
 	say_worst_cb();
-	for (unsigned which = 0; pan != nullptr && which < 45; which++) {    /* (4: tiles; 5 and on: one span's passes) */
+	for (unsigned which = 0; pan != nullptr && which < 47; which++) {    /* (4: tiles; 5: one span's jobs; 6 and on: its passes) */
 		char wide[600];
 
 		if (pan(which, wide, sizeof(wide)) != 0) {
