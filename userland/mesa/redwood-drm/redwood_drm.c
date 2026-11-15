@@ -1291,13 +1291,22 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 EXPORT int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 {
+	/*
+	 * A34 (after y2sios's redwood-drm, MIT): a buffer object handed to another part of this same
+	 * process (a Metal texture over a buffer's memory, air_metal.c's rwa_texture_from_buffer): the
+	 * "file descriptor" is the handle with a tag no IOSurface ID has, and drmPrimeFDToHandle gives
+	 * the handle back, so panfrost finds its own buffer object and takes a reference. Nothing
+	 * leaves the process this way; another process still cannot be given a buffer.
+	 */
 	(void)fd;
-	(void)handle;
 	(void)flags;
-	*prime_fd = -1;
-	note("drmPrimeHandleToFD: not supported");
-	errno = EOPNOTSUPP;
-	return -1;
+	if (handle == 0 || (handle & REDWOOD_DRM_PRIME_LOCAL) != 0) {
+		*prime_fd = -1;
+		errno = EINVAL;
+		return -1;
+	}
+	*prime_fd = (int)(handle | REDWOOD_DRM_PRIME_LOCAL);
+	return 0;
 }
 
 /*
@@ -1332,6 +1341,10 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 	if (prime_fd <= 0) {
 		errno = EBADF;
 		return -1;
+	}
+	if (((uint32_t)prime_fd & REDWOOD_DRM_PRIME_LOCAL) != 0) {
+		*handle = (uint32_t)prime_fd & ~REDWOOD_DRM_PRIME_LOCAL;      /* (in-process, see drmPrimeHandleToFD) */
+		return 0;
 	}
 	if (surface_request(&request) != 0) {
 		return -1;

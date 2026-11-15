@@ -178,6 +178,17 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
 					     unsigned row_bytes, char *why, size_t why_size);
 
 /*
+ * A34 (from y2sios's air_metal.c, MIT): a texture over a buffer's memory,
+ * -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a linear 2D image of `shape` from byte
+ * `offset` with `row_bytes` a row, the same GPU buffer object as the buffer (not a copy). Refused by
+ * name as an import is: one level, one slice, rows of at least the width and a multiple of 64 bytes,
+ * inside the buffer.
+ */
+struct rwa_texture *rwa_texture_from_buffer(struct rwa_buffer *buffer,
+                                            const struct rwa_texture_shape *shape, size_t offset,
+                                            size_t row_bytes, char *why, size_t why_size);
+
+/*
  * Pixels in and out, which is -replaceRegion:... and -getBytes:... on the Metal side. The
  * region is given in texels and `stride` in bytes per row of the caller's memory; a stride
  * of 0 means tightly packed. 0, or -1 and a sentence.

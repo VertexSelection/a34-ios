@@ -1709,6 +1709,57 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
    return texture_of_shape(device, shape, &import, why, why_size);
 }
 
+/*
+ * A34 (from y2sios, MIT: kernel/tools/mesa/air/air_metal.c, rwa_texture_from_buffer): a texture over
+ * a buffer's memory. The buffer's GPU buffer object is handed to the texture inside this process
+ * (redwood-drm's in-process export: the "file descriptor" is the GEM handle with a tag no IOSurface ID
+ * has, and importing it gives the handle back, so panfrost takes a reference on its own buffer
+ * object), so the two are one memory, as in Metal. Everything texture_of_shape refuses for an import
+ * it refuses here -- a row not a multiple of 64 bytes among them, which the caller answers with nil
+ * and Metal's user with a texture of its own.
+ */
+struct rwa_texture *
+rwa_texture_from_buffer(struct rwa_buffer *buffer, const struct rwa_texture_shape *shape,
+                        size_t offset, size_t row_bytes, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!buffer || !buffer->res) {
+      say(why, why_size, "a texture over no buffer");
+      return NULL;
+   }
+   struct rwa_device *device = buffer->device;
+   const struct rwa_pixel_format *fmt = shape ? pixel_format(shape->pixel_format) : NULL;
+   unsigned height = shape && shape->height ? shape->height : 1;
+
+   if (fmt && (offset > buffer->size || (size_t)row_bytes * height > buffer->size - offset)) {
+      say(why, why_size, "%u rows of %zu bytes from offset %zu of a buffer of %zu bytes", height,
+          row_bytes, offset, buffer->size);
+      return NULL;
+   }
+   if (fmt && offset % util_format_get_blocksize(fmt->pipe) != 0) {
+      say(why, why_size, "a texture of %s at offset %zu of a buffer: Metal asks for an offset that "
+                         "is a multiple of the texel (%u bytes)", fmt->name, offset,
+          util_format_get_blocksize(fmt->pipe));
+      return NULL;
+   }
+   if (row_bytes % 64 != 0 || offset % 64 != 0) {
+      say(why, why_size, "a texture over a buffer at offset %zu with %zu bytes a row: Valhall's linear "
+                         "images want both a multiple of 64 bytes", offset, row_bytes);
+      return NULL;
+   }
+   struct winsys_handle out = { .type = WINSYS_HANDLE_TYPE_FD };
+   if (device->software || !device->screen->resource_get_handle ||
+       !device->screen->resource_get_handle(device->screen, NULL, buffer->res, &out, 0)) {
+      say(why, why_size, "%s would not hand this buffer's memory over to a texture",
+          rwa_device_name(device));
+      return NULL;
+   }
+   const struct rwa_surface_import import = {
+      .id = (int)out.handle, .offset = (unsigned)offset, .row_bytes = (unsigned)row_bytes };
+
+   return texture_of_shape(device, shape, &import, why, why_size);
+}
+
 void
 rwa_texture_destroy(struct rwa_texture *texture)
 {

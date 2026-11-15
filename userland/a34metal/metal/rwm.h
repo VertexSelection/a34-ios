@@ -84,6 +84,7 @@ struct rwm_air {
 	__typeof__(&rwa_compute_create) compute_create;
 	__typeof__(&rwa_compute_destroy) compute_destroy;
 	__typeof__(&rwa_texture_create) texture_create;
+	__typeof__(&rwa_texture_from_buffer) texture_from_buffer;   /* A34 (y2sios): may be NULL */
 	__typeof__(&rwa_texture_write) texture_write;
 	__typeof__(&rwa_texture_read) texture_read;
 	__typeof__(&rwa_texture_copy) texture_copy;

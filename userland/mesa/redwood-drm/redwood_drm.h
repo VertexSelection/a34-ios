@@ -145,6 +145,10 @@ struct redwood_drm_wait_seq {
 
 int redwood_drm_queued(void);
 
+/* A34: drmPrimeHandleToFD's in-process "file descriptor": the GEM handle with this bit, which no
+ * IOSurface ID has (redwood_drm.c) */
+#define REDWOOD_DRM_PRIME_LOCAL 0x40000000u
+
 /* For the Metal driver (userland/a34metal, HackiOS's air_metal.c): see redwood_drm.c */
 uint64_t redwood_drm_last_seq(void);
 int redwood_drm_wait_seq(uint64_t seq, int64_t relative_ns);

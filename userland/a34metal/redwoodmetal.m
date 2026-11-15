@@ -2527,11 +2527,56 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 - (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
 		   bytesPerRow:(NSUInteger)bytesPerRow
 {
-	(void)descriptor; (void)offset; (void)bytesPerRow;
-	RW_ONCE("redwoodmetal: a texture over a buffer was asked for; the contract lays a texture "
-		"over an IOSurface and over memory of its own, but not over a buffer this driver "
-		"already holds\n");
-	return nil;
+	/*
+	 * A34 (after y2sios, MIT: their RedwoodMetalBuffer -newTextureWithDescriptor:offset:bytesPerRow:):
+	 * a texture laid over this buffer's memory (rwa_texture_from_buffer), one GPU buffer object for
+	 * both, so what is written through either is what the other reads -- CoreAnimation's layer images
+	 * are such textures, and every one of them used to be nil here. Where the library refuses (a row
+	 * or an offset not a multiple of 64 bytes, Valhall's linear images), nil as before, and the
+	 * caller makes a texture of its own.
+	 */
+	char why[256] = "no compiler library";
+	struct rwa_buffer *buffer = [self mesaBuffer];
+	struct rwa_texture_shape shape = {
+		.pixel_format = rw_known_format((unsigned)[descriptor pixelFormat]),
+		.type = (unsigned)[descriptor textureType],
+		.width = (unsigned)[descriptor width],
+		.height = (unsigned)[descriptor height],
+		.depth = (unsigned)[descriptor depth],
+		.array_length = (unsigned)[descriptor arrayLength],
+		.mip_levels = (unsigned)[descriptor mipmapLevelCount],
+		.sample_count = (unsigned)[descriptor sampleCount],
+		.usage = (unsigned)[descriptor usage],
+	};
+	struct rwa_texture *texture = NULL;
+	RedwoodMetalTexture *made;
+	static unsigned long made_count, refused_count;
+
+	if (buffer != NULL && mesa.texture_from_buffer != NULL) {
+		texture = mesa.texture_from_buffer(buffer, &shape, offset, bytesPerRow, why, sizeof(why));
+	} else if (buffer == NULL) {
+		strlcpy(why, "the buffer's memory is not the compiler library's", sizeof(why));
+	}
+	if (texture == NULL) {
+		if (((++refused_count) & (refused_count - 1)) == 0) {
+			rw_print("a texture over a buffer (%ux%u format %u at offset %lu, %lu bytes a row): %s; nil "
+				 "(%lu so far)\n", shape.width, shape.height, shape.pixel_format, (unsigned long)offset,
+				 (unsigned long)bytesPerRow, why, refused_count);
+		}
+		return nil;
+	}
+	made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner texture:texture shape:&shape];
+	if (made != nil) {
+		/* the buffer lives as long as the texture over its memory */
+		objc_setAssociatedObject(made, sel_registerName("redwoodBufferUnderTexture"), self,
+					 OBJC_ASSOCIATION_RETAIN);
+		if (((++made_count) & (made_count - 1)) == 0) {
+			rw_print("a texture over a buffer's own memory made (%ux%u format %u, %lu bytes a row; %lu so "
+				 "far)\n", shape.width, shape.height, shape.pixel_format, (unsigned long)bytesPerRow,
+				 made_count);
+		}
+	}
+	return made;
 }
 
 - (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
