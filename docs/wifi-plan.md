@@ -581,6 +581,45 @@ a34_apple80211.c compiled and linked, no warnings of our own); `a34wifi`
    with a typed passphrase (`iOS asks us to join`).
 3. If 0968 makes things worse: boot-arg `a34wifilegacy=1` is 0967's behaviour.
 
+### On the phone: online (kernel main 33f1f28 + 0991, `a34wifi connect`; `build/logs/0991-all-a`)
+
+Joined as an HT (20 MHz, one stream) QoS station on channel 5 in 4843 ms; DHCP DISCOVER out
+ciphered, OFFER and ACK in, en0 192.168.1.x by DHCP (through our IPConfiguration `setservice`:
+configd made no Wi-Fi service of its own in the first 10 s), a TCP connection to 1.1.1.1:80
+answered "HTTP/". BSS transition requests came and were answered (we stay, status 7); no
+disassociation. Of iOS's side, already: A34WLAN in the registry, `IONetworkStack opened by
+configd`, configd asking Apple80211 (SSID, BSSID, auth type, capabilities). wifid was not started
+(its job's `_LimitLoadToDeviceTree`). And MobileGestalt (in SpringBoard) looked for the Wi-Fi
+address: services named `sdio`, `wlan`, `marconi-wifi` (none), then a wait for an
+`IONetworkController` to be published (never: "class-match IONetworkController -> 0").
+
+### 0995: "wlan", an IONetworkController with the address; and Settings' root
+
+- The controller is now named `wlan`, carries the address as `local-mac-address`,
+  `mac-address-wifi0` and `IOMACAddress`, and is an `IONetworkController` (the baseline's class,
+  `SweetNetwork.cpp`, declared word for word), as IO80211Family's controllers are: MobileGestalt's
+  look-up and its wait both find it.
+- No log line says a passphrase's or key's length any more (step 8, the Apple80211 join line,
+  a34wifi's check); the passphrase itself never was in one: it comes from `/a34/wifi/network` or
+  from Settings, and wifid keeps Settings' in the keychain as on any iPhone.
+- `tools/wifi-settings-setup.sh ROOT` (idempotent): removes wifid's `_LimitLoadToDeviceTree`;
+  checks configd, mDNSResponder (+Helper), trustd, securityd, nsurlsessiond and CFNetworkAgent --
+  all stock jobs of our root, configd and mDNSResponder started at boot, the rest on demand by
+  their Mach services (no `exec` line until something asks), none disabled -- and stops, changing
+  nothing, if one is missing; leaves the `com.a34.wifi` fallback job; makes `/a34/wifi/network`
+  root's, mode 0600, without reading it.
+
+Built in CI with every patch through 0995:
+[43729951490](https://github.com/VertexSelection/a34-ios/actions/runs/43729951490) (no warnings of
+our own); `a34wifi` [43729951074](https://github.com/VertexSelection/a34-ios/actions/runs/43729951074).
+
+**The Settings test**: kernel with 0995; `sudo tools/wifi-settings-setup.sh /mnt`; keep the
+`a34wifi connect` job. In the log: `A34WLAN: en0 in the registry ("wlan": ...)`, `exec wifid`,
+`A34 WIFI: apple80211: wifid gets/sets ...` (the request list says what wifid needs: a REFUSED
+type is one to answer next), MobileGestalt's `IONameMatch wlan -> ` the service. In Settings >
+Wi-Fi: the switch, the networks around (wifid's scans: `scan for iOS`), the joined network ticked;
+joining another network with a typed passphrase (`iOS asks us to join "..."`, then JOINED).
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both

@@ -296,7 +296,7 @@ check_network(void)
 			}
 			psk = k == 64 && hex == 64 ? "WPA2-PSK, a 64-digit key" : k >= 8 && k <= 63 ? "WPA2-PSK, a passphrase" : NULL;
 			if (psk == NULL) {
-				printf("a34wifi: psk= is neither 8 to 63 characters nor 64 hex digits (%zu characters)\n", k);
+				printf("a34wifi: psk= is neither 8 to 63 characters nor 64 hex digits\n");     /* (not even its length) */
 				psk = "unusable";
 				bad = 1;
 			}
