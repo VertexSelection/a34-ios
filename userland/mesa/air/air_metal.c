@@ -5396,7 +5396,7 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
       static const char *const kinds[] = { "linear", "16x16 tiled", "AFBC", "other" };
       snprintf(line, size, "rwm pass %u of %u: %ux%u %s %s%s level %u (framebuffer %ux%u, drawn %ux%u), "
                "%u draws, %u colour attachments; colour 0 %s%s%s, %s; colour 1 %s; depth/stencil %s%s%s; "
-               "preloads %s; sent for: %s; GPU jobs %llu-%llu",
+               "preloads %s; sampled %u texture reads, the largest %ux%u %s%s; sent for: %s; GPU jobs %llu-%llu",
                k + 1, ntrace, r->res_w, r->res_h, util_format_short_name((enum pipe_format)r->format),
                kinds[r->kind & 3], r->shared ? " IOSurface" : "", r->level, r->width, r->height, r->extent_w,
                r->extent_h, r->draws, r->nr_cbufs, r->clear ? "cleared" : r->preload ? "preloaded" : "not loaded",
@@ -5413,6 +5413,7 @@ rwa_pan_profile(unsigned which, char *line, size_t size)
                !(r->preload || r->preload1 || r->zs_preload) ? "none"
                : r->always ? "over the whole drawn area (a kept clear forces ALWAYS)"
                : "only where geometry falls (INTERSECT)",
+               r->tex_reads, r->tex_w, r->tex_h, kinds[r->tex_kind & 3], r->tex_shared ? " IOSurface" : "",
                r->why,
                (unsigned long long)r->first_seq, (unsigned long long)r->seq);
       return 1;
@@ -8080,6 +8081,16 @@ fail:
       pthread_mutex_lock(&rwa_lock);   /* (the guard lets go of it on the way out) */
    rwa_render_destroy(render);
    return NULL;
+}
+
+int
+rwa_render_stats(struct rwa_render *render, char *line, size_t size)
+{
+   RWA_GUARD();
+   if (!render || !line || !size)
+      return 0;
+   line[0] = '\0';
+   return render->fs_cso ? redwood_pan_shader_stats(render->fs_cso, line, size) : 0;
 }
 
 void

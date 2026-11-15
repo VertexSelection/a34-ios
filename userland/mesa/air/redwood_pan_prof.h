@@ -14,6 +14,7 @@
 #define REDWOOD_PAN_PROF_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "util/os_time.h"
@@ -114,6 +115,11 @@ struct redwood_pan_pass {
     * runs over the whole drawn area (ALWAYS) instead of only the tiles geometry touches (INTERSECT) */
    bool always;
    bool read_later;                   /* (patch 0021) what it wrote back was sampled after, in the same work */
+   /* (patch 0022) the textures its draws sampled: how many reads, and the largest one */
+   uint32_t tex_reads;
+   uint16_t tex_w, tex_h;
+   uint8_t tex_kind;                  /* as `kind` */
+   bool tex_shared;
 };
 extern bool redwood_pan_trace_on;
 extern unsigned redwood_pan_trace_n;
@@ -147,6 +153,8 @@ int redwood_pan_pass_flush(struct pipe_context *pctx, const struct pipe_surface 
  */
 struct pipe_resource;
 void redwood_pan_forget(struct pipe_resource *res, unsigned level);
+/* (patch 0023) a shader CSO's compiled statistics as one line (its first variant's); 1 if any */
+int redwood_pan_shader_stats(void *cso, char *buf, size_t size);
 int redwood_pan_pass_discard(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
                              const struct pipe_surface *zs, unsigned color_mask, unsigned zs_mask);
 

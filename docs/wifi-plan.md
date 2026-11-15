@@ -650,6 +650,47 @@ shows wifid's own threads if it still waits on something. Undo for the root:
 `sudo tools/wifi-settings-setup.sh --undo ROOT` (`root-add-job.py --relimit ROOT
 com.apple.wifid`: `_LimitLoadToDeviceTree` back to its stock `["wlan", "marconi-wifi"]`).
 
+### Settings works (kernel main with 0995 + 0999; `build/logs/0999-wifi-a`)
+
+Wi-Fi in Settings, and Safari (YouTube's page) over it. What is left of the log (bluetoothd
+flooded it) shows ~97 MB received, 3.4 MB sent, every token given back -- and **4264 of ~27 000
+frames dropped on the way out**: with 64 tokens in flight (a token comes back only when the
+firmware reports the frame sent) a burst from the stack found none free and was dropped. One
+BSS transition request was answered (we stay). The system never sleeps on this port (only "SWEET
+FB: display off"), so "sleep/wake" is the display turning off with the link kept.
+
+### 1010: robustness (built as one patch; numbers 1010-1019 are Wi-Fi's)
+
+- **TX without drops**: 256 tokens and ring slots (Android's 256), their buffers after RX ring 5's;
+  with none free the sender takes in the token reports itself (rings 4/5 under their own lock) and
+  waits up to 5 ms before dropping; drops are counted by cause in the `carried:` line.
+- **Coming back**: after the AP lets us go or the beacons stop, joining again never gives up while
+  the network is wanted -- 3, 10, 30 s, then every 60 s -- and stops when iOS asks to leave or
+  switches Wi-Fi off. (wifid also rejoins known networks by itself.)
+- **Roaming by BSS transition**: the AP's candidates (Neighbor Report elements, preference
+  subelement) are read; we go -- BTM Response status 0 with the target BSSID, then leave and join
+  again preferring that BSS -- when the AP says it will disassociate us (mode bit 2), or when a
+  candidate we heard in the last two minutes is 8 dB louder than the AP is now and above -75 dBm;
+  otherwise status 7, as Android answered this AP (accepting every steer would move us between the
+  bands every minute, each move a few seconds without a link). How loud the AP is now comes from
+  the RX vector (group 3) of its data frames, averaged; wifid's RSSI and the status bar get that.
+- **Hidden networks**: a join whose name two passive scans did not hear probes for it (an active
+  scan for that name: ucScanType 1, SSID type 4, the name in arSSID[0]); a scan wifid asks for with
+  a name is that active scan too.
+- **Power save**: the firmware does 802.11 power save itself (PS-Poll, the PM bit, DTIM wake-ups,
+  keep-alive, ARP offload: the RAM code's strings) once it has the DTIM and our AID
+  (INDICATE_PM_BSS_CONNECTED, sent at the join). We join in CAM and go to FAST_PSP (Android's: dozes,
+  awake while traffic flows) 15 s later, after the handshake and DHCP; an AP without a TIM element
+  keeps us in CAM, as gen4m does. `kern.a34wifi.powersave` / boot-arg `a34wifips`: -1 automatic,
+  0 CAM, 1 MAX_PSP, 2 FAST_PSP. (The ~80 s stall another MediaTek port saw in PS came from the
+  firmware dozing without a correct DTIM/AID; we send both before leaving CAM.)
+- **The Wi-Fi switch**: off leaves the network, stops rejoining and refuses scans/joins; on tells
+  wifid (power event) and lets it scan and join again. The firmware stays up (no re-run of steps
+  4-5).
+
+`a34wifi get [URL] [SECONDS]` times an HTTP GET (default `http://speedtest.tele2.net/10MB.zip`) and
+prints Mbit/s, for the throughput work.
+
 ### Biggest unknowns
 
 0. **Whether a scan hears anything without PHY_ACTION and NVRAM** (M2): Android sends both
@@ -724,3 +765,35 @@ WFDMA are new work here; everything above the radio is not.
 - iOS: strings and disassembly of 16.7.16's `wifid`, `configd`, IPConfiguration, IO80211 and
   SystemConfiguration (root image and dyld cache); `com.apple.wifid.plist` from the root.
 - XNU interfaces: xnu-8796.141.3 headers (the version CI builds for macOS 13.5).
+
+## 1011: faster
+
+0999-wifi-a joined as an HT 20 MHz, one-stream station (MCS 7: 72 Mbit/s on the air at best).
+1011 joins as wide and with as many streams as the chip, the AP and two switches allow:
+
+- **The chip's PHY**: the NIC capability's tag 8 (ucHt, ucVht, uc5gBand, ucMaxBandwidth, ucNss,
+  ...; nic_cmd_event.c) is read at step 6 and logged ("step 6: PHY: ..."). Android shows the A34 at
+  two streams (MCS 15).
+- **Two streams** when the chip has them and the AP receives MCS 8-15: the request advertises MCS
+  0-15 and TX STBC, BSS info's NSS 2; with one stream the AP's record is masked to MCS 0-7.
+- **Width, 5 GHz only**: 40 MHz when the AP's HT Operation has a secondary channel and the width
+  bit; 80 MHz when it also has VHT Operation at 80 and the chip has VHT. CH_PRIVILEGE gets the SCO,
+  channel width and centre segment, BSS info's RLM the same (and u2VhtBasicMcsSet = the basic rate
+  set, as rlm.c fills it), the AP's record its VHT capabilities as they are and ucVhtOpMode
+  (width | (AP's streams - 1) << 4); the request carries VHT Capabilities (MCS 0-9 per stream,
+  RX LDPC, short GI 80, max A-MPDU 2^20-1, no beamformee). 2.4 GHz stays at 20 MHz (gen4m's
+  default; 40 MHz there collides with the neighbours).
+- **Switches**, read at the next join: `kern.a34wifi.width` / boot-arg `a34wifiwidth` (20, 40, 80;
+  default 80) and `kern.a34wifi.nss` / `a34wifinss` (1, 2; default 2). If a wide join misbehaves on
+  a given AP, `a34wifiwidth=20 a34wifinss=1` is 0968's join.
+- **RX reordering**: the firmware takes the AP's ADDBA and reports it (EVENT_ID_RX_ADDBA: TID,
+  window, SSN). From then unicast QoS data of that TID goes up in sequence order (group 4's sequence
+  control and QoS control), as que_mgt.c does: held inside the window, the window moved by a frame
+  beyond it, late/duplicate frames dropped, a hole given up after 100 ms; DELBA ends it. A-MSDU
+  subframes after the first go straight up. Counters in the carried line: "reordered, late or twice,
+  holes given up".
+- **RX ring 2** (all our data) has 256 slots instead of 64 (Android's size): at 300 Mbit/s about
+  50 frames arrive between two 2 ms polls.
+- **Measuring**: `a34wifi get [URL] [SECONDS]` (default http://speedtest.tele2.net/10MB.zip, at most
+  30 s) prints the bytes each second and the Mbit/s at the end.
+

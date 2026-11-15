@@ -73,6 +73,14 @@ Status (2026-11-15):
   MT6635's own value) so the controller stays legacy (LE_Create_Connection, for pairing, is legacy too); if
   0x200B is refused anyway, the kernel carries bluetoothd's scanning over LE_Set_Extended_Scan_Parameters /
   _Enable and hands back extended reports of legacy PDUs as legacy reports.
+- **Boot 0976-120-a**: no 712, the switch stays on; but bluetoothd aborted every 10-20 s: PowerLog asked
+  for the power profile, bluetoothd sent BD_VSC_OLYMPIC_READ_PROFILING_STATS (0xFCE2) and
+  `_BCM_ProfilingStatsEventParser` (`+0x123ab4`) reads four 16-bit values after the status ("AssertFail
+  bcm_vsc.c:138 ... >= 2"); the kernel gave none. All 43 vendor-command parsers (bcm_vsc.c, aci_vsc.c) check
+  for at least N bytes, never exactly N; the largest reads ~212 (`_BCM_LowPowerCoreStatsEventParser`).
+  0977 answers every vendor command with 240 zero bytes after the status (0xFD1B's first still 0x51). The
+  "0401 with status 0x4" lines were 0975's logging reading a Command Status' length byte: HCI_Inquiry was
+  taken and ended with Inquiry Complete, status 0 (classic discovery works; nothing discoverable answered).
 - **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
   address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
   transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).

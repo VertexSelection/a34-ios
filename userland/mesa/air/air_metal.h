@@ -1198,6 +1198,9 @@ struct rwa_render *rwa_render_create(struct rwa_device *device,
 				     const struct rwa_render_shape *shape,
 				     struct rwa_render_info *info, char *why, size_t why_size);
 void rwa_render_destroy(struct rwa_render *render);
+/* A34: a render pipeline's fragment shader as the GPU's compiler made it -- instructions, cycles by unit,
+ * registers and threads, spills (panfrost's statistics, the disk cache's too) -- as one line; 1 if known */
+int rwa_render_stats(struct rwa_render *render, char *line, size_t size);
 
 /*
  * One draw into one render pass, which is what MTLRenderPassDescriptor plus one
