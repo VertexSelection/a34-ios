@@ -1,0 +1,278 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 8ff10b1..4ba6032 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -2112,6 +2112,7 @@ a34w_step7(void)
+ #define CMD_ID_INDICATE_PM_BSS_CONNECTED 0x16u
+ #define CMD_ID_INDICATE_PM_BSS_ABORT    0x17u
+ #define CMD_ID_CH_PRIVILEGE             0x1cu
++#define CMD_ID_UPDATE_WMM_PARMS         0x1du           /* (0968) */
+ #define EVENT_ID_TX_DONE                0x0fu
+ #define EVENT_ID_CH_PRIVILEGE           0x10u
+ #define EVENT_ID_RX_ADDBA               0x0au           /* (0967) */
+@@ -2169,6 +2170,11 @@ static uint16_t a34w_aid;
+ static uint8_t a34w_ch_token, a34w_pid, a34w_tx_done_pid, a34w_tx_done_status = 0xff, a34w_tx_done_count;
+ static uint16_t a34w_mgmt_sn;
+ static int a34w_auth_status = -1, a34w_assoc_status = -1;
++/* (0968) joined as Android joins: an HT (20 MHz, one stream) and WMM (QoS) station that can be told to move */
++static int a34w_legacy;                         /* kern.a34wifi.legacy=1: as 0964, no HT, no WMM */
++static bool a34w_ht, a34w_qos;                  /* what this join is */
++static uint8_t a34w_assoc_ies[512];             /* the Association Response's elements */
++static uint32_t a34w_assoc_ies_length;
+ static int a34w_ch_status = -1;
+ static uint32_t a34w_eapol_rx, a34w_eapol_tx;
+ static uint32_t a34w_reports, a34w_tokens_back, a34w_report_version = 0xffffffffu;
+@@ -2771,8 +2777,37 @@ a34w_action_in(const uint8_t *f, uint32_t length)
+ 		    (unsigned)((f[27] | f[28] << 8) >> 6));
+ 		(void)a34w_mgmt_tx(r, sizeof(r), "ADDBA Response (declined)");
+ 	} else if (category == 10u && action == 7u && length >= 31u) {             /* BSS Transition Management Request */
++		uint8_t r[24 + 5 + 9];
++		uint32_t n = 24u + 5u;
++		bool mbo = false;
++
+ 		a34w_say("the AP asks us to move (BSS transition request: token %u, mode 0x%02x, disassociation in %u beacons, "
+-		    "valid %u)", f[26], f[27], (unsigned)(f[28] | f[29] << 8), f[30]);
++		    "valid %u)%s", f[26], f[27], (unsigned)(f[28] | f[29] << 8), f[30], (f[4] & 1u) ? "" : ": we stay (status 7)");
++		for (uint32_t at = 31; at + 8u <= length; at++) {       /* (an MBO element anywhere in it) */
++			if (f[at] == 221u && f[at + 2u] == 0x50 && f[at + 3u] == 0x6f && f[at + 4u] == 0x9a && f[at + 5u] == 0x16) {
++				mbo = true;
++				break;
++			}
++		}
++		if ((f[4] & 1u) == 0) {                 /* (wnm.c: a request to everybody gets no answer) */
++			bzero(r, sizeof(r));
++			r[0] = 0xd0;
++			memcpy(r + 4, a34w_target.bssid, 6);
++			memcpy(r + 10, a34w_mac, 6);
++			memcpy(r + 16, a34w_target.bssid, 6);
++			r[24] = 10;                     /* WNM */
++			r[25] = 8;                      /* BSS Transition Management Response */
++			r[26] = f[26];                  /* dialog token */
++			r[27] = 7;                      /* status: no suitable candidate (as Android answered this AP) */
++			r[28] = 0;                      /* BSS termination delay */
++			if (mbo) {                      /* MBO: transition rejection reason 0 (unspecified) */
++				static const uint8_t reason[9] = { 221, 7, 0x50, 0x6f, 0x9a, 0x16, 7, 1, 0 };
++
++				memcpy(r + n, reason, sizeof(reason));
++				n += (uint32_t)sizeof(reason);
++			}
++			(void)a34w_mgmt_tx(r, n, "BSS Transition Management Response");
++		}
+ 	}
+ }
+ 
+@@ -2812,6 +2847,9 @@ a34w_mgmt_in(const uint8_t *frame, uint32_t length, int rssi, uint8_t channel)
+ 	case 3u:
+ 		if (length >= 30u) {
+ 			a34w_assoc_status = frame[26] | frame[27] << 8;
++			a34w_assoc_ies_length = length - 30u > sizeof(a34w_assoc_ies) ? (uint32_t)sizeof(a34w_assoc_ies) :
++			    length - 30u;                   /* (0968) */
++			memcpy(a34w_assoc_ies, frame + 30, a34w_assoc_ies_length);
+ 			a34w_aid = (uint16_t)((frame[28] | frame[29] << 8) & 0x3fffu);
+ 		}
+ 		break;
+@@ -3086,6 +3124,80 @@ a34w_eapol_in(const uint8_t *frame, uint32_t length)
+ 
+ /* ---- the commands of joining ---- */
+ 
++/* (0968) the element `id` in `ies`, or NULL; id 221 with `wmm`: the WMM element of subtype `wmm` (0 info, 1 parameter) */
++static const uint8_t *
++a34w_ie_in(const uint8_t *ies, uint32_t length, uint8_t id, int wmm)
++{
++	const uint8_t *ie = ies, *end = ies + length;
++
++	for (; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
++		if (ie[0] != id) {
++			continue;
++		}
++		if (wmm < 0 || (ie[1] >= 6u && ie[2] == 0x00 && ie[3] == 0x50 && ie[4] == 0xf2 && ie[5] == 2u && ie[6] == (uint8_t)wmm)) {
++			return ie;
++		}
++	}
++	return NULL;
++}
++
++/* the AP's element: from its Association Response if there is one with it, else from its beacon */
++static const uint8_t *
++a34w_ap_ie(uint8_t id, int wmm)
++{
++	const uint8_t *e = a34w_assoc_ies_length != 0 ? a34w_ie_in(a34w_assoc_ies, a34w_assoc_ies_length, id, wmm) : NULL;
++
++	return e != NULL ? e : a34w_ie_in(a34w_target.ies, a34w_target.ies_length, id, wmm);
++}
++
++/*
++ * (0968) What we say we are in the Association Request, after the RSN element: HT Capabilities
++ * (rlm.c's for an HT20, one-stream station: LDPC, SM power save off, short GI 20, RX STBC 1;
++ * A-MPDU 64 KB, no density limit; MCS 0-7), Extended Capabilities with BSS transition (bit 19:
++ * the AP may ask us to move -- we answer -- rather than throw us out), the WMM Information
++ * element (QoS info 0: no U-APSD). Only what the AP has itself: HT if it sent HT Capabilities,
++ * WMM if it sent WMM parameters.
++ */
++static const uint8_t a34w_own_ht[] = {
++	45, 26, 0x2d, 0x01, 0x03, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++static const uint8_t a34w_own_ext_cap[] = { 127, 8, 0, 0, 0x08, 0, 0, 0, 0, 0 };
++_Static_assert(sizeof(a34w_own_ht) == 28, "HT Capabilities: 2 + 26 bytes");
++static const uint8_t a34w_own_wmm[] = { 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
++
++/* UPDATE_WMM_PARMS (0x1d, 44 bytes) from the AP's WMM Parameter element: per AC (BE, BK, VI, VO) CWmin/CWmax, TXOP, AIFSN, ACM */
++static void
++a34w_wmm_params(void)
++{
++	const uint8_t *e = a34w_ap_ie(221, 1);
++	uint8_t c[44];
++
++	if (e == NULL || e[1] < 24u) {
++		return;
++	}
++	bzero(c, sizeof(c));
++	for (uint32_t r = 0; r < 4u; r++) {
++		const uint8_t *rec = e + 10 + 4u * r;   /* ACI/AIFSN, ECWmin/ECWmax, TXOP limit (32 us) */
++		uint32_t aci = (rec[0] >> 5) & 3u, cwmin = (1u << (rec[1] & 0xfu)) - 1u, cwmax = (1u << (rec[1] >> 4)) - 1u;
++		uint8_t *q = c + 10u * aci;             /* ACI 0 BE, 1 BK, 2 VI, 3 VO: the command's order too */
++
++		q[0] = (uint8_t)cwmin;
++		q[1] = (uint8_t)(cwmin >> 8);
++		q[2] = (uint8_t)cwmax;
++		q[3] = (uint8_t)(cwmax >> 8);
++		q[4] = rec[2];
++		q[5] = rec[3];
++		q[6] = rec[0] & 0xfu;
++		q[9] = (rec[0] >> 4) & 1u;
++	}
++	c[40] = BSS_AIS;
++	c[41] = 1;                                      /* fgIsQBSS */
++	c[42] = 0;                                      /* ucWmmSet */
++	(void)a34w_cmd(CMD_ID_UPDATE_WMM_PARMS, CMD_SET, c, sizeof(c));
++	a34w_say("step 8: the AP's WMM parameters sent (BE AIFSN %u CW %u-%u, VO AIFSN %u CW %u-%u)", c[6], c[0] | c[1] << 8,
++	    c[2] | c[3] << 8, c[36], c[30] | c[31] << 8, c[32] | c[33] << 8);
++}
++
+ /* CMD_UPDATE_STA_RECORD (168 bytes, version 0) for the AP: state 0 (STA_STATE_1) or 2 (STA_STATE_3) */
+ static uint8_t
+ a34w_sta_record(uint8_t state, bool need_response)
+@@ -3114,6 +3226,36 @@ a34w_sta_record(uint8_t state, bool need_response)
+ 	c[55] = 0xffu;                                  /* ucBMCWlanIndex, as cnmStaSendUpdateCmd */
+ 	c[74] = (uint8_t)fixed;                         /* u2HwDefaultFixedRateCode */
+ 	c[75] = (uint8_t)(fixed >> 8);
++	if (a34w_qos) {                                 /* (0968) cnmStaSendUpdateCmd for a QoS AP */
++		c[18] = 1;                              /* ucIsQoS */
++	}
++	if (a34w_ht) {
++		const uint8_t *ht = a34w_ap_ie(45, -1); /* the AP's own HT Capabilities, as they are */
++
++		c[13] |= 0x10u;                         /* ucDesiredPhyTypeSet: + HT */
++		if (ht != NULL && ht[1] >= 26u) {
++			uint16_t info = (uint16_t)((ht[2] | ht[3] << 8) & ~0x0042u);     /* no 40 MHz, no SGI40: we are at 20 */
++
++			c[21] = ht[5];                  /* ucMcsSet: MCS 0-7 */
++			c[22] = (uint8_t)((ht[9] & 1u) != 0);   /* ucSupMcs32 */
++			memcpy(c + 24, ht + 5, 10);     /* aucRxMcsBitmask */
++			c[34] = ht[15];                 /* u2RxHighestSupportedRate */
++			c[35] = ht[16];
++			memcpy(c + 36, ht + 17, 4);     /* u4TxRateInfo */
++			c[40] = (uint8_t)info;          /* u2HtCapInfo */
++			c[41] = (uint8_t)(info >> 8);
++			c[42] = ht[21];                 /* u2HtExtendedCap */
++			c[43] = ht[22];
++			memcpy(c + 44, ht + 23, 4);     /* u4TxBeamformingCap */
++			c[48] = ht[4];                  /* ucAmpduParam */
++			c[49] = ht[27];                 /* ucAselCap */
++		}
++		c[68] = 3;                              /* ucRtsPolicy: legacy (cnm_mem.c) */
++		c[76] = 1;                              /* ucTxAmpdu */
++		c[77] = 1;                              /* ucRxAmpdu */
++		c[92] = 64;                             /* rBaSize: TX 64, RX 64; no A-MSDU in A-MPDU (+128 stay 0) */
++		c[93] = 64;
++	}
+ 	return a34w_cmd(CMD_ID_UPDATE_STA_RECORD, CMD_SET, c, sizeof(c));
+ }
+ 
+@@ -3145,6 +3287,24 @@ a34w_bss_info(bool connected)
+ 	c[54] = a34w_net.psk_given ? 6u : 1u;           /* ucEncStatus: CCMP / none */
+ 	c[55] = a34w_target_phy(operational);           /* ucPhyTypeSet */
+ 	c[58] = BMC_WLAN_INDEX;                         /* ucBMCWlanIndex */
++	if (a34w_qos) {
++		c[42] = 1;                              /* (0968) ucIsQBSS */
++	}
++	if (a34w_ht) {
++		const uint8_t *op = a34w_ap_ie(61, -1);  /* HT Operation: primary channel, info 1, 2, 3 */
++
++		c[55] |= 0x10u;                         /* ucPhyTypeSet: + HT */
++		if (op != NULL && op[1] >= 22u) {
++			rlm[12] = op[3] & (uint8_t)~0x07u;      /* ucHtOpInfo1 without SCO and STA width: 20 MHz */
++			rlm[10] = op[4];                /* u2HtOpInfo2 */
++			rlm[11] = op[5];
++			rlm[8] = op[6];                 /* u2HtOpInfo3 */
++			rlm[9] = op[7];
++			rlm[5] = op[4] & 3u;            /* ucHtProtectMode */
++			rlm[6] = (uint8_t)((op[4] & 0x04u) ? 1u : 0u);  /* ucGfOperationMode: non-greenfield stations present */
++			rlm[7] = (uint8_t)((op[3] & 0x08u) ? 0u : 1u);  /* ucTxRifsMode */
++		}
++	}
+ 	rlm[0] = BSS_AIS;                               /* rBssRlmParam (rlmFillSyncCmdParam): ucBssIndex */
+ 	rlm[1] = five ? CMD_BAND_5G : CMD_BAND_2G4;     /* ucRfBand */
+ 	rlm[2] = a34w_target.channel;                   /* ucPrimaryChannel; SCO 0: 20 MHz, no HT/VHT */
+@@ -3221,6 +3381,18 @@ a34w_frame_assoc(uint8_t *f, uint32_t room)
+ 		memcpy(f + n, a34w_own_rsn, sizeof(a34w_own_rsn));
+ 		n += (uint32_t)sizeof(a34w_own_rsn);
+ 	}
++	if (a34w_ht && n + sizeof(a34w_own_ht) <= room) {         /* (0968) */
++		memcpy(f + n, a34w_own_ht, sizeof(a34w_own_ht));
++		n += (uint32_t)sizeof(a34w_own_ht);
++	}
++	if (!a34w_legacy && n + sizeof(a34w_own_ext_cap) <= room) {
++		memcpy(f + n, a34w_own_ext_cap, sizeof(a34w_own_ext_cap));
++		n += (uint32_t)sizeof(a34w_own_ext_cap);
++	}
++	if (a34w_qos && n + sizeof(a34w_own_wmm) <= room) {
++		memcpy(f + n, a34w_own_wmm, sizeof(a34w_own_wmm));
++		n += (uint32_t)sizeof(a34w_own_wmm);
++	}
+ 	return n;
+ }
+ 
+@@ -3280,6 +3452,11 @@ a34w_connect(void)
+ 	a34w_associated = false;
+ 	a34w_keys_in = false;
+ 	a34w_aid = 0;
++	a34w_assoc_ies_length = 0;
++	a34w_ht = !a34w_legacy && a34w_target_ie(45) != NULL;     /* (0968) as the AP is */
++	a34w_qos = !a34w_legacy && (a34w_ie_in(a34w_target.ies, a34w_target.ies_length, 221, 1) != NULL || a34w_ht);
++	a34w_say("step 8: joining as %s%s", a34w_ht ? "an HT (20 MHz, one stream) " : a34w_legacy ? "a legacy (kern.a34wifi.legacy) " :
++	    "a legacy ", a34w_qos ? "QoS (WMM) station that takes BSS transition requests" : "station");
+ 	if (a34w_ch_privilege(true) == 0 || !a34w_wait_status(&a34w_ch_status, 2000)) {
+ 		a34w_say("step 8: channel %u NOT GRANTED (CH_PRIVILEGE, token %u)", a34w_target.channel, a34w_ch_token);
+ 		(void)a34w_ch_privilege(false);
+@@ -3328,7 +3505,12 @@ a34w_connect(void)
+ 	a34w_associated = true;
+ 	a34w_say("step 8: ASSOCIATED, AID %u (%llu ms in)", a34w_aid, (unsigned long long)(a34w_ms() - t0));
+ 
+-	/* the firmware told: the BSS connected, the AP's record in state 3, power management, CAM, the RX filter */
++	/* the firmware told: (0968: the AP's WMM parameters,) the BSS connected, the AP's record in state 3, power
++	 * management, CAM, the RX filter */
++	if (a34w_qos) {
++		a34w_qos = a34w_ap_ie(221, 1) != NULL || a34w_ap_ie(45, -1) != NULL;      /* (as que_mgt.c decides it) */
++		a34w_wmm_params();
++	}
+ 	(void)a34w_bss_info(true);
+ 	seq = a34w_sta_record(2, true);
+ 	got = seq != 0 ? a34w_wait_event(EVENT_ANY, seq, answer, sizeof(answer), 1000) : -1;
+@@ -3719,6 +3901,8 @@ SYSCTL_PROC(_kern_a34wifi, OID_AUTO, rescan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+     a34w_sysctl_rescan, "I", "write 1: scan again (after step 7)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_legacy, 0,
++    "(0968) 1: join as a legacy station (no HT, no WMM), as 0964 did");
+ SYSCTL_UINT(_kern_a34wifi, OID_AUTO, trace, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_trace_left, 0,
+     "(0967) frames either way still to be said in the log (48 at boot)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, phyaction, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_phyaction, 0,
+@@ -3807,6 +3991,7 @@ a34_wifi_init(void)
+ 	int step = 0;
+ 
+ 	(void)PE_parse_boot_argn("a34wifiphy", &a34w_phyaction, sizeof(a34w_phyaction));       /* (0966) */
++	(void)PE_parse_boot_argn("a34wifilegacy", &a34w_legacy, sizeof(a34w_legacy));         /* (0968) */
+ 	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
+ 		return;
+ 	}

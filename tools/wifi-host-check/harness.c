@@ -84,14 +84,30 @@ int a34_wifi_net_attach(const uint8_t address[6], bool (*tx)(const uint8_t *, ui
 void a34_wifi_net_input(const uint8_t *frame, uint32_t length) { if (length <= sizeof(net_got)) { memcpy(net_got, frame, length); net_got_len = length; } net_got_count++; }
 void a34_wifi_net_link(bool up) { net_link = up; }
 const char *a34_wifi_net_name(void) { return "en9"; }
+/* (0969) the registry entries (iokit/Kernel/arm/A34WLAN.cpp) and the kernel's KPIs a34_apple80211.c uses, stood in for */
+static char wlan_registered[16];
+void a34_wlan_registry(const char *interface, const uint8_t *address);
+void a34_wlan_registry(const char *interface, const uint8_t *address) { (void)address; snprintf(wlan_registered, sizeof(wlan_registered), "%s", interface); }
+int copyout(const void *k, user_addr_t u, size_t n) { memcpy((void *)(uintptr_t)u, k, n); return 0; }
+int copyin(user_addr_t u, void *k, size_t n) { memcpy(k, (const void *)(uintptr_t)u, n); return 0; }
+void proc_selfname(char *b, int n) { snprintf(b, (size_t)n, "wifid"); }
+static uint32_t kev_codes[64], kev_count;
+int kev_post_msg(struct kev_msg *m) { if (kev_count < 64) kev_codes[kev_count++] = m->event_code; return 0; }
+size_t strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { size_t c = l < n - 1 ? l : n - 1; memcpy(d, s, c); d[c] = 0; } return l; }
 #include "a34_wifi.c"     /* (run.sh puts it beside ruby_hal.h) */
 #include "a34_wpa.c"      /* (0964) */
+#include "a34_apple80211.c"   /* (0969) */
 
 /*
  * (0964) The firmware's side of the mailbox, simulated: whenever the code waits (delay), every
  * frame it put into the mailbox is taken and kept in `sent` (a copy each), as the firmware would.
  */
-static int sim_on, sim_ap;
+static int sim_on, sim_ap, sim_ap_ht;
+/* (0968) an HT AP's HT Capabilities (MCS 0-15, 40 MHz, SGI 20/40) and WMM Parameter element (BE AIFSN 3 CW 15-1023, VO AIFSN 2 CW 3-7) */
+static const uint8_t sim_ht_cap[28] = { 45, 26, 0xef, 0x09, 0x17, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const uint8_t sim_ht_op[24] = { 61, 22, 48, 0x05, 0x04, 0x00, 0x00, 0x00 };
+static const uint8_t sim_wmm[26] = { 221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 0x03, 0xa4, 0, 0, 0x27, 0xa4, 0, 0,
+	                             0x42, 0x43, 0x5e, 0, 0x62, 0x32, 0x2f, 0 };
 static uint8_t sent[64][CMD_FRAME_MOST];
 static uint32_t sent_len[64], nsent;
 static uint8_t sim_ap_addr[6];
@@ -150,7 +166,19 @@ static void sim_react(const uint8_t *t)
 	bool cmd = ((dw_of(t, 1) >> 16) & 3u) == 1u;
 	if (!sim_ap) return;
 	bzero(ev, sizeof(ev)); bzero(fr, sizeof(fr));
-	if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
+	if (cmd && t[36] == 0x03) {                     /* (0969) a scan: the AP's beacon, then SCAN_DONE */
+		uint8_t b[160], done[16];
+		uint32_t k = 36;
+		bzero(b, sizeof(b)); bzero(done, sizeof(done));
+		b[0] = 0x80; memset(b + 4, 0xff, 6); memcpy(b + 10, sim_ap_addr, 6); memcpy(b + 16, sim_ap_addr, 6);
+		b[32] = 100; b[34] = 0x01;
+		b[k++] = 0; b[k++] = 9; memcpy(b + k, "Sim Open", 9); k += 9;      /* (9 bytes: "Sim Open" and a 0) */
+		b[k++] = 1; b[k++] = 4; memcpy(b + k, "\x82\x84\x8b\x96", 4); k += 4;
+		b[k++] = 3; b[k++] = 1; b[k++] = 6;
+		rx_mgmt(b, k, 6);
+		done[0] = t[64]; done[4] = 22;
+		rx_event(EVENT_ID_SCAN_DONE, 0, done, 16);
+	} else if (cmd && t[36] == 0x1c && t[64 + 2] == 0) {
 		ev[0] = 0; ev[1] = t[64 + 1]; ev[2] = 0; ev[3] = t[64 + 3];
 		rx_event(EVENT_ID_CH_PRIVILEGE, 0, ev, 24);
 	} else if (!cmd && (t[32] >> 4) == 11) {
@@ -162,7 +190,13 @@ static void sim_react(const uint8_t *t)
 	} else if (!cmd && (t[32] >> 4) == 0) {
 		fr[0] = 0x10; memcpy(fr + 4, t + 32 + 10, 6); memcpy(fr + 10, sim_ap_addr, 6); memcpy(fr + 16, sim_ap_addr, 6);
 		fr[24] = 0x21; fr[26] = 0; fr[28] = 0x05; fr[29] = 0xc0;   /* status 0, AID 5 (bits 14/15 set) */
-		rx_mgmt(fr, 30, 5);
+		if (sim_ap_ht) {
+			uint8_t big[30 + 28 + 24 + 26];
+			memcpy(big, fr, 30); memcpy(big + 30, sim_ht_cap, 28); memcpy(big + 58, sim_ht_op, 24); memcpy(big + 82, sim_wmm, 26);
+			rx_mgmt(big, sizeof(big), 48);
+		} else {
+			rx_mgmt(fr, 30, 5);
+		}
 	}
 }
 static void firmware_sim(void)
@@ -400,7 +434,8 @@ int main(int argc, char **argv)
 			const uint8_t *f = sent[assoc_at] + 32;
 			uint32_t n = sent_len[assoc_at] - 32;
 			failed |= f[24] != 0x21 || f[25] != 0x04 || f[26] != 10 || f[28] != 0 || f[29] != 15 || memcmp(f + 30, "veryCoolNetwork", 15) != 0 ||
-			    f[45] != 1 || f[46] != 8 || f[55] != 50 || n != 24 + 4 + 17 + 10 + 6;
+			    f[45] != 1 || f[46] != 8 || f[55] != 50 || n != 24 + 4 + 17 + 10 + 6 + 10 ||   /* (0968: + Extended Capabilities) */
+			    f[61] != 127 || f[63 + 2] != 0x08;
 		}
 		/* STA_REC state 3: 168 bytes, AID 5, WTBL 5, broadcast 0xff, rates 0x0fcf? (1 2 5.5 11 6 9 12 18 24 36 48 54) basic 0x000f */
 		{
@@ -502,6 +537,222 @@ int main(int argc, char **argv)
 		printf("0965 interface data path: %s\n", failed ? "WRONG" : "ok");
 		bad |= failed;
 	}
+	/* ---- 0967: an ADDBA request declined, a DHCP DISCOVER out with its TX status, the AP letting go ---- */
+	{
+		uint8_t f[64], dhcp[14 + 20 + 8 + 240 + 4];
+		const uint8_t *t, *tok;
+		int failed = 0;
+		uint32_t n0, l4 = 14 + 20;
+
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1;
+		a34w_joined = true; a34w_keys_in = true;
+		bzero(f, sizeof(f));
+		f[0] = 0xd0; memcpy(f + 4, a34w_mac, 6); memcpy(f + 10, a34w_target.bssid, 6); memcpy(f + 16, a34w_target.bssid, 6);
+		f[24] = 3; f[25] = 0; f[26] = 7;                /* block ack, ADDBA Request, token 7 */
+		f[27] = 0x02; f[28] = 0x10;                     /* BA parameter set: immediate, TID 0, 64 frames */
+		a34w_mgmt_in(f, 33, -60, 48);
+		firmware_sim();
+		t = sent[0];
+		printf("0967 ADDBA: %u frames to the firmware; the first: subtype %u, category %u action %u token %u status %u\n", nsent,
+		    t[32] >> 4, t[32 + 24], t[32 + 25], t[32 + 26], t[32 + 27] | t[32 + 28] << 8);
+		failed |= nsent != 1 || (t[32] >> 4) != 13 || t[32 + 24] != 3 || t[32 + 25] != 1 || t[32 + 26] != 7 || t[32 + 27] != 37 ||
+		    (dw_of(t, 2) & 0xfu) != 13u;
+		/* DHCP DISCOVER from the stack: UDP 68 -> 67, option 53 = 1 */
+		bzero(dhcp, sizeof(dhcp));
+		memset(dhcp, 0xff, 6); memcpy(dhcp + 6, a34w_mac, 6); dhcp[12] = 0x08; dhcp[14] = 0x45; dhcp[14 + 9] = 17;
+		memset(dhcp + 14 + 16, 0xff, 4);
+		dhcp[l4 + 1] = 68; dhcp[l4 + 3] = 67;
+		dhcp[l4 + 8 + 236] = 99; dhcp[l4 + 8 + 237] = 130; dhcp[l4 + 8 + 238] = 83; dhcp[l4 + 8 + 239] = 99;
+		dhcp[l4 + 8 + 240] = 53; dhcp[l4 + 8 + 241] = 1; dhcp[l4 + 8 + 242] = 1; dhcp[l4 + 8 + 243] = 255;
+		n0 = a34w_dtx_cidx;
+		failed |= !a34w_net_tx(dhcp, sizeof(dhcp));
+		tok = (const uint8_t *)a34w_dma + DMA_TOKENS;
+		for (uint32_t k = 0; k < DATA_TX_SLOTS; k++) {         /* the token buffer that holds it */
+			const uint8_t *b = (const uint8_t *)a34w_dma + DMA_TOKENS + k * DATA_TOKEN_SIZE;
+			if (memcmp(b + 64, dhcp, sizeof(dhcp)) == 0) { tok = b; break; }
+		}
+		printf("0967 DHCP out: TX0 %u -> %u, DW3 0x%08x (protected bit %u), DW5 0x%08x (TX status asked for: %s)\n", n0, a34w_dtx_cidx,
+		    a34w_le32(tok + 12), (a34w_le32(tok + 12) >> 1) & 1u, a34w_le32(tok + 20), (a34w_le32(tok + 20) & 0x200u) ? "yes" : "no");
+		failed |= memcmp(tok + 64, dhcp, sizeof(dhcp)) != 0 || (a34w_le32(tok + 12) & 2u) == 0 || (a34w_le32(tok + 20) & 0x2ffu) == 0 ||
+		    strstr(a34w_log, "DHCP DISCOVER") == NULL;
+		/* the AP disassociates us: the firmware's side undone, a join again in 3 s */
+		nsent = 0;
+		bzero(f, sizeof(f));
+		f[0] = 0xa0; memcpy(f + 4, a34w_mac, 6); memcpy(f + 10, a34w_target.bssid, 6); memcpy(f + 16, a34w_target.bssid, 6);
+		f[24] = 37;
+		a34w_mgmt_in(f, 26, -60, 48);
+		firmware_sim();
+		printf("0967 LEFT: joined %d, rejoin in %lld ms, %u commands (", a34w_joined,
+		    (long long)a34w_auto_rejoin_at - (long long)a34w_ms(), nsent);
+		for (uint32_t i = 0; i < nsent; i++) printf(" 0x%02x", sent[i][36]);
+		printf(" )\n");
+		failed |= a34w_joined || a34w_auto_rejoin_at == 0 || nsent < 3 || sent[0][36] != 0x17 || sent[1][36] != 0x12 || sent[2][36] != 0x14 ||
+		    net_link;
+		sim_on = 0;
+		printf("0967 action frames, DHCP TX status, leaving: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0968: a join with an HT + WMM AP on 5 GHz; a BSS transition request answered ---- */
+	{
+		static const uint8_t ap[6] = { 0xc4, 0x9a, 0x31, 0x2a, 0xc8, 0x5a };
+		uint8_t fr[256], ies[128];
+		int failed = 0;
+		uint32_t k = 0, n;
+		int assoc_at = -1, wmm_at = -1, bss_at = -1, sta3_at = -1;
+
+		bzero(&a34w_target, sizeof(a34w_target)); a34w_target.rssi = -128;
+		a34w_joining = true;
+		bzero(fr, sizeof(fr));
+		fr[0] = 0x80; memset(fr + 4, 0xff, 6); memcpy(fr + 10, ap, 6); memcpy(fr + 16, ap, 6);
+		fr[32] = 100; fr[34] = 0x11; fr[35] = 0x19;
+		k = 36;
+		fr[k++] = 0; fr[k++] = 15; memcpy(fr + k, "veryCoolNetwork", 15); k += 15;
+		fr[k++] = 1; fr[k++] = 8; memcpy(fr + k, "\x8c\x12\x98\x24\xb0\x48\x60\x6c", 8); k += 8;
+		memcpy(fr + k, sim_ht_cap, 28); k += 28; memcpy(fr + k, sim_ht_op, 24); k += 24; memcpy(fr + k, sim_wmm, 26); k += 26;
+		a34w_mgmt_in(fr, k, -74, 48);
+		a34w_joining = false;
+		a34w_net.psk_given = false;
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1; sim_ap = 1; sim_ap_ht = 1; memcpy(sim_ap_addr, ap, 6);
+		a34w_joined = false;
+		bool joined = a34w_connect();
+		firmware_sim();
+		sim_on = 0; sim_ap = 0; sim_ap_ht = 0;
+		for (uint32_t i = 0; i < nsent; i++) {
+			bool cmd = ((dw_of(sent[i], 1) >> 16) & 3u) == 1u;
+			if (!cmd && (sent[i][32] >> 4) == 0) assoc_at = (int)i;
+			if (cmd && sent[i][36] == 0x1d) wmm_at = (int)i;
+			if (cmd && sent[i][36] == 0x12 && bss_at < 0) bss_at = (int)i;
+			if (cmd && sent[i][36] == 0x13 && sent[i][64 + 20] == 2) sta3_at = (int)i;
+		}
+		printf("0968 HT join: %s; Association Request at %d, WMM parameters at %d, BSS info at %d, STA record (state 3) at %d\n",
+		    joined ? "joined" : "NOT JOINED", assoc_at, wmm_at, bss_at, sta3_at);
+		failed |= !joined || assoc_at < 0 || wmm_at < 0 || bss_at < 0 || sta3_at < 0 || wmm_at > bss_at;
+		if (assoc_at >= 0) {
+			const uint8_t *f = sent[assoc_at] + 32;
+			n = sent_len[assoc_at] - 32;
+			bzero(ies, sizeof(ies));
+			memcpy(ies, f + 28, n - 28 < sizeof(ies) ? n - 28 : sizeof(ies));
+			failed |= a34w_ie_in(ies, n - 28, 45, -1) == NULL || a34w_ie_in(ies, n - 28, 127, -1) == NULL ||
+			    a34w_ie_in(ies, n - 28, 221, 0) == NULL || a34w_ie_in(ies, n - 28, 45, -1)[2] != 0x2d;
+		}
+		if (sta3_at >= 0) {
+			const uint8_t *c = sent[sta3_at] + 64;
+			printf("  STA_REC: QoS %u, phy 0x%02x, MCS 0x%02x 0x%02x, HT cap info 0x%04x, A-MPDU 0x%02x, TX/RX A-MPDU %u/%u, BA %u/%u, RTS %u\n",
+			    c[18], c[13], c[24], c[25], c[40] | c[41] << 8, c[48], c[76], c[77], c[92], c[93], c[68]);
+			failed |= c[18] != 1 || c[13] != 0x18 || c[24] != 0xff || c[25] != 0xff || (c[40] | c[41] << 8) != (0x09ef & ~0x42) ||
+			    c[48] != 0x17 || c[76] != 1 || c[77] != 1 || c[92] != 64 || c[68] != 3;
+		}
+		if (bss_at >= 0) {
+			const uint8_t *c = sent[bss_at] + 64;
+			printf("  BSS_INFO: QBSS %u, phy 0x%02x, RLM HT info1 0x%02x info2 0x%02x protect %u\n", c[42], c[55], c[68 + 12], c[68 + 10],
+			    c[68 + 5]);
+			failed |= c[42] != 1 || c[55] != 0x18 || c[68 + 12] != 0x00 || c[68 + 10] != 0x04;
+		}
+		if (wmm_at >= 0) {
+			const uint8_t *c = sent[wmm_at] + 64;
+			printf("  WMM: BE CW %u-%u AIFSN %u, VO CW %u-%u AIFSN %u TXOP %u\n", c[0] | c[1] << 8, c[2] | c[3] << 8, c[6],
+			    c[30] | c[31] << 8, c[32] | c[33] << 8, c[36], c[34] | c[35] << 8);
+			failed |= (c[0] | c[1] << 8) != 15 || (c[2] | c[3] << 8) != 1023 || c[6] != 3 || (c[30] | c[31] << 8) != 3 ||
+			    (c[32] | c[33] << 8) != 7 || c[36] != 2 || (c[34] | c[35] << 8) != 0x2f || c[41] != 1;
+		}
+		/* a BSS transition request with an MBO element: answered with status 7 and an MBO reason */
+		bzero(fr, sizeof(fr));
+		fr[0] = 0xd0; memcpy(fr + 4, a34w_mac, 6); memcpy(fr + 10, ap, 6); memcpy(fr + 16, ap, 6);
+		fr[24] = 10; fr[25] = 7; fr[26] = 1; fr[27] = 0x01; fr[28] = 0; fr[29] = 0; fr[30] = 200;
+		memcpy(fr + 31, "\xdd\x07\x50\x6f\x9a\x16\x01\x01\x00", 9);
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		nsent = 0; sim_on = 1;
+		a34w_mgmt_in(fr, 40, -74, 48);
+		firmware_sim();
+		sim_on = 0;
+		printf("  BTM: %u frames; category %u action %u token %u status %u, %u bytes\n", nsent, sent[0][32 + 24], sent[0][32 + 25],
+		    sent[0][32 + 26], sent[0][32 + 27], sent_len[0] - 32);
+		failed |= nsent != 1 || sent[0][32 + 24] != 10 || sent[0][32 + 25] != 8 || sent[0][32 + 26] != 1 || sent[0][32 + 27] != 7 ||
+		    sent_len[0] - 32 != 24 + 5 + 9 || sent[0][32 + 29] != 221;
+		printf("0968 HT and WMM station, BSS transition answered: %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
+	/* ---- 0969: iOS's Wi-Fi side: the interface in the registry, Apple80211 requests as wifid makes them ---- */
+	{
+		static const uint8_t ap[6] = { 0x02, 0x51, 0x4d, 0x00, 0x00, 0x01 };
+		struct apple80211req rq;
+		static struct apple80211_scan_request scan;
+		static struct apple80211_scan_result result;
+		static struct apple80211_assoc assoc;
+		uint8_t caps[13];
+		struct { uint32_t version, radios, state[4]; } power;
+		int failed = 0, e;
+
+		a34w_joined = false; a34w_attached = false; a34w_done = 9; a34w_sta_off = false;
+		/* the domain on and reachable, the firmware's ready bits: what a scan checks first */
+		a34w_wr(a34w_ap, SPM_PWR_STATUS, CONN_PWR_STA); a34w_wr(a34w_ap, SPM_PWR_STATUS_2ND, CONN_PWR_STA);
+		a34w_wr(a34w_ap, SPM_CONN_PWR_CON, PWR_RST_B); a34w_wr(a34w_ap, INFRA_PROTECTEN_STA1, 0);
+		a34w_wr(a34w_conn, HOST_SW_SYNC0, 3);
+		failed |= !a34w_attach() || strcmp(wlan_registered, "en9") != 0;
+		/* CARD_CAPABILITIES (WPA2 bit 14), POWER */
+		bzero(&rq, sizeof(rq)); rq.req_type = 12; rq.req_len = sizeof(caps); rq.req_data = (user_addr_t)(uintptr_t)caps;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != 0 || (caps[1] & 0x40u) == 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 19; rq.req_len = sizeof(power); rq.req_data = (user_addr_t)(uintptr_t)&power;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != 0 || power.state[0] != 1;
+		/* a scan: asked, done by the thread (here inline), its results one by one, then EIO */
+		*a34w_mbox_word(4) = *a34w_mbox_word(0);
+		sim_on = 1; sim_ap = 1; memcpy(sim_ap_addr, ap, 6); kev_count = 0;
+		bzero(&scan, sizeof(scan)); scan.scan_type = 1;
+		bzero(&rq, sizeof(rq)); rq.req_type = 10; rq.req_len = sizeof(scan); rq.req_data = (user_addr_t)(uintptr_t)&scan;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_scan != 1;
+		a34w_sta_scan = 0;
+		a34w_sta_do(false, NULL, true);
+		bzero(&result, sizeof(result)); result.elements_length = 1024;
+		bzero(&rq, sizeof(rq)); rq.req_type = 11; rq.req_len = sizeof(result); rq.req_data = (user_addr_t)(uintptr_t)&result;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		printf("0969 scan: SCAN_DONE posted %d; first result: %d, \"%.*s\" ch %u %d dBm, %u elements bytes, %u rates\n",
+		    kev_count > 0 && kev_codes[kev_count - 1] == 10, e, result.ssid_length, result.ssid, result.channel.channel, result.rssi,
+		    result.elements_length, result.rate_count);
+		failed |= e != 0 || result.ssid_length != 9 || memcmp(result.ssid, "Sim Open", 8) != 0 || result.channel.channel != 6 ||
+		    result.rate_count != 4 || kev_count == 0 || kev_codes[kev_count - 1] != 10;
+		e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+		failed |= e != EIO;
+		/* a join from Settings: the name and nothing else (open), done by the thread, ASSOCIATE_RESULT 1, STATE 4, SSID */
+		bzero(&assoc, sizeof(assoc)); assoc.ssid_length = 9; memcpy(assoc.ssid, "Sim Open", 9);
+		bzero(&rq, sizeof(rq)); rq.req_type = 20; rq.req_len = sizeof(assoc); rq.req_data = (user_addr_t)(uintptr_t)&assoc;
+		e = a34_apple80211_ioctl(SIOCSA80211, &rq);
+		failed |= e != 0 || a34w_sta_join_asked != 1;
+		{
+			struct a34_sta_join what = a34w_sta_join_what;
+			a34w_sta_join_asked = 0;
+			kev_count = 0;
+			a34w_sta_do(false, &what, false);
+		}
+		firmware_sim();
+		sim_on = 0; sim_ap = 0;
+		bzero(&rq, sizeof(rq)); rq.req_type = 21;
+		(void)a34_apple80211_ioctl(SIOCGA80211, &rq);
+		{
+			int32_t result21 = rq.req_val;
+			char name[33] = "";
+			bzero(&rq, sizeof(rq)); rq.req_type = 13;
+			(void)a34_apple80211_ioctl(SIOCGA80211, &rq);
+			printf("0969 join: joined %d, ASSOCIATE_RESULT %d, STATE %d, events:", a34w_joined, result21, rq.req_val);
+			for (uint32_t i = 0; i < kev_count; i++) printf(" %u", kev_codes[i]);
+			failed |= !a34w_joined || result21 != 1 || rq.req_val != 4;
+			bzero(&rq, sizeof(rq)); rq.req_type = 1; rq.req_len = 32; rq.req_data = (user_addr_t)(uintptr_t)name;
+			e = a34_apple80211_ioctl(SIOCGA80211, &rq);
+			printf("; SSID \"%s\" (%u bytes)\n", name, rq.req_len);
+			failed |= e != 0 || strcmp(name, "Sim Open") != 0;
+		}
+		/* the link events: SSID (2), BSSID (3), LINK (4) changed, then ASSOC_DONE (9) */
+		failed |= kev_count < 4 || kev_codes[kev_count - 1] != 9;
+		printf("0969 iOS's Wi-Fi side (registry, Apple80211 scan and join): %s\n", failed ? "WRONG" : "ok");
+		bad |= failed;
+	}
+
 	/* ---- 0966: PHY_ACTION out of the vendor's default NVRAM image (FW_DIR/WIFI), as wlanPreCal builds it ---- */
 	{
 		static const uint8_t head[] = { 0xaa, 0x89, 0x67, 0x55, 0x03, 0x01, 0x7c, 0x01, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00,
