@@ -37,17 +37,38 @@ profile_call(const char *name)
 
 } // namespace
 
+/*
+ * The kernel's boot-args, and after them the words of /a34/a34metal.args (A34): XNU keeps at most
+ * 607 characters of boot-args (BOOT_LINE_LENGTH), and boot 65's line was cut there, after camtl=1 --
+ * its camprof=5 never reached anybody. The driver's own switches (camprof=, rwm_*, metal_profile=,
+ * camtl=, a34metalall=, ...) can live in that file instead, spaces or lines between them.
+ */
 extern "C" const char *
 rwm_boot_args(void)
 {
-	static char arguments[1024];
+	static char arguments[2048];
 	static int read;
 
 	if (!read) {
-		size_t size = sizeof(arguments) - 1;
+		size_t size = 1024;
+		FILE *more;
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
 			arguments[0] = '\0';
+		}
+		arguments[1024] = '\0';
+		if ((more = fopen("/a34/a34metal.args", "r")) != NULL) {
+			size_t at = strlen(arguments), n;
+
+			arguments[at++] = ' ';
+			n = fread(arguments + at, 1, sizeof(arguments) - at - 1, more);
+			arguments[at + n] = '\0';
+			for (size_t i = at; i < at + n; i++) {
+				if (arguments[i] == '\n' || arguments[i] == '\r' || arguments[i] == '\t') {
+					arguments[i] = ' ';
+				}
+			}
+			fclose(more);
 		}
 		arguments[sizeof(arguments) - 1] = '\0';
 		read = 1;

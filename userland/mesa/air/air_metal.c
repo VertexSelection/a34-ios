@@ -4608,9 +4608,9 @@ rwa_submit_profile(uint64_t out[5])
          snprintf(line, sizeof(line), "!rwm pipelines: %llu made, %llu ms translating, %llu ms compiling",
                   (unsigned long long)rwa_pipelines_made, (unsigned long long)(rwa_pipelines_translate_ns / 1000000),
                   (unsigned long long)(rwa_pipelines_compile_ns / 1000000));
-#ifdef __APPLE__
-         sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
-#endif
+         /* A34: through stdout (HackiOS's kernel kept it with kern.redwood.say; ours has not) */
+         printf("redwoodmetal kept: %s\n", line[0] == '!' ? line + 1 : line);
+         fflush(stdout);
          rwa_pipelines_made = rwa_pipelines_translate_ns = rwa_pipelines_compile_ns = 0;
       }
    }
