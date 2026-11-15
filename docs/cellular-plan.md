@@ -259,6 +259,16 @@ md1_pmic_setting_on sets md-vdigrf (MT6359P VPU buck) to 700 mV before power-on.
 md-vmodem/md-vsram (MT6315 on SPMI, 825 mV) are not driven. VPU, the RF LDOs and
 GPIO_RF_PWREN_RST_PIN (GPIO 75) are logged before power-on and at an exception.
 
+Eighth run (`1001-cell3`, log build/logs/1001-cell3-a): same eLNA assert. The modem runs its own
+rails (VPU 550 mV before power-on, 650 mV set by the modem at the exception; VFE28 off before,
+on at the exception); GPIO 75 is a GPIO output, high. ADC 1940 -> 1953 as Android. No AP-side
+pinctrl, clock-buffer init command or Samsung RF node exists in the live tree for the modem.
+What Samsung's CCCI build adds over MTK's (TC10 features) is now done too: the BIG_DATA regions
+(features 46/47), AP_DEBUG_LEVEL 0 (LOW, as ccci_mdinit passes ro.boot.debug_level; we sent -1)
+and the UPDATE_MD_SEC_SMEM SMC after let-go. Not done: the SBP code ccci_mdinit may take from
+nvdata APCFG/APRDCL/MD_SBP (unknown format; Samsung sets no project SBP), the AMMS interrupt
+(DRDI/POS free requests), MT6315 rails.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
