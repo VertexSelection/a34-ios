@@ -209,6 +209,14 @@ asset lookup for the iPhone X's screen failed. Neither the `boot` path nor 0950 
 `tools/build-xnu-boot.sh` now refuses to build without the iPhone X tree and checks the ADT
 for `/product`.
 
+Third run (`0991-cell2`, log build/logs/0991-cell2-a): with Android's start sequence (MD1
+bus protection set and acked, power off, MD_FLIGHT_MODE_SET 1/0 answered 0, power on, bus
+protection released, MD_KERNEL_BOOT_UP, whose a0 is 1 on the working path too) the modem sent
+**HS1**: header ffffffff 00000000 00000000 5555ffff, feature query patterns 0x49434343. It asks
+feature 0 (BOOT_INFO) as MUST and every other one as optional, version 0, so the AP's policy
+offers all it can and nothing cuts the runtime data; CCCI_FAST_HEADER stays off.
+CCIF_CLK_REQUEST answers -16 and MD_CHECK_FLAG 1 on this firmware (Android ignores both).
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
