@@ -1,0 +1,47 @@
+name: a34media
+
+# mediaserverd on the Galaxy A34 (iOS 16.7.16): userland/a34media/README.md. Builds
+# liba34media.dylib, RedwoodAudio.driver and liba34gl-inject.dylib (userland/a34media/build.sh;
+# no Mesa). The artifact "a34media" is laid out by where each file goes on the root:
+# a34/ -> /a34, System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver/ -> the same path; INSTALL.md.
+
+on:
+  push:
+    branches: [media]
+  workflow_dispatch:
+
+concurrency:
+  group: a34media-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_MIN: "16.0"
+  INSTALL_DIR: /a34
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: a34media (userland/a34media/build.sh)
+        run: A34MEDIA_OUT="$WORK/a34media-out" userland/a34media/build.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: a34media
+          path: ${{ env.WORK }}/a34media-out
+          if-no-files-found: error

@@ -24,6 +24,11 @@
  * Every program it is inserted into gets one line on the console (the kernel's log), whatever
  * its stderr is: "a34gl-inject: NAME[PID]: loaded, mode ...".
  *
+ * The kernel inserts one library, this one, into every program it names; other libraries of ours
+ * for a program are opened from here, before anything of a34gl's: A34_LOAD (paths separated by
+ * ':', from the environment or /a34/NAME.env; empty: none). mediaserverd's default is
+ * /a34/liba34media.dylib (userland/a34media). Each gets a line on the console too.
+ *
  * Ported from ios-topaz's userland/gpu/topaz_inject.c (MIT; its scheme is HackiOS's /
  * darwin-redwood's inject.c, MIT, Copyright (c) 2026 OOSEX GANG). Left out: topaz's
  * containermanagerd fix (not the GPU's business). The addresses are of the iOS 16.7.16
@@ -270,6 +275,41 @@ environment_file(void)
 }
 
 /*
+ * A34_LOAD: the other libraries of ours for this program (see the top). What cannot be opened is
+ * said and skipped; the program goes on either way.
+ */
+static void
+companions(void)
+{
+	const char *list = getenv("A34_LOAD");
+	char paths[512];
+
+	if (list == NULL && strcmp(program, "mediaserverd") == 0) {
+		list = A34GL_DIR "/liba34media.dylib";
+	}
+	if (list == NULL || *list == 0) {
+		return;
+	}
+	strlcpy(paths, list, sizeof(paths));
+	for (char *path = paths, *next; path != NULL; path = next) {
+		void *opened;
+
+		if ((next = strchr(path, ':')) != NULL) {
+			*next++ = 0;
+		}
+		if (*path == 0) {
+			continue;
+		}
+		if (access(path, R_OK) != 0) {
+			announce("A34_LOAD: no %s", path);
+			continue;
+		}
+		opened = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+		announce("A34_LOAD: %s %s", path, opened != NULL ? "loaded" : dlerror());
+	}
+}
+
+/*
  * liba34gl.dylib into this program, once: when the GPU's service is there (the window server,
  * started before the kernel may have brought the GPU up, gives it five seconds).
  */
@@ -376,11 +416,12 @@ a34gl_inject(void)
 	}
 	program[n] = 0;
 	render_server = strcmp(program, "backboardd") == 0;
+	environment_file();
+	companions();                   /* (whatever a34gl's own switches say) */
 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "a34gl=0") != NULL) {
 		announce("loaded, mode off (boot-arg a34gl=0)");
 		return;
 	}
-	environment_file();
 	asked = getenv("A34GL_MODE");
 	if ((getenv("A34GL_OFF") != NULL && strcmp(getenv("A34GL_OFF"), "1") == 0) || (asked != NULL && strcmp(asked, "off") == 0)) {
 		announce("loaded, mode off (%s)", asked != NULL && strcmp(asked, "off") == 0 ? "A34GL_MODE=off" : "A34GL_OFF=1");
