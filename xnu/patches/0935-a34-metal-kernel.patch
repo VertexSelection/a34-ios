@@ -1,0 +1,583 @@
+diff --git a/iokit/Kernel/arm/A34Mali.cpp b/iokit/Kernel/arm/A34Mali.cpp
+index d5eeebb..931f886 100644
+--- a/iokit/Kernel/arm/A34Mali.cpp
++++ b/iokit/Kernel/arm/A34Mali.cpp
+@@ -193,6 +193,7 @@ enum {
+ 	kA34PanfrostQueryBOInfo = 0x4d,
+ 	kA34MaliSetMode         = 0x7a,         /* A34 (0919): ours, queued or synchronous SUBMIT for this client */
+ 	kA34MaliWaitSeq         = 0x7b,         /* A34 (0919): ours, wait for this client's queued jobs */
++	kA34SurfaceSeq          = 0x7c,         /* A34 (0935): HackiOS's, a surface drawn on a driver's own thread, not yet sent */
+ 	kA34RedwoodSurface      = 0x7e,         /* A34 (0914): ios-topaz's, an IOSurface's memory as a buffer */
+ };
+ 
+@@ -302,6 +303,22 @@ struct a34_wait_seq {
+ };
+ static_assert(sizeof(struct a34_wait_seq) == 24, "WAIT_SEQ is 24 bytes");
+ 
++/*
++ * A34 (0935, from the Metal agent's research/metal/kernel/a34metal-kernel.patch):
++ * request 0x7c, HackiOS's kRedwoodSurfaceSeq (their RedwoodMali.cpp, MIT), for
++ * their Metal driver's asynchronous mode (userland/a34metal, rwm_async=1): seq
++ * ~0 marks the surface as being drawn with its jobs not yet sent, anything else
++ * takes the mark off (the jobs that name the surface are then waited for by
++ * gpuBusySeq, as for every client). 16 bytes. A mark older than
++ * A34_PENDING_STALE_NS is dropped (a driver that went without taking it off).
++ */
++struct a34_surface_seq {
++	uint32_t surface, pad;
++	uint64_t seq;
++};
++static_assert(sizeof(struct a34_surface_seq) == 16, "kRedwoodSurfaceSeq is 16 bytes");
++#define A34_PENDING_STALE_NS    NSEC_PER_SEC
++
+ union a34_request {
+ 	struct a34_drm_version version;
+ 	struct a34_gem_close close;
+@@ -319,6 +336,7 @@ union a34_request {
+ 	struct a34_redwood_surface surface;
+ 	struct a34_set_mode mode;
+ 	struct a34_wait_seq waitseq;
++	struct a34_surface_seq sseq;    /* A34 (0935) */
+ 	uint8_t raw[64];                /* the largest: struct drm_version */
+ };
+ 
+@@ -373,6 +391,8 @@ a34_bo_used(const struct a34_bo *b)
+ #define A34_CLOSE_WAIT_NS       (5ull * NSEC_PER_SEC)   /* ... GEM_CLOSE waits so long for jobs that name the buffer */
+ #define A34_WAIT_BO_NS          (10ull * NSEC_PER_SEC)  /* ... WAIT_BO with a timeout waits so long at most */
+ #define A34_FOREVER             (~0ull)
++#define A34_STALL_NS            (250ull * NSEC_PER_MSEC)       /* A34 (0935): a queued job slower than this is told of */
++#define A34_STALL_SAY_NS        (10ull * NSEC_PER_SEC)         /* ... once per this at most */
+ 
+ static IOLock *gA34MaliLock;
+ static uint64_t gA34MaliWired;                  /* bytes of every client's buffers */
+@@ -449,6 +469,7 @@ struct a34_qjob {
+ 	uint64_t seq;                   /* the client's number for it (WAIT_SEQ) */
+ 	uint64_t gseq;                  /* its place in the order of every client's queued jobs */
+ 	uint64_t queued;                /* mach time it was queued */
++	uint64_t taken;                 /* A34 (0935): ... taken off the queue by the worker */
+ 	struct a34_mali_job job;
+ };
+ 
+@@ -555,10 +576,37 @@ a34_qjob_free(struct a34_qjob *j)
+ bool
+ a34_mali_surface_idle(SweetSurface *surface, uint32_t ms)
+ {
+-	static uint32_t said;
+-	uint64_t busy = surface->gpuBusySeq;
++	static uint32_t said, staleSaid;
++	uint64_t busy, mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE);
+ 	bool idle = true;
+ 
++	/* A34 (0935): a frame still on a driver's thread (request 0x7c): until it is sent, at most `ms` */
++	if (mark != 0) {
++		uint64_t now = mach_absolute_time(), stale, deadline;
++
++		nanoseconds_to_absolutetime(A34_PENDING_STALE_NS, &stale);
++		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &deadline);
++		deadline += now;
++		while (mark != 0 && now - mark < stale && now < deadline) {
++			IOSleep(1);
++			mark = __atomic_load_n(&surface->gpuPendingSince, __ATOMIC_ACQUIRE);
++			now = mach_absolute_time();
++		}
++		if (mark != 0 && now - mark >= stale) {
++			(void)__atomic_compare_exchange_n(&surface->gpuPendingSince, &mark, 0ull, false, __ATOMIC_ACQ_REL,
++			    __ATOMIC_ACQUIRE);
++			if (staleSaid < 8) {
++				staleSaid++;
++				IOLog("A34 MALI UC: surface %u: marked as being drawn (0x7c) for more than 1 s: the mark is dropped\n",
++				    surface->id);
++			}
++		} else if (mark != 0 && said < 8) {
++			said++;
++			IOLog("A34 MALI UC: surface %u: still marked as being drawn after %u ms; the CPU goes on\n", surface->id, ms);
++		}
++	}
++	busy = surface->gpuBusySeq;
++
+ 	if (gA34MaliQLock == NULL || busy == 0) {
+ 		return true;
+ 	}
+@@ -770,6 +818,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	/* A34 (0915): cache upkeep per job, for the log: this window's jobs, mach time upkeep took (all, most), job ns, bytes */
+ 	uint32_t fWinJobs;
+ 	uint64_t fWinUpkeep, fWinUpkeepMax, fWinJobNs, fWinBytes, fWinStarted;
++	uint64_t fWinJobNsMax;                  /* A34 (0935): the window's longest job */
+ 	/* A34 (0919): of the window's jobs, the queued ones: how many, jobs ahead of them, mach time from SUBMIT to done */
+ 	uint32_t fWinQJobs, fWinQDepthMax;
+ 	uint64_t fWinQDepth, fWinQWait, fWinQWaitMax;
+@@ -1021,6 +1070,9 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 		fWinUpkeepMax = ticks;
+ 	}
+ 	fWinJobNs += jobNs;
++	if (jobNs > fWinJobNsMax) {
++		fWinJobNsMax = jobNs;
++	}
+ 	fWinBytes += before + after;
+ 	absolutetime_to_nanoseconds(now - fWinStarted, &window);
+ 	if (fWinJobs >= A34_UPKEEP_WINDOW && window >= A34_UPKEEP_WINDOW_NS) {
+@@ -1030,12 +1082,14 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 		absolutetime_to_nanoseconds(fWinUpkeepMax, &most);
+ 		absolutetime_to_nanoseconds((uint64_t)sweet_surface_sync_stats[3], &surf);
+ 		IOLog("A34 MALI UC: %s: %u jobs in %llu ms: cache upkeep %llu us a job (most %llu us), %llu KB a job; "
+-		    "jobs %llu us each; surfaces at lock/unlock so far: %lld invalidated, %lld cleaned, %lld MB, %llu ms\n",
++		    "jobs %llu us each (longest %llu us); surfaces at lock/unlock so far: %lld invalidated, %lld cleaned, %lld MB, "
++		    "%llu ms; it holds %u buffers (%llu MB of its own), %u of them surfaces\n",
+ 		    fName, fWinJobs, (unsigned long long)(window / NSEC_PER_MSEC), (unsigned long long)(all / 1000 / fWinJobs),
+ 		    (unsigned long long)(most / 1000), (unsigned long long)((fWinBytes >> 10) / fWinJobs),
+-		    (unsigned long long)(fWinJobNs / 1000 / fWinJobs), (long long)sweet_surface_sync_stats[0],
+-		    (long long)sweet_surface_sync_stats[1], (long long)(sweet_surface_sync_stats[2] >> 20),
+-		    (unsigned long long)(surf / NSEC_PER_MSEC));
++		    (unsigned long long)(fWinJobNs / 1000 / fWinJobs), (unsigned long long)(fWinJobNsMax / 1000),
++		    (long long)sweet_surface_sync_stats[0], (long long)sweet_surface_sync_stats[1],
++		    (long long)(sweet_surface_sync_stats[2] >> 20), (unsigned long long)(surf / NSEC_PER_MSEC), fBoCount,
++		    (unsigned long long)(fWired >> 20), fSurfaceBos);
+ 		if (fWinQJobs != 0) {
+ 			uint64_t qwait, qmost;
+ 
+@@ -1051,7 +1105,7 @@ RedwoodMaliUserClient::upkeepLog(uint32_t n, uint32_t requirements, uint64_t bef
+ 			fNappedSeen = napped;
+ 		}
+ 		fWinJobs = 0;
+-		fWinUpkeep = fWinUpkeepMax = fWinJobNs = fWinBytes = 0;
++		fWinUpkeep = fWinUpkeepMax = fWinJobNs = fWinBytes = fWinJobNsMax = 0;
+ 		fWinQJobs = fWinQDepthMax = fWinQSame = 0;
+ 		fWinQDepth = fWinQWait = fWinQWaitMax = 0;
+ 	}
+@@ -1081,7 +1135,30 @@ RedwoodMaliUserClient::runChain(struct a34_mali_job *job, bool all, uint64_t t0,
+ 	flushed = upkeep(false, all);           /* and no stale lines over what the GPU wrote */
+ 	ticks += mach_absolute_time() - t0;
+ 	if (q != NULL) {
+-		uint64_t waited = mach_absolute_time() - q->queued;
++		uint64_t waited = mach_absolute_time() - q->queued, slow;
++
++		/*
++		 * A34 (0935): a queued job done long after its SUBMIT (boot 65: 1.19 s
++		 * once): where the time went, once per A34_STALL_SAY_NS at most.
++		 */
++		nanoseconds_to_absolutetime(A34_STALL_NS, &slow);
++		if (waited > slow) {
++			static uint64_t saidAt;
++			uint64_t now = mach_absolute_time(), every, inQueue, forLock, total;
++
++			nanoseconds_to_absolutetime(A34_STALL_SAY_NS, &every);
++			if (saidAt == 0 || now - saidAt > every) {
++				saidAt = now;
++				absolutetime_to_nanoseconds(q->taken - q->queued, &inQueue);
++				absolutetime_to_nanoseconds(t0 - q->taken, &forLock);
++				absolutetime_to_nanoseconds(waited, &total);
++				IOLog("A34 MALI UC: %s: job %llu done %llu ms after its SUBMIT: %llu ms in the queue (%u ahead when "
++				    "queued, %u queued now), %llu ms for the GPU's lock, the job %llu us\n", fName,
++				    (unsigned long long)q->seq, (unsigned long long)(total / NSEC_PER_MSEC),
++				    (unsigned long long)(inQueue / NSEC_PER_MSEC), q->depth, gA34MaliQDepth,
++				    (unsigned long long)(forLock / NSEC_PER_MSEC), (unsigned long long)(job->ns / 1000));
++			}
++		}
+ 		int slot = (job->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
+ 
+ 		if (slot == gA34MaliLastSlot) {
+@@ -1164,6 +1241,7 @@ RedwoodMaliUserClient::worker(__unused void *arg, __unused wait_result_t result)
+ 		j->next = NULL;
+ 		gA34MaliQDepth--;
+ 		gA34MaliQRunning = j;
++		j->taken = mach_absolute_time();        /* A34 (0935) */
+ 		IOLockUnlock(gA34MaliQLock);
+ 		/* whoever waits for the GPU's lock to make, map or close a buffer goes first (a34_gpu_lock()): 1 ms at most */
+ 		for (uint32_t waits = 0; gA34MaliWaiters > 0 && waits < 100; waits++) {
+@@ -2196,7 +2274,19 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		if (insize != 0) {
+ 			memcpy(&r, args->structureInput, insize);
+ 		}
+-		if (selector == kA34RedwoodSurface) {
++		if (selector == kA34SurfaceSeq) {
++			/* A34 (0935): no lock of the client's: one word of the surface's */
++			SweetSurface *s = insize == sizeof(r.sseq) ? sweet_surface_copy(r.sseq.surface) : NULL;
++
++			if (s == NULL) {
++				ret = insize == sizeof(r.sseq) ? kIOReturnNotFound : kIOReturnBadArgument;
++			} else {
++				__atomic_store_n(&s->gpuPendingSince, r.sseq.seq == ~0ull ? (mach_absolute_time() | 1ull) : 0ull,
++				    __ATOMIC_RELEASE);
++				OSSafeReleaseNULL(s);
++				ret = kIOReturnSuccess;
++			}
++		} else if (selector == kA34RedwoodSurface) {
+ 			/* A34 (0914): looks the surface up and maps it before it takes the lock */
+ 			ret = surfaceBo(&r.surface);
+ 			if (ret != kIOReturnSuccess && ret != kIOReturnUnsupported && fErrors++ < A34_LOGGED_ERRORS) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eefd8cf..ccde905 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -60,6 +60,9 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSString.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -113,6 +116,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void nowFired(OSObject *owner, IOTimerEventSource *sender);     /* A34 (0935): a34fbnow */
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -159,6 +163,8 @@ public:
+ 	volatile uint32_t *fOvl[2];             /* OVL0_2L, OVL0 */
+ 	uint32_t      fOvlFlip[2];              /* their enabled layers that read picture 0 at start, a bit each */
+ 	uint64_t      fTELast, fTEPeriod;       /* mach time of the last TE seen, the TE period */
++	IOTimerEventSource *fNow;               /* A34 (0935): a34fbnow: a swap copied at once, not at the next vsync */
++	bool          fPresentNow;
+ 	bool          fTEBitWanted;             /* A34 (0931): a34fbte=2 and TE only with EXT_TE_EN: set it at the first kick */
+ 	bool          fTEBit;                   /* ... it is set by us: a transfer that does not end clears it */
+ 	bool          fTEMissSaid;
+@@ -178,6 +184,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	uint8_t *takePending(SweetSurface *presenting[SWEET_FB_LAYERS]);
++	void presentTaken(uint8_t *rec, SweetSurface *presenting[SWEET_FB_LAYERS]);
+ 	IOReturn swapWait(uint32_t id, uint32_t options);
+ };
+ 
+@@ -193,10 +201,82 @@ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+  */
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++/*
++ * A34 (0935, from the Metal agent's research/metal/kernel/a34metal-kernel.patch,
++ * after HackiOS's MiniIOMobileFramebuffer.cpp, MIT): with boot-arg
++ * a34metalprops=1 a program may put Metal's two discovery properties on this
++ * service, or take them off (an empty string), at run time
++ * (IORegistryEntrySetCFProperties(), userland/a34metal's metal_props). Only
++ * MetalPluginName and MetalPluginClassName, only strings. For tests: from then
++ * on every program that asks Metal for a device loads the plug-in (which still
++ * decides which programs it serves); a34metal=1 (0920) has it from boot.
++ */
++static bool gA34MetalProps;
++
++IOReturn
++IOAcceleratorES::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *keys;
++	OSObject *next;
++	char who[32] = "?";
++
++	proc_selfname(who, sizeof(who));
++	if (!gA34MetalProps) {
++		static unsigned said;
++
++		if (said++ < 4) {
++			IOLog("SWEET FB: IOAcceleratorES: %s asks to set properties; boot-arg a34metalprops=1 was not given\n", who);
++		}
++		return kIOReturnUnsupported;
++	}
++	if (dict == NULL || dict->getCount() == 0) {
++		return kIOReturnBadArgument;
++	}
++	keys = OSCollectionIterator::withCollection(dict);
++	if (keys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol *key = OSDynamicCast(OSSymbol, next);
++
++		if (key == NULL || (!key->isEqualTo("MetalPluginName") && !key->isEqualTo("MetalPluginClassName")) ||
++		    OSDynamicCast(OSString, dict->getObject(key)) == NULL) {
++			IOLog("SWEET FB: IOAcceleratorES: refusing what %s sent: only the strings MetalPluginName and "
++			    "MetalPluginClassName\n", who);
++			keys->release();
++			return kIOReturnBadArgument;
++		}
++	}
++	keys->reset();
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol *key = OSDynamicCast(OSSymbol, next);
++		OSString *value = key != NULL ? OSDynamicCast(OSString, dict->getObject(key)) : NULL;
++
++		if (value == NULL) {
++			continue;
++		}
++		if (value->getLength() == 0) {
++			removeProperty(key);
++			IOLog("SWEET FB: IOAcceleratorES: %s removed by %s\n", key->getCStringNoCopy(), who);
++		} else if (setProperty(key, value)) {
++			IOLog("SWEET FB: IOAcceleratorES: %s = %s, set by %s\n", key->getCStringNoCopy(), value->getCStringNoCopy(),
++			    who);
++		} else {
++			keys->release();
++			return kIOReturnNoMemory;
++		}
++	}
++	keys->release();
++	return kIOReturnSuccess;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -447,6 +527,19 @@ AppleCLCD::start(IOService *provider)
+ 	(void)PE_parse_boot_argn("a34fbflush", &flushCopy, sizeof(flushCopy));
+ 	fFlushCopy = flushCopy != 0 || fSurface->wrapped || fSurface->mapCache != kIOMapWriteCombineCache;
+ 	flipStart();                    /* A34 (0930), before the first vsync */
++	uint32_t presentNow = 0;
++	(void)PE_parse_boot_argn("a34fbnow", &presentNow, sizeof(presentNow));     /* A34 (0935) */
++	if (presentNow != 0) {
++		if (fFlip) {
++			fNow = IOTimerEventSource::timerEventSource(this, &AppleCLCD::nowFired);
++			if (fNow != NULL && fWorkLoop->addEventSource(fNow) != kIOReturnSuccess) {
++				OSSafeReleaseNULL(fNow);
++			}
++			fPresentNow = fNow != NULL;
++		}
++		IOLog("SWEET FB: a34fbnow: swaps are copied %s\n", fPresentNow ? "as soon as they come" :
++		    "at the vsync (it needs a34fbflip=1 with two pictures)");
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -496,8 +589,10 @@ AppleCLCD::start(IOService *provider)
+ 		 * /a34/A34Metal.clients; 2: all but backboardd; 3: all). Without
+ 		 * the boot-arg nothing changes.
+ 		 */
+-		uint32_t metalOn = 0;
++		uint32_t metalOn = 0, metalProps = 0;
+ 		(void)PE_parse_boot_argn("a34metal", &metalOn, sizeof(metalOn));
++		(void)PE_parse_boot_argn("a34metalprops", &metalProps, sizeof(metalProps));    /* A34 (0935) */
++		gA34MetalProps = metalProps != 0;
+ 		if (metalOn != 0) {
+ 			accel->setProperty("MetalPluginName", "A34Metal");
+ 			accel->setProperty("MetalPluginClassName", "A34MetalDevice");
+@@ -637,6 +732,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if ((count % SWEET_FB_HOLD_LOG_TICKS) == 0) {
+ 		sweet_fb_hold_log();
+ 		sweet_fb_flip_log();    /* A34 (0930) */
++		sweet_surface_report(); /* A34 (0935) */
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -669,35 +765,74 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+ 	SweetSurface *presenting[SWEET_FB_LAYERS] = { NULL, NULL, NULL, NULL };
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-			/* A34 (0927): the swap is the one being copied now; its surfaces stay held until that is done */
+-			fb->fPresentingSwapID = fb->fPendingSwapID;
+-			fb->fPendingSwapID = 0;
+-			memcpy(presenting, fb->fPendingHeld, sizeof(presenting));
+-			bzero(fb->fPendingHeld, sizeof(fb->fPendingHeld));
+-		}
+-	}
++	uint8_t *rec = flush ? fb->takePending(presenting) : NULL;
+ 	IOLockUnlock(fb->fLock);
+ 	/* A34 (0905): re-arm first; the present below must not stretch the
+ 	 * vsync period that backboardd paces its frames by. */
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	a34_fb_stats[5]++;
+ 	if (rec != NULL) {
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-		/* A34 (0927): copied: the swap is done, its surfaces free for CoreAnimation again */
+-		IOLockLock(fb->fLock);
+-		fb->fPresentingSwapID = 0;
+-		sweet_fb_hold_stats[1]++;
+-		IOLockWakeup(fb->fLock, &fb->fPendingSwapID, false);
+-		IOLockUnlock(fb->fLock);
+-		sweet_fb_unhold(presenting);
++		fb->presentTaken(rec, presenting);
++	}
++}
++
++/*
++ * With fLock held: the swap waiting, taken for present(), or NULL (no memory).
++ * A34 (0927): the swap is the one being copied now; its surfaces stay held
++ * until that is done. (A34 (0935): moved here from vsyncFired(), for nowFired().)
++ */
++uint8_t *
++AppleCLCD::takePending(SweetSurface *presenting[SWEET_FB_LAYERS])
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++
++	if (rec != NULL) {
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++		fPresentingSwapID = fPendingSwapID;
++		fPendingSwapID = 0;
++		memcpy(presenting, fPendingHeld, sizeof(fPendingHeld));
++		bzero(fPendingHeld, sizeof(fPendingHeld));
++	}
++	return rec;
++}
++
++/* Without fLock, on the vsync work loop: the taken swap copied; A34 (0927): then it is done, its surfaces let go. */
++void
++AppleCLCD::presentTaken(uint8_t *rec, SweetSurface *presenting[SWEET_FB_LAYERS])
++{
++	present(rec);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	IOLockLock(fLock);
++	fPresentingSwapID = 0;
++	sweet_fb_hold_stats[1]++;
++	IOLockWakeup(fLock, &fPendingSwapID, false);
++	IOLockUnlock(fLock);
++	sweet_fb_unhold(presenting);
++}
++
++/*
++ * A34 (0935): a34fbnow=1 (with two pictures, a34fbflip=1): a swap is copied as
++ * soon as it comes, on the vsync work loop, not at the next vsync tick: its
++ * SwapWait (CoreAnimation blocks in it for nearly every frame: 0927's "waited")
++ * ends ~8 ms sooner on average. The panel still gets a picture per TE: the
++ * kick sends the newest one queued (kickFlip()).
++ */
++void
++AppleCLCD::nowFired(OSObject *owner, __unused IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	SweetSurface *presenting[SWEET_FB_LAYERS] = { NULL, NULL, NULL, NULL };
++	uint8_t *rec = NULL;
++
++	IOLockLock(fb->fLock);
++	if (!fb->fPowerOff && fb->fDirty) {
++		rec = fb->takePending(presenting);
++	}
++	IOLockUnlock(fb->fLock);
++	if (rec != NULL) {
++		fb->presentTaken(rec, presenting);
+ 	}
+ }
+ 
+@@ -769,6 +904,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fPendingSwapID = id;
+ 	IOLockUnlock(fLock);
+ 	sweet_fb_unhold(dropped);
++	if (fPresentNow) {
++		fNow->setTimeoutUS(1);  /* A34 (0935): a34fbnow */
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e05f35a..9a2b51f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -146,6 +146,8 @@ static uint32_t      sweet_surface_row_fix_nsaid;
+  */
+ static uint32_t      sweet_surface_use_on = 1;
+ SInt32               sweet_surface_held_touch[2];
++/* A34 (0935): IOSurfaceLocks: how many, mach time in them, the longest (since the last report) */
++static SInt64        sweet_surface_lock_stats[3];
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -245,6 +247,42 @@ sweet_surface_put(SweetSurface *s)
+ 	}
+ }
+ 
++/* A34 (0935): see SweetSurface.h */
++void
++sweet_surface_report(void)
++{
++	static SInt64 last[2];
++	SInt64 locks = sweet_surface_lock_stats[0], ticks = sweet_surface_lock_stats[1], most = sweet_surface_lock_stats[2];
++	uint32_t alive = 0, inUse = 0, held = 0, shared = 0;
++	uint64_t ms, mostMs;
++
++	if (sweet_surface_lock == NULL) {
++		return;
++	}
++	sweet_surface_lock_stats[2] = 0;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		const SweetSurface *s = sweet_surface_table[id];        /* (the table holds a retain) */
++
++		if (s != NULL) {
++			alive++;
++			inUse += s->useCount > 0 ? 1 : 0;
++			held += s->displayHeld > 0 ? 1 : 0;
++			shared += s->gpuShared > 0 ? 1 : 0;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	absolutetime_to_nanoseconds((uint64_t)(ticks - last[1]), &ms);
++	absolutetime_to_nanoseconds((uint64_t)most, &mostMs);
++	IOLog("A34 SURF: 10 s: %lld IOSurfaceLocks, %llu ms in them (longest %llu ms); %u surfaces alive, %llu MB of "
++	    "kernel memory in surfaces; %u in use (use counts), %u held by the display, %u imported by a GPU client\n",
++	    (long long)(locks - last[0]), (unsigned long long)(ms / NSEC_PER_MSEC),
++	    (unsigned long long)(mostMs / NSEC_PER_MSEC), alive, (unsigned long long)(sweet_surface_wired >> 20), inUse,
++	    held, shared);
++	last[0] = locks;
++	last[1] = ticks;
++}
++
+ SweetSurface *
+ sweet_surface_copy(uint32_t id)
+ {
+@@ -1610,7 +1648,15 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s->displayHeld > 0) {
+ 		OSIncrementAtomic(&sweet_surface_held_touch[1]);       /* A34 (0927): locked while the display holds it */
+ 	}
++	uint64_t began = mach_absolute_time(), took;
++
+ 	sweet_surface_cpu_begin(s);     /* A34 (0915): what the GPU wrote, visible to the CPU */
++	took = mach_absolute_time() - began;
++	OSAddAtomic64(1, &sweet_surface_lock_stats[0]);         /* A34 (0935) */
++	OSAddAtomic64((SInt64)took, &sweet_surface_lock_stats[1]);
++	if ((SInt64)took > sweet_surface_lock_stats[2]) {
++		sweet_surface_lock_stats[2] = (SInt64)took;     /* (a race may lose a maximum: a statistic) */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 2d6151c..8fab825 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -62,8 +62,14 @@ public:
+ 	SInt32                    displayHeld;
+ 	/* A34 (0927): IOSurfaceIncrementUseCount of every client, the "in use" of the state page (+0x18) */
+ 	SInt32                    useCount;
++	/*
++	 * A34 (0935, the Metal driver's request 0x7c, A34Mali.cpp): drawn on a
++	 * driver's own thread, its jobs not yet sent: the CPU's side waits for
++	 * the mark to go as it waits for gpuBusySeq. mach time of the mark | 1, 0: none.
++	 */
++	uint64_t                  gpuPendingSince;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuShared = 0; gpuWrites = 0; cpuSeen = 0; gpuBusySeq = 0; askedBytesPerRow = 0; displayHeld = 0; useCount = 0; gpuPendingSince = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -98,6 +104,13 @@ void sweet_surface_cpu_end(SweetSurface *surface);
+ void sweet_surface_cpu_whole(SweetSurface *surface);
+ extern SInt64 sweet_surface_sync_stats[4];
+ 
++/*
++ * A34 (0935): SweetFramebuffer's 10 s line about surfaces: IOSurfaceLocks and
++ * the time spent in them (GPU jobs waited for, caches), surfaces alive and
++ * their memory, in use, held by the display, imported by a GPU client.
++ */
++void sweet_surface_report(void);
++
+ /*
+  * A34 (0919), in A34Mali.cpp: wait, at most ms, for the queued GPU jobs
+  * that name the surface: before the CPU reads or writes it (IOSurfaceLock,
