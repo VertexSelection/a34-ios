@@ -1,0 +1,586 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index ab45e22..530392f 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -602,7 +602,7 @@ a34w_step3(void)
+  * that give the tokens back). Above the command rings' memory; 1.1 MB of the 4 MB in all.
+  */
+ #define DATA_TX_RING                    0u
+-#define DATA_TX_SLOTS                   64u
++#define DATA_TX_SLOTS                   256u            /* (1010: 64 -> 256, ring slots and tokens both, as Android's 256) */
+ #define DATA_TOKEN_SIZE                 0x800u          /* TXD 32 + TXP 32 + up to 1532 bytes of frame */
+ #define DATA_RX_SLOTS                   64u
+ #define DATA_RX_BUF_SIZE                2352u
+@@ -610,14 +610,15 @@ a34w_step3(void)
+ #define FREE_RX_BUF_SIZE                3840u
+ #define DMA_TX0_DESC                    0x02000u
+ #define DMA_RX2_DESC                    0x03000u        /* ring n's descriptors at 0x03000 + 0x1000 * (n - 2), n = 2..5 */
+-#define DMA_TOKENS                      0x50000u        /* DATA_TX_SLOTS token buffers */
++#define DMA_TOKENS                      0x140000u       /* DATA_TX_SLOTS token buffers (1010: after RX ring 5's buffers) */
+ #define DMA_RX2_BUFS                    0x70000u        /* ring n's buffers at 0x70000 + 0x40000 * (n - 2), 4 KB apart */
+ #define DMA_RXN_DESC(n)                 (DMA_RX2_DESC + 0x1000u * ((n) - 2u))
+ #define DMA_RXN_BUFS(n)                 (DMA_RX2_BUFS + 0x40000u * ((n) - 2u))
+-#define DMA_USED_END                    (DMA_RXN_BUFS(5u) + FREE_RX_SLOTS * SLOT_SIZE)
++#define DMA_USED_END                    (DMA_TOKENS + DATA_TX_SLOTS * DATA_TOKEN_SIZE)
+ #define DMASHDL                         0x26000u        /* WF_HIF_DMASHDL_TOP (0x7c026000 = AP 0x18026000) */
+ _Static_assert(DMA_USED_END <= A34W_DMA_SIZE, "the rings fit in the DMA memory");
+-_Static_assert(DMA_TOKENS + DATA_TX_SLOTS * DATA_TOKEN_SIZE <= DMA_RX2_BUFS, "the token buffers fit");
++_Static_assert(DMA_TOKENS >= DMA_RXN_BUFS(5u) + FREE_RX_SLOTS * SLOT_SIZE, "the token buffers after the RX buffers");
++_Static_assert(DMA_TX0_DESC + DATA_TX_SLOTS * 16u <= DMA_RX2_DESC, "TX ring 0's descriptors fit");
+ 
+ static vm_offset_t a34w_wf, a34w_emi, a34w_dma;
+ static uint64_t a34w_emi_pa;
+@@ -882,7 +883,7 @@ struct a34w_rx_ring {
+ };
+ static struct a34w_rx_ring a34w_drx[4];
+ static uint32_t a34w_dtx_cidx;
+-static uint64_t a34w_tokens_busy;               /* bit n: token n is the DMA's until its report comes */
++static uint64_t a34w_tokens_busy[DATA_TX_SLOTS / 64u];  /* bit n: token n is the DMA's until its report comes */
+ static bool a34w_data_rings;
+ 
+ /* soc5_0DmashdlInit (hal_dmashdl_soc5_0.c:290-332, values hal_dmashdl_soc5_0.h): read-modify-write */
+@@ -939,7 +940,7 @@ a34w_data_rings_init(void)
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	a34w_dtx_cidx = 0;
+-	a34w_tokens_busy = 0;
++	bzero(a34w_tokens_busy, sizeof(a34w_tokens_busy));
+ 	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_TX0_DESC);
+ 	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x8u, 0);
+ 	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x4u, DATA_TX_SLOTS);
+@@ -2005,8 +2006,17 @@ a34w_bss_activate(bool on)
+  * (`who` starts each line). (0964) `stay`: the BSS is left active afterwards (step 8 joins with
+  * it: HakiOS run 457, a scan that deactivated the BSS of a connection killed its traffic).
+  */
++/* (1010) the same scan, active for one network by its name when `ssid` is given (a hidden one answers only then) */
++static bool a34w_scan_for(const char *who, bool stay, const uint8_t *ssid, uint32_t ssid_length);
++
+ static bool
+ a34w_scan(const char *who, bool stay)
++{
++	return a34w_scan_for(who, stay, NULL, 0);
++}
++
++static bool
++a34w_scan_for(const char *who, bool stay, const uint8_t *ssid, uint32_t ssid_length)
+ {
+ 	static uint8_t scan[SCAN_REQ_V2_SIZE], done[476];
+ 	static const uint8_t channels_2g4[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+@@ -2037,6 +2047,13 @@ a34w_scan(const char *who, bool stay)
+ 	scan[1] = BSS_AIS;                              /* ucBssIndex */
+ 	scan[2] = 0;                                    /* ucScanType: passive */
+ 	scan[3] = 0;                                    /* ucSSIDType: none (passive) */
++	if (ssid != NULL && ssid_length != 0 && ssid_length <= 32u) {
++		scan[2] = 1;                            /* (1010) ucScanType: active */
++		scan[3] = 4;                            /* ucSSIDType: the names given */
++		scan[4] = 1;                            /* ucSSIDNum */
++		scan[8] = (uint8_t)ssid_length;         /* arSSID[0]: u4SsidLen, aucSsid[32]; probes: the firmware's count */
++		memcpy(scan + 12, ssid, ssid_length);
++	}
+ 	scan[6] = 0x02u;                                /* ucScnFuncMask: DBDC scan off (wifi.cfg DbdcMode 0) */
+ 	scan[7] = 1;                                    /* auVersion */
+ 	scan[158] = 4;                                  /* ucChannelType: the list below */
+@@ -2057,7 +2074,8 @@ a34w_scan(const char *who, bool stay)
+ 		a34w_say("%s: SCAN_REQ_V2 not sent", who);
+ 		return false;
+ 	}
+-	a34w_say("%s: passive scan %u of %u channels asked (command sequence %u)", who, a34w_scan_seq, n, seq);
++	a34w_say("%s: %s scan %u of %u channels asked (command sequence %u)", who, scan[2] ? "active (a name asked for)" :
++	    "passive", a34w_scan_seq, n, seq);
+ 	sweet_log_flush();
+ 	got = a34w_wait_event(EVENT_ID_SCAN_DONE, 0, done, sizeof(done), 20000);
+ 	if (!stay) {
+@@ -2197,8 +2215,30 @@ static uint32_t a34w_actions_said, a34w_trace_left = 48u;
+ static uint8_t a34w_kicked[6];                  /* the BSS that last let us go ... */
+ static uint64_t a34w_kicked_at;                 /* ... and when (ms): it scores 20 dB less for 5 minutes */
+ static uint64_t a34w_auto_rejoin_at;            /* when to join again by itself (0: not) */
+-static uint32_t a34w_auto_rejoins;              /* how many times so far (5 at most a boot) */
++/* (1010) how loud the AP is now (from its data frames' RX vectors), and a move the AP asked for that we took */
++static int a34w_link_rssi = -128;
++static uint64_t a34w_link_rssi_at;
++static uint8_t a34w_roam_to[6];
++static bool a34w_roam_pending, a34w_roam_wanted;
++/*
++ * (1010) Power save. The firmware does 802.11 power save by itself -- PS-Poll, the PM bit in null
++ * frames, waking for the DTIM, keep-alive and ARP offload (the RAM code's strings) -- once it knows
++ * the BSS's DTIM and our AID (INDICATE_PM_BSS_CONNECTED, sent at the join). Android runs FAST_PSP
++ * (2: dozes, and is awake while traffic flows). We join in CAM and go to FAST_PSP 15 s later
++ * (handshake and DHCP done), unless the AP has no TIM element (gen4m keeps CAM then).
++ * kern.a34wifi.powersave: -1 automatic (that), 0 CAM always, 2 FAST_PSP, 1 MAX_PSP.
++ */
++static int a34w_powersave = -1;
++static uint64_t a34w_ps_at;
++static int a34w_ps_now;
++static uint32_t a34w_auto_rejoins;              /* tries since the link was lost (1010: no limit; 3, 10, 30, then 60 s apart) */
++static uint32_t
++a34w_rejoin_delay_ms(uint32_t tries)
++{
++	return tries <= 1u ? 3000u : tries == 2u ? 10000u : tries == 3u ? 30000u : 60000u;
++}
+ static void a34w_lost(const char *why);
++static bool a34w_sta_off_now(void);
+ static void a34w_link_tell(bool up, int status);
+ static void a34w_unjoin(bool deauth);
+ static void (*a34w_link_change)(bool up);
+@@ -2363,7 +2403,7 @@ a34w_target_heard(const uint8_t *frame, uint32_t length, int rssi, uint8_t chann
+ 	}
+ 	channel = ds != 0 ? ds : channel;
+ 	score = rssi - (a34w_kicked_at != 0 && a34w_ms() - a34w_kicked_at < 300000u && memcmp(frame + 16, a34w_kicked, 6) == 0 ?
+-	    20 : 0);
++	    20 : 0) + (a34w_roam_wanted && memcmp(frame + 16, a34w_roam_to, 6) == 0 ? 40 : 0);   /* (1010) where we roam to */
+ 	if (ssid == NULL || ssid[1] != a34w_net.ssid_length || memcmp(ssid + 2, a34w_net.ssid, ssid[1]) != 0 ||
+ 	    (a34w_net.bssid_given && memcmp(frame + 16, a34w_net.bssid, 6) != 0) || channel == 0 ||
+ 	    (a34w_target.found && score <= a34w_target.score && memcmp(frame + 16, a34w_target.bssid, 6) != 0)) {
+@@ -2625,7 +2665,7 @@ a34w_report_in(const uint8_t *r, uint32_t count)
+ 		}
+ 		done++;
+ 		if (token < DATA_TX_SLOTS) {
+-			a34w_tokens_busy &= ~(1ull << token);
++			a34w_tokens_busy[token / 64u] &= ~(1ull << (token % 64u));
+ 			a34w_tokens_back++;
+ 		}
+ 	}
+@@ -2637,28 +2677,62 @@ a34w_report_in(const uint8_t *r, uint32_t count)
+  * (fillTxDescAppendByHostV2: the token, where the frame is and how long) and the frame; the
+  * DMA reads the first 64 bytes, the MAC the frame. The token is the DMA's until its report.
+  */
++/* (1010) a free token, or DATA_TX_SLOTS (a34w_tx_mtx held) */
++static uint32_t
++a34w_token_free(void)
++{
++	for (uint32_t w = 0; w < DATA_TX_SLOTS / 64u; w++) {
++		if (~a34w_tokens_busy[w] != 0) {
++			return 64u * w + (uint32_t)__builtin_ctzll(~a34w_tokens_busy[w]);
++		}
++	}
++	return DATA_TX_SLOTS;
++}
++
++static uint64_t a34w_drop_no_token, a34w_drop_ring_full, a34w_tx_waits;
++static void a34w_reclaim(void);
++
+ static bool
+ a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect, bool status)
+ {
+ 	uint32_t token, slot, next, didx;
+ 	uint8_t *buf;
+-	uint64_t pa;
++	uint64_t pa, until = 0;
+ 	volatile uint32_t *d;
+ 	uint8_t pid = eapol || status ? a34w_next_pid() : 0;
+ 
+ 	if (!a34w_data_rings || length < 14u || length > FRAME_MOST) {
+ 		return false;
+ 	}
+-	lck_mtx_lock(&a34w_tx_mtx);
+-	for (token = 0; token < DATA_TX_SLOTS && (a34w_tokens_busy & (1ull << token)) != 0; token++) {
+-	}
+-	slot = a34w_dtx_cidx;
+-	next = (slot + 1u) % DATA_TX_SLOTS;
+-	didx = a34w_rd(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0xcu) & 0xfffu;
+-	if (token == DATA_TX_SLOTS || next == didx) {
++	/*
++	 * (1010) No free token (all 256 in flight until the firmware reports them sent) or a full ring:
++	 * the token reports are taken in here (a34w_reclaim) and the frame waits for up to 5 ms, as a
++	 * driver's queue would, instead of being dropped (0999-wifi-a: 4264 of 27k frames dropped).
++	 */
++	for (;;) {
++		lck_mtx_lock(&a34w_tx_mtx);
++		token = a34w_token_free();
++		slot = a34w_dtx_cidx;
++		next = (slot + 1u) % DATA_TX_SLOTS;
++		didx = a34w_rd(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0xcu) & 0xfffu;
++		if (token != DATA_TX_SLOTS && next != didx) {
++			break;
++		}
+ 		lck_mtx_unlock(&a34w_tx_mtx);
+-		a34w_data_dropped_out++;
+-		return false;
++		if (until == 0) {
++			until = a34w_ms() + 5u;
++			a34w_tx_waits++;
++		} else if (a34w_ms() >= until) {
++			if (token == DATA_TX_SLOTS) {
++				a34w_drop_no_token++;
++			} else {
++				a34w_drop_ring_full++;
++			}
++			a34w_data_dropped_out++;
++			return false;
++		}
++		a34w_reclaim();
++		delay(50);
+ 	}
+ 	buf = (uint8_t *)(a34w_dma + DMA_TOKENS + token * DATA_TOKEN_SIZE);
+ 	pa = A34W_DMA_PA + DMA_TOKENS + token * DATA_TOKEN_SIZE;
+@@ -2676,7 +2750,7 @@ a34w_data_tx(const uint8_t *frame, uint32_t length, bool eapol, bool protect, bo
+ 	d[3] = 0;
+ 	d[1] = DESC_SDLEN0(64u) | DESC_LS0;             /* DMADONE clear: the DMA's */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	a34w_tokens_busy |= 1ull << token;
++	a34w_tokens_busy[token / 64u] |= 1ull << (token % 64u);
+ 	a34w_dtx_cidx = next;
+ 	a34w_wr(a34w_conn, WFDMA_TX_RING(DATA_TX_RING) + 0x8u, next);
+ 	a34w_data_frames_out++;
+@@ -2793,15 +2867,74 @@ a34w_action_in(const uint8_t *f, uint32_t length)
+ 		uint32_t n = 24u + 5u;
+ 		bool mbo = false;
+ 
++		uint8_t best[6] = { 0 };
++		int best_score = -1000;
++		bool imminent = (f[27] & 0x04u) != 0, take = false;
++		uint32_t at = 31;
++
++		/* (1010) the candidates (Neighbor Report elements, preference subelement 3), after the optional fields */
++		if (f[27] & 0x08u) {
++			at += 12u;                      /* BSS Termination Duration */
++		}
++		if ((f[27] & 0x10u) && at < length) {
++			at += 1u + f[at];               /* Session Information URL */
++		}
++		for (; (f[27] & 0x01u) && at + 2u <= length && at + 2u + f[at + 1u] <= length; at += 2u + f[at + 1u]) {
++			const uint8_t *e = f + at;
++			int pref = 1, heard = -128, score;
++			struct a34_sta_bss seen;
++
++			if (e[0] != 52u || e[1] < 13u || memcmp(e + 2, a34w_target.bssid, 6) == 0) {
++				continue;
++			}
++			for (uint32_t sub = 15; sub + 2u <= 2u + e[1] && sub + 2u + e[sub + 1u] <= 2u + e[1]; sub += 2u + e[sub + 1u]) {
++				if (e[sub] == 3u && e[sub + 1u] >= 1u) {
++					pref = e[sub + 2u];
++				}
++			}
++			for (unsigned i = 0; a34_sta_heard(i, &seen); i++) {    /* heard in the last scan, and how loud */
++				if (memcmp(seen.bssid, e + 2, 6) == 0 && seen.age_ms < 120000u) {
++					heard = seen.rssi;
++				}
++			}
++			score = pref * 4 + heard;
++			a34w_say("  candidate %02x:%02x:%02x:%02x:%02x:%02x, channel %u, preference %d, heard %d dBm", e[2], e[3], e[4], e[5],
++			    e[6], e[7], e[13], pref, heard);
++			if (pref > 0 && score > best_score && (imminent || (heard >= -75 && heard >= a34w_link_rssi + 8))) {
++				best_score = score;
++				memcpy(best, e + 2, 6);
++				take = true;
++			}
++		}
+ 		a34w_say("the AP asks us to move (BSS transition request: token %u, mode 0x%02x, disassociation in %u beacons, "
+-		    "valid %u)%s", f[26], f[27], (unsigned)(f[28] | f[29] << 8), f[30], (f[4] & 1u) ? "" : ": we stay (status 7)");
+-		for (uint32_t at = 31; at + 8u <= length; at++) {       /* (an MBO element anywhere in it) */
++		    "valid %u; we hear it at %d dBm)%s", f[26], f[27], (unsigned)(f[28] | f[29] << 8), f[30], a34w_link_rssi,
++		    (f[4] & 1u) ? "" : take ? ": we go (status 0)" : ": we stay (status 7)");
++		for (at = 31; at + 8u <= length; at++) {       /* (an MBO element anywhere in it) */
+ 			if (f[at] == 221u && f[at + 2u] == 0x50 && f[at + 3u] == 0x6f && f[at + 4u] == 0x9a && f[at + 5u] == 0x16) {
+ 				mbo = true;
+ 				break;
+ 			}
+ 		}
+ 		if ((f[4] & 1u) == 0) {                 /* (wnm.c: a request to everybody gets no answer) */
++			uint8_t accept[24 + 5 + 6];
++
++			if (take) {                     /* (1010) accept: status 0, the target BSSID; then we move */
++				bzero(accept, sizeof(accept));
++				accept[0] = 0xd0;
++				memcpy(accept + 4, a34w_target.bssid, 6);
++				memcpy(accept + 10, a34w_mac, 6);
++				memcpy(accept + 16, a34w_target.bssid, 6);
++				accept[24] = 10;
++				accept[25] = 8;
++				accept[26] = f[26];
++				accept[27] = 0;
++				accept[28] = 0;
++				memcpy(accept + 29, best, 6);
++				(void)a34w_mgmt_tx(accept, sizeof(accept), "BSS Transition Management Response (we go)");
++				memcpy(a34w_roam_to, best, 6);
++				a34w_roam_pending = true;
++				return;
++			}
+ 			bzero(r, sizeof(r));
+ 			r[0] = 0xd0;
+ 			memcpy(r + 4, a34w_target.bssid, 6);
+@@ -2929,13 +3062,13 @@ a34w_lost(const char *why)
+ 	a34w_unjoin(false);                             /* the firmware's side of it undone, as Android's disconnect */
+ 	memcpy(a34w_kicked, a34w_target.bssid, 6);
+ 	a34w_kicked_at = a34w_ms();
+-	if (a34w_auto_rejoins < 5u) {
+-		a34w_auto_rejoins++;
+-		a34w_auto_rejoin_at = a34w_ms() + 3000u;
+-		a34w_say("LEFT the network (%s): joining again in 3 s (%u of 5 this boot; that BSS scores 20 dB less for 5 min)",
+-		    why, a34w_auto_rejoins);
++	if (!a34w_sta_off_now()) {                      /* (1010) for as long as the network is wanted */
++		a34w_auto_rejoins = 1;
++		a34w_auto_rejoin_at = a34w_ms() + a34w_rejoin_delay_ms(1);
++		a34w_say("LEFT the network (%s): joining again in %u s (that BSS scores 20 dB less for 5 min)", why,
++		    a34w_rejoin_delay_ms(1) / 1000u);
+ 	} else {
+-		a34w_say("LEFT the network (%s): not joining again by itself any more ('a34wifi join' does)", why);
++		a34w_say("LEFT the network (%s); Wi-Fi is switched off: not joining again", why);
+ 	}
+ }
+ 
+@@ -2996,6 +3129,25 @@ a34w_data_in(const uint8_t *rxd, uint32_t count, uint32_t at, bool translated)
+ 	}
+ }
+ 
++/* (1010) the RX vector's first two words (group 3): the AP's RSSI, averaged */
++static void
++a34w_link_rssi_note(const uint8_t *g3)
++{
++	uint32_t rv0, rv1, rcpi;
++	int rssi;
++
++	memcpy(&rv0, g3, 4);
++	memcpy(&rv1, g3 + 4, 4);
++	rcpi = ((rv0 >> 18) & 7u) == 0u ? ((rv1 & 0xffu) >= 255u ? (rv1 >> 8) & 0xffu : rv1 & 0xffu) :
++	    ((rv1 & 0xffu) > ((rv1 >> 8) & 0xffu) ? rv1 & 0xffu : (rv1 >> 8) & 0xffu);
++	if (rcpi == 0 || rcpi > 220u) {
++		return;
++	}
++	rssi = (int)(rcpi >> 1) - 110;
++	a34w_link_rssi = a34w_ms() - a34w_link_rssi_at > 10000u ? rssi : (7 * a34w_link_rssi + rssi) / 8;
++	a34w_link_rssi_at = a34w_ms();
++}
++
+ /* one RX ring of 2..5 drained; how many buffers it gave */
+ static uint32_t
+ a34w_drx_poll(uint32_t n)
+@@ -3030,6 +3182,13 @@ a34w_drx_poll(uint32_t n)
+ 			vld = (dw1 >> 11) & 0x1fu;
+ 			at = RXD_SIZE + ((vld & 8u) ? 16u : 0u) + ((vld & 1u) ? 16u : 0u) + ((vld & 2u) ? 8u : 0u) +
+ 			    ((vld & 4u) ? 8u : 0u) + ((vld & 16u) ? 72u : 0u) + ((dw2 >> 14) & 3u) * 2u;
++			if ((vld & 4u) != 0 && (dw1 & 0x3ffu) == AP_WLAN_INDEX) {      /* (1010) how loud the AP is, now */
++				uint32_t g3 = RXD_SIZE + ((vld & 8u) ? 16u : 0u) + ((vld & 1u) ? 16u : 0u) + ((vld & 2u) ? 8u : 0u);
++
++				if (g3 + 8u <= count) {
++					a34w_link_rssi_note(buf + g3);
++				}
++			}
+ 			if ((dw2 & (1u << 29)) != 0 && (dw2 & (1u << 13)) == 0 && at + 24u <= count) {
+ 				a34w_mgmt_in(buf + at, count - at, -128, (uint8_t)0);   /* a management frame here */
+ 			} else {
+@@ -3050,6 +3209,18 @@ a34w_drx_poll(uint32_t n)
+ 	return got;
+ }
+ 
++/* (1010) rings 4 and 5 (the token reports) are taken in by the thread and, when TX waits for a token, by the sender */
++static LCK_MTX_DECLARE(a34w_free_mtx, &a34w_grp);
++
++static void
++a34w_reclaim(void)
++{
++	lck_mtx_lock(&a34w_free_mtx);
++	(void)a34w_drx_poll(4);
++	(void)a34w_drx_poll(5);
++	lck_mtx_unlock(&a34w_free_mtx);
++}
++
+ /* RX rings 2..5 once; true if anything came */
+ static bool
+ a34w_data_poll(void)
+@@ -3059,9 +3230,12 @@ a34w_data_poll(void)
+ 	if (!a34w_data_rings) {
+ 		return false;
+ 	}
+-	for (uint32_t n = 2; n <= 5u; n++) {
+-		got += a34w_drx_poll(n);
+-	}
++	got += a34w_drx_poll(2);
++	got += a34w_drx_poll(3);
++	lck_mtx_lock(&a34w_free_mtx);
++	got += a34w_drx_poll(4);
++	got += a34w_drx_poll(5);
++	lck_mtx_unlock(&a34w_free_mtx);
+ 	return got != 0;
+ }
+ 
+@@ -3543,6 +3717,8 @@ a34w_connect(void)
+ 	bzero(c, sizeof(c));
+ 	c[0] = BSS_AIS;                                 /* CMD_PS_PROFILE: CAM */
+ 	(void)a34w_cmd(CMD_ID_POWER_SAVE_MODE, CMD_SET, c, 4);
++	a34w_ps_now = 0;
++	a34w_ps_at = tim != NULL && tim[1] >= 2u && tim[3] != 0 ? a34w_ms() + 15000u : 0;   /* (1010) */
+ 	bzero(c, sizeof(c));
+ 	a34w_put32(c, 0x0fu);                           /* CMD_RX_PACKET_FILTER: directed, multicast, all multicast, broadcast */
+ 	(void)a34w_cmd(CMD_ID_SET_RX_FILTER, CMD_SET, c, sizeof(c));
+@@ -3604,10 +3780,13 @@ a34w_join_now(void)
+ 	for (uint32_t scan = 1; scan <= 2u; scan++) {     /* (0967) both, always: one may miss a BSS's beacon */
+ 		(void)a34w_scan("step 8", true);
+ 	}
++	if (!a34w_target.found) {                       /* (1010) a hidden network answers a probe for its name */
++		(void)a34w_scan_for("step 8", true, a34w_net.ssid, a34w_net.ssid_length);
++	}
+ 	a34w_joining = false;
+ 	a34w_net_ssid(ssid);
+ 	if (!a34w_target.found) {
+-		a34w_say("step 8: \"%s\" NOT HEARD in two scans (a hidden network is not looked for)", ssid);
++		a34w_say("step 8: \"%s\" NOT HEARD in two scans and a probe for its name", ssid);
+ 		(void)a34w_bss_activate(false);
+ 		a34w_join_error = ENOENT;
+ 		return false;
+@@ -3679,14 +3858,28 @@ a34w_service(void)
+ 	}
+ 	for (uint32_t i = 0; i < 8u && a34w_data_poll(); i++) {
+ 	}
++	if (a34w_joined) {                              /* (1010) power save, when it is time or asked for */
++		int want = a34w_powersave >= 0 ? a34w_powersave : a34w_ps_at != 0 && a34w_ms() >= a34w_ps_at ? 2 : 0;
++
++		if (want != a34w_ps_now && want >= 0 && want <= 2) {
++			uint8_t ps[4] = { BSS_AIS, (uint8_t)want, 0, 0 };
++
++			if (a34w_cmd(CMD_ID_POWER_SAVE_MODE, CMD_SET, ps, sizeof(ps)) != 0) {
++				a34w_ps_now = want;
++				a34w_say("power save: %s", want == 0 ? "CAM (awake)" : want == 1 ? "MAX_PSP" : "FAST_PSP (dozes, awake on traffic)");
++			}
++		}
++	}
+ 	moved = a34w_data_frames_in + a34w_data_frames_out + a34w_data_dropped_in + a34w_data_dropped_out;
+ 	if (a34w_ms() - said_at >= 30000u && moved != said_moved) {
+ 		said_at = a34w_ms();
+ 		said_moved = moved;
+-		a34w_say("carried: %llu frames out (%llu bytes), %llu in (%llu bytes); dropped %llu out, %llu in; tokens back %u",
+-		    (unsigned long long)a34w_data_frames_out, (unsigned long long)a34w_data_bytes_out,
+-		    (unsigned long long)a34w_data_frames_in, (unsigned long long)a34w_data_bytes_in,
+-		    (unsigned long long)a34w_data_dropped_out, (unsigned long long)a34w_data_dropped_in, a34w_tokens_back);
++		a34w_say("carried: %llu frames out (%llu bytes), %llu in (%llu bytes); dropped %llu out (%llu no token, %llu ring "
++		    "full; %llu waited), %llu in; tokens back %u", (unsigned long long)a34w_data_frames_out,
++		    (unsigned long long)a34w_data_bytes_out, (unsigned long long)a34w_data_frames_in,
++		    (unsigned long long)a34w_data_bytes_in, (unsigned long long)a34w_data_dropped_out,
++		    (unsigned long long)a34w_drop_no_token, (unsigned long long)a34w_drop_ring_full,
++		    (unsigned long long)a34w_tx_waits, (unsigned long long)a34w_data_dropped_in, a34w_tokens_back);
+ 	}
+ }
+ 
+@@ -3767,6 +3960,8 @@ static struct a34_sta_bss a34w_results[SCAN_MOST];
+ static uint32_t a34w_result_count;
+ static int a34w_sta_scan, a34w_sta_leave, a34w_sta_join_asked;        /* asked (a34w_run_mtx) */
+ static struct a34_sta_join a34w_sta_join_what;
++static uint8_t a34w_sta_scan_ssid[32];          /* (1010) the name a scan was asked for with (a34w_run_mtx) */
++static uint32_t a34w_sta_scan_ssid_length;
+ static bool a34w_sta_off;                       /* iOS turned the radio off: no scans, no joins */
+ static bool a34w_sta_power_wait;                /* iOS asked for it on before the firmware was up */
+ static enum a34_sta_phase a34w_sta_phase_now = A34_STA_IDLE;
+@@ -3829,6 +4024,12 @@ a34_sta_switched_off(void)
+ 	return a34w_sta_off;
+ }
+ 
++static bool
++a34w_sta_off_now(void)
++{
++	return a34w_sta_off;
++}
++
+ bool
+ a34_sta_powered(void)
+ {
+@@ -3855,7 +4056,8 @@ a34_sta_state(struct a34_sta_state *state)
+ 		state->bss.ssid_length = (uint8_t)a34w_net.ssid_length;
+ 		memcpy(state->bss.bssid, a34w_target.bssid, 6);
+ 		state->bss.channel = a34w_target.channel;
+-		state->bss.rssi = a34w_target.rssi;
++		state->bss.rssi = (int16_t)(a34w_link_rssi_at != 0 && a34w_ms() - a34w_link_rssi_at < 30000u ? a34w_link_rssi :
++		    a34w_target.rssi);                  /* (1010) live while frames come */
+ 		state->bss.beacon_interval = a34w_target.beacon_interval;
+ 		state->bss.capability = a34w_target.capability;
+ 	}
+@@ -3878,9 +4080,16 @@ a34w_sta_queue(int *flag)
+ int
+ a34_sta_ask_scan(const uint8_t *ssid, uint32_t ssid_length)
+ {
+-	(void)ssid;                             /* (passive scans only: a hidden network is not asked for) */
+-	(void)ssid_length;
+-	return a34_sta_powered() ? a34w_sta_queue(&a34w_sta_scan) : ENETDOWN;
++	if (!a34_sta_powered()) {
++		return ENETDOWN;
++	}
++	lck_mtx_lock(&a34w_run_mtx);                    /* (1010) a name asked for: an active scan for it */
++	a34w_sta_scan_ssid_length = ssid != NULL && ssid_length <= 32u ? ssid_length : 0;
++	if (a34w_sta_scan_ssid_length != 0) {
++		memcpy(a34w_sta_scan_ssid, ssid, ssid_length);
++	}
++	lck_mtx_unlock(&a34w_run_mtx);
++	return a34w_sta_queue(&a34w_sta_scan);
+ }
+ 
+ int
+@@ -3957,10 +4166,17 @@ a34w_sta_do(bool leave, const struct a34_sta_join *join, bool scan)
+ 		a34_apple80211_event(A34_STA_JOIN_DONE, ok ? 0 : a34w_join_error != 0 ? a34w_join_error : EIO);
+ 	}
+ 	if (scan) {
++		uint8_t name[32];
++		uint32_t name_length;
+ 		bool ok;
+ 
++		lck_mtx_lock(&a34w_run_mtx);
++		name_length = a34w_sta_scan_ssid_length;
++		memcpy(name, a34w_sta_scan_ssid, sizeof(name));
++		a34w_sta_scan_ssid_length = 0;
++		lck_mtx_unlock(&a34w_run_mtx);
+ 		a34w_sta_phase_now = A34_STA_SCANNING;
+-		ok = a34w_scan("scan for iOS", a34w_joined);
++		ok = a34w_scan_for("scan for iOS", a34w_joined, name_length != 0 ? name : NULL, name_length);
+ 		a34w_sta_phase_now = A34_STA_IDLE;
+ 		a34_apple80211_event(A34_STA_SCAN_DONE, ok ? 0 : EIO);
+ 	}
+@@ -4020,6 +4236,10 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 					a34w_auto_rejoin_at = 0;        /* (0967) the join again, by itself */
+ 					a34w_rejoin = 2;                /* (0969) of the network last joined */
+ 				}
++				if (a34w_joined && a34w_roam_pending) {
++					a34w_roam_pending = false;      /* (1010) the move the AP asked for, which we took */
++					a34w_rejoin = 3;
++				}
+ 			} else {
+ 				lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
+ 			}
+@@ -4030,15 +4250,28 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 
+ 			a34w_rejoin = 0;
+ 			lck_mtx_unlock(&a34w_run_mtx);
+-			if (how == 2 && a34w_net.ssid_length != 0 && !a34w_sta_off) {
++			if (how == 3) {                 /* (1010) roam: leave, join again preferring the BSS asked for */
++				a34w_say("moving to %02x:%02x:%02x:%02x:%02x:%02x as the AP asked", a34w_roam_to[0], a34w_roam_to[1],
++				    a34w_roam_to[2], a34w_roam_to[3], a34w_roam_to[4], a34w_roam_to[5]);
++				a34w_unjoin(true);
++				a34w_roam_wanted = true;
++				if (!a34w_join_now()) {
++					a34w_auto_rejoins = 1;  /* (then as after any loss) */
++					a34w_auto_rejoin_at = a34w_ms() + a34w_rejoin_delay_ms(1);
++				}
++				a34w_roam_wanted = false;
++			} else if (how == 2 && a34w_net.ssid_length != 0 && !a34w_sta_off) {
+ 				(void)a34w_join_now();  /* (0969) the network last joined, whoever asked for it */
+ 			} else if (how != 2) {
+ 				(void)a34w_step8();     /* (0965) joined again: the interface's link follows */
+ 			}
+-			if (!a34w_joined && a34w_auto_rejoins != 0 && a34w_auto_rejoins < 5u) {
+-				a34w_auto_rejoins++;    /* (0967) by itself again in 10 s */
+-				a34w_auto_rejoin_at = a34w_ms() + 10000u;
+-				a34w_say("not joined: trying again in 10 s (%u of 5 this boot)", a34w_auto_rejoins);
++			if (!a34w_joined && a34w_auto_rejoins != 0 && !a34w_sta_off) {
++				a34w_auto_rejoins++;    /* (1010) by itself again, later each time, never giving up */
++				a34w_auto_rejoin_at = a34w_ms() + a34w_rejoin_delay_ms(a34w_auto_rejoins);
++				a34w_say("not joined: trying again in %u s (try %u)", a34w_rejoin_delay_ms(a34w_auto_rejoins) / 1000u,
++				    a34w_auto_rejoins);
++			} else if (a34w_joined) {
++				a34w_auto_rejoins = 0;
+ 			}
+ 			sweet_log_flush();
+ 			continue;
+@@ -4188,6 +4421,8 @@ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_bus
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_legacy, 0,
+     "(0968) 1: join as a legacy station (no HT, no WMM), as 0964 did");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, powersave, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_powersave, 0,
++    "(1010) -1 automatic (FAST_PSP 15 s after a join), 0 CAM, 1 MAX_PSP, 2 FAST_PSP");
+ SYSCTL_UINT(_kern_a34wifi, OID_AUTO, trace, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_trace_left, 0,
+     "(0967) frames either way still to be said in the log (48 at boot)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, phyaction, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_phyaction, 0,
+@@ -4277,6 +4512,7 @@ a34_wifi_init(void)
+ 
+ 	(void)PE_parse_boot_argn("a34wifiphy", &a34w_phyaction, sizeof(a34w_phyaction));       /* (0966) */
+ 	(void)PE_parse_boot_argn("a34wifilegacy", &a34w_legacy, sizeof(a34w_legacy));         /* (0968) */
++	(void)PE_parse_boot_argn("a34wifips", &a34w_powersave, sizeof(a34w_powersave));       /* (1010) */
+ 	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
+ 		return;
+ 	}
