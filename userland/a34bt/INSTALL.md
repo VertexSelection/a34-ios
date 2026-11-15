@@ -54,8 +54,8 @@ power, 3 conn_infra awake, 4 firmware copy, 5 BGF power, 6 BTIF, 7 driver own, 8
     A34 BT: in  8: 04 e4 05 02 06 01 00 00
     A34 BT: step 8: Bluetooth's function on: status 0
     A34 BT: out 4: 01 03 0c 00
-    A34 BT: in  7: 04 0e 04 01 03 0c 00                     <- HCI_Reset answered: milestone 1
-    A34 BT: step 9: controller: HCI 11 rev ..., manufacturer 0x0046
+    A34 BT: in  7: 04 0e 04 01 03 0c 00                     <- HCI_Reset answered (byte 4 may differ): milestone 1
+    A34 BT: step 9: controller: HCI .. rev ..., LMP .., manufacturer 0x0046 (MediaTek, expected)
     A34 BT: step 9: 6 of 6 HCI commands answered as a controller answers
     A34 BT: UP in N ms: ...
     a34bt: kernel: up: ...
