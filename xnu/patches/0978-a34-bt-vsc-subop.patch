@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 39c6faf..e9fb8bc 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -108,6 +108,14 @@
+  * lines ("the controller answers 0401 with status 0x4": HCI_Inquiry was taken, status 0, and ended with Inquiry
+  * Complete, status 0), and a proximity pairing advert that is not the first of Apple's data now gives its model.
+  *
++ * A34 (0978): the sub-opcode echoed. Boot 0977-120-a: "BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller",
++ * reason 3602 (a vendor-command stall). For 0xFCE9 (LE meta) bluetoothd's _BCM_SubOpcodeChecker (+0x126390) takes
++ * an answer as the pending command's only if its first byte after the status is that command's sub-opcode -- or if
++ * it has no bytes at all, which is why 0976's empty answers passed and 0977's zeros did not; the 0xFC2C (ADV buffer,
++ * match table) parsers check the same themselves ("AdvBufConfig sub-opcode incorrect"). Those two now echo the
++ * command's first parameter byte, as 0xFD1B's answer (0x51, its own parameter) always did. Also: an LE scan window
++ * over half its interval is cut to half (bluetoothd's 30/300 ms is not; this keeps the radio for Wi-Fi in any case).
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1619,6 +1627,8 @@ br_vsc(const uint8_t *cmd, uint32_t n)
+ 	ev[6] = 0;
+ 	if (op == 0xfd1b) {
+ 		ev[7] = 0x51;                                           /* BD_VSC_FACTORY_CAL_READ_TABLE (HackiOS) */
++	} else if ((op == 0xfce9 || op == 0xfc2c) && n > 4) {
++		ev[7] = sub;                                            /* (0978) the sub-opcode echoed */
+ 	}
+ 	if (said++ < 64) {
+ 		printf("A34 BT: br: vendor command %04x (%u bytes, first %02x) answered here, %u byte(s) of data\n", op, n - 4, sub,
+@@ -2006,6 +2016,25 @@ br_drain(void)
+ 				n = m;
+ 			}
+ 		}
++		if (pkt[0] == 0x01 && n >= 9 && ((pkt[1] == 0x0b && pkt[2] == 0x20) || (pkt[1] == 0x41 && pkt[2] == 0x20))) {
++			/* (0978) an LE scan window over half its interval cut to half: the radio is Wi-Fi's too */
++			uint32_t at = pkt[1] == 0x0b ? 5 : 8, end = n;
++
++			for (; at + 4 <= end; at += pkt[1] == 0x0b ? end : 5) {
++				uint32_t interval = (uint32_t)(pkt[at] | (pkt[at + 1] << 8));
++				uint32_t window = (uint32_t)(pkt[at + 2] | (pkt[at + 3] << 8));
++				static uint32_t said;
++
++				if (interval >= 8 && window > interval / 2) {
++					if (said++ < 4) {
++						printf("A34 BT: br: LE scan window %u of interval %u (x0.625 ms) cut to %u\n", window,
++						    interval, interval / 2);
++					}
++					pkt[at + 2] = (uint8_t)((interval / 2) & 0xff);
++					pkt[at + 3] = (uint8_t)((interval / 2) >> 8);
++				}
++			}
++		}
+ 		br_scan_command(pkt, n);                               /* (0975) scanning off around it, if need be */
+ 		br_dump("br>", pkt, n);
+ 		if (bt_btif_write(pkt, n) == 0 && pkt[0] == 0x01) {

@@ -226,6 +226,25 @@ rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned
 		case RWM_WORK_DRAW: {
 			int failed;
 
+			/*
+			 * A34, a measurement, boot-arg rwm_skiplub=1: CoreAnimation's luma boost (a pipeline labelled _Tlub)
+			 * not drawn. It is a full-screen pass over the drawable at the end of every frame -- 2.1-2.5 ms of
+			 * the GPU's ~7 in boot 1011-120-b, most of it the drawable read in and written out once more. What
+			 * the screen looks like without it, and what the GPU saves, is what the switch is for.
+			 */
+			static int skip_lub = -1;
+
+			if (skip_lub < 0) {
+				skip_lub = rwm_boot_arg("rwm_skiplub=1");
+			}
+			if (skip_lub) {
+				const char *label = rwm_label_of(w->pipeline);
+
+				if (label != nullptr && strstr(label, "_Tlub") != nullptr) {
+					rwm_perf.lub_skipped++;
+					break;
+				}
+			}
 			rwm_perf.draws++;
 			if (rwm_pass_draws_on) {
 				note_pass_draw(w);

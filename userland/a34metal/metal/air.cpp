@@ -68,6 +68,10 @@ load()
 	if (rwm_boot_arg("rwm_pushubo=0")) {
 		setenv("REDWOOD_PAN_PUSHUBO", "0", 1);
 	}
+	/* boot-arg rwm_fpk=rt0 (an experiment): forward pixel kill asks only colour attachment 0 to be written (Mesa 0024) */
+	if (rwm_boot_arg("rwm_fpk=rt0")) {
+		setenv("REDWOOD_PAN_FPK", "rt0", 1);
+	}
 	/* boot-arg rwm_actions=0: DontCare load and store actions treated as Load and Store, as before 16 November */
 	if (rwm_boot_arg("rwm_actions=0")) {
 		setenv("RWA_LOAD_STORE", "0", 1);

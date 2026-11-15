@@ -207,9 +207,10 @@ rwm_perf_report(uint64_t now)
 	snprintf(line, sizeof(line), "rwm frames in flight: %llu buffers begun while the GPU still drew the one committed before, "
 		 "%llu after it had finished (%llu of them within 1 ms of its end as the completion queue saw it, %.1f ms "
 		 "after it on average); handlers delivered: %llu scheduled, %llu completed; memoryless: %llu textures made, "
-		 "%llu attachments of passes", p.begun_overlapped,
+		 "%llu attachments of passes; luma-boost draws skipped (rwm_skiplub=1): %llu", p.begun_overlapped,
 		 p.begun_after_done, p.begun_soon, p.begun_gap_n ? p.begun_gap_ns / 1e6 / p.begun_gap_n : 0.0,
-		 p.scheduled_handlers, p.completed_handlers, p.memoryless_textures, p.memoryless_attachments);
+		 p.scheduled_handlers, p.completed_handlers, p.memoryless_textures, p.memoryless_attachments,
+		 p.lub_skipped);
 	say(line);
 
 	static void (*profile)(uint64_t *);
