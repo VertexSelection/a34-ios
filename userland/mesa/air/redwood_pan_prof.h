@@ -73,6 +73,19 @@ extern const char *redwood_pan_reason[RWP_REASONS];
 extern uint64_t redwood_pan_reason_count[RWP_REASONS];
 extern const char *redwood_pan_why;
 
+/*
+ * The Metal driver's passes (Mesa patch 0013, pan_job.c): whether a render batch drawing into
+ * these attachments (the first colour attachment and the depth/stencil one, by value; either may
+ * be NULL) is open, and submitting it. air_metal.c keeps a pass it leaves open for a few passes
+ * more, so that one going back into the same attachments joins it.
+ */
+struct pipe_context;
+struct pipe_surface;
+int redwood_pan_pass_open(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
+                          const struct pipe_surface *zs);
+int redwood_pan_pass_flush(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
+                           const struct pipe_surface *zs);
+
 static inline uint64_t
 rwp_now(void)
 {

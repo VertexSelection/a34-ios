@@ -603,6 +603,8 @@ static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, 
  * of work (since the last finish or rwa_flush_seq): each such pass is a second batch with a
  * preload of its own where one would have done, unless something in between read it */
 static uint64_t rwa_bind_returns, rwa_bind_span;
+/* passes that went back into a pass kept open and joined its batch (RWA_OPEN_PASSES) */
+static uint64_t rwa_bind_merges;
 /* draw_vbo on the processor (the thread's own time) against the clock: what of a draw's time
  * is work and what is the thread waiting to run */
 static uint64_t rwa_bind_vbo_wall_ns, rwa_bind_vbo_cpu_ns;
@@ -1804,13 +1806,13 @@ rwa_bind_profile(char *line, size_t size)
    uint64_t draws = rwa_bind_fresh_draws + rwa_bind_steady_draws;
    if (!draws || !line || !size)
       return 0;
-   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch "
-            "(%llu back into one left before); "
+   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes sent on a switch; "
+            "%llu back into one left before, %llu of them joined to it; "
             "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu), "
             "%llu%% of it on the processor; states set %llu, skipped %llu%s; "
             "constant buffers %llu, %llu of them copied",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
-            (unsigned long long)rwa_bind_returns,
+            (unsigned long long)rwa_bind_returns, (unsigned long long)rwa_bind_merges,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
             (unsigned long long)rwa_bind_fresh_draws,
             (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
@@ -1820,6 +1822,7 @@ rwa_bind_profile(char *line, size_t size)
             (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "",
             (unsigned long long)rwa_bind_ubos, (unsigned long long)rwa_bind_ubo_copies);
    rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
+   rwa_bind_merges = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
    rwa_bind_vbo_wall_ns = rwa_bind_vbo_cpu_ns = 0;
    rwa_bind_ubos = rwa_bind_ubo_copies = 0;
@@ -8217,29 +8220,86 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * the end of a pool's mapping (24 October, twice). The passes are sent in the order
     * CoreAnimation made them either way.
     */
-   static int flush_on_switch = -1;
+   /*
+    * ...and since 15 November not all of them: a pass that is left is kept open for the next
+    * RWA_OPEN_PASSES passes (3 unless set; the plug-in's rwm_passes=N), so that a pass going
+    * back into the same attachments joins it -- one batch, one preload, one write-back where
+    * there were two; 1204 of 4515 passes went back into one left before (boot 0980) -- and is
+    * sent off when it falls out of that window (redwood_pan_pass_flush, Mesa 0013). panfrost
+    * sends it earlier whenever another batch reads or writes what it draws (the order Metal
+    * requires is kept by that; a blur that samples the pass it returns to still splits it), and
+    * everything goes at the end of the command buffer. The GPU still has the passes before the
+    * window to draw while the processor records the rest. RWA_FLUSH_ON_SWITCH=all: every switch
+    * sends everything, as from 26 October to 15 November; =0: no switch sends anything.
+    */
+   static int flush_on_switch = -1;       /* 0 never, 1 everything, 2 the window */
+   static unsigned open_window = 3;
    if (flush_on_switch < 0) {
       /* on unless RWA_FLUSH_ON_SWITCH=0, since 26 October: a frame's passes kept until its end left
        * the GPU idle while the processor recorded them and the processor idle while the GPU drew,
        * 8 + 11 ms one after the other -- 28 frames a second (run 148) */
       const char *flag = getenv("RWA_FLUSH_ON_SWITCH");
-      flush_on_switch = flag == NULL || strcmp(flag, "0") != 0;
+      const char *window = getenv("RWA_OPEN_PASSES");
+      flush_on_switch = flag == NULL ? 2 : strcmp(flag, "0") == 0 ? 0 : strcmp(flag, "all") == 0 ? 1 : 2;
+      if (window != NULL && *window != '\0')
+         open_window = MIN2((unsigned)strtoul(window, NULL, 10), 15u);
    }
    if (flush_on_switch) {
       static struct pipe_surface *last_cbuf, *last_zs;
       static struct pipe_surface *left[16];
       static unsigned nleft;
       static uint64_t left_span;
+      /* the passes left and kept open, oldest first, by value (a texture may go meanwhile; its
+       * batch holds the resource, so no other can take its address while the batch is open) */
+      static struct { struct pipe_surface c, z; } open[16];
+      static unsigned nopen;
       if ((fb.nr_cbufs ? surf[0] : NULL) != last_cbuf || zsurf != last_zs) {
-         if (last_cbuf || last_zs) {
-            pipe->flush(pipe, NULL, 0);
-            rwa_bind_flushes++;
-         }
-         /* counted for the profile only: a pass back into colour attachments left before */
          if (left_span != rwa_bind_span) {
             nleft = 0;
+            nopen = 0;
             left_span = rwa_bind_span;
          }
+         if (flush_on_switch == 1 && (last_cbuf || last_zs)) {
+            pipe->flush(pipe, NULL, 0);
+            rwa_bind_flushes++;
+         } else if (flush_on_switch == 2) {
+            const struct pipe_surface *to_c = fb.nr_cbufs ? surf[0] : NULL;
+            /* going back into a pass kept open: joined, if panfrost still has it */
+            for (unsigned i = 0; i < nopen; i++) {
+               bool same_c = to_c ? pipe_surface_equal(&open[i].c, to_c) : !open[i].c.texture;
+               bool same_z = zsurf ? pipe_surface_equal(&open[i].z, zsurf) : !open[i].z.texture;
+               if (same_c && same_z) {
+                  if (redwood_pan_pass_open(pipe, open[i].c.texture ? &open[i].c : NULL,
+                                            open[i].z.texture ? &open[i].z : NULL))
+                     rwa_bind_merges++;
+                  memmove(&open[i], &open[i + 1], (nopen - i - 1) * sizeof(open[0]));
+                  nopen--;
+                  break;
+               }
+            }
+            /* the pass left joins the window; what falls out of it is sent */
+            if (last_cbuf || last_zs) {
+               if (nopen == ARRAY_SIZE(open)) {
+                  redwood_pan_pass_flush(pipe, open[0].c.texture ? &open[0].c : NULL,
+                                         open[0].z.texture ? &open[0].z : NULL);
+                  memmove(&open[0], &open[1], (nopen - 1) * sizeof(open[0]));
+                  nopen--;
+               }
+               memset(&open[nopen], 0, sizeof(open[0]));
+               if (last_cbuf)
+                  open[nopen].c = *last_cbuf;
+               if (last_zs)
+                  open[nopen].z = *last_zs;
+               nopen++;
+            }
+            while (nopen > open_window) {
+               rwa_bind_flushes += redwood_pan_pass_flush(pipe, open[0].c.texture ? &open[0].c : NULL,
+                                                          open[0].z.texture ? &open[0].z : NULL);
+               memmove(&open[0], &open[1], (nopen - 1) * sizeof(open[0]));
+               nopen--;
+            }
+         }
+         /* counted for the profile only: a pass back into colour attachments left before */
          for (unsigned i = 0; fb.nr_cbufs && surf[0] && i < nleft; i++) {
             if (left[i] == surf[0]) {
                rwa_bind_returns++;

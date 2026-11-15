@@ -1,0 +1,83 @@
+Darwin: the Metal driver's passes -- whether one is open, and sending one off alone.
+
+A34 (local to this port; nothing here goes upstream). Two functions for air_metal.c, declared in
+src/compiler/air/redwood_pan_prof.h (userland/mesa/air): redwood_pan_pass_open, whether a render
+batch drawing into the given attachments (the first colour attachment and the depth/stencil one,
+by value) is open, and redwood_pan_pass_flush, submitting it and nothing else.
+
+The Metal driver sent every batch off at each switch to other attachments (pipe->flush), which
+split each pass that CoreAnimation goes back into into two batches, each with its preload and its
+write-back (1204 of 4515 passes in boot 0980). It now keeps a pass it leaves open for a few
+passes more and sends it alone when it falls out of that window; panfrost's own tracking still
+sends it at once when another batch reads or writes what it draws.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -958,6 +958,67 @@
+       u_trace_context_process(&ctx->trace_context, false);
+ }
+ 
++/*
++ * A34 (patch 0013): the Metal driver's pass switches (air_metal.c). A render pass that is left
++ * is no longer sent off at once with everything else (pipe->flush): its batch is kept open for
++ * a few passes more, so that a pass going back into the same attachments joins it -- one batch,
++ * one preload and one write-back where there were two -- and it is sent when it falls out of
++ * that window, when another batch reads or writes what it draws (panfrost_batch_update_access),
++ * or at the command buffer's end. A pass is its first colour attachment and its depth/stencil
++ * attachment, by value.
++ */
++static bool
++redwood_pan_batch_is_pass(const struct panfrost_batch *batch, const struct pipe_surface *cbuf0,
++                          const struct pipe_surface *zs)
++{
++   if (!batch->seqnum)
++      return false;
++
++   const struct pipe_surface *c =
++      batch->key.nr_cbufs > 0 && batch->key.cbufs[0].texture ? &batch->key.cbufs[0] : NULL;
++   const struct pipe_surface *z = batch->key.zsbuf.texture ? &batch->key.zsbuf : NULL;
++
++   if (cbuf0 && !cbuf0->texture)
++      cbuf0 = NULL;
++   if (zs && !zs->texture)
++      zs = NULL;
++   if (!c != !cbuf0 || !z != !zs)
++      return false;
++   return (!c || pipe_surface_equal(c, cbuf0)) && (!z || pipe_surface_equal(z, zs));
++}
++
++int
++redwood_pan_pass_open(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
++                      const struct pipe_surface *zs)
++{
++   struct panfrost_context *ctx = pan_context(pctx);
++
++   for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
++      if (redwood_pan_batch_is_pass(&ctx->batches.slots[i], cbuf0, zs))
++         return 1;
++   }
++   return 0;
++}
++
++int
++redwood_pan_pass_flush(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
++                       const struct pipe_surface *zs)
++{
++   struct panfrost_context *ctx = pan_context(pctx);
++   const char *rwp_why = redwood_pan_why;
++   int sent = 0;
++
++   redwood_pan_why = "a pass left (Metal driver)";
++   for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
++      if (redwood_pan_batch_is_pass(&ctx->batches.slots[i], cbuf0, zs)) {
++         panfrost_batch_submit(ctx, &ctx->batches.slots[i]);
++         sent++;
++      }
++   }
++   redwood_pan_why = rwp_why;
++   return sent;
++}
++
+ void
+ panfrost_flush_writer(struct panfrost_context *ctx,
+                       struct panfrost_resource *rsrc, const char *reason)
