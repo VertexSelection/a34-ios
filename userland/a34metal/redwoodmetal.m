@@ -4215,7 +4215,7 @@ rw_core_of(id texture)
 	RedwoodMetalRenderPipeline *p = state;
 
 	rwm_render_set_pipeline(&_state, p, [p render], [p vertexStreamMask], [p vertexStreamCount], [p writesDepth]);
-	if (rwm_blurdump_on() || rwm_framedump_on()) {  /* (metal-fx) which draws rwm_blurdump/rwm_framedump probe */
+	if (rwm_blurdump_on() || rwm_framedump_on() || rwm_scene_on()) {  /* (metal-fx) which draws the probes follow */
 		rwm_render_set_label(&_state, [[p label] UTF8String]);
 	}
 }

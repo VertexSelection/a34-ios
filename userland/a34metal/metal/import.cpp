@@ -132,6 +132,20 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 	}
 	texture = in_place(context, device, s, plane, &shape, road, why, why_size);
 	tell_kind(s, plane, shape, texture != nullptr, why);
+	/* (metal-fx) rwm_scene: every surface of 600 pixels or wider a texture is made over, the first 80: its number,
+	 * size, format and usage, and whether it is laid in place (else the reason, and the roads below) */
+	if (rwm_scene_on() && IOSurfaceGetWidthOfPlane(s, plane) >= 600) {
+		static unsigned scene_said;
+
+		if (scene_said++ < 80) {
+			const uint32_t fourcc = IOSurfaceGetPixelFormat(s);
+
+			rwm_print("scene: import surface %u '%c%c%c%c' %zux%zu plane %u, format %u, usage %#x: %s\n",
+				  IOSurfaceGetID(s), (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8),
+				  (char)fourcc, IOSurfaceGetWidthOfPlane(s, plane), IOSurfaceGetHeightOfPlane(s, plane), plane,
+				  shape.pixel_format, shape.usage, texture != nullptr ? "in place" : why);
+		}
+	}
 	if (texture == nullptr && shape.pixel_format == 500) {
 		static int said500;
 

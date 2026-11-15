@@ -1,0 +1,69 @@
+Darwin: no "overdraw alpha" flags on a Metal process's draws (panvk's choice with a shader).
+
+A34 (local to this port). panfrost_overdraw_alpha() tells the GPU, per draw, that "alpha 1 is a
+full overdraw" and "alpha 0 is no overdraw". Its test reads `!info.enabled`: it looks only at the
+render targets a draw does NOT write, so any draw that writes all of its targets gets both flags,
+whatever its blend -- a replacing draw, an additive one, a programmable blend's -- although an
+alpha of 0 still writes there. CoreAnimation draws exactly those: it clears regions of its second
+attachment with a replacing draw of transparent black, and its vibrancy adds light with
+premultiplied colours whose alpha is 0. panvk sets neither flag on a draw with a fragment shader.
+
+In a process that draws through Metal (redwood_pan_metal) neither flag is set.
+REDWOOD_PAN_OVERDRAW=upstream (the plug-in's rwm_overdraw=upstream) keeps the test as it is;
+=fixed asks it of the targets a draw writes, as its comment says. A process that only uses
+OpenGL ES keeps panfrost as upstream.
+
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.h
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.h
+@@ -21,6 +21,10 @@
+ #include "pipe/p_state.h"
+ 
+ #include "util/u_prim.h"
++#ifdef __APPLE__
++#include <stdlib.h>
++#include <string.h>
++#endif
+ 
+ #define PAN_GPU_SUPPORTS_DISPATCH_INDIRECT (PAN_ARCH >= 6)
+ #define PAN_GPU_SUPPORTS_DRAW_INDIRECT     (PAN_ARCH >= 10)
+@@ -119,6 +123,40 @@
+ {
+    const struct panfrost_blend_state *so = ctx->blend;
+ 
++#ifdef __APPLE__
++   /* A34 (patch 0015): in a process that draws through Metal, neither flag by default --
++    * what panvk sets for every draw with a fragment shader. The test below reads
++    * `!info.enabled`, so it looks only at render targets with no colour written and
++    * says yes for any draw that writes them all: "alpha 0 is no overdraw" for a
++    * replacing draw, an additive one, a programmable blend's, where an alpha of 0 still
++    * writes (CoreAnimation clears regions of its second attachment that way, and adds
++    * light with premultiplied colours whose alpha is 0). REDWOOD_PAN_OVERDRAW=upstream
++    * keeps the test as it is; =fixed asks it of the targets that ARE written, as the
++    * comment above says. Read once. */
++   {
++      extern bool redwood_pan_metal;
++      static int mode = -1;   /* 0 neither flag, 1 upstream, 2 fixed */
++
++      if (mode < 0) {
++         const char *e = getenv("REDWOOD_PAN_OVERDRAW");
++
++         mode = e != NULL && strcmp(e, "upstream") == 0 ? 1 : e != NULL && strcmp(e, "fixed") == 0 ? 2 : 0;
++      }
++      if (redwood_pan_metal && mode == 0)
++         return false;
++      if (redwood_pan_metal && mode == 2) {
++         for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
++            const struct pan_blend_info info = so->info[i];
++            bool written = ctx->pipe_framebuffer.cbufs[i].texture && info.enabled;
++
++            if (written && !(zero ? info.alpha_zero_nop : info.alpha_one_store))
++               return false;
++         }
++         return true;
++      }
++   }
++#endif
++
+    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
+       const struct pan_blend_info info = so->info[i];
+ 

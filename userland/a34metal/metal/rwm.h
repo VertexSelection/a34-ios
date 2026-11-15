@@ -201,6 +201,9 @@ bool rwm_texture_read_depth(struct rwm_texture *texture, const unsigned origin[3
 			    float *depth, uint8_t *stencil);
 /* the surface a texture laid over its memory lies over (src/metal/import.cpp), drawn in place; 0: none */
 uint32_t rwm_texture_in_place(const struct rwm_texture *texture);
+/* (metal-fx, rwm_scene) the surface a texture shows: laid over it (its number), copied in from it (its number with
+ * bit 31 set), or 0 */
+uint32_t rwm_texture_scene_id(const struct rwm_texture *texture);
 void rwm_texture_set_in_place(struct rwm_texture *texture, uint32_t surface);
 int rwm_texture_sync_surface(struct rwm_texture *texture, char *why, size_t why_size);
 
@@ -267,6 +270,8 @@ struct rwm_draw {
 	float clear_colors[8][4];
 	char probe[64];                            /* (metal-fx) rwm_blurdump: the pipeline, when one to probe */
 	char label[64];                            /* (metal-fx) rwm_framedump: every pipeline's */
+	unsigned color_surface[8];                 /* (metal-fx, rwm_scene) the surface each attachment lies over, 0: none */
+	unsigned texture_surface[RWM_MAX_BUFFERS]; /* (metal-fx, rwm_scene) ... and each texture read */
 	const float *clear_color;       /* NULL: kept, not cleared */
 	struct rwa_texture *depth;
 	const float *clear_depth;
@@ -423,6 +428,9 @@ void rwm_render_begin(struct rwm_render_state *state, struct rwa_device *device)
  * material's: downsample, narrow blur, variable blur, colour matrix, vibrant, or a plus-darker/-lighter blend) */
 bool rwm_blurdump_on(void);
 bool rwm_framedump_on(void);           /* (metal-fx) rwm_framedump=N */
+bool rwm_scene_on(void);               /* (metal-fx) rwm_scene=N: what is drawn, and whether it draws anything */
+void rwm_scene_copy(struct rwa_texture *from, unsigned from_level, struct rwa_texture *to, unsigned to_level,
+		    const unsigned size[3]);
 void rwm_blurdump_used(void);           /* (one of the N taken by something else: a copy) */
 void rwm_render_set_label(struct rwm_render_state *state, const char *label);
 void rwm_render_color(struct rwm_render_state *state, unsigned index, void *object, struct rwm_texture *core,

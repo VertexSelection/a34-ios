@@ -197,6 +197,28 @@ device for three things this driver did not do. QuartzCore's own selectors list 
 - **`rwm_pandebug=FLAGS`**: Mesa's `PAN_MESA_DEBUG` for the driver's screen (`sync`: every GPU
   job waited for; `nocrc`, `noafbc`, `linear`). The first test: `rwm_pandebug=sync` shows whether
   the blur's black is a read of a texture before the GPU wrote it.
+- **No "overdraw alpha" flags (Mesa patch 0015).** After the blur (c455f8c), what stays missing is
+  what CoreAnimation draws with an alpha of 0 that still has to land: the vibrant glyphs of Control
+  Center and of the edit mode (light added with premultiplied colours whose alpha is 0), and the
+  regions of its second attachment it clears with a replacing draw of transparent black (the white
+  squares behind the widgets). panfrost tells the GPU, per draw, "alpha 0 is no overdraw" and
+  "alpha 1 is a full overdraw", and its test reads `!info.enabled`: it looks only at the targets a
+  draw does not write, so every draw that writes all of its targets gets both flags, whatever its
+  blend. panvk sets neither on a draw with a fragment shader; in a Metal process neither is set now.
+  Boot-arg `rwm_overdraw=upstream`: as upstream; `rwm_overdraw=fixed`: the test asked of the targets
+  a draw writes.
+- **`rwm_scene=N`**: N windows of 5 s (lines `scene`): every pipeline drawn with and how often; for
+  the first two draws a window of each pipeline that clips (`Ccl`), draws into the second attachment
+  (`A2S1`), reads an attachment (`M0`, `M1`), blends other than source-over (`Badd`, `Bpld`, `Bcbn`,
+  `Bvcm`, `Bdin`, `Bdot`, `Bdov`, `Bdso`), samples one channel (`Ired`, `Igrn`, `Ialp`), clears
+  (`Tatc`) or is a small-radius blur step (`_Tvr`, `_Tsb`, `_Tbds`, `_Tdb`, `_Tups`, `_Thom`,
+  `_Tnb`), at most 400: its target over its scissor before and after (o/z, mean B G R A, how many of
+  16 texels changed), the second attachment there for a draw that reads it, and the textures it
+  reads (`surface N`: laid over IOSurface N; `copied N`: copied in from it). Also, once a window,
+  each surface 600 pixels or wider read or drawn into and what it holds; every such surface a
+  texture is made over (`scene: import surface N ...`, 80); the first 60 copy-ins with how many of
+  16 texels are not zero (a glyph's 'LA08'); the first 60 copies 600 pixels or wider. The probes wait
+  for the GPU, so the draws probed run as passes of their own.
 - **`rwm_caps=1`**: every capability question CoreAnimation or Metal asks of the device
   (`supports*`, `max*`, `min*`, `readWrite*`, `are*`, `is*`, `has*`, ... with integer or pointer
   arguments) with our answer, once each, and every `new*` of the device that answers nil, with

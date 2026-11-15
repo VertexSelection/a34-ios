@@ -339,6 +339,35 @@ rwm_texture_copy_in(struct rwm_texture *texture, size_t *bytes, char *why, size_
 		return -1;
 	}
 	texture->source_seed = seed;
+
+	/* (metal-fx) rwm_scene: what was copied in -- of sixteen texels on a 4 x 4 grid, how many are not all zero and
+	 * the largest last byte (an LA08's alpha, a BGRA's) -- the first 60 copies: whether a glyph's surface held
+	 * anything when it was read */
+	static unsigned scene_said;
+	const size_t texel = texture->source_two_planes ? 4 : texel_bytes(texture->shape.pixel_format);
+
+	if (rwm_scene_on() && scene_said < 60 && texel != 0) {
+		const uint32_t fourcc = IOSurfaceGetPixelFormat(texture->source);
+		unsigned lit = 0, top = 0;
+
+		scene_said++;
+		for (unsigned gy = 0; gy < 4; gy++) {
+			for (unsigned gx = 0; gx < 4; gx++) {
+				const unsigned x = (2 * gx + 1) * width / 8, y = (2 * gy + 1) * height / 8;
+				const uint8_t *p = (const uint8_t *)texels + (size_t)y * row + (size_t)x * texel;
+				bool any = false;
+
+				for (size_t c = 0; c < texel; c++) {
+					any = any || p[c] != 0;
+				}
+				lit += any;
+				top = p[texel - 1] > top ? p[texel - 1] : top;
+			}
+		}
+		rwm_print("scene: copy-in surface %u '%c%c%c%c' %ux%u seed %u: %u of 16 texels not zero, last byte up to "
+			  "%02x\n", IOSurfaceGetID(texture->source), (char)(fourcc >> 24), (char)(fourcc >> 16),
+			  (char)(fourcc >> 8), (char)fourcc, width, height, seed, lit, top);
+	}
 	return 0;
 }
 
@@ -422,6 +451,15 @@ extern "C" uint32_t
 rwm_texture_in_place(const struct rwm_texture *texture)
 {
 	return texture->in_place;
+}
+
+extern "C" uint32_t
+rwm_texture_scene_id(const struct rwm_texture *texture)
+{
+	if (texture->in_place != 0) {
+		return texture->in_place;
+	}
+	return texture->source != nullptr ? (IOSurfaceGetID(texture->source) | 0x80000000u) : 0;
 }
 
 extern "C" void

@@ -86,6 +86,14 @@ load()
 			}
 		}
 	}
+	/* (metal-fx) boot-arg rwm_overdraw=upstream|fixed: panfrost's "overdraw alpha" flags as upstream sets them
+	 * (any draw that writes all its targets gets both, its blend unread) or asked of the targets a draw writes.
+	 * Without it, Mesa patch 0015 sets neither in this process, as panvk does for a draw with a shader. */
+	if (rwm_boot_arg("rwm_overdraw=upstream")) {
+		setenv("REDWOOD_PAN_OVERDRAW", "upstream", 1);
+	} else if (rwm_boot_arg("rwm_overdraw=fixed")) {
+		setenv("REDWOOD_PAN_OVERDRAW", "fixed", 1);
+	}
 	struct rwm_air &c = calls;
 	const Call table[] = {
 		call("rwa_device_open", &c.device_open, true),

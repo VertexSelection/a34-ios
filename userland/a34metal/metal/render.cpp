@@ -113,7 +113,7 @@ rwm_render_set_label(struct rwm_render_state *s, const char *label)
 
 	s->probe[0] = '\0';
 	s->label[0] = '\0';
-	if (label != nullptr && rwm_framedump_on()) {
+	if (label != nullptr && (rwm_framedump_on() || rwm_scene_on())) {
 		const char *at = strstr(label, "coreanimation.");
 
 		snprintf(s->label, sizeof(s->label), "%s", at != nullptr ? at + 14 : label);
@@ -395,6 +395,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 		d->color[i] = mesa_of(s->color[i].core);
 		d->color_level[i] = s->color_level[i];
 		d->color_slice[i] = s->color_slice[i];
+		d->color_surface[i] = s->color[i].core != nullptr ? rwm_texture_in_place(s->color[i].core) : 0;
 	}
 	d->color_levels = levels_on();
 	memcpy(d->probe, s->probe, sizeof(d->probe));
@@ -438,6 +439,7 @@ rwm_render_draw(struct rwm_render_state *s, const struct rwm_draw_call *call, st
 		struct rwm_texture *core = s->textures[i].core;
 
 		d->textures[i] = mesa_of(core);
+		d->texture_surface[i] = core != nullptr ? rwm_texture_scene_id(core) : 0;
 		if (core != nullptr) {
 			w->copy_in[w->copy_in_count++] = core;
 			if (rwm_texture_in_place(core) != 0) {
