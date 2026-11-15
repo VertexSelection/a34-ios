@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..84a2cac
+index 0000000..4ff7340
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1527 @@
+@@ -0,0 +1,1545 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -351,6 +351,22 @@ index 0000000..84a2cac
 +		set_region(6, ap + (2u << 20), md + (2u << 20), s - (2u << 20));
 +	} else {
 +		rg[1].size = rg[2].size = rg[3].size = rg[5].size = rg[6].size = 0;
++	}
++	/*
++	 * Then Android's port_smem.c collect_ccb_info (run at port init, after the above): each
++	 * CCB user gets the size of its entries in ccb_configs[] (DL + UL buffers, 4 KiB aligned),
++	 * packed from CCB_DHL's base: DHL 0x70000, MD_MONITOR 0x8000, META 0x104000. The modem's
++	 * CCB buffer manager (ccci_shm_bm) checks this layout (CCB_SHARE_MEMORY's total, 0x17c000).
++	 */
++	{
++		static const uint32_t ccb_sz[3] = { 0x70000, 0x8000, 0x104000 };
++		uint64_t ap = rg[1].ap;
++		uint32_t md = rg[1].md;
++		for (int k = 0; k < 3; k++) {
++			set_region(1 + k, ap, md, ccb_sz[k]);
++			ap += ccb_sz[k];
++			md += ccb_sz[k];
++		}
 +	}
 +	for (int id = 0; id < NREG; id++)
 +		if (rg[id].size)
@@ -1311,10 +1327,12 @@ index 0000000..84a2cac
 +	w->off += 8 + len;
 +}
 +
++/* {MD view, size} of a region; as Android, the address of a table region is sent even when
++ * its size is 0 (MD_DRDI, ...); a region in no table gives {0, 0}. */
 +static void
 +share(uint32_t out[2], int id)
 +{
-+	out[0] = rg[id].size ? rg[id].md : 0;
++	out[0] = rg[id].md;
 +	out[1] = rg[id].size;
 +}
 +
