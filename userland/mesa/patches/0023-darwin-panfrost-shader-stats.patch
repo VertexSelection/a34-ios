@@ -1,0 +1,63 @@
+Darwin: a shader CSO's compiled statistics as text, for the Metal driver's profile.
+
+A34 (local to this port; nothing here goes upstream). Panfrost prints shader-db statistics only to
+stderr (BIFROST_MESA_DEBUG=shaderdb), which backboardd does not show, and only when it compiles --
+not for a variant from the disk cache. The statistics are kept in every variant's info, the disk
+cache's included, so redwood_pan_shader_stats(cso, buf, size) formats the first variant's
+(pan_stats_fprintf: instructions, cycles by unit, registers and threads, spills) as one line;
+air_metal.c hands it out as rwa_render_stats, and the plug-in prints it for each pipeline its
+traced passes ran ("rwm pipeline <label>: ...").
+
+--- a/src/gallium/drivers/panfrost/pan_shader.c
++++ b/src/gallium/drivers/panfrost/pan_shader.c
+@@ -23,6 +23,8 @@
+ #include "pan_nir.h"
+ #include "pan_trace.h"
+ #include "compiler/bifrost/bifrost_compile.h"
++#include <stdio.h>
++#include "compiler/air/redwood_pan_prof.h"
+ #include "panfrost/compiler/midgard/midgard_quirks.h"
+ #include "shader_enums.h"
+ #include "util/os_time.h"
+@@ -667,6 +669,41 @@
+    return so;
+ }
+ 
++/*
++ * A34 (patch 0023): a shader CSO's compiled statistics -- its first variant's, as the compiler
++ * gathered them (instructions, cycles by unit, registers and threads, spills) -- as one line of
++ * text, for the Metal driver's profile (air_metal.c, rwa_render_stats). They are kept in the
++ * variant's info, the disk cache's included, so a pipeline from the cache has them too. 1 when
++ * there was a variant to describe.
++ */
++int
++redwood_pan_shader_stats(void *cso, char *buf, size_t size)
++{
++   struct panfrost_uncompiled_shader *so = cso;
++   int found = 0;
++
++   if (!so || !buf || size < 2)
++      return 0;
++   buf[0] = '\0';
++   simple_mtx_lock(&so->lock);
++   if (util_dynarray_num_elements(&so->variants, struct panfrost_compiled_shader)) {
++      struct panfrost_compiled_shader *v = util_dynarray_begin(&so->variants);
++      FILE *f = fmemopen(buf, size - 1, "w");
++
++      if (f) {
++         pan_stats_fprintf(f, mesa_shader_stage_name(so->nir->info.stage), &v->info.stats);
++         fclose(f);
++         buf[size - 1] = '\0';
++         size_t n = strlen(buf);
++         while (n && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
++            buf[--n] = '\0';
++         found = 1;
++      }
++   }
++   simple_mtx_unlock(&so->lock);
++   return found;
++}
++
+ static void
+ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
+ {

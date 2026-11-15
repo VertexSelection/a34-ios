@@ -270,6 +270,33 @@ rwm_perf_report(uint64_t now)
 		}
 		say(wide);
 	}
+	/* ... and each pipeline's fragment shader as compiled, once a boot each (by label) */
+	{
+		static char said[160][48];
+		static unsigned nsaid;
+
+		for (unsigned k = 0; !rwm_pass_draws_on && k < rwm_pass_draws_n; k++) {
+			const struct rwm_pass_draws *d = &rwm_pass_draws[k];
+
+			for (unsigned i = 0; i < d->nshaders; i++) {
+				unsigned j;
+
+				if (d->shaders[i].stats[0] == '\0') {
+					continue;
+				}
+				for (j = 0; j < nsaid && strcmp(said[j], d->shaders[i].label) != 0; j++) {
+				}
+				if (j < nsaid || nsaid == 160) {
+					continue;
+				}
+				snprintf(said[nsaid++], sizeof(said[0]), "%s", d->shaders[i].label);
+				char wide[400];
+
+				snprintf(wide, sizeof(wide), "rwm pipeline %s: %s", d->shaders[i].label, d->shaders[i].stats);
+				say(wide);
+			}
+		}
+	}
 	rwm_pass_draws_n = 0;
 	rwm_pass_draws_on = true;
 	for (unsigned which = 0; pan != nullptr && which < 47; which++) {    /* (4: tiles; 5: one span's jobs; 6 and on: its passes) */

@@ -8083,6 +8083,16 @@ fail:
    return NULL;
 }
 
+int
+rwa_render_stats(struct rwa_render *render, char *line, size_t size)
+{
+   RWA_GUARD();
+   if (!render || !line || !size)
+      return 0;
+   line[0] = '\0';
+   return render->fs_cso ? redwood_pan_shader_stats(render->fs_cso, line, size) : 0;
+}
+
 void
 rwa_render_destroy(struct rwa_render *render)
 {

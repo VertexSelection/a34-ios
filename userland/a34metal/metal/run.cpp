@@ -140,7 +140,13 @@ note_pass_draw(const struct rwm_work *w)
 	for (k = 0; k < p->nshaders && strncmp(p->shaders[k].label, label, sizeof(p->shaders[k].label) - 1) != 0; k++) {
 	}
 	if (k == p->nshaders && p->nshaders < RWM_PASS_SHADERS) {
+		const struct rwm_air *air = rwm_air();
+
 		snprintf(p->shaders[k].label, sizeof(p->shaders[k].label), "%s", label);
+		p->shaders[k].stats[0] = '\0';
+		if (air->render_stats != nullptr && d->render != nullptr) {
+			air->render_stats(d->render, p->shaders[k].stats, sizeof(p->shaders[k].stats));
+		}
 		p->nshaders++;
 	}
 	if (k < p->nshaders) {

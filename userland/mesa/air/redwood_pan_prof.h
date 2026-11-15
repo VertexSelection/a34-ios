@@ -14,6 +14,7 @@
 #define REDWOOD_PAN_PROF_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "util/os_time.h"
@@ -152,6 +153,8 @@ int redwood_pan_pass_flush(struct pipe_context *pctx, const struct pipe_surface 
  */
 struct pipe_resource;
 void redwood_pan_forget(struct pipe_resource *res, unsigned level);
+/* (patch 0023) a shader CSO's compiled statistics as one line (its first variant's); 1 if any */
+int redwood_pan_shader_stats(void *cso, char *buf, size_t size);
 int redwood_pan_pass_discard(struct pipe_context *pctx, const struct pipe_surface *cbuf0,
                              const struct pipe_surface *zs, unsigned color_mask, unsigned zs_mask);
 
