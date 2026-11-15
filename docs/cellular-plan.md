@@ -286,6 +286,15 @@ gives it garbage. The ADC level table (0x916d48b8, 11 bins up to 1.5 V) puts our
 the same bin as Android's, so the DRDI set is the same. Next: the DRDI memory the modem used is
 compared, once given back, with md1drdi from the md1img partition; RF pin modes logged.
 
+Eleventh run (`1013-cell3-trace`, log build/logs/1013-cell3-trace-a): the DRDI region is mostly
+zeros once given back (the modem or ATF clears it), so that check says nothing about what the
+modem copied. RF pin modes GPIO 66-97 are as the preloader leaves them (MIPI_M, MIPI0, MIPI1 and
+some BPI lines in mode 1; the live Android tree uses some of the others, 76, 90, 96, 97, as AP
+GPIOs; no AP-side pinctrl for the rest), the same as under Android. With the user's approval the
+modem's own boot-trace text (masked) is logged: it is its NVRAM layer's trace; the 48 KiB cap
+was used by file-operation lines, the first other lines being NVRAM init and a "default value"
+failure. Next: file-operation lines skipped, 128 KiB.
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
