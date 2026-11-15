@@ -1,0 +1,204 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index f8681db..abfba9a 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -112,6 +112,7 @@ void a34_clocks_init(void);             /* bsd/dev/sweet_ufs.c, at boot */
+ bool a34_clocks_gpu_wanted(void);       /* bsd/dev/a34_mali.c */
+ bool a34_clocks_gpu_raise(void);
+ void a34_clocks_gpu_restore(void);
++void a34_battery_report(void);          /* A34 (0929): bsd/dev/a34_diag.c's heartbeat */
+ 
+ /* ---- where things are ---- */
+ 
+@@ -974,6 +975,149 @@ ck_gpu_report(const char *when)
+ 	    ruby_rd32(ck_gpupll, GPU_FHCTL_HP_EN), ruby_rd32(ck_gpupll, GPU_FHCTL0_CFG));
+ }
+ 
++/* ---- the battery (A34 0929) ---- */
++
++/*
++ * Read only, but for the AUXADC's request; nothing of the charger is
++ * written. MT6359P registers (MediaTek's upmu_hw.h for the MT6359P, GPL;
++ * Linux's drivers/iio/adc/mt6359-auxadc.c):
++ *   BATADC, AUXADC channel 0: bit 0 of AUXADC_RQST0 (0x1108) asks for a
++ *     conversion, AUXADC_ADC0 (0x1088) [14:0] is the result, [15] ready;
++ *     128 samples averaged, 15 bits of 1.8 V over the battery's 7/2 divider
++ *     (the phone's device tree, pmic-auxadc batadc resistance-ratio):
++ *     mV = counts x 6300 / 32768. The request is taken back after it, as
++ *     Linux does. Without a request the register keeps the last
++ *     conversion anybody made (the boot line says that one too).
++ *   CHR_CON0 (0xa88): [0] RGS_CHRDET, the PMIC's charger (VBUS) detection,
++ *     [1] AD_CHRDETB. The charger is the MT6360 on I2C (Android's log), not
++ *     read here and not set: what it does it does on its own.
++ *   RTC_AL_MTH (0x5aa) [14:8]: the percentage MediaTek's gauge keeps in the
++ *     PMIC's RTC for its next start (mt6359p-rtc nvmem cell "fg-soc" of the
++ *     device tree; Android's log: "rtc_ui_soc 6400"), [15] kept by it;
++ *     RTC_AL_HOU (0x5a4) [15:8] its "fg-init" cell. Left by the last
++ *     Android or TWRP run: stale here, nothing counts since.
++ * Not read: the fuel gauge's current. Its latch (FGADC_CON1, 0xd0a) shares
++ * the register with the reset bits of Android's charge counters
++ * (FG_CHARGE_RST, FG_TIME_RST, ...): no read-modify-write there for a
++ * number the voltage's trend gives roughly.
++ */
++#define BAT_RTC_AL_HOU          0x05a4u
++#define BAT_RTC_AL_MTH          0x05aau
++#define BAT_CHR_CON0            0x0a88u
++#define BAT_CHRDET              0x0001u
++#define BAT_AUXADC_ADC0         0x1088u
++#define BAT_AUXADC_RQST0        0x1108u
++#define BAT_RDY                 0x8000u
++#define BAT_COUNTS              0x7fffu
++#define BAT_MV_MIN              2500u   /* outside: not a cell's voltage, no reading */
++#define BAT_MV_MAX              4800u
++#define BAT_LOW_BOOT_MV         3500u   /* below at boot: no a34cpuopp, no a34gpumhz */
++#define BAT_LOW_RUN_MV          3450u   /* below: a warning every heartbeat */
++
++static LCK_MTX_DECLARE(ck_bat_mtx, &a34_pmic_grp);     /* one conversion at a time */
++static uint32_t ck_bat_on = 1;          /* a34bat=0: no conversion asked */
++static bool ck_bat_low_boot;
++static uint32_t ck_bat_last_mv;
++
++static uint32_t
++ck_bat_mv(uint16_t counts)
++{
++	return (uint32_t)counts * 6300u / 32768u;
++}
++
++/* One BATADC conversion: mV, 0 if none or not a cell's (*counts: what was read). */
++static uint32_t
++ck_vbat(uint16_t *counts)
++{
++	uint16_t v = 0;
++	uint32_t mv;
++	bool ready = false;
++
++	*counts = 0;
++	if (ck_pwrap == 0 || ck_bat_on == 0) {
++		return 0;
++	}
++	lck_mtx_lock(&ck_bat_mtx);
++	if (ck_pmic_write(BAT_AUXADC_RQST0, 1u)) {
++		delay(2000);            /* the 128 samples (1.28 ms); the last result's ready bit may still be up */
++		for (uint32_t i = 0; i < 320u && !ready; i++) {        /* 32 ms */
++			ready = ck_pmic_read(BAT_AUXADC_ADC0, &v) && (v & BAT_RDY) != 0;
++			if (!ready) {
++				delay(100);
++			}
++		}
++		(void)ck_pmic_write(BAT_AUXADC_RQST0, 0);
++	}
++	lck_mtx_unlock(&ck_bat_mtx);
++	if (!ready) {
++		return 0;
++	}
++	*counts = v & BAT_COUNTS;
++	mv = ck_bat_mv(*counts);
++	return (mv < BAT_MV_MIN || mv > BAT_MV_MAX) ? 0 : mv;
++}
++
++/* At boot, before the raises: the battery, and whether the raises are done. */
++static void
++ck_bat_boot(void)
++{
++	uint16_t before = 0, counts = 0, chr = 0, mth = 0, hou = 0;
++	uint32_t mv;
++
++	if (ck_bat_on == 0) {
++		printf("A34 BAT: not read (a34bat=0): a34cpuopp and a34gpumhz go ahead unchecked\n");
++		return;
++	}
++	(void)ck_pmic_read(BAT_AUXADC_ADC0, &before);
++	mv = ck_vbat(&counts);
++	(void)ck_pmic_read(BAT_CHR_CON0, &chr);
++	(void)ck_pmic_read(BAT_RTC_AL_MTH, &mth);
++	(void)ck_pmic_read(BAT_RTC_AL_HOU, &hou);
++	ck_bat_last_mv = mv;
++	printf("A34 BAT: at boot VBAT %u mV (BATADC %u counts; before this kernel asked, the last conversion was %u counts, "
++	    "%u mV), charger %s (CHR_CON0 0x%04x); the gauge's percentage in the RTC %u%% (RTC_AL_MTH 0x%04x, AL_HOU "
++	    "0x%04x): what Android's or TWRP's gauge left, stale\n", mv, counts, before & BAT_COUNTS,
++	    ck_bat_mv(before & BAT_COUNTS), (chr & BAT_CHRDET) ? "detected" : "not detected", chr, (mth >> 8) & 0x7fu, mth,
++	    hou);
++	if (mv == 0) {
++		printf("A34 BAT: no battery reading (%s): a34cpuopp and a34gpumhz go ahead unchecked\n",
++		    counts != 0 ? "not a cell's voltage" : "no conversion in 32 ms");
++	} else if (mv < BAT_LOW_BOOT_MV) {
++		ck_bat_low_boot = true;
++		printf("A34 BAT: VBAT %u mV is below %u mV at boot: a34cpuopp and a34gpumhz are NOT done this boot "
++		    "(raised clocks on a flat battery risk a brown-out); charge it in Android or TWRP\n", mv, BAT_LOW_BOOT_MV);
++	}
++}
++
++/* A34 (0929): every heartbeat (a34hb): the battery, and a warning while it is low. */
++void
++a34_battery_report(void)
++{
++	uint16_t counts = 0, chr = 0;
++	uint32_t mv, was = ck_bat_last_mv;
++	char change[40] = "";
++
++	if (ck_pwrap == 0 || ck_bat_on == 0) {
++		return;
++	}
++	mv = ck_vbat(&counts);
++	(void)ck_pmic_read(BAT_CHR_CON0, &chr);
++	if (mv != 0 && was != 0) {
++		(void)snprintf(change, sizeof(change), ", %c%u mV since the last reading", mv >= was ? '+' : '-',
++		    mv >= was ? mv - was : was - mv);
++	}
++	printf("A34 BAT: VBAT %u mV (BATADC %u%s), charger %s (CHR_CON0 0x%04x)%s\n", mv, counts, change,
++	    (chr & BAT_CHRDET) ? "detected" : "not detected", chr, mv == 0 ? ": no reading" : "");
++	if (mv != 0 && mv < BAT_LOW_RUN_MV) {
++		printf("A34 BAT: !!!!! LOW BATTERY: VBAT %u mV is below %u mV. Nothing in this kernel charges the battery "
++		    "or lowers the clocks: it will go flat. Shut down and charge in Android or TWRP !!!!!\n", mv,
++		    BAT_LOW_RUN_MV);
++	}
++	if (mv != 0) {
++		ck_bat_last_mv = mv;
++	}
++}
++
+ void
+ a34_clocks_init(void)
+ {
+@@ -988,6 +1132,7 @@ a34_clocks_init(void)
+ 		printf("A34 CLOCKS: nothing read or changed (a34clocks=0)\n");
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("a34bat", &ck_bat_on, (int)sizeof(ck_bat_on));   /* A34 (0929), before ck_pwrap is set */
+ 	ck_top = ml_io_map(CK_TOP_PA, CK_PAGE);
+ 	ck_spm = ml_io_map(CK_SPM_PA, CK_PAGE);
+ 	ck_apmixed = ml_io_map(CK_APMIXED_PA, CK_PAGE);
+@@ -1018,7 +1163,12 @@ a34_clocks_init(void)
+ 		printf("A34 CLOCKS: a34cpufreq=%u does nothing: a34cpuopp=<L MHz>,<LL MHz> asks MCUPM's firmware, "
+ 		    "never the PLLs or Vproc directly\n", cpu);
+ 	}
+-	ck_cpu_requests();
++	ck_bat_boot();                  /* A34 (0929) */
++	if (ck_bat_low_boot) {
++		ck_gpu_want_mhz = 0;    /* (a34_clocks_gpu_wanted(): no) */
++	} else {
++		ck_cpu_requests();
++	}
+ 	if (ck_gpu_want_mhz != 0) {
+ 		printf("A34 CLOCKS: a34gpumhz=%u: the GPU's clock is raised before programs get the GPU (a34_mali.c)\n",
+ 		    ck_gpu_want_mhz);
+diff --git a/bsd/dev/a34_diag.c b/bsd/dev/a34_diag.c
+index 51e3e8f..756d273 100644
+--- a/bsd/dev/a34_diag.c
++++ b/bsd/dev/a34_diag.c
+@@ -26,6 +26,7 @@ extern uint64_t a34_fb_stats[6];
+ extern uint64_t a34_kick_stats[6];
+ extern void a34_big_init(void);         /* A34 (0922): osfmk/kern/sched_prim.c */
+ extern void a34_big_report(void);
++extern void a34_battery_report(void);   /* A34 (0929): bsd/dev/a34_clocks.c */
+ void a34_diag_init(void);
+ 
+ #define A34_HB_CPUS 8
+@@ -67,6 +68,7 @@ a34_hb_thread(void *arg, wait_result_t result)
+ 		printf("A34 HB %llus on c%u swaps %llu |%s\n", now_ns / NSEC_PER_SEC, cpu,
+ 		    sweet_fb_swap_count, line);
+ 		a34_big_report();       /* A34 (0922): where the UI threads ran */
++		a34_battery_report();   /* A34 (0929): VBAT, the charger, a warning when low */
+ 
+ 		/* present() cost since the last line, in microseconds per present */
+ 		uint64_t s[6], dp;
