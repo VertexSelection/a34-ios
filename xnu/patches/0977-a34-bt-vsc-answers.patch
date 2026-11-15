@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/a34_bt.c b/bsd/dev/a34_bt.c
+index 88e31d4..39c6faf 100644
+--- a/bsd/dev/a34_bt.c
++++ b/bsd/dev/a34_bt.c
+@@ -97,6 +97,17 @@
+  * (1M PHY), their answers given back under the legacy opcodes, and extended advertising reports of legacy PDUs
+  * given to bluetoothd as legacy reports.
+  *
++ * A34 (0977): Apple's vendor commands answered long enough. Boot 0976-120-a: 0976 worked (no 712, the switch stays
++ * on), but every 10-20 s bluetoothd aborted: PowerLog's session asked for the power profile, bluetoothd sent
++ * BD_VSC_OLYMPIC_READ_PROFILING_STATS (0xFCE2), and its parser, _BCM_ProfilingStatsEventParser (+0x123ab4), reads
++ * four 16-bit values after the status ("AssertFail bcm_vsc.c:138 : ByteStream_NumReadBytesAvail(*pBs) >= 2"); the
++ * answer here had none. bluetoothd's vendor-command parsers (bcm_vsc.c, aci_vsc.c: 43 of them) only assert that at
++ * least N bytes are left, never an exact length, and the most any reads is _BCM_LowPowerCoreStatsEventParser's ~212
++ * bytes; so every vendor command is now answered with 240 bytes of zeros after the status (BD_VSC_FACTORY_CAL_
++ * READ_TABLE's first still 0x51). Also: a Command Status' status was read from its length byte in 0975's status
++ * lines ("the controller answers 0401 with status 0x4": HCI_Inquiry was taken, status 0, and ended with Inquiry
++ * Complete, status 0), and a proximity pairing advert that is not the first of Apple's data now gives its model.
++ *
+  * Boot-args: a34bt=1 (default 0: nothing is touched, nothing is started); a34btstep=N stops after step N;
+  * a34btwait=S seconds to wait for the firmware files (default 180); a34btsync=0 does not push the log to
+  * the disk before each step that could hang a bus (default 1: ~1 s each, so the last line of a hung boot
+@@ -1534,7 +1545,7 @@ br_quirks(uint8_t *p, uint32_t n)
+ 	uint16_t op;
+ 
+ 	if (n >= 7 && p[0] == 0x04 && (p[1] == 0x0e || p[1] == 0x0f)) {                     /* (0975) */
+-		uint8_t status = p[1] == 0x0e ? p[6] : p[2];
++		uint8_t status = p[1] == 0x0e ? p[6] : p[3];            /* (0977: a Command Status' is p[3]) */
+ 
+ 		op = p[1] == 0x0e ? (uint16_t)(p[4] | (p[5] << 8)) : (uint16_t)(p[5] | (p[6] << 8));
+ 		if (status != 0 && status != 0x01 && op != 0 && status_said++ < 64) {
+@@ -1584,22 +1595,20 @@ br_quirks(uint8_t *p, uint32_t n)
+ 	}
+ }
+ 
+-/* Apple's (Broadcom's) vendor command, answered here: Command Complete, status 0, and what its parser reads */
++/*
++ * Apple's (Broadcom's) vendor command, answered here: Command Complete, status 0, and (0977) 240 bytes of zeros,
++ * more than any of bluetoothd's parsers reads (they check for at least so many bytes, never for exactly so many).
++ */
++#define BR_VSC_DATA             240u
+ static void
+ br_vsc(const uint8_t *cmd, uint32_t n)
+ {
+ 	static uint32_t said;
++	static uint8_t ev[7 + BR_VSC_DATA];
+ 	uint16_t op = (uint16_t)(cmd[1] | (cmd[2] << 8));
+-	uint8_t sub = n > 4 ? cmd[4] : 0, ev[7 + 64];
+-	unsigned extra = 0;
++	uint8_t sub = n > 4 ? cmd[4] : 0;
++	unsigned extra = BR_VSC_DATA;
+ 
+-	if (op == 0xfd1b) {
+-		extra = 64;                                             /* BD_VSC_FACTORY_CAL_READ_TABLE */
+-	} else if (op == 0xfce2 && (sub == 0x15 || sub == 0x36)) {
+-		extra = 16;                                             /* OLYMPIC antenna preference, retain LE duplicates */
+-	} else if (op == 0xfd48) {
+-		extra = 1;
+-	}
+ 	bzero(ev, sizeof(ev));
+ 	ev[0] = 0x04;
+ 	ev[1] = 0x0e;
+@@ -1609,7 +1618,7 @@ br_vsc(const uint8_t *cmd, uint32_t n)
+ 	ev[5] = cmd[2];
+ 	ev[6] = 0;
+ 	if (op == 0xfd1b) {
+-		ev[7] = 0x51;
++		ev[7] = 0x51;                                           /* BD_VSC_FACTORY_CAL_READ_TABLE (HackiOS) */
+ 	}
+ 	if (said++ < 64) {
+ 		printf("A34 BT: br: vendor command %04x (%u bytes, first %02x) answered here, %u byte(s) of data\n", op, n - 4, sub,
+@@ -2056,6 +2065,11 @@ br_le_one(const uint8_t *addr, const uint8_t *data, uint32_t len, int rssi)
+ 				}
+ 				if (data[t] == 0x07 && t != at + 4 && t + 4 < at + 1 + l) {    /* proximity pairing, not first */
+ 					br_le.proximity++;
++					if (rssi != 127 && (br_le.model_rssi == 0 || rssi > br_le.model_rssi)) {
++						br_le.model[0] = data[t + 3];          /* (0977) 07 len prefix model(2) */
++						br_le.model[1] = data[t + 4];
++						br_le.model_rssi = rssi;
++					}
+ 				}
+ 			}
+ 			if (l >= 8 && data[at + 4] == 0x07) {                   /* proximity pairing: 07 len prefix model(2) ... */
