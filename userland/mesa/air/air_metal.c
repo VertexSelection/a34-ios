@@ -596,6 +596,10 @@ static uint64_t rwa_pipelines_made, rwa_pipelines_translate_ns, rwa_pipelines_co
  */
 static uint64_t rwa_bind_fb_sets, rwa_bind_sets, rwa_bind_skips, rwa_bind_flushes;
 static uint64_t rwa_bind_fresh_draws, rwa_bind_fresh_ns, rwa_bind_steady_draws, rwa_bind_steady_ns;
+/* passes flushed on a switch that went back into attachments left earlier in the same span
+ * of work (since the last finish or rwa_flush_seq): each such pass is a second batch with a
+ * preload of its own where one would have done, unless something in between read it */
+static uint64_t rwa_bind_returns, rwa_bind_span;
 
 static bool
 rebind_all(void)
@@ -1782,16 +1786,18 @@ rwa_bind_profile(char *line, size_t size)
    uint64_t draws = rwa_bind_fresh_draws + rwa_bind_steady_draws;
    if (!draws || !line || !size)
       return 0;
-   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch; "
+   snprintf(line, size, "rwm draw state: %llu framebuffers set, %llu passes flushed on a switch "
+            "(%llu back into one left before); "
             "draw_vbo %llu us after a framebuffer set (x%llu), %llu us otherwise (x%llu); "
             "states set %llu, skipped %llu%s",
             (unsigned long long)rwa_bind_fb_sets, (unsigned long long)rwa_bind_flushes,
+            (unsigned long long)rwa_bind_returns,
             (unsigned long long)(rwa_bind_fresh_draws ? rwa_bind_fresh_ns / 1000 / rwa_bind_fresh_draws : 0),
             (unsigned long long)rwa_bind_fresh_draws,
             (unsigned long long)(rwa_bind_steady_draws ? rwa_bind_steady_ns / 1000 / rwa_bind_steady_draws : 0),
             (unsigned long long)rwa_bind_steady_draws, (unsigned long long)rwa_bind_sets,
             (unsigned long long)rwa_bind_skips, rebind_all() ? " (RWA_REBIND_ALL)" : "");
-   rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = 0;
+   rwa_bind_fb_sets = rwa_bind_flushes = rwa_bind_sets = rwa_bind_skips = rwa_bind_returns = 0;
    rwa_bind_fresh_draws = rwa_bind_fresh_ns = rwa_bind_steady_draws = rwa_bind_steady_ns = 0;
    return 1;
 }
@@ -3865,6 +3871,7 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
 {
    struct pipe_fence_handle *fence = NULL;
    device->pipe->flush(device->pipe, &fence, 0);
+   rwa_bind_span++;
    if (!fence) {
       if (!required)
          return 0;
@@ -4860,6 +4867,7 @@ rwa_flush_seq(struct rwa_device *device)
    if (!redwood_drm_last_seq)
       return 0;
    device->pipe->flush(device->pipe, NULL, 0);
+   rwa_bind_span++;
    return redwood_drm_last_seq();
 }
 
@@ -8005,11 +8013,27 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    if (flush_on_switch) {
       static struct pipe_surface *last_cbuf, *last_zs;
+      static struct pipe_surface *left[16];
+      static unsigned nleft;
+      static uint64_t left_span;
       if ((fb.nr_cbufs ? surf[0] : NULL) != last_cbuf || zsurf != last_zs) {
          if (last_cbuf || last_zs) {
             pipe->flush(pipe, NULL, 0);
             rwa_bind_flushes++;
          }
+         /* counted for the profile only: a pass back into colour attachments left before */
+         if (left_span != rwa_bind_span) {
+            nleft = 0;
+            left_span = rwa_bind_span;
+         }
+         for (unsigned i = 0; fb.nr_cbufs && surf[0] && i < nleft; i++) {
+            if (left[i] == surf[0]) {
+               rwa_bind_returns++;
+               break;
+            }
+         }
+         if (last_cbuf && nleft < ARRAY_SIZE(left))
+            left[nleft++] = last_cbuf;
          last_cbuf = fb.nr_cbufs ? surf[0] : NULL;
          last_zs = zsurf;
       }
