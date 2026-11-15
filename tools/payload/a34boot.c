@@ -239,6 +239,8 @@ static int gic_prepare(void)
 
 // ------------------------------------------------------------- ADT patch --
 
+static u64 adt_dram_size;           // nonzero: XNU's memory trimmed around LK's reservations (0950)
+
 static int name_is(const u8 *p, const char *s)
 {
     for (int i = 0; i < 32; i++) {
@@ -271,6 +273,8 @@ static int adt_patch(u8 *adt, u64 *off, u64 end, int depth)
             reg = val;
         if (name_is(name, "stride") && len == 4)
             stride = val;
+        if (adt_dram_size && name_is(name, "dram-size") && len == 8)
+            *(u64 *)val = adt_dram_size;    // trimmed around LK's reserved memory (0950)
         *off += 36 + ((len + 3) & ~3u);
     }
     if (is_fbcon && reg && stride) {
@@ -283,6 +287,95 @@ static int adt_patch(u8 *adt, u64 *off, u64 end, int depth)
     for (u32 i = 0; i < nchildren; i++)
         done |= adt_patch(adt, off, end, depth + 1);
     return done;
+}
+
+// ------------------------------------------------- LK's reserved memory --
+//
+// The memory XNU manages (payload phys_base .. +mem_size) must not hold anything LK reserved:
+// on a normal boot (from `boot`) LK also loads the modem, ADSP, SCP and VPU images and reserves
+// their memory. Every reg of /reserved-memory's children and every /memreserve/ entry of LK's
+// device tree is checked; an overlap above phys_base trims mem_size below it, one at or below
+// phys_base stops the boot (the kernel is linked for phys_base). A34 (0950).
+
+static u32 be32p(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
+static u64 be64p(const u8 *p) { return (u64)be32p(p) << 32 | be32p(p + 4); }
+
+static u64 carve_hits, carve_trims;
+
+// Returns the usable size (<= size), or 0 when the start itself is reserved.
+static u64 carve_one(u64 base, u64 size, u64 rb, u64 rs)
+{
+    if (rs == 0 || rb >= base + size || rb + rs <= base)
+        return size;
+    carve_hits++;
+    if (rb <= base)
+        return 0;
+    carve_trims++;
+    return (rb - base) & ~(PAGE_16K - 1);
+}
+
+static u64 carve_reserved(u64 dtb, u64 base, u64 size)
+{
+    const u8 *f = (const u8 *)dtb;
+    if (!dtb || be32p(f) != 0xd00dfeedu)
+        return size;
+    u32 total = be32p(f + 4), off_struct = be32p(f + 8), off_strings = be32p(f + 12);
+    u32 off_rsv = be32p(f + 16), size_struct = be32p(f + 36);
+    if (total > (2u << 20) || off_struct + size_struct > total || off_rsv + 16 > total)
+        return size;
+    for (const u8 *r = f + off_rsv; r + 16 <= f + total; r += 16) {
+        u64 rb = be64p(r), rs = be64p(r + 8);
+        if (!rb && !rs)
+            break;
+        size = carve_one(base, size, rb, rs);
+        if (!size)
+            return 0;
+    }
+    const u8 *s = f + off_struct, *end = s + size_struct;
+    int depth = 0, resv_depth = -1;
+    while (s + 4 <= end) {
+        u32 tok = be32p(s);
+        s += 4;
+        if (tok == 1) {                     // BEGIN_NODE
+            const char *nm = (const char *)s;
+            u32 l = 0;
+            while (s + l < end && nm[l])
+                l++;
+            static const char rm[] = "reserved-memory";
+            int is_rm = depth == 1 && l == sizeof(rm) - 1;
+            for (u32 i = 0; is_rm && i < l; i++)
+                if (nm[i] != rm[i])
+                    is_rm = 0;
+            if (is_rm)
+                resv_depth = depth + 1;
+            depth++;
+            s += (l + 1 + 3) & ~3u;
+        } else if (tok == 2) {              // END_NODE
+            depth--;
+            if (depth < resv_depth)
+                resv_depth = -1;
+        } else if (tok == 3) {              // PROP
+            if (s + 8 > end)
+                break;
+            u32 len = be32p(s), nameoff = be32p(s + 4);
+            const u8 *v = s + 8;
+            s += 8 + ((len + 3) & ~3u);
+            const char *pn = (const char *)f + off_strings + nameoff;
+            if (resv_depth > 0 && depth == resv_depth + 1 && pn[0] == 'r' && pn[1] == 'e' &&
+                pn[2] == 'g' && pn[3] == 0) {
+                for (u32 k = 0; k + 16 <= len; k += 16) {
+                    size = carve_one(base, size, be64p(v + k), be64p(v + k + 8));
+                    if (!size)
+                        return 0;
+                }
+            }
+        } else if (tok == 4) {              // NOP
+            continue;
+        } else {
+            break;
+        }
+    }
+    return size;
 }
 
 // --------------------------------------------------------------- loader --
@@ -381,7 +474,6 @@ static u64 place_image(u64 src, u64 len)
 
 u64 shim_main(u64 dtb, u64 load)
 {
-    (void)dtb;
     // 1. UFS awake and recovery note cleared first, then the watchdog off:
     //    from here on any hang or forced restart lands in Android.
     u32 hcs, err;
@@ -433,7 +525,15 @@ u64 shim_main(u64 dtb, u64 load)
         stage(1, RED);                      // payload overlaps kernel RAM
         return 0;
     }
-    stage(1, GREEN);
+    // LK's reserved memory out of XNU's (A34 0950): nothing expected, a trim if there is.
+    u64 mem_size = carve_reserved(dtb, p->phys_base, p->mem_size);
+    if (mem_size == 0) {
+        stage(1, RED);                      // LK reserved XNU's first page: do not start
+        return 0;
+    }
+    if (mem_size < p->mem_size)
+        adt_dram_size = mem_size;
+    stage(1, carve_hits ? YELLOW : GREEN);
 
     // 3. Kernel segments.
     for (u32 i = 0; i < p->nsegs; i++) {
@@ -461,7 +561,7 @@ u64 shim_main(u64 dtb, u64 load)
     ba->Version = 2;
     ba->virtBase = p->virt_base;
     ba->physBase = p->phys_base;
-    ba->memSize = p->mem_size;
+    ba->memSize = mem_size;
     ba->topOfKernelData = ba_pa + PAGE_16K;
     ba->Video.v_baseAddr = fb_base;
     ba->Video.v_display = 1;
@@ -473,7 +573,7 @@ u64 shim_main(u64 dtb, u64 load)
     ba->deviceTreeLength = (u32)p->adt_size;
     for (int i = 0; i < BOOT_LINE_LENGTH; i++)
         ba->CommandLine[i] = p->cmdline[i];
-    ba->memSizeActual = p->mem_size;
+    ba->memSizeActual = mem_size;
     stage(4, GREEN);
 
     // 6. Jump. The square stays yellow if XNU never draws anything.

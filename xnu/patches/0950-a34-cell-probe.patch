@@ -1,21 +1,21 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 70c2540..058916d 100644
+index 70c2540..5317fe7 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -115,6 +115,7 @@ bsd/dev/a34_clocks.c			standard
- bsd/dev/a34_connsys.c			standard
- bsd/dev/a34_bt.c			standard
- bsd/dev/a34_wifi.c			standard
-+bsd/dev/a34_cell.c			standard
+@@ -118,6 +118,7 @@ bsd/dev/a34_wifi.c			standard
  bsd/dev/ruby_hal.c			standard
  bsd/dev/ruby_eint.c			standard
  bsd/dev/ruby_irq.c			standard
++bsd/dev/a34_cell.c			standard
+ bsd/dev/ruby_spi3.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_goodix_spi.c		standard
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..46976d4
+index 0000000..c4a8930
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,726 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -31,7 +31,9 @@ index 0000000..46976d4
 + *     manages (0x47c80000 on this phone, a34lkfdt=ADDR to change): /chosen's
 + *     "ccci,modem_info_v2" says whether LK loaded and verified the modem image (it does on a
 + *     normal boot and skips it on a recovery boot, LK's own log string "recovery mode, no need
-+ *     load modem"), and /reserved-memory names the modem's and the shared memory's regions.
++ *     load modem"), and /reserved-memory lists what LK reserved (all regions are logged with
++ *     a check against XNU's memory, ADT /chosen dram-base/dram-size; the loader already trims
++ *     XNU's memory around any of them).
 + *     The struct is MediaTek's _ccci_lk_info_v2 (Samsung kernel ccci_util_lib_fo.c), copied as
 + *     raw little-endian bytes into the property. When LK loaded the modem, its tag table
 + *     (reserved "ccci_tag_mem") is listed: tag names, sizes, small values in hex.
@@ -61,6 +63,7 @@ index 0000000..46976d4
 +#include <kern/kalloc.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -157,6 +160,8 @@ index 0000000..46976d4
 +#define FDT_END         9
 +
 +static int ac_lk_md = -1;       /* -1 unknown, 0 not loaded, 1 loaded */
++static uint64_t ac_xnu_base, ac_xnu_size;       /* XNU's memory: ADT /chosen dram-base, dram-size */
++static uint32_t ac_resv, ac_resv_hits;
 +static uint64_t ac_tag_base;
 +static uint32_t ac_tag_size, ac_tag_count, ac_tag_version;
 +
@@ -252,6 +257,17 @@ index 0000000..46976d4
 +	uint8_t hdr[40];
 +
 +	(void)PE_parse_boot_argn("a34lkfdt", &pa, (int)sizeof(pa));
++	{
++		DTEntry chosen;
++		void const *pv;
++		unsigned int sz;
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess) {
++			if (SecureDTGetProperty(chosen, "dram-base", &pv, &sz) == kSuccess && sz == 8)
++				memcpy(&ac_xnu_base, pv, 8);
++			if (SecureDTGetProperty(chosen, "dram-size", &pv, &sz) == kSuccess && sz == 8)
++				memcpy(&ac_xnu_size, pv, 8);
++		}
++	}
 +	vm_offset_t m = ml_io_map((vm_offset_t)pa, PAGE_SIZE);
 +	if (!m) {
 +		printf("A34 CELL: LK FDT 0x%llx: no mapping\n", pa);
@@ -325,13 +341,19 @@ index 0000000..46976d4
 +			} else if (depth == 2 && strcmp(node, "chosen") == 0 && strcmp(pn, "atag,mdinfo") == 0) {
 +				printf("A34 CELL: LK /chosen atag,mdinfo: %u bytes, first word 0x%08x\n", len,
 +				    len >= 4 ? be32(v) : 0);
-+			} else if (in_resv && strcmp(pn, "reg") == 0 && len >= 16 &&
-+			    (ac_has(node, "md") || ac_has(node, "ccci") || ac_has(node, "MD"))) {
-+				uint64_t rb = (uint64_t)be32(v) << 32 | be32(v + 4);
-+				uint64_t rs = (uint64_t)be32(v + 8) << 32 | be32(v + 12);
-+				printf("A34 CELL: LK reserved %s: 0x%llx-0x%llx (%llu KiB)\n", node, rb,
-+				    rb + rs, rs >> 10);
-+				nregions++;
++			} else if (in_resv && strcmp(pn, "reg") == 0 && len >= 16) {
++				/* every region LK reserved, and whether it touches XNU's memory */
++				for (uint32_t k = 0; k + 16 <= len; k += 16) {
++					uint64_t rb = (uint64_t)be32(v + k) << 32 | be32(v + k + 4);
++					uint64_t rs = (uint64_t)be32(v + k + 8) << 32 | be32(v + k + 12);
++					bool hit = rs && rb < ac_xnu_base + ac_xnu_size && rb + rs > ac_xnu_base;
++					printf("A34 CELL: LK reserved %s: 0x%llx-0x%llx (%llu KiB)%s\n", node, rb,
++					    rb + rs, rs >> 10, hit ? " OVERLAPS XNU MEMORY" : "");
++					ac_resv++;
++					ac_resv_hits += hit;
++					if (ac_has(node, "md") || ac_has(node, "ccci") || ac_has(node, "MD"))
++						nregions++;
++				}
 +			}
 +		} else if (tok == FDT_NOP) {
 +			continue;
@@ -340,7 +362,9 @@ index 0000000..46976d4
 +		}
 +	}
 +	kfree_data(f, total);
-+	printf("A34 CELL: LK modem regions in reserved-memory: %d\n", nregions);
++	printf("A34 CELL: LK modem regions in reserved-memory: %d; all reserved regions: %u, overlapping XNU's 0x%llx-0x%llx: %u\n",
++	    nregions, ac_resv, ac_xnu_base, ac_xnu_base + ac_xnu_size, ac_resv_hits);
++	AC_NOTE("resv=%u overlap=%u", ac_resv, ac_resv_hits);
 +	ac_lk_tags();
 +	AC_NOTE("lk=%s mdregions=%d", ac_lk_md == 1 ? "loaded" : ac_lk_md == 0 ? "notloaded" : "noinfo",
 +	    nregions);
