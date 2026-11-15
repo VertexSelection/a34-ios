@@ -1,0 +1,275 @@
+diff --git a/bsd/dev/a34_clocks.c b/bsd/dev/a34_clocks.c
+index 27fde41..237a452 100644
+--- a/bsd/dev/a34_clocks.c
++++ b/bsd/dev/a34_clocks.c
+@@ -113,6 +113,9 @@ bool a34_clocks_gpu_wanted(void);       /* bsd/dev/a34_mali.c */
+ bool a34_clocks_gpu_raise(void);
+ void a34_clocks_gpu_restore(void);
+ void a34_battery_report(void);          /* A34 (0929): bsd/dev/a34_diag.c's heartbeat */
++uint32_t a34_disp_clock_khz(uint32_t *sel, uint32_t *mmpll_khz);     /* A34 (0940): SweetFramebuffer.cpp */
++uint32_t a34_vcore_uv(void);
++bool a34_disp_clock_set(uint32_t sel);
+ 
+ /* ---- where things are ---- */
+ 
+@@ -246,6 +249,102 @@ ck_pmic_write(uint16_t reg, uint16_t val)
+ 	return ok;
+ }
+ 
++/*
++ * ---- the display engine's clock (A34 0940) ----
++ *
++ * disp0_sel, TOPCKGEN CLK_CFG_1 [3:0] (MediaTek's clk-mt6877.c, Xiaomi's
++ * open-source MT6877 kernel): 0 26M, 1 univpll_d6_d2 208, 2 mainpll_d5_d2
++ * 218.4, 3 mmpll_d6_d2, 4 univpll_d5_d2 249.6, 5 univpll_d4_d2 312, 6
++ * mmpll_d7, 7 univpll_d6 416, 8 mainpll_d4 546, 9 tvdpll, 10 mmpll_d5_d2,
++ * 11 univpll_d4 624 MHz; set through CLK_CFG_1_CLR/SET, latched by
++ * CLK_CFG_UPDATE bit 4. Android's display OPPs (the phone's opp-table-disp):
++ * 208 at 0.55 V, 312 at 0.60, 416 at 0.65, 546 at 0.725 (VCORE). Android asks
++ * 403 MHz for this panel (mtk_dsi_set_mmclk_by_datarate_V1: 806 Mbps x 4 lanes
++ * x 3 (DSC) / 24 bpp) -> 416 MHz. MMPLL_CON1 (APMIXED 0x3a4): PCW [21:0],
++ * post divider [26:24]. VCORE: MT6359P DA_VCORE_VOSEL (0x1526 [6:0]),
++ * 400 mV + 6.25 mV a step. Mapped here on first use: AppleCLCD starts before
++ * a34_clocks_init().
++ */
++#define CK_TOP_CLK_CFG_UPDATE   0x004u
++#define CK_TOP_CLK_CFG_1        0x020u
++#define CK_TOP_CLK_CFG_1_SET    0x024u
++#define CK_TOP_CLK_CFG_1_CLR    0x028u
++#define CK_DISP0_SEL_MASK       0xfu
++#define CK_DISP0_UPD            (1u << 4)
++#define CK_MMPLL_CON1           0x3a4u
++#define CK_VCORE_DBG0           0x1526u
++
++static bool
++ck_disp_map(void)
++{
++	if (ck_top == 0) {
++		ck_top = ml_io_map(CK_TOP_PA, CK_PAGE);
++	}
++	if (ck_apmixed == 0) {
++		ck_apmixed = ml_io_map(CK_APMIXED_PA, CK_PAGE);
++	}
++	if (ck_pwrap == 0) {
++		ck_pwrap = ml_io_map(CK_PWRAP_PA, CK_PAGE);
++	}
++	return ck_top != 0 && ck_apmixed != 0 && ck_pwrap != 0;
++}
++
++/* kHz of disp0_sel (0: not known), its select field, MMPLL in kHz. */
++uint32_t
++a34_disp_clock_khz(uint32_t *sel, uint32_t *mmpll_khz)
++{
++	uint32_t con1, khz[12];
++	uint64_t mm;
++
++	*sel = 0xffu;
++	*mmpll_khz = 0;
++	if (!ck_disp_map()) {
++		return 0;
++	}
++	*sel = ruby_rd32(ck_top, CK_TOP_CLK_CFG_1) & CK_DISP0_SEL_MASK;
++	con1 = ruby_rd32(ck_apmixed, CK_MMPLL_CON1);
++	mm = ((26000ull * (con1 & 0x3fffffu)) >> 14) >> ((con1 >> 24) & 7u);
++	*mmpll_khz = (uint32_t)mm;
++	khz[0] = 26000;
++	khz[1] = 208000;
++	khz[2] = 218400;
++	khz[3] = (uint32_t)(mm / 12u);
++	khz[4] = 249600;
++	khz[5] = 312000;
++	khz[6] = (uint32_t)(mm / 7u);
++	khz[7] = 416000;
++	khz[8] = 546000;
++	khz[9] = 0;                     /* tvdpll: not read */
++	khz[10] = (uint32_t)(mm / 10u);
++	khz[11] = 624000;
++	return *sel < 12u ? khz[*sel] : 0;
++}
++
++/* VCORE in uV, 0 if not read. */
++uint32_t
++a34_vcore_uv(void)
++{
++	uint16_t v = 0;
++
++	if (!ck_disp_map() || !ck_pmic_read(CK_VCORE_DBG0, &v)) {
++		return 0;
++	}
++	return 400000u + (uint32_t)(v & 0x7fu) * 6250u;
++}
++
++/* disp0_sel to `sel` (glitch-free mux; the caller keeps the display idle). */
++bool
++a34_disp_clock_set(uint32_t sel)
++{
++	if (sel > CK_DISP0_SEL_MASK || !ck_disp_map()) {
++		return false;
++	}
++	ruby_wr32(ck_top, CK_TOP_CLK_CFG_1_CLR, CK_DISP0_SEL_MASK);
++	ruby_wr32(ck_top, CK_TOP_CLK_CFG_1_SET, sel);
++	ruby_wr32(ck_top, CK_TOP_CLK_CFG_UPDATE, CK_DISP0_UPD);
++	return (ruby_rd32(ck_top, CK_TOP_CLK_CFG_1) & CK_DISP0_SEL_MASK) == sel;
++}
++
+ /* ---- the rails ---- */
+ 
+ struct ck_rail {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 18ba463..b80becf 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,7 +174,6 @@ public:
+ 	uint64_t      fQueuedAt;                /* with fFlipLock: mach time the queued picture was drawn */
+ 	uint64_t      fXferEnd;                 /* mach time the last transfer ended */
+ 	uint32_t      fVsyncLeadUS;             /* a34vsynclead: the vsync tick this long before the TE */
+-	bool          fKickBound;
+ 	bool          fTEBitWanted;             /* A34 (0931): a34fbte=2 and TE only with EXT_TE_EN: set it at the first kick */
+ 	bool          fTEBit;                   /* ... it is set by us: a transfer that does not end clears it */
+ 	bool          fTEMissSaid;
+@@ -409,8 +408,18 @@ extern "C" void a34_dsi_wr(uint32_t off, uint32_t val);       /* A34 (0930): pex
+ #define SWEET_FB_DCS_IDLE_MS    20u
+ static uint32_t sweet_fb_dsi_hs;                /* a34dsihs: 1 per frame (0937), 2 set once and kept, 3 also BYPASS_SHADOW */
+ static bool sweet_fb_hs_said;
+-static uint32_t sweet_fb_kick_cpu = 255;        /* A34 (0938): a34kickcpu: the kick's processor (>= 8: any) */
+-extern "C" bool a34_thread_bind_cpu(int cpu);   /* osfmk/kern/sched_prim.c (0928) */
++/*
++ * A34 (0940): the display's clock (bsd/dev/a34_clocks.c), boot-arg
++ * a34dispclk=416 (or 546): disp0_sel to Android's 120 Hz OPP, only when VCORE
++ * already is at least that OPP's voltage (0.65 / 0.725 V); every 10 s VCORE is
++ * read again and the clock goes back if it fell below.
++ */
++extern "C" uint32_t a34_disp_clock_khz(uint32_t *sel, uint32_t *mmpll_khz);
++extern "C" uint32_t a34_vcore_uv(void);
++extern "C" bool a34_disp_clock_set(uint32_t sel);
++static uint32_t sweet_fb_disp_was = 0xffu;      /* disp0_sel before a34dispclk (0xff: not changed) */
++static uint32_t sweet_fb_disp_need_uv;          /* VCORE the new clock needs */
++static bool sweet_fb_disp_say;                  /* the first transfer after the change, to be said */
+ /*
+  * A34 (0938): 0937's a34dsihs=1 changed nothing (boot 69: 7631 us). MT6877's
+  * DSI registers are shadowed unless DSI_SHADOW_DEBUG (0xC00) bit 1
+@@ -479,6 +488,12 @@ sweet_fb_con_check(uint64_t xfer)
+ 	uint32_t sta;
+ 	uint64_t ns;
+ 
++	if (sweet_fb_disp_say) {
++		sweet_fb_disp_say = false;      /* A34 (0940) */
++		absolutetime_to_nanoseconds(xfer, &ns);
++		IOLog("A34 FB 120: a34dispclk: the first transfer with the display clock raised took %llu us\n",
++		    (unsigned long long)(ns / NSEC_PER_USEC));
++	}
+ 	if (sweet_fb_con_watch == 0) {
+ 		return;
+ 	}
+@@ -790,6 +805,43 @@ AppleCLCD::start(IOService *provider)
+ 		    "a34dsicon=%u)\n", shadow, type1, con, sweet_fb_con_was, dsiCon);
+ 		sweet_fb_dsi_dump("after the changes");
+ 	}
++	/* A34 (0940): the display engine's clock: a frame of 1080 x 2340 pixels at one a clock */
++	uint32_t dispWant = 0, dispSel = 0xffu, mmpll = 0, dispKhz, vcore;
++	(void)PE_parse_boot_argn("a34dispclk", &dispWant, sizeof(dispWant));
++	if (dispWant != 0 || panelRate != 0 || sweet_fb_dsi_hs != 0) {
++		dispKhz = a34_disp_clock_khz(&dispSel, &mmpll);
++		vcore = a34_vcore_uv();
++		IOLog("A34 FB 120: display clock: disp0_sel %u = %u kHz (MMPLL %u kHz), VCORE %u uV; a frame at one pixel "
++		    "a clock: %u us\n", dispSel, dispKhz, mmpll, vcore,
++		    dispKhz != 0 ? (uint32_t)((uint64_t)fWidth * fHeight * 1000u / dispKhz) : 0u);
++		if (dispWant == 416 || dispWant == 546) {
++			uint32_t sel = dispWant == 416 ? 7u : 8u, need = dispWant == 416 ? 650000u : 725000u;
++
++			if (vcore < need) {
++				IOLog("A34 FB 120: a34dispclk=%u not done: VCORE %u uV is below the %u uV of Android's OPP for it\n",
++				    dispWant, vcore, need);
++			} else if (dispSel == sel) {
++				IOLog("A34 FB 120: a34dispclk=%u: already\n", dispWant);
++			} else if (a34_dsi_lock()) {
++				uint64_t idleTicks;
++				bool set;
++
++				(void)a34_dsi_wait_idle(&idleTicks, SWEET_FB_TE_PROBE_MS);
++				set = a34_disp_clock_set(sel);
++				a34_dsi_unlock();
++				if (set) {
++					sweet_fb_disp_was = dispSel;
++					sweet_fb_disp_need_uv = need;
++					sweet_fb_disp_say = true;
++				}
++				dispKhz = a34_disp_clock_khz(&dispSel, &mmpll);
++				IOLog("A34 FB 120: a34dispclk=%u: disp0_sel now %u = %u kHz (%s), VCORE %u uV\n", dispWant, dispSel,
++				    dispKhz, set ? "set" : "NOT set", a34_vcore_uv());
++			}
++		} else if (dispWant != 0) {
++			IOLog("A34 FB 120: a34dispclk=%u: only 416 or 546\n", dispWant);
++		}
++	}
+ 	if (panelRate == 60 || panelRate == 120) {
+ 		panelHz(panelRate);
+ 	} else if (panelRate != 0) {
+@@ -801,8 +853,13 @@ AppleCLCD::start(IOService *provider)
+ 	if (PE_parse_boot_argn("a34vsynclead", &lead, sizeof(lead)) && lead >= 500 && lead <= 8000) {
+ 		fVsyncLeadUS = lead;    /* A34 (0938) */
+ 	}
+-	if (PE_parse_boot_argn("a34kickcpu", &kickCpu, sizeof(kickCpu)) && kickCpu < 8) {
+-		sweet_fb_kick_cpu = kickCpu;    /* A34 (0938): kickFlip() binds itself there at its first frame */
++	if (PE_parse_boot_argn("a34kickcpu", &kickCpu, sizeof(kickCpu))) {
++		/*
++		 * A34 (0940): a timer's action runs on a thread call's thread
++		 * (IOTimerEventSource::timeout() takes the work loop's gate there),
++		 * one of a pool: binding it (0938) was wrong, and failed (0962).
++		 */
++		IOLog("A34 FB 120: a34kickcpu=%u ignored: the kick runs on the thread-call pool's threads\n", kickCpu);
+ 	}
+ 	if (PE_parse_boot_arg_str("a34vsync", vsyncArg, (int)sizeof(vsyncArg)) && vsyncArg[0] == 't' && vsyncArg[1] == 'e' &&
+ 	    vsyncArg[2] == '\0') {
+@@ -969,6 +1026,31 @@ sweet_fb_hold_log(void)
+ 	sweet_fb_touch_last[1] = t[1];
+ }
+ 
++/* A34 (0940): every 10 s: VCORE still high enough for a34dispclk's clock, or the clock goes back. */
++static void
++sweet_fb_disp_watch(void)
++{
++	uint32_t vcore, sel, mm;
++
++	if (sweet_fb_disp_was == 0xffu) {
++		return;
++	}
++	vcore = a34_vcore_uv();
++	if (vcore >= sweet_fb_disp_need_uv) {
++		return;
++	}
++	if (a34_dsi_lock()) {
++		uint64_t idleTicks;
++
++		(void)a34_dsi_wait_idle(&idleTicks, SWEET_FB_TE_PROBE_MS);
++		(void)a34_disp_clock_set(sweet_fb_disp_was);
++		a34_dsi_unlock();
++		IOLog("A34 FB 120: a34dispclk: VCORE fell to %u uV (needs %u): display clock back to sel %u (%u kHz)\n", vcore,
++		    sweet_fb_disp_need_uv, sweet_fb_disp_was, a34_disp_clock_khz(&sel, &mm));
++		sweet_fb_disp_was = 0xffu;
++	}
++}
++
+ /* A34 (0930): every 10 s from the vsync work loop, when anything happened (a34fbflip, a34fbte). */
+ static void
+ sweet_fb_flip_log(void)
+@@ -1022,6 +1104,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if ((count % (fb->fLogTicks != 0 ? fb->fLogTicks : SWEET_FB_HOLD_LOG_TICKS)) == 0) {
+ 		sweet_fb_hold_log();
+ 		sweet_fb_flip_log();    /* A34 (0930) */
++		sweet_fb_disp_watch();  /* A34 (0940) */
+ 		sweet_surface_report(); /* A34 (0935) */
+ 	}
+ 	if (fb->fPowerOff) {
+@@ -1721,11 +1804,6 @@ AppleCLCD::kickFlip(void)
+ 	 * transfer, while a picture is queued or being drawn (present() wakes it),
+ 	 * it goes on to the next TE itself.
+ 	 */
+-	if (!fKickBound && sweet_fb_kick_cpu < 8) {
+-		fKickBound = true;
+-		IOLog("A34 FB 120: the kick %s cpu%u (a34kickcpu)\n", a34_thread_bind_cpu((int)sweet_fb_kick_cpu) ?
+-		    "is bound to" : "could not be bound to", sweet_fb_kick_cpu);
+-	}
+ 	while (kickOne() && fTE) {
+ 		bool more;
+ 
