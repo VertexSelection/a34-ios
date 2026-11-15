@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..782174e
+index 0000000..af2b84b
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,1870 @@
+@@ -0,0 +1,1880 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -246,7 +246,7 @@ index 0000000..782174e
 +	{ 10, 0 }, { 27, 0 }, { 31, 0 }, { 34, 0 }, { 29, 0 }, { 12, 0x800 }, { 13, 0x3800 }, { 37, 0 },
 +	{ 18, 0xA800 }, { 14, 0x1000 }, { 15, 0x400 }, { 33, 0x200 }, { 0, 0x200 }, { 16, 0x8000 },
 +	{ 4, 0x1000 }, { 7, 0x2000 }, { 8, 0x1000 }, { 9, 0xD000 }, { 19, 0xB4400 }, { 20, 0x1E400 },
-+	{ 40, 0x4800 }, { 41, 0 },
++	{ 43, 0x800 }, { 44, 0x80 }, { 40, 0x3F80 }, { 41, 0 },   /* MTK_TC10_FEATURE_BIG_DATA (Samsung's build) */
 +};
 +static const int c6297[] = { 22, 32, 1, 46, 28, 24 };
 +
@@ -1433,7 +1433,7 @@ index 0000000..782174e
 + * MD_DRDI 41, PHY_CAP 23, AMMS_POS 29, MD_CONSYS 22, USIP 24. RAM only.
 + */
 +static const uint8_t clear_first[] = {
-+	10, 27, 31, 12, 13, 37, 18, 14, 15, 33, 0, 16, 4, 7, 8, 9, 40, 11, 30,  /* non-cached */
++	10, 27, 31, 12, 13, 37, 18, 14, 15, 33, 0, 16, 4, 7, 8, 9, 43, 44, 40, 11, 30, /* non-cached */
 +	32, 1, 2, 3, 5, 6, 46, 28,                                              /* cached */
 +};
 +
@@ -1670,6 +1670,7 @@ index 0000000..782174e
 +	case 0: case 1: case 2: case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12:
 +	case 14: case 15: case 16: case 17: case 18: case 19: case 20: case 25: case 26: case 27:
 +	case 28: case 30: case 36: case 45: case 48:
++	case 46: case 47:                               /* Samsung's BIG_DATA regions (TC10) */
 +		return 2;
 +	case 13: case 31: case 32: case 35: case 38: case 54: case 55: case 56: case 57:
 +		return 3;
@@ -1687,6 +1688,12 @@ index 0000000..782174e
 +}
 +
 +static uint32_t sbp_code, rat_bitmap = 0x79;    /* N/Lf/Lt/W/G; boot-args a34cellsbp, a34cellrat */
++/*
++ * AP_DEBUG_LEVEL (MTK_TC10_FEATURE_SET_DEBUG_LEVEL): ccci_mdinit hands the kernel
++ * ro.boot.debug_level (0x4f4c LOW on a retail phone), which ccci_get_ap_debug_level turns into
++ * 0; -1 only when no level was set. Boot-arg a34celldbg (0, 1, 2).
++ */
++static uint32_t dbg_level;
 +static bool mpu_v21;
 +
 +static void
@@ -1796,7 +1803,9 @@ index 0000000..782174e
 +		n = 48;
 +		break;
 +	case 45: share(d, 41); n = 8; break;
-+	case 48: d[0] = 0xFFFFFFFFu; n = 4; break;    /* AP_DEBUG_LEVEL: -1 */
++	case 46: share(d, 43); n = 8; break;          /* CCCI_MD_BIGDATA_SHARE_MEMORY */
++	case 47: share(d, 44); n = 8; break;          /* CCCI_MD_IPCA_BIGDATA_SHARE_MEMORY */
++	case 48: d[0] = dbg_level; n = 4; break;      /* AP_DEBUG_LEVEL: 0 LOW, 1 MID, 2 HIGH */
 +	case 54: d[0] = 0; n = 4; break;              /* SPM_MD_PARA: none in the DTS */
 +	case 55: share(d, 46); n = 8; break;
 +	case 56: share(d, 33); n = 8; break;
@@ -1823,6 +1832,7 @@ index 0000000..782174e
 +	ap = ap_ccif;
 +	(void)PE_parse_boot_argn("a34cellsbp", &sbp_code, (int)sizeof(sbp_code));
 +	(void)PE_parse_boot_argn("a34cellrat", &rat_bitmap, (int)sizeof(rat_bitmap));
++	(void)PE_parse_boot_argn("a34celldbg", &dbg_level, (int)sizeof(dbg_level));
 +	if (f[0] != MD_PATTERN || f[17] != MD_PATTERN)
 +		printf("A34 CELL: HS1 feature query patterns 0x%08x/0x%08x: answering without runtime data\n", f[0], f[17]);
 +	w.base = rva(R_RUNTIME);
@@ -1942,10 +1952,10 @@ index 0000000..0e1aaf3
 +#endif
 diff --git a/bsd/dev/a34_cell.c b/bsd/dev/a34_cell.c
 new file mode 100644
-index 0000000..751cca3
+index 0000000..01e34ab
 --- /dev/null
 +++ b/bsd/dev/a34_cell.c
-@@ -0,0 +1,1007 @@
+@@ -0,0 +1,1012 @@
 +/*
 + * A34 (0950): cellular, stage 0 -- how the modem's side looks, read only.
 + *
@@ -2643,6 +2653,7 @@ index 0000000..751cca3
 +#define AC_PWR_ON               (1u << 2)
 +#define AC_MD_CHECK_FLAG        2u
 +#define AC_MD_FLIGHT_MODE_SET   7u
++#define AC_UPDATE_MD_SEC_SMEM   11u     /* modem_secure_base.h */
 +
 +/*
 + * Android's way to start the modem LK left in its boot ROM (Samsung A34 kernel,
@@ -2758,6 +2769,10 @@ index 0000000..751cca3
 +	/* 4. let go */
 +	ac_smc(AC_MD_POWER_CONFIG, AC_MD_KERNEL_BOOT_UP, r);
 +	ac_smc_log("MD_KERNEL_BOOT_UP (ret, boot_status_0, boot_status_1, boot_slave)", r);
++	/* md_cd_start under MTK_TC10_FEATURE_MD1_SEC (Samsung's build): right after let_md_go the
++	 * kernel asks ATF to update the modem's secure shared memory (UPDATE_MD_SEC_SMEM, 11). */
++	ac_smc(AC_UPDATE_MD_SEC_SMEM, 0, r);
++	ac_smc_log("UPDATE_MD_SEC_SMEM (size)", r);
 +	ac_boot_status();
 +
 +	uint32_t seen = 0;
