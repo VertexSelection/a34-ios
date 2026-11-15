@@ -225,6 +225,17 @@ rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned
 			break;
 		case RWM_WORK_DRAW: {
 			int failed;
+			/* (A34: a pass, for the burst record: a draw into other attachments than the draw before's) */
+			static const struct rwa_texture *pass_target;
+			static unsigned pass_level;
+			const struct rwa_texture *target = w->draw.color_count != 0 ? w->draw.color[0] : nullptr;
+			const unsigned level = w->draw.color_count != 0 ? w->draw.color_level[0] : 0;
+
+			if (rwm_cb_now.passes == 0 || target != pass_target || level != pass_level) {
+				rwm_cb_now.passes++;
+				pass_target = target;
+				pass_level = level;
+			}
 
 			/*
 			 * A34, a measurement, boot-arg rwm_skiplub=1: CoreAnimation's luma boost (a pipeline labelled _Tlub)

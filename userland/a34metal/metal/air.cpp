@@ -139,6 +139,7 @@ load()
 		call("rwa_texture_create", &c.texture_create, true),
 		call("rwa_texture_from_buffer", &c.texture_from_buffer, false),
 		call("rwa_render_stats", &c.render_stats, false),
+		call("rwa_trace_jobs", &c.trace_jobs, false),
 		call("rwa_texture_write", &c.texture_write, false),
 		call("rwa_texture_read", &c.texture_read, false),
 		call("rwa_texture_copy", &c.texture_copy, false),
