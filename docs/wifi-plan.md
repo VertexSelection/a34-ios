@@ -226,7 +226,12 @@ passes `gcc -fsyntax-only -Wall -Wextra -Wconversion -Werror` against stand-in d
 the XNU interfaces it uses (each checked against xnu-8796.141.3's headers: `ml_io_map_unmappable`
 and `ml_io_unmap` in `osfmk/arm/machine_routines.h`, `vnode_lookup`/`vn_rdwr`/`rootvnode` in
 `bsd/sys/vnode*.h`, `vsnprintf` in `bsd/libkern/libkern.h`, `thread_wakeup` and `lck_mtx_sleep`
-outside any private guard). The real build is CI's.
+outside any private guard). `tools/wifi-host-check/run.sh FW_DIR` repeats that check and then
+runs the file's firmware code on the host (ASan/UBSan) with buffers standing for CONNSYS's memory,
+the AP2WF window and the DMA rings: the ROM-EMI image lands at EMI + 0x380000 and its date at
++0x4954e0, regions 3/4 at +0x4ad400/+0x5bd400, region 2 in the window with `0x18400120` =
+0x00404000, the FW_FINISH frame is `DW0 0x01000048 DW1 0x00010000`, CID 0x41, 0xa0, length 40,
+and `GLO_CFG` ends at 0x50209075 -- byte for byte against the files. The real build is CI's.
 
 **User space**: `userland/a34wifi` (`a34wifi up N`, `a34wifi log`, `a34wifi files`; built and
 ad-hoc signed by `.github/workflows/a34wifi.yml`), and `tools/wifi-fw.sh SUPER_IMG DIR`, which
