@@ -239,6 +239,16 @@ allocates with KMA_NOFAIL. Shared memory now comes from kernel_map (ml_io_map_un
 regions only through 1 MiB windows unmapped after use, kept mappings capped at 1 MiB, LK's tag
 table and device tree unmapped once copied (`xnu-boot-0999-cell3`).
 
+Sixth run (`0999-cell3`, log build/logs/0999-cell3-a): no panic; 20 regions (40417 KiB)
+cleared, the CCB sizes went out (DHL 0x70000, MD_MONITOR 0x8000, META 0x104000), FS as before,
+then the same assert at ccci_shm_bm.c line 602. The kernel never writes CCB_CTRL; Android's
+ccci_mdinit does right after starting the modem: libccci_util `ccci_ccb_init_users` (DHL,
+MD_MONITOR, META) writes, per ccb_configs[] entry, a 64-byte header pair at
+(ccb_ctrl_offset + k) * 64 through /dev/ccci_ccb_ctrl: DL {0, 0, 0, 0, 0, page size, buffer
+size, 0xEEFF0011}, UL the same (from the vendor binaries' arm64 code). Our kernel writes them
+after the clear; CCB_CTRL headers are logged before/after and at an exception, the CCB data
+areas only as counts of non-zero words (they hold modem logs).
+
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 
 Only on a boot where LK loaded the modem. Read LK's tag table (smem layout tags
