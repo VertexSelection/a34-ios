@@ -1,0 +1,76 @@
+Darwin: the traced passes say what their draws sampled.
+
+A34 (local to this port; nothing here goes upstream). Boot 0976-120-a's job trace put each frame's
+GPU time in two or three passes over the drawable: the first (4-100 draws) 2.9-3.7 ms, and the
+last, with 3 to 10 draws, 2.3-2.5 ms -- while a frame of one pass of 7 draws over the same drawable,
+preloaded and written back, took 0.17 ms. The time is in what those few draws do, not in the tiles'
+traffic. While a span is traced (patch 0019), panfrost_batch_read_rsrc now counts, per batch, the
+texture reads of its draws and keeps the largest texture sampled -- its size, its layout and
+whether it is an IOSurface -- for the pass's line.
+
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -258,6 +258,38 @@
+    redwood_nwritten = 0;
+ }
+ 
++/* (patch 0022) per batch slot, while a span is traced: the textures its draws sampled */
++static struct {
++   uint32_t reads;
++   uint64_t pixels;
++   uint16_t w, h;
++   uint8_t kind;
++   bool shared;
++} redwood_sampled[PAN_MAX_BATCHES];
++
++static void
++redwood_pan_note_sampled(const struct panfrost_batch *batch, const struct panfrost_resource *rsrc)
++{
++   const struct pipe_resource *res = &rsrc->base;
++
++   if (res->target == PIPE_BUFFER)
++      return;
++   unsigned idx = panfrost_batch_idx((struct panfrost_batch *)batch);
++   uint64_t pixels = (uint64_t)res->width0 * res->height0;
++
++   redwood_sampled[idx].reads++;
++   if (pixels > redwood_sampled[idx].pixels) {
++      redwood_sampled[idx].pixels = pixels;
++      redwood_sampled[idx].w = res->width0;
++      redwood_sampled[idx].h = res->height0;
++      redwood_sampled[idx].kind = rsrc->modifier == DRM_FORMAT_MOD_LINEAR ? 0
++                                  : rsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED ? 1
++                                  : drm_is_afbc(rsrc->modifier) ? 2 : 3;
++      redwood_sampled[idx].shared = (rsrc->bo && (rsrc->bo->flags & PAN_BO_SHARED)) ||
++                                    (res->bind & PIPE_BIND_SHARED);
++   }
++}
++
+ static void
+ redwood_pan_note_read(const struct panfrost_resource *rsrc)
+ {
+@@ -394,6 +426,15 @@
+          rec.format = batch->key.zsbuf.texture->format;
+       }
+    }
++   {
++      unsigned idx = panfrost_batch_idx((struct panfrost_batch *)batch);
++      rec.tex_reads = redwood_sampled[idx].reads;
++      rec.tex_w = redwood_sampled[idx].w;
++      rec.tex_h = redwood_sampled[idx].h;
++      rec.tex_kind = redwood_sampled[idx].kind;
++      rec.tex_shared = redwood_sampled[idx].shared;
++      memset(&redwood_sampled[idx], 0, sizeof(redwood_sampled[idx]));
++   }
+    if (redwood_pan_trace_on && redwood_pan_trace_n < RWP_TRACE) {
+       redwood_pan_trace[redwood_pan_trace_n] = rec;
+       return (int)redwood_pan_trace_n++;
+@@ -652,6 +693,8 @@
+ {
+    if (redwood_pan_metal && redwood_nwritten)
+       redwood_pan_note_read(rsrc);   /* (A34, patch 0021) */
++   if (redwood_pan_metal && redwood_pan_trace_on)
++      redwood_pan_note_sampled(batch, rsrc);   /* (A34, patch 0022) */
+    /* Recursive call to panfrost_batch_read_rsrc() to add all planes.
+     * The max recursion depth should be 3.
+     */

@@ -114,6 +114,11 @@ struct redwood_pan_pass {
     * runs over the whole drawn area (ALWAYS) instead of only the tiles geometry touches (INTERSECT) */
    bool always;
    bool read_later;                   /* (patch 0021) what it wrote back was sampled after, in the same work */
+   /* (patch 0022) the textures its draws sampled: how many reads, and the largest one */
+   uint32_t tex_reads;
+   uint16_t tex_w, tex_h;
+   uint8_t tex_kind;                  /* as `kind` */
+   bool tex_shared;
 };
 extern bool redwood_pan_trace_on;
 extern unsigned redwood_pan_trace_n;
