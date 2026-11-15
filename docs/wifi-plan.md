@@ -332,6 +332,11 @@ again). Read from `gen4m_s1` and checked against Android's dmesg where it shows 
   and `nic_cmd_event.h` (none is packed) and their offsets printed; `tools/wifi-host-check` then runs
   the code on synthetic RX entries (a forwarded beacon with an RX vector, a SCAN_DONE) and checks the
   mailbox frame byte for byte.
+- **Built in CI**: `xnu-a34` on branch `wifi` with 0939, 0940, 0960, 0961
+  ([43681034639](https://github.com/VertexSelection/a34-ios/actions/runs/43681034639); 0960 alone:
+  [43679809066](https://github.com/VertexSelection/a34-ios/actions/runs/43679809066)): every A34
+  patch applied, `a34_connsys.c`, `a34_bt.c`, `a34_wifi.c` compiled, no errors; the warnings are of
+  the kinds XNU's own macros give every A34 file.
 
 **First M2 test** (after M1 has passed; Wi-Fi only, without `a34bt`): kernel with 0939, 0940, 0960
 and 0961; the `com.a34.wifi` job running `a34wifi up 7`; then `grep 'A34 WIFI\|A34 CONNSYS'`:
