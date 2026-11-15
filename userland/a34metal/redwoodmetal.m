@@ -431,6 +431,7 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 &&
 @interface RedwoodMetalDevice : _MTLDevice {
 	io_service_t _acceleratorService;   /* the IOAcceleratorES service Metal handed us */
 	io_connect_t _gpu;                  /* this port's own gpu client, or IO_OBJECT_NULL */
+	uint32_t _maliProduct;              /* A34: RedwoodMali's GPU_PROD_ID (0x9204: Mali-G68), or 0 */
 	struct rwa_device *_mesa;           /* Mesa's screen and context, or NULL */
 	BOOL _assertions;                   /* Metal's own assertion switch, stored for it */
 	struct MTLTargetDeviceArch _target;     /* answered by pointer; see -targetDeviceInfo */
@@ -892,6 +893,16 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	 * placeholder (the solid squares, 24 October). Without one they draw with the processor, as
 	 * they did before Metal.
 	 */
+	/*
+	 * A34: nor for the window server unless boot-arg camtl=1. With a device, CoreAnimation takes
+	 * its Metal renderer instead of the OpenGL ES (userland/a34gl) that draws the screen today,
+	 * and that renderer needs HackiOS's camtl hooks (their inject.c), which are not ported yet.
+	 * So a kernel that names this plug-in (a34metal=1) leaves the screen as it is.
+	 */
+	if (strcmp(getprogname(), "backboardd") == 0 && !rwm_boot_arg("camtl=1")) {
+		rw_print("no device for backboardd (CoreAnimation stays on OpenGL ES; camtl=1 to give it Metal)\n");
+		return nil;
+	}
 	if (strcmp(getprogname(), "chronod") == 0 || strstr(getprogname(), "Widget") != NULL) {
 		rw_print("no device for %s (RenderBox draws with the processor then)\n", getprogname());
 		return nil;
@@ -914,7 +925,28 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 	_gpu = IO_OBJECT_NULL;
 	if (gpu == IO_OBJECT_NULL) {
-		rw_print("no RedwoodGPU service (the gpu was not started)\n");
+		/* A34: the Mali's service, RedwoodMali (iokit/Kernel/arm/A34Mali.cpp, Linux's panfrost
+		 * uAPI): its GPU_PROD_ID for the device's name when there is no compiler library. Not
+		 * kept open, and not _gpu: _gpu is the Adreno's msm client, which buffer.cpp would send
+		 * msm requests to; on the Mali, buffers are Mesa's (rwa_buffer_create). */
+		io_service_t mali = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodMali"));
+
+		if (mali == IO_OBJECT_NULL) {
+			rw_print("no RedwoodMali service (boot-arg a34mali=1 starts the GPU)\n");
+		} else {
+			io_connect_t c = IO_OBJECT_NULL;
+			struct { uint32_t param, pad; uint64_t value; } q = { 0, 0, 0 };   /* GPU_PROD_ID */
+			size_t qsize = sizeof(q);
+
+			if (IOServiceOpen(mali, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+				if (IOConnectCallStructMethod(c, 0x44, &q, sizeof(q), &q, &qsize) == KERN_SUCCESS) {
+					_maliProduct = (uint32_t)q.value;
+				}
+				IOServiceClose(c);
+			}
+			rw_print("RedwoodMali: GPU_PROD_ID %#x\n", _maliProduct);
+			IOObjectRelease(mali);
+		}
 	} else {
 		kern_return_t kr = IOServiceOpen(gpu, mach_task_self(), 0, &_gpu);
 
@@ -1009,7 +1041,16 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	if (profile == (NSUInteger)-1) {
 		const char *at;
 
-		profile = 0;
+		/* A34: 4 by default, which HackiOS's CoreAnimation runs used (metal_profile=4). In Metal
+		 * 306.6.6's -[_MTLDevice initGPUFamilySupport] (jump table at 0x181b5eb8c) the profiles
+		 * enter one ladder of families: 0 Apple1 Common1; 1 + Apple2; 4 + Apple3 Common2; 5 +
+		 * Apple4 (the A11's, Apple's own driver answers 5); 6 + Apple5 Common3; 7 + Metal3
+		 * Apple6; 8 + Apple7; 9 + Apple8 (2 and 3 abort in initLimits). Apple2 is the lowest
+		 * family Metal Performance Shaders takes; Apple4 promises imageblocks, tile shaders and
+		 * raster order groups, which neither the Mali nor this driver has; Apple3 (A9-class:
+		 * indirect draws, base vertex/instance, cube arrays, ASTC/ETC2) is what a GLES 3.1-class
+		 * Valhall can honour through panfrost. */
+		profile = 4;
 		if ((at = strstr(rwm_boot_args(), "metal_profile=")) != NULL && (at == rwm_boot_args() || at[-1] == ' ')) {
 			profile = (NSUInteger)strtoul(at + strlen("metal_profile="), NULL, 10);
 		}
@@ -1147,9 +1188,9 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		return [self fail:error with:@"no render pipeline descriptor"];
 	}
 	if (_mesa == NULL) {
-		return [self fail:error with:@"there is no GPU compiler here: either the Adreno "
-					     @"was not started (gpu=1) or libredwoodair.dylib is "
-					     @"missing or older than this driver"];
+		return [self fail:error with:@"there is no GPU compiler here: either the Mali "
+					     @"was not started (a34mali=1) or /a34/libgallium-26.3.0.dylib "
+					     @"is missing or older than this driver"];
 	}
 	if (mesa.render_create == NULL) {
 		/* The order of these two matters: the first version asked about render_create
@@ -1869,8 +1910,8 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		return [self fail:error with:@"the descriptor has no compute function"];
 	}
 	if (_mesa == NULL) {
-		return [self fail:error with:@"there is no GPU compiler here: either the Adreno "
-					     @"was not started (gpu=1) or libredwoodair.dylib "
+		return [self fail:error with:@"there is no GPU compiler here: either the Mali "
+					     @"was not started (a34mali=1) or /a34/libgallium-26.3.0.dylib "
 					     @"is missing"];
 	}
 	if (![function respondsToSelector:bitcode]) {
@@ -2189,11 +2230,22 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 {
 	uint64_t chip = 0;
 
+	/* A34: the Mali. Mesa's renderer string when the compiler library has the GPU
+	 * ("Mali-G68 MC4 (Panfrost)"), else the kernel's product id. */
+	if (_mesa != NULL && mesa.device_name != NULL) {
+		return [NSString stringWithUTF8String:mesa.device_name(_mesa)];
+	}
+	if (_maliProduct == 0x9204) {
+		return @"Mali-G68 (no compiler library)";
+	}
+	if (_maliProduct != 0) {
+		return [NSString stringWithFormat:@"Mali %#x (no compiler library)", _maliProduct];
+	}
 	if (gpu_param(_gpu, 0x03, &chip)) {
 		return [NSString stringWithFormat:@"Adreno 7c+ Gen 3 (chip %#x, Redwood)",
 				 (unsigned)(chip & 0xffffffffu)];
 	}
-	return @"Adreno (Redwood; the GPU is not started)";
+	return @"A34Metal (no GPU: boot-arg a34mali=1 starts it)";
 }
 
 /*

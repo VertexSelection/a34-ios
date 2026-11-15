@@ -17,6 +17,40 @@ on Metal needs their `camtl` hooks in `inject.c`, not ported yet). What the kern
 their asynchronous mode and run-time discovery switch (0x7c, `setProperties`) is a proposed
 patch kept outside the repository.
 
+**Boot 57 (kernel 0932):** both tests ran through. `metal-probe --direct`: PASS, the device
+registered with `MTLAddDevice`, `MTLCreateSystemDefaultDevice()` gives `RedwoodMetalDevice`; queue
+and buffer made. `metal_drv_test --bundle`: all 103 `MTLDevice` and 337 `MTLDeviceSPI` methods
+answered; AV1SW.metallib's 11 kernels compiled by the AIR frontend and panfrost for the G68, 0
+refused; the dispatch stopped at the harness binding RGBA32Float where the kernel reads
+`texture2d<ushort>`. What boots 31 and 54 lacked: the first use of `os_log` waits 5-10 s in
+`_os_trace_init_slow` -> `_firehose_client_reconnect` -> `mach_msg` (logd), and some 10 s into
+each test the console its stdout was opened on goes dead (`fstat(1)`: EBADF, the deadfs answer of
+a revoked tty), so every line written through descriptors opened before was lost. `a34_watch.c`
+writes each line through a new `/dev/console` and `/dev/null` (boot-arg `sweetnull`).
+
+### CoreAnimation on Metal: what HackiOS's `camtl=1` does, and the port
+
+Their `userland/src/inject.c` (in backboardd, like our `liba34gl-inject`), about 600 lines:
+
+| piece | what | here |
+| --- | --- | --- |
+| `keep_metal_from_core_animation` | without `camtl=1`, empties Metal's device array before `-[CAWindowServer _detectDisplays]` (16.5 addresses) | not needed: the plug-in refuses backboardd unless `camtl=1` (`redwoodmetal.m`) |
+| `give_quartzcore_its_shaders` | `URLForResource:@"default" withExtension:@"metallib"` answered with a macOS library | not needed: our root has QuartzCore's `default.metallib` (141 functions) |
+| `specialize_without_apple` | `MTLFunctionConstantValues` setters, `-[_MTLLibrary newFunctionWithName:constantValues:...]`, every `newFunctionWithDescriptor:error:`: function constants recorded and specialized by the compiler library (`rwa_render_constants`) instead of Apple's compiler service, which cannot compile for this GPU | needed: port as is (method swizzling, no addresses) |
+| `watch_for_exceptions`, `watch_for_faults` | a Mach exception port and signal handlers that say where backboardd dies | port (our `a34_watch.c` covers part) |
+| `CA_DISABLE_DISPLAY_OVERDRIVE_FIX=1`, `ca_dirty=0` -> `CA_DISABLE_DIRTY_REGIONS` | the OLED overdrive pass off; whole frames for debugging | port |
+| `dup2(/dev/console, 1)` | the driver's lines out of backboardd | ours: `|backboardd|` via the devnull tee |
+
+Size: about 400 lines into a new `liba34metal-inject.dylib` (or `liba34gl-inject`, behind
+`camtl=1`), plus the plug-in's warm-start recipes (`/a34/rwm-recipes.txt`, made from a run's log
+by their `tools/rwm-recipes.py`) so that backboardd does not stall 13-19 s per uber-shader
+variant. Risk to the GL path: none while `camtl` is off (the plug-in refuses backboardd and the
+hooks are not installed); with `camtl=1` backboardd's Metal renderer is all or nothing -- a
+pipeline that fails ends backboardd (HackiOS), so the fallback is rebooting without `camtl`.
+Expected problems in order: pipeline build time at first frames, function-constant
+specialization of the uber shaders, then correctness under their synchronous mode
+(`rwm_finish=1`), then speed (their async mode needs kernel request 0x7c, proposed).
+
 **Boot 31 (metal-probe, kernel 0918):** silent for 30 s inside `MTLCreateSystemDefaultDevice()`,
 then the GPU opened and closed and nothing more was printed. Metal 306.6.6 has no timeout on that
 path (no semaphore, group wait, sleep or timer is reachable from `MTLDeviceArrayInitialize`); what

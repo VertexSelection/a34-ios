@@ -13,8 +13,18 @@
  *   metal-probe --any      PASS for any device (default: only for class RedwoodMetalDevice)
  *   metal-probe --next     after the verdict, also ask for a command queue and a buffer
  *                          (milestone 2's first questions; not judged)
+ *   metal-probe --compute [LIB]   then run kernel a34_fill of LIB (default
+ *                          /a34/a34metal-tests.metallib, a34metal-tests.metal) over 1024 of a
+ *                          buffer's 4096 words and check every word: 3i + 7 where it ran, the
+ *                          canary where it did not
+ *   metal-probe --draw [LIB]   then into a 64x64 BGRA IOSurface through Metal's own
+ *                          -newTextureWithDescriptor:iosurface:plane:: a pass that only clears,
+ *                          checked pixel by pixel in the surface's memory; then a pass that
+ *                          clears and draws a34_tri_vs/a34_tri_fs's red triangle, checked at
+ *                          places inside and outside it
  *
- * exit 0 PASS, 1 no device, 2 a device of another class, 3 the device is not as Metal wants it.
+ * exit 0 PASS, 1 no device, 2 a device of another class, 3 the device is not as Metal wants it,
+ * 4 a --compute or --draw check failed.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -30,6 +40,9 @@
 #include <sys/stat.h>
 
 #include "a34metal_iokit.h"
+#include <IOSurface/IOSurfaceRef.h>
+
+#define DEFAULT_TESTS "/a34/a34metal-tests.metallib"
 
 #define DEFAULT_BUNDLE "/System/Library/Extensions/A34Metal.bundle"
 
@@ -153,6 +166,261 @@ direct(const char *path, io_service_t accelerator)
 	return true;
 }
 
+/* ---- end to end: our own shaders through Metal's public API and the driver ---- */
+
+static id<MTLLibrary>
+tests_library(id<MTLDevice> device, const char *path)
+{
+	NSError *error = nil;
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]
+						    error:&error];
+
+	if (library == nil) {
+		say("FAIL: newLibraryWithURL:%s: %s", path, error != nil ? [[error localizedDescription] UTF8String] : "nil");
+		return nil;
+	}
+	say("library %s: %lu functions", path, (unsigned long)[[library functionNames] count]);
+	return library;
+}
+
+static const char *
+status_name(MTLCommandBufferStatus status)
+{
+	static const char *const names[] = { "NotEnqueued", "Enqueued", "Committed", "Scheduled", "Completed", "Error" };
+
+	return (unsigned)status < 6 ? names[status] : "?";
+}
+
+/* the command buffer completed without an error, said either way */
+static bool
+completed(id<MTLCommandBuffer> cb, const char *what)
+{
+	if ([cb status] != MTLCommandBufferStatusCompleted || [cb error] != nil) {
+		say("FAIL: %s: command buffer %s%s%s", what, status_name([cb status]), [cb error] != nil ? ": " : "",
+		    [cb error] != nil ? [[[cb error] localizedDescription] UTF8String] : "");
+		return false;
+	}
+	return true;
+}
+
+static bool
+compute_test(id<MTLDevice> device, const char *path)
+{
+	const NSUInteger words = 4096, grid = 1024, group = 64;
+	const uint32_t canary = 0xdeadbeef;
+	id<MTLLibrary> library = tests_library(device, path);
+	id<MTLFunction> function;
+	id<MTLComputePipelineState> pipeline;
+	id<MTLCommandQueue> queue;
+	id<MTLCommandBuffer> cb;
+	id<MTLComputeCommandEncoder> encoder;
+	id<MTLBuffer> buffer;
+	NSError *error = nil;
+	uint32_t *w;
+	NSUInteger wrong = 0, first_wrong = words;
+
+	if (library == nil) {
+		return false;
+	}
+	function = [library newFunctionWithName:@"a34_fill"];
+	if (function == nil) {
+		say("FAIL: compute: no function a34_fill");
+		return false;
+	}
+	pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+	if (pipeline == nil) {
+		say("FAIL: compute: newComputePipelineStateWithFunction: %s",
+		    error != nil ? [[error localizedDescription] UTF8String] : "nil");
+		return false;
+	}
+	say("compute: a34_fill compiled; maxTotalThreadsPerThreadgroup %lu, threadExecutionWidth %lu",
+	    (unsigned long)[pipeline maxTotalThreadsPerThreadgroup], (unsigned long)[pipeline threadExecutionWidth]);
+	buffer = [device newBufferWithLength:words * 4 options:MTLResourceStorageModeShared];
+	queue = [device newCommandQueue];
+	if (buffer == nil || queue == nil) {
+		say("FAIL: compute: buffer %p, queue %p", (void *)buffer, (void *)queue);
+		return false;
+	}
+	w = (uint32_t *)[buffer contents];
+	for (NSUInteger i = 0; i < words; i++) {
+		w[i] = canary;
+	}
+	cb = [queue commandBuffer];
+	encoder = [cb computeCommandEncoder];
+	[encoder setComputePipelineState:pipeline];
+	[encoder setBuffer:buffer offset:0 atIndex:0];
+	[encoder dispatchThreadgroups:MTLSizeMake(grid / group, 1, 1) threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
+	[encoder endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (!completed(cb, "compute")) {
+		return false;
+	}
+	for (NSUInteger i = 0; i < words; i++) {
+		uint32_t want = i < grid ? (uint32_t)i * 3u + 7u : canary;
+
+		if (w[i] != want) {
+			if (wrong++ == 0) {
+				first_wrong = i;
+			}
+		}
+	}
+	say("compute: words 0..3 %#x %#x %#x %#x, 1023 %#x, 1024 %#x", w[0], w[1], w[2], w[3], w[1023], w[1024]);
+	if (wrong != 0) {
+		say("FAIL: compute: %lu of %lu words wrong, the first at %lu (%#x)", (unsigned long)wrong,
+		    (unsigned long)words, (unsigned long)first_wrong, w[first_wrong]);
+		return false;
+	}
+	say("PASS: compute: 1024 words written as 3i + 7 by the GPU, 3072 canaries untouched");
+	return true;
+}
+
+static IOSurfaceRef
+test_surface(unsigned size)
+{
+	unsigned bpr = size * 4;            /* 256 for 64: a multiple of 64, as panfrost wants */
+	NSDictionary *properties = @{
+		(id)kIOSurfaceWidth: @(size), (id)kIOSurfaceHeight: @(size), (id)kIOSurfaceBytesPerElement: @4,
+		(id)kIOSurfaceBytesPerRow: @(bpr), (id)kIOSurfaceAllocSize: @(bpr * size),
+		(id)kIOSurfacePixelFormat: @(0x42475241),   /* 'BGRA' */
+	};
+
+	return IOSurfaceCreate((CFDictionaryRef)properties);
+}
+
+/* the pixel at (x, y) of the surface, as the CPU reads its memory: 0xAARRGGBB */
+static uint32_t
+surface_pixel(IOSurfaceRef surface, unsigned x, unsigned y)
+{
+	uint32_t value;
+
+	IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+	value = *(const uint32_t *)((const uint8_t *)IOSurfaceGetBaseAddress(surface) + y * IOSurfaceGetBytesPerRow(surface) + x * 4);
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	return value;
+}
+
+static bool
+draw_test(id<MTLDevice> device, const char *path)
+{
+	const unsigned size = 64;
+	const uint32_t green = 0xff00ff00, blue = 0xff0000ff, red = 0xffff0000;
+	IOSurfaceRef surface = test_surface(size);
+	MTLTextureDescriptor *td;
+	id<MTLTexture> texture;
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	id<MTLLibrary> library;
+	id<MTLRenderPipelineState> pipeline;
+	MTLRenderPipelineDescriptor *pd;
+	MTLRenderPassDescriptor *pass;
+	id<MTLCommandBuffer> cb;
+	id<MTLRenderCommandEncoder> encoder;
+	NSError *error = nil;
+	unsigned wrong = 0;
+	bool ok = true;
+
+	if (surface == NULL || queue == nil) {
+		say("FAIL: draw: IOSurface %p, queue %p", (void *)surface, (void *)queue);
+		return false;
+	}
+	say("draw: IOSurface %u, %ux%u 'BGRA', %zu bytes a row", IOSurfaceGetID(surface), size, size,
+	    IOSurfaceGetBytesPerRow(surface));
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:size height:size
+							    mipmapped:NO];
+	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	[td setStorageMode:MTLStorageModeShared];
+	texture = [device newTextureWithDescriptor:td iosurface:surface plane:0];
+	if (texture == nil) {
+		say("FAIL: draw: newTextureWithDescriptor:iosurface:plane: gave nil");
+		return false;
+	}
+
+	/* 1. a pass that only clears (green) */
+	pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = texture;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 1.0, 0.0, 1.0);
+	cb = [queue commandBuffer];
+	encoder = [cb renderCommandEncoderWithDescriptor:pass];
+	[encoder endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (!completed(cb, "clear")) {
+		return false;
+	}
+	for (unsigned y = 0; y < size; y++) {
+		for (unsigned x = 0; x < size; x++) {
+			wrong += surface_pixel(surface, x, y) != green;
+		}
+	}
+	say("draw: clear: (0,0) %#010x, (63,63) %#010x, %u of %u pixels not green", surface_pixel(surface, 0, 0),
+	    surface_pixel(surface, size - 1, size - 1), wrong, size * size);
+	if (wrong != 0) {
+		say("FAIL: draw: the clear");
+		ok = false;
+	} else {
+		say("PASS: draw: a clear through Metal into an IOSurface, every pixel");
+	}
+
+	/* 2. clear (blue) and the triangle (red) */
+	library = tests_library(device, path);
+	if (library == nil) {
+		return false;
+	}
+	pd = [[MTLRenderPipelineDescriptor alloc] init];
+	pd.vertexFunction = [library newFunctionWithName:@"a34_tri_vs"];
+	pd.fragmentFunction = [library newFunctionWithName:@"a34_tri_fs"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	if (pd.vertexFunction == nil || pd.fragmentFunction == nil) {
+		say("FAIL: draw: a34_tri_vs %p, a34_tri_fs %p", (void *)pd.vertexFunction, (void *)pd.fragmentFunction);
+		return false;
+	}
+	pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (pipeline == nil) {
+		say("FAIL: draw: newRenderPipelineStateWithDescriptor: %s",
+		    error != nil ? [[error localizedDescription] UTF8String] : "nil");
+		return false;
+	}
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 1.0, 1.0);
+	cb = [queue commandBuffer];
+	encoder = [cb renderCommandEncoderWithDescriptor:pass];
+	[encoder setRenderPipelineState:pipeline];
+	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[encoder endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (!completed(cb, "triangle")) {
+		return false;
+	}
+	{
+		/* pixel centres; the triangle spans x 16..48 at its base (y 48) and its apex is at
+		 * (32, 16): Metal's y goes up in NDC and down in the texture */
+		static const struct { unsigned x, y; bool inside; const char *where; } at[] = {
+			{ 32, 32, true, "centre" }, { 32, 44, true, "near the base" }, { 32, 20, true, "near the apex" },
+			{ 2, 2, false, "corner" }, { 61, 61, false, "corner" }, { 10, 40, false, "left of it" },
+			{ 54, 40, false, "right of it" }, { 32, 8, false, "above the apex" }, { 32, 56, false, "below the base" },
+		};
+		unsigned bad = 0;
+
+		for (unsigned i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
+			uint32_t got = surface_pixel(surface, at[i].x, at[i].y), want = at[i].inside ? red : blue;
+
+			say("draw: triangle: (%2u,%2u) %-14s %#010x, want %#010x%s", at[i].x, at[i].y, at[i].where, got, want,
+			    got == want ? "" : "  WRONG");
+			bad += got != want;
+		}
+		if (bad != 0) {
+			say("FAIL: draw: the triangle, %u of %zu places wrong", bad, sizeof(at) / sizeof(at[0]));
+			ok = false;
+		} else {
+			say("PASS: draw: a translated vertex and fragment shader drew the triangle into the IOSurface");
+		}
+	}
+	CFRelease(surface);
+	return ok;
+}
+
 static const char *
 yes_no(BOOL value)
 {
@@ -163,7 +431,8 @@ int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
-		bool want_direct = false, any = false, next = false;
+		bool want_direct = false, any = false, next = false, compute = false, draw = false;
+		const char *tests_lib = DEFAULT_TESTS;
 		const char *bundle = DEFAULT_BUNDLE;
 		io_service_t accelerator;
 		id<MTLDevice> device;
@@ -195,10 +464,16 @@ main(int argc, char **argv)
 				}
 			} else if (strcmp(argv[i], "--any") == 0) {
 				any = true;
+			} else if (strcmp(argv[i], "--compute") == 0 || strcmp(argv[i], "--draw") == 0) {
+				*(argv[i][2] == 'c' ? &compute : &draw) = true;
+				if (i + 1 < argc && argv[i + 1][0] != '-') {
+					tests_lib = argv[++i];
+				}
 			} else if (strcmp(argv[i], "--next") == 0) {
 				next = true;
 			} else {
-				fprintf(stderr, "usage: metal-probe [--direct [BUNDLE]] [--any] [--next]\n");
+				fprintf(stderr, "usage: metal-probe [--direct [BUNDLE]] [--any] [--next] [--compute [LIB]] "
+				    "[--draw [LIB]]\n");
 				return 64;
 			}
 		}
@@ -286,6 +561,24 @@ main(int argc, char **argv)
 				[buffer release];
 			} @catch (NSException *exception) {
 				say("next: exception %s: %s", [[exception name] UTF8String], [[exception reason] UTF8String]);
+			}
+		}
+		if (compute || draw) {
+			int failed = 0;
+
+			@try {
+				if (compute && !compute_test(device, tests_lib)) {
+					failed++;
+				}
+				if (draw && !draw_test(device, tests_lib)) {
+					failed++;
+				}
+			} @catch (NSException *exception) {
+				say("FAIL: exception %s: %s", [[exception name] UTF8String], [[exception reason] UTF8String]);
+				failed++;
+			}
+			if (failed) {
+				return 4;
 			}
 		}
 		[device release];

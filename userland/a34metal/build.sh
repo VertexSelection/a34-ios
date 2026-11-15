@@ -71,9 +71,15 @@ log "metal_drv_test (the driver's test, HackiOS's), with a34_watch"
 [ "${PIPESTATUS[0]}" = 0 ]
 echo "compiler warnings: $(grep -c 'warning:' "$BUILD/drvtest.log" || true)"
 
+log "a34metal-tests.metallib (our own shaders for metal-probe --compute/--draw), Xcode's metal for iOS $IOS_MIN"
+xcrun -sdk iphoneos metal -mios-version-min="$IOS_MIN" -c "$HERE/a34metal-tests.metal" -o "$BUILD/a34metal-tests.air"
+xcrun -sdk iphoneos metallib "$BUILD/a34metal-tests.air" -o "$BUILD/a34metal-tests.metallib"
+xcrun -sdk iphoneos metal --version 2>&1 | head -n 1 || true
+ls -l "$BUILD/a34metal-tests.metallib"
+
 log "metal-probe and metal_props"
 "${CC[@]}" -fno-objc-arc -I"$HERE" -o "$BUILD/metal-probe" "$HERE/metal-probe.m" "$HERE/a34_watch.c" \
-	-framework Foundation -framework Metal -framework IOKit -framework CoreFoundation -lobjc
+	-framework Foundation -framework Metal -framework IOKit -framework IOSurface -framework CoreFoundation -lobjc
 "${CC[@]}" -o "$BUILD/metal_props" "$HERE/metal_props.c" -framework CoreFoundation -framework IOKit
 
 log "package"
@@ -82,13 +88,14 @@ for f in A34Metal metal_drv_test metal-probe metal_props; do
 	codesign -f -s - "$BUILD/$f"            # (last: nothing changes a load command after this)
 done
 cp "$BUILD/A34Metal" "$HERE/Info.plist" "$OUT/A34Metal.bundle/"
-cp "$BUILD/metal_drv_test" "$BUILD/metal-probe" "$BUILD/metal_props" "$A/"
+cp "$BUILD/metal_drv_test" "$BUILD/metal-probe" "$BUILD/metal_props" "$BUILD/a34metal-tests.metallib" "$A/"
 cp "$MESA_OUT"/*.dylib "$MESA_OUT/mali-tri" "$A/"
 cp "$HERE/README.md" "$OUT/"
 
 log "check"
 bad=0
 for f in "$OUT/A34Metal.bundle/A34Metal" "$A"/*; do
+	case "$f" in *.metallib) continue ;; esac
 	name=$(basename "$f")
 	if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -v -E "^($INSTALL_DIR/|/usr/lib/|/System/Library/)"; then
 		echo "error: $name refers to a library outside $INSTALL_DIR and the system"

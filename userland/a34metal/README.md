@@ -42,15 +42,15 @@ has run on our phone yet. Built by `.github/workflows/a34metal.yml` (branch `met
 
 ## On the phone (first run)
 
-Do **not** boot with `a34metal=1` yet: with the plug-in named on `IOAcceleratorES`, every program
-that asks Metal gets this device, backboardd included, and CoreAnimation on Metal needs HackiOS's
-`camtl` hooks (their `inject.c`), which are not ported. The tests register the device themselves
-(`MTLAddDevice`), in their own processes only. With the root at `/mnt` and the artifact in
+The tests register the device themselves (`MTLAddDevice`), in their own processes only, so the
+kernel needs no `a34metal`. With `a34metal=1` every program that asks Metal loads the plug-in;
+it then refuses backboardd unless boot-arg `camtl=1` (CoreAnimation's Metal renderer needs
+HackiOS's `camtl` hooks, not ported yet), SpringBoard unless `sbmtl=1`, and chronod/widgets. With the root at `/mnt` and the artifact in
 `a34metal/`:
 
 ```
 tools/root-add-job.py --copy /mnt /System/Library/Extensions/A34Metal.bundle a34metal/A34Metal.bundle
-tools/root-add-job.py /mnt com.a34.metalprobe /a34 a34metal/a34 metal-probe --direct --next
+tools/root-add-job.py /mnt com.a34.metalprobe /a34 a34metal/a34 metal-probe --direct --next --compute --draw
 tools/root-add-job.py --env /mnt com.a34.metalprobe REDWOOD_DRM_ASYNC=0
 tools/root-add-job.py /mnt com.a34.metaldrvtest /a34 a34metal/a34 metal_drv_test --bundle
 tools/root-add-job.py --env /mnt com.a34.metaldrvtest REDWOOD_DRM_ASYNC=0
@@ -58,7 +58,8 @@ tools/root-add-job.py --env /mnt com.a34.metaldrvtest REDWOOD_DRM_ASYNC=0
 
 The second line also copies `a34/` into `/a34`: Mesa's four dylibs (the same Mesa as a34gl's, plus
 patches 0006/0007, which also turn panfrost's CRC off for GL), `mali-tri`, `metal-probe`,
-`metal_drv_test`, `metal_props`. Boot-args as today (`a34mali=1`, no `a34metal`), plus
+`metal_drv_test`, `metal_props`, `a34metal-tests.metallib` (our own shaders, `a34metal-tests.metal`,
+compiled in CI by Xcode's `metal` for iOS 16). Boot-args as today (`a34mali=1`, no `a34metal`), plus
 `sweetnull=backboardd,SpringBoard,metal-probe,metal_drv_test`: the kernel then copies what the
 tests write to `/dev/null` into its log as `|metal-probe| ...`, a second copy of every line that
 no console state can lose (boot 54 lost everything the tests wrote after their first lines).
@@ -70,14 +71,21 @@ What a good run puts in the kernel log (stdout of both jobs goes to the console)
   `direct: ... loaded, principal class RedwoodMetalDevice`, `redwoodmetal[metal-probe N]: the
   compiler library Mali-G68 ...`, `direct: registered`, the device's name and families, `PASS:
   Metal's default device is RedwoodMetalDevice "..."`, then `next: newCommandQueue = 0x...` and
-  `next: newBufferWithLength:4096 = 0x...` (exit 0; 1 no device, 2 another class, 3 not as Metal
-  wants it).
+  `next: newBufferWithLength:4096 = 0x...`; then `--compute`: `PASS: compute: 1024 words written as
+  3i + 7 by the GPU, 3072 canaries untouched`, and `--draw`: `PASS: draw: a clear through Metal into
+  an IOSurface, every pixel` and `PASS: draw: a translated vertex and fragment shader drew the
+  triangle into the IOSurface` (nine pixels listed). Exit 0; 1 no device, 2 another class, 3 not as
+  Metal wants it, 4 a compute or draw check failed. The device calls itself `Mali-G68 MC4
+  (Panfrost)` and claims families Apple1-3, Common1-2 (feature profile 4; `metal_profile=N`).
 - `metal_drv_test --bundle`: `drvtest: step 4 isSubclassOfClass:_MTLDevice PASSES`, `step 5 gave
   RedwoodMetalDevice`, `MTLAddDevice returned`, `MTLCreateSystemDefaultDevice() =
   RedwoodMetalDevice`, `it calls itself "..."`, what the device still owes, then the eleven
   kernels of `/System/Library/VideoDecoders/AV1SW.metallib` compiled for the Mali (`drvtest: of 11
-  functions, N compiled and M were refused`) and dispatched. Other modes (`--draw`, `--draw-all`,
-  `--time`): the top of `metal_drv_test.m`.
+  functions, N compiled and M were refused`) and the first dispatched. It binds RGBA32Float to
+  every texture unless told otherwise, which AV1SW's FilmGrain kernels refuse (they read
+  `texture2d<ushort>`): `--texslots 0=2d:rgba16uint,1=2d:rgba16uint` (per slot) or `--texfmt` set
+  it; `metal-probe --compute` is the checked end-to-end compute test. Other modes (`--draw`,
+  `--draw-all`, `--time`): the top of `metal_drv_test.m`.
 - Both (`a34_watch.c`): every line of stdout and stderr -- theirs, the plug-in's, redwood-drm's --
   prefixed `+SECONDS`, written through `/dev/console` opened anew for that line and to `/dev/null`;
   `a34watch: PROGRAM[PID] T s: alive; fd 1 ..., N lines out, M lost` and `main thread: c:0x18...
