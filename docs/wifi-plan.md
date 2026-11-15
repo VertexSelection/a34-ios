@@ -231,7 +231,13 @@ runs the file's firmware code on the host (ASan/UBSan) with buffers standing for
 the AP2WF window and the DMA rings: the ROM-EMI image lands at EMI + 0x380000 and its date at
 +0x4954e0, regions 3/4 at +0x4ad400/+0x5bd400, region 2 in the window with `0x18400120` =
 0x00404000, the FW_FINISH frame is `DW0 0x01000048 DW1 0x00010000`, CID 0x41, 0xa0, length 40,
-and `GLO_CFG` ends at 0x50209075 -- byte for byte against the files. The real build is CI's.
+and `GLO_CFG` ends at 0x50209075 -- byte for byte against the files. **CI built the kernel with
+0939** (`xnu-a34` on branch `wifi`, run
+[43678571231](https://github.com/VertexSelection/a34-ios/actions/runs/43678571231), commit
+`8276cdc`, artifact `xnu-a34-kernel`): the patch applied and `a34_wifi.c` compiled with no
+error; its 13 warnings are 10 `-Wcast-function-type-strict` from XNU's own `LCK_*_DECLARE`,
+`SYSCTL_*` and `kalloc` macros (as in the other A34 files), 2 `-Wdeclaration-after-statement`
+(as `a34_diag.c`/`a34_mali.c`) and 1 `-Wmissing-noreturn` (the worker thread).
 
 **User space**: `userland/a34wifi` (`a34wifi up N`, `a34wifi log`, `a34wifi files`; built and
 ad-hoc signed by `.github/workflows/a34wifi.yml`), and `tools/wifi-fw.sh SUPER_IMG DIR`, which
