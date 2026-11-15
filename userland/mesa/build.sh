@@ -197,8 +197,8 @@ ios_mesa() {
 			-Dopengl=false -Dgles1=disabled -Dgles2=enabled \
 			-Dllvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system -Dspirv-tools=disabled \
 			-Dmicrosoft-clc=disabled -Dgallium-rusticl=false -Dteflon=false -Dpanfrost-rust=false \
-			-Dzstd=disabled -Dzlib=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dvalgrind=disabled \
-			-Dlibunwind=disabled -Dlmsensors=disabled -Dshader-cache=disabled -Dvideo-codecs= \
+			-Dzstd=disabled -Dzlib=enabled -Dxmlconfig=disabled -Dexpat=disabled -Dvalgrind=disabled \
+			-Dlibunwind=disabled -Dlmsensors=disabled -Dshader-cache=enabled -Dshader-cache-max-size=256M -Dvideo-codecs= \
 			-Dgallium-va=disabled -Ddisplay-info=disabled -Dbuild-tests=false
 		if ! ninja -C "$WORK/build-ios" -j "$JOBS" -k 0 >"$WORK/build-ios.log" 2>&1; then
 			grep -E -B2 -A12 'error:|FAILED:|Undefined symbols|ld: ' "$WORK/build-ios.log" | head -n 600
@@ -350,7 +350,7 @@ build_info() {
 	echo "host LLVM:     $("$LLVM_PREFIX/bin/llvm-config" --version 2>/dev/null) (mesa_clc, build time only)"
 	echo "meson:         $(meson --version)"
 	echo "meson options: -Dgallium-drivers=panfrost -Dplatforms= -Degl=enabled (surfaceless) -Dgles2=enabled"
-	echo "               -Dopengl=false -Dglx=disabled -Dgbm=disabled -Dllvm=disabled -Dshader-cache=disabled"
+	echo "               -Dopengl=false -Dglx=disabled -Dgbm=disabled -Dllvm=disabled -Dshader-cache=enabled (256M, zlib; patch 0008)"
 	echo "               -Dxmlconfig=disabled -Dbuildtype=release -Db_ndebug=true (see build.sh)"
 	echo
 	echo "files:"

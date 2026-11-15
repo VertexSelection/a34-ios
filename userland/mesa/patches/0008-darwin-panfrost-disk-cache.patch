@@ -1,0 +1,46 @@
+Darwin: panfrost's on-disk shader cache without an ELF build id (userland/a34metal, a34gl).
+
+panfrost names its cache by the library's GNU build id, which a Mach-O has not (it asserts,
+or with NDEBUG dereferences NULL). On Darwin the identity is taken from the library file
+instead, as Mesa's other drivers do (disk_cache_get_function_identifier: dladdr and the
+file's modification time), so a newly installed libgallium starts a new cache. The cache
+itself is Mesa's ($HOME/.cache/mesa_shader_cache, or MESA_SHADER_CACHE_DIR): backboardd's
+CoreAnimation pipelines (Metal and OpenGL ES alike) are compiled once and read back at
+the next boot. build.sh builds Mesa with -Dshader-cache=enabled and zlib for it.
+
+--- a/src/gallium/drivers/panfrost/pan_disk_cache.c	2026-11-15 05:43:12.278288898 +0300
++++ b/src/gallium/drivers/panfrost/pan_disk_cache.c	2026-11-15 05:43:12.284288815 +0300
+@@ -147,7 +147,23 @@
+ {
+ #ifdef ENABLE_SHADER_CACHE
+    const char *renderer = screen->base.get_name(&screen->base);
++   char timestamp[BLAKE3_HEX_LEN];
++
++#ifdef __APPLE__
++   /* A34: no ELF build id in a Mach-O: the library's identity from its file instead
++    * (disk_cache_get_function_identifier: dladdr and the file's modification time), so
++    * that a new libgallium on the phone starts a new cache. Without one, no cache. */
++   {
++      struct mesa_blake3 ctx;
++      blake3_hash id;
+ 
++      _mesa_blake3_init(&ctx);
++      if (!disk_cache_get_function_identifier(panfrost_disk_cache_init, &ctx))
++         return;
++      _mesa_blake3_final(&ctx, id);
++      _mesa_blake3_format(timestamp, id);
++   }
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(panfrost_disk_cache_init);
+    assert(note && build_id_length(note) == BUILD_ID_EXPECTED_HASH_LENGTH); /* sha1 */
+@@ -155,8 +171,8 @@
+    const uint8_t *id_sha1 = build_id_data(note);
+    assert(id_sha1);
+ 
+-   char timestamp[BLAKE3_HEX_LEN];
+    _mesa_sha1_format(timestamp, id_sha1);
++#endif
+ 
+    /* Consider any flags affecting the compile when caching */
+    uint64_t driver_flags = screen->dev.debug;
