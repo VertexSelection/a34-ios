@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..c4cea7d
+index 0000000..91b3628
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,2113 @@
+@@ -0,0 +1,2141 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -406,9 +406,10 @@ index 0000000..c4cea7d
 +	return rg[id].va;
 +}
 +
-+/* Zero physical [pa, pa + len) through CC_WIN windows, each unmapped after use. */
++/* Counts the non-zero words of physical [pa, pa + len) and, with zero, clears it; through
++ * CC_WIN windows, each unmapped after use. Only counts are reported, never contents. */
 +static bool
-+pa_zero(uint64_t pa, uint32_t len)
++pa_scan(uint64_t pa, uint32_t len, bool zero, uint32_t *nonzero)
 +{
 +	while (len >= 4) {
 +		uint64_t page = pa & ~(uint64_t)PAGE_MASK;
@@ -418,7 +419,11 @@ index 0000000..c4cea7d
 +		vm_offset_t m = ml_io_map_unmappable((vm_offset_t)page, mlen, CC_WIMG_IO);
 +		if (!m)
 +			return false;
-+		dm_zero(m, off, n & ~3u);
++		if (nonzero)
++			for (uint32_t o = 0; o + 4 <= n; o += 4)
++				*nonzero += rd32(m, off + o) != 0;
++		if (zero)
++			dm_zero(m, off, n & ~3u);
 +		ml_io_unmap(m, mlen);
 +		pa += n;
 +		len -= n;
@@ -1656,10 +1661,27 @@ index 0000000..c4cea7d
 +	32, 1, 2, 3, 5, 6, 46, 28,                                              /* cached */
 +};
 +
++/* Boot-arg a34cellclear, which groups the first-boot clear covers (default all, 0x1F): bit 0 the
++ * non-cached regions, 1 CCB data (1-3), 2 RAW_DHL/RAW_MDM (5, 6), 3 NVRAM_CACHE (32), 4 the
++ * other cached ones (46, 28). Each region's non-zero words are counted before (counts only). */
++static uint32_t
++clear_group(int id)
++{
++	switch (id) {
++	case 1: case 2: case 3: return 1u << 1;
++	case 5: case 6: return 1u << 2;
++	case 32: return 1u << 3;
++	case 46: case 28: return 1u << 4;
++	default: return 1u << 0;
++	}
++}
++
 +static void
 +smem_clear_first_boot(void)
 +{
-+	uint32_t n = 0, kib = 0;
++	uint32_t n = 0, kib = 0, mask = 0x1F;
++
++	(void)PE_parse_boot_argn("a34cellclear", &mask, (int)sizeof(mask));
 +
 +	for (size_t i = 0; i < sizeof(clear_first); i++) {
 +		int id = clear_first[i];
@@ -1671,15 +1693,21 @@ index 0000000..c4cea7d
 +				dup = true;
 +		if (dup)
 +			continue;
-+		if (!pa_zero(rg[id].ap, rg[id].size)) {
++		bool zero = (mask & clear_group(id)) != 0;
++		uint32_t nz = 0;
++		if (!pa_scan(rg[id].ap, rg[id].size, zero, &nz)) {
 +			printf("A34 CELL: smem %d: no mapping to clear it; clearing stopped\n", id);
 +			break;
 +		}
-+		n++;
-+		kib += rg[id].size >> 10;
++		printf("A34 CELL: smem %d before the clear: %u of %u words non-zero%s\n", id, nz, rg[id].size / 4,
++		    zero ? "" : " (left as it is: a34cellclear)");
++		if (zero) {
++			n++;
++			kib += rg[id].size >> 10;
++		}
 +	}
 +	printf("A34 CELL: shared memory cleared as Android's first boot: %u regions, %u KiB "
-+	    "(rings, DRDI, PHY_CAP, AMMS, CONSYS, USIP kept)\n", n, kib);
++	    "(rings, DRDI, PHY_CAP, AMMS, CONSYS, USIP kept; a34cellclear 0x%x)\n", n, kib, mask);
 +}
 +
 +/* ---- the modem's PMIC rails (md_sys1_platform.c md1_pmic_setting_on) ---- */
