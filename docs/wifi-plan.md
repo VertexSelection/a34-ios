@@ -824,7 +824,7 @@ on sends PHY_ACTION "use the backup".
 - Still deaf: the Wi-Fi firmware is started again -- WFSYS off as soc5_0.c wf_pwr_off_consys_mcu
   does it (sleep protection, WFSYS_ON_TOP off, its semaphore reset, the A-die's top clock 1 off,
   the EMI/infra requests toggled; conn_infra and Bluetooth untouched), the ROM mailbox and ready
-  bits cleared, then steps 4-6 and the scans again. At most twice a boot
+  bits cleared, then steps 4-6 and the scans again. Once a boot by default
   (`kern.a34wifi.restarts_most` / boot-arg `a34wifirestarts`; 0 keeps a deaf radio for study);
   `kern.a34wifi.restarts` counts them. Three deaf scans by iOS while not joined do the same.
 - Before a restart the log has the radio status, the A-die's top clocks, CONN_ON_MISC, LPCTL and
@@ -832,4 +832,26 @@ on sends PHY_ACTION "use the backup".
 
 If restarts keep being needed, the next steps are Android's: calibrate with PHY_ACTION (0966,
 `a34wifiphy=1`), or have Bluetooth hold its LE scan for the ~0.8 s of Wi-Fi's FW_FINISH.
+
+## 1013: the A-die from cold at every boot
+
+Then 1011-120-b: the very kernel and root that had joined (1011-120-a) booted again, warm, after
+0977-120-a -- and heard nothing, with FW_FINISH at a normal 783 ms. So the deafness survives warm
+reboots. Everything in the CONN power domain starts from reset at each boot (ph3 finds
+CONN_PWR_CON 0x12, off): conn_infra, WFSYS, the Wi-Fi firmware. What does not:
+- the A-die (MT6635), a chip of its own on the PMIC's VCN18, VCN13, VCN33_1/2: ph1 and ph15 switch
+  them on by software, nothing switches them off before a reboot, LK leaves the PMIC alone -- the
+  A-die runs on through a warm reboot with what the last boot's firmwares set in it;
+- CONNSYS's memory (DRAM at 0x60000000, 7.5 MB): only the images, Wi-Fi's log/dump areas and the
+  mailbox are rewritten each boot.
+
+1013 (bsd/dev/a34_connsys.c, the first power-on of a boot, before any radio):
+- ph0 cold: CONNSYS's memory zeroed.
+- ph1 cold: the rails' state logged ("ph1: before: ..."); any seen on are switched off as Android's
+  power-off does (VCN33_2, VCN33_1: software and SRCLKEN_RC enables; 1 ms; VCN13, VCN18), left off
+  100 ms, then ph1/ph15 switch them on as always. A cold boot logs "a cold start already".
+- ph8: the A-die's reset held 100 us before it is released (it was only released).
+- `a34conncold=0` skips the memory and the rails (not the reset).
+
+Shared with Bluetooth (the first power-on is usually Bluetooth's): it costs ~100 ms there.
 

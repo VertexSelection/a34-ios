@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
-index 4fa71d3..b7cb5c2 100644
+index 4fa71d3..61f3949 100644
 --- a/bsd/dev/a34_wifi.c
 +++ b/bsd/dev/a34_wifi.c
 @@ -726,6 +726,15 @@ a34w_poll_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uin
@@ -55,7 +55,7 @@ index 4fa71d3..b7cb5c2 100644
 +static bool a34w_last_scan_deaf;
 +static uint32_t a34w_deaf_scans, a34w_restarts;
 +#define DEAF_SCANS                      3u      /* scans, 5 s apart, before a start is called deaf */
-+static uint32_t a34w_restarts_most = 2;  /* firmware restarts a boot: kern.a34wifi.restarts_most, boot-arg a34wifirestarts */
++static uint32_t a34w_restarts_most = 1;  /* firmware restarts a boot: kern.a34wifi.restarts_most, boot-arg a34wifirestarts */
 +
  static bool
  a34w_scan_for(const char *who, bool stay, const uint8_t *ssid, uint32_t ssid_length)
@@ -176,7 +176,7 @@ index 4fa71d3..b7cb5c2 100644
 +	return ok;
 +}
 +
-+/* step 7: a scan (three while nothing at all is heard); a deaf start restarted up to twice */
++/* step 7: a scan (three while nothing at all is heard); a deaf start restarted (once by default) */
  static bool
  a34w_step7(void)
  {

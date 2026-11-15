@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/a34_connsys.c b/bsd/dev/a34_connsys.c
+index 4d31392..7cdb560 100644
+--- a/bsd/dev/a34_connsys.c
++++ b/bsd/dev/a34_connsys.c
+@@ -167,6 +167,7 @@ static vm_offset_t cs_rgu, cs_cfg, cs_therm, cs_afe, cs_spi, cs_slp, cs_clkgen,
+     cs_hc, cs_sema, cs_infra, cs_gpio, cs_spm, cs_toprgu, cs_rc, cs_pwrap, cs_iocfg;
+ static uint64_t cs_emi_pa = CS_EMI_DEFAULT;
+ static uint32_t cs_mpu = 1, cs_vcn33 = 1, cs_lp, cs_deep = 1, cs_force;
++static uint32_t cs_cold = 1;            /* (1013) boot-arg a34conncold: the A-die's rails cycled, CONNSYS's memory cleared */
+ static bool cs_up, cs_tried;
+ static uint32_t cs_adie_id;
+ static uint32_t cs_radios;              /* CS_RADIO_BIT() of every radio got */
+@@ -456,6 +457,85 @@ cs_map(void)
+ 	       cs_sysram && cs_hc && cs_sema && cs_infra && cs_gpio && cs_spm && cs_toprgu && cs_rc && cs_pwrap && cs_iocfg;
+ }
+ 
++/*
++ * ---- (1013) ph1 cold: what a warm reboot leaves, undone ----
++ * The CONN power domain is off when a boot starts (ph3 "before": CONN_PWR_CON 0x12), so conn_infra
++ * and the Wi-Fi/Bluetooth subsystems start from reset. The A-die (MT6635, a chip of its own) does
++ * not: its rails are the PMIC's VCN18, VCN13 and VCN33_1/2, which ph1/ph15 switch on by software
++ * and nothing switches off before a reboot (power-off is not implemented); LK leaves the PMIC as
++ * it is. So a warm reboot hands the next boot an A-die that has run all along, with whatever the
++ * last boot's firmware set in it. After boot 0977-120-a the radio heard nothing at all, and the
++ * very kernel that had heard well (1011-120-a) heard nothing when booted again warm (1011-120-b).
++ * Android's conninfra powers the A-die up from off: its power-off disables VCN13 and VCN18 (VCN33
++ * after: in RC mode SRCLKEN_RC drops it), consys_plt_pmic_common_power_ctrl_mt6877(0). Here, at
++ * the first power-on of a boot, with every radio still off: the rails seen on are switched off --
++ * VCN33_2 and VCN33_1 (their software enables and their SRCLKEN_RC enables), 1 ms, VCN13, VCN18 --
++ * and left off 100 ms; ph1 and ph15 switch them on again as always. Then (ph0 cold) CONNSYS's
++ * memory is zeroed: no image, log, calibration or mailbox of the last boot's firmware is left in it.
++ * a34conncold=0 skips both.
++ */
++#define PMIC_OP_EN_CLR(set)     ((uint16_t)((set) + 2u))        /* RG_LDO_*_OP_EN_SET + 2: _CLR */
++
++static uint16_t
++cs_pmic_get(uint16_t reg)
++{
++	uint16_t v = 0;
++
++	(void)cs_pmic_read(reg, &v);
++	return v;
++}
++
++static void
++cs_ph1_cold(void)
++{
++	uint16_t m18 = cs_pmic_get(PMIC_VCN18_MON), m13 = cs_pmic_get(PMIC_VCN13_MON);
++	uint16_t m331 = cs_pmic_get(PMIC_VCN33_1_MON), m332 = cs_pmic_get(PMIC_VCN33_2_MON);
++
++	printf("A34 CONNSYS: ph1: before: VCN18 CON0 %#x MON %#x, VCN13 CON0 %#x MON %#x, VCN33_1 CON0 %#x MULTI_SW %#x "
++	    "MON %#x, VCN33_2 CON0 %#x MULTI_SW %#x MON %#x\n", cs_pmic_get(PMIC_VCN18_CON0), m18, cs_pmic_get(PMIC_VCN13_CON0),
++	    m13, cs_pmic_get(PMIC_VCN33_1_CON0), cs_pmic_get(PMIC_VCN33_1_MULTI_SW), m331, cs_pmic_get(PMIC_VCN33_2_CON0),
++	    cs_pmic_get(PMIC_VCN33_2_MULTI_SW), m332);
++	if (!cs_cold) {
++		return;
++	}
++	if (((m18 | m13 | m331 | m332) & 1u) == 0) {
++		printf("A34 CONNSYS: ph1: the A-die's rails are off: a cold start already\n");
++		return;
++	}
++	(void)cs_pmic_write(PMIC_OP_EN_CLR(PMIC_VCN33_2_OP_EN_SET), 0x00ffu);
++	(void)cs_pmic_field(PMIC_VCN33_2_MULTI_SW, 1u << 15, 0);
++	(void)cs_pmic_field(PMIC_VCN33_2_CON0, 1u << 0, 0);
++	(void)cs_pmic_write(PMIC_OP_EN_CLR(PMIC_VCN33_1_OP_EN_SET), 0x00ffu);
++	(void)cs_pmic_field(PMIC_VCN33_1_MULTI_SW, 1u << 15, 0);
++	(void)cs_pmic_field(PMIC_VCN33_1_CON0, 1u << 0, 0);
++	delay(1000);
++	(void)cs_pmic_write(PMIC_OP_EN_CLR(PMIC_VCN13_OP_EN_SET), 0x00ffu);
++	(void)cs_pmic_field(PMIC_VCN13_CON0, 1u << 0, 0);
++	(void)cs_pmic_write(PMIC_OP_EN_CLR(PMIC_VCN18_OP_EN_SET), 0x00ffu);
++	(void)cs_pmic_field(PMIC_VCN18_CON0, 1u << 0, 0);
++	delay(100000);
++	printf("A34 CONNSYS: ph1: the A-die's rails were left on by the last boot (a warm reboot): off for 100 ms "
++	    "(MON now VCN18 %#x, VCN13 %#x, VCN33_1 %#x, VCN33_2 %#x), then on again\n", cs_pmic_get(PMIC_VCN18_MON),
++	    cs_pmic_get(PMIC_VCN13_MON), cs_pmic_get(PMIC_VCN33_1_MON), cs_pmic_get(PMIC_VCN33_2_MON));
++}
++
++static void
++cs_emi_clear(void)
++{
++	vm_offset_t m = ml_io_map_unmappable((vm_offset_t)cs_emi_pa, CS_EMI_SIZE, 0x6u /* VM_WIMG_WCOMB */);
++
++	if (m == 0) {
++		printf("A34 CONNSYS: ph0: CONNSYS's memory could not be mapped to be cleared\n");
++		return;
++	}
++	for (uint32_t off = 0; off < CS_EMI_SIZE; off += 8u) {
++		*(volatile uint64_t *)(m + off) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("A34 CONNSYS: ph0: CONNSYS's memory (%#x bytes at %#llx) cleared: nothing of the last boot's firmwares\n",
++	    CS_EMI_SIZE, cs_emi_pa);
++}
++
+ /* ---- ph1: VCN18 and VCN13 (consys_plt_pmic_common_power_ctrl_mt6877, RC mode) ---- */
+ 
+ static bool
+@@ -612,6 +692,8 @@ cs_ph8_adie(void)
+ 	wr(cs_gpio, 0x164, 1u << 12);
+ 	field(cs_gpio, 0x490, 0x70000u, 0);                                     /* ... as a GPIO while 26 MHz is set up */
+ 	cs_top_ck(true);
++	clrb(cs_cfg, 0x030, 1u << 0);                                           /* (1013) A-die reset held a moment ... */
++	delay(100);
+ 	setb(cs_cfg, 0x030, 1u << 0);                                           /* A-die reset released */
+ 	if (!cs_sema_get(SEMA_RFSPI)) {
+ 		cs_top_ck(false);
+@@ -904,6 +986,7 @@ cs_first_on(uint32_t radio)
+ 	(void)PE_parse_boot_argn("a34btlp", &cs_lp, sizeof(cs_lp));
+ 	(void)PE_parse_boot_argn("a34btdeep", &cs_deep, sizeof(cs_deep));
+ 	(void)PE_parse_boot_argn("a34btforce", &cs_force, sizeof(cs_force));
++	(void)PE_parse_boot_argn("a34conncold", &cs_cold, sizeof(cs_cold));    /* (1013) */
+ 	if ((cs_emi_pa & 0xfffffu) != 0 || cs_emi_pa + CS_EMI_SIZE > 0x100000000ull || cs_emi_pa < 0x40000000ull) {
+ 		printf("A34 CONNSYS: a34btemi=%#llx is not 1 MB aligned in DRAM below 4 GB\n", cs_emi_pa);
+ 		return EINVAL;
+@@ -922,6 +1005,10 @@ cs_first_on(uint32_t radio)
+ 	if (cs_mpu) {
+ 		cs_emi_mpu();
+ 	}
++	if (cs_cold) {
++		cs_emi_clear();                                                 /* (1013) */
++	}
++	cs_ph1_cold();                                                          /* (1013) */
+ 	if (!cs_ph1_pmic()) {
+ 		printf("A34 CONNSYS: ph1: VCN18/VCN13 did not come on\n");
+ 		return EIO;
