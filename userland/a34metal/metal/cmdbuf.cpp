@@ -107,6 +107,9 @@ say_first_drawn(struct rwm_work *const *works, unsigned count, const char *(*lab
 } // namespace
 
 __thread bool rwm_on_completion_queue;
+
+/* A34: the last buffer committed (its last GPU job) and when the completion queue saw a buffer's GPU work end */
+static uint64_t last_committed_seq, last_done_ns;
 __thread struct rwm_cb_parts rwm_cb_now;
 
 extern "C" bool
@@ -127,6 +130,31 @@ rwm_command_begin(struct rwm_command *c)
 	c->born = rwm_ns();
 	c->born_cpu = rwm_thread_cpu_ns();
 	c->status = RWM_CB_ENQUEUED;    /* nothing is pending yet */
+	/*
+	 * A34: frames in flight. Begun while the GPU still draws the buffer committed before: the program overlaps its
+	 * next frame with the GPU, as Metal lets it (2-3 frames). Begun only after: something made it wait for the GPU
+	 * -- a completed handler, the display's swap, a surface in use. The question is asked of the kernel (a WAIT_SEQ
+	 * that does not wait), and only while camprof is on.
+	 */
+	const uint64_t committed = __atomic_load_n(&last_committed_seq, __ATOMIC_RELAXED);
+	const struct rwm_air *air = rwm_air();
+
+	if (committed != 0 && rwm_camprof() != 0 && air->wait_seq != nullptr) {
+		if (air->wait_seq(committed, 0) != 0) {
+			rwm_perf.begun_overlapped++;
+		} else {
+			const uint64_t done = __atomic_load_n(&last_done_ns, __ATOMIC_RELAXED);
+
+			rwm_perf.begun_after_done++;
+			if (done != 0 && c->born >= done) {
+				rwm_perf.begun_gap_n++;
+				rwm_perf.begun_gap_ns += c->born - done;
+				if (c->born - done < 1000000) {
+					rwm_perf.begun_soon++;
+				}
+			}
+		}
+	}
 }
 
 extern "C" bool
@@ -211,6 +239,9 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 	}
 	rwm_cb_now.took_ns = took;
 	rwm_cb_parts_note(&rwm_cb_now);
+	if (c->seq != 0) {
+		__atomic_store_n(&last_committed_seq, c->seq, __ATOMIC_RELAXED);
+	}
 	rwm_perf.last_end = now;
 	rwm_perf.cbs++;
 	rwm_perf.wait += waited;
@@ -281,6 +312,7 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 		if (rwm_on_completion_queue) {
 			rwm_perf.completed_q_waits++;
 			rwm_perf.completed_q_ns += rwm_ns() - from;
+			__atomic_store_n(&last_done_ns, rwm_ns(), __ATOMIC_RELAXED);
 		} else {
 			rwm_perf.completed_waits++;
 			rwm_perf.completed_ns += rwm_ns() - from;

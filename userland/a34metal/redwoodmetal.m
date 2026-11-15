@@ -4085,6 +4085,8 @@ rw_core_of(id texture)
 
 	_scheduled = nil;
 	_completed = nil;
+	rwm_perf.scheduled_handlers += [scheduled count];      /* (A34: rwm frames in flight) */
+	rwm_perf.completed_handlers += [completed count];
 	for (id handler in scheduled) {
 		[self redwoodDeliver:(void (^)(id))handler];
 	}
