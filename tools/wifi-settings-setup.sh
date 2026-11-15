@@ -6,7 +6,7 @@
 #   sudo tools/wifi-settings-setup.sh --undo ROOT     wifid's job as it was (stock _LimitLoadToDeviceTree:
 #                                                    ["wlan", "marconi-wifi"]); nothing else is touched
 #
-# wifid needs kernel 0996 too (the registry going quiet): without it wifid waits for configd's
+# wifid needs kernel 0997 too (the registry going quiet): without it wifid waits for configd's
 # interface namer at boot, and SpringBoard waits for wifid (log 0995-wifi-a: stuck at the logo).
 #
 # ROOT is the iOS root, mounted read-write. What it does:

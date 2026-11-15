@@ -620,7 +620,7 @@ type is one to answer next), MobileGestalt's `IONameMatch wlan -> ` the service.
 Wi-Fi: the switch, the networks around (wifid's scans: `scan for iOS`), the joined network ticked;
 joining another network with a typed passphrase (`iOS asks us to join "..."`, then JOINED).
 
-### 0996: the registry goes quiet (stuck at the logo with wifid: `build/logs/0995-wifi-a`)
+### 0997: the registry goes quiet (stuck at the logo with wifid: `build/logs/0995-wifi-a`)
 
 With wifid started (0995 and the setup script) the phone stayed at the Apple logo. The kernel's
 sampler (baseline patch 0054, `SMP` lines; symbolized with `ipsw dyld a2s` against
@@ -637,7 +637,7 @@ registry never went quiet, configd's interface namer never said "quiet", wifid w
 "IOKit never quiesced, wifid hung boot".) Without wifid, MobileWiFi's open failed at once, which
 is why every boot before reached the home screen.
 
-0996 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
+0997 (`iokit/Kernel/IOStartIOKit.cpp`, `IOService.cpp`, diffed against 8796.141.3 with the
 baseline's 0021/0022/0083): on this board the hold is not taken (boot-arg `a34iokithold=1` takes
 it as XNU does), and `iokitDaemonLaunched` gives back only a hold that was taken. Expected in the
 log: `the registry's busy state is 0` when configd opens IONetworkStack. Next boot with wifid:
