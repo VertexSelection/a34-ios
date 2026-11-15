@@ -252,8 +252,15 @@ rwm_texture_copy_in(struct rwm_texture *texture, size_t *bytes, char *why, size_
 	}
 
 	uint32_t seed = IOSurfaceGetSeed(texture->source);
+	/* (metal-fx) boot-arg rwm_copyin=always: copied before every command buffer that reads it, whatever its
+	 * seed -- a surface over a program's memory is written without a lock and keeps its seed (the
+	 * icons that stay empty or old) */
+	static int always = -1;
 
-	if (seed != 0 && seed == texture->source_seed) {
+	if (always < 0) {
+		always = rwm_boot_arg("rwm_copyin=always");
+	}
+	if (!always && seed != 0 && seed == texture->source_seed) {
 		return 0;               /* (a surface whose seed never moves is copied every time) */
 	}
 

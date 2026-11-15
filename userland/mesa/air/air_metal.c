@@ -1045,6 +1045,12 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 123, "MTLPixelFormatRGBA32Uint",      PIPE_FORMAT_R32G32B32A32_UINT },
    { 124, "MTLPixelFormatRGBA32Sint",      PIPE_FORMAT_R32G32B32A32_SINT },
    { 125, "MTLPixelFormatRGBA32Float",     PIPE_FORMAT_R32G32B32A32_FLOAT },
+   /* A34 (metal-fx): Apple's BGR10_XR and its sRGB twin (554, 555) have no alpha: a sample reads 1.
+    * Stored as BGRA8 (the plug-in's old mapping), what a shader or a clear wrote into the alpha stayed
+    * there, and CoreAnimation compositing such a target read 0 where it means opaque -- transparent or
+    * black. As B8G8R8X8 the alpha reads 1, as on Apple's GPU (eight bits a channel: this panel is). */
+   { 554, "MTLPixelFormatBGR10_XR (as B8G8R8X8)", PIPE_FORMAT_B8G8R8X8_UNORM },
+   { 555, "MTLPixelFormatBGR10_XR_sRGB (as B8G8R8X8)", PIPE_FORMAT_B8G8R8X8_SRGB },
 
    /* Depth and stencil. These are in the same table because a depth texture is a
     * texture (air_metal.h) and every caller asks for one the same way; what the format
@@ -7358,6 +7364,14 @@ rwa_render_destroy(struct rwa_render *render)
  * sample count IS the attachment's resource's (util_framebuffer_get_num_samples): a
  * mismatch would silently become whatever the first attachment happened to be.
  */
+/* (A34 metal-fx) BGR10_XR as B8G8R8X8 and BGRA8 are the same eight bits a channel: an attachment of one
+ * drawn by a pipeline made for the other (a surface's texture is BGRA8, a texture of CoreAnimation's own BGRX) */
+static bool
+xr_compatible(unsigned a, unsigned b)
+{
+   return ((a == 554 || a == 80) && (b == 554 || b == 80)) || ((a == 555 || a == 81) && (b == 555 || b == 81));
+}
+
 static bool
 attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char *what,
                       char *why, size_t why_size)
@@ -7606,7 +7620,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                             "MTLTextureUsageRenderTarget", i, t->format_name);
          return -1;
       }
-      if (t->shape.pixel_format != render->shape.color_format[i]) {
+      if (t->shape.pixel_format != render->shape.color_format[i] &&
+          !xr_compatible(t->shape.pixel_format, render->shape.color_format[i])) {
          say(why, why_size, "colour attachment %u is pixel format %u and the pipeline's "
                             "attachment %u is %u", i, t->shape.pixel_format, i,
              render->shape.color_format[i]);

@@ -2167,7 +2167,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 	char why[512] = { 0 };
 	struct rwm_import road;
 	struct rwa_texture_shape shape = {
-		.pixel_format = rw_known_format((unsigned)[d pixelFormat]),
+		.pixel_format = rwm_surface_format((unsigned)[d pixelFormat]),
 		.type = (unsigned)[d textureType],
 		.width = (unsigned)[d width],
 		.height = (unsigned)[d height],
