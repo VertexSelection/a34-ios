@@ -1,7 +1,17 @@
 # Bluetooth on the Galaxy A34 under iOS 16.7.16: research and plan
 
-Status (2026-11-15): research done, milestone 1 built and **not yet run on the phone**
-(`xnu/patches/0939-a34-bt-m1.patch`, `userland/a34bt`, boot-arg `a34bt=1`, default off).
+Status (2026-11-15):
+
+- **Milestone 1 passed on the phone** (boot `0961-radio-a`, kernel 0961 with Wi-Fi up in the same
+  boot, `a34bt=1`): CONNSYS up (A-die MT6635 E3, `0x66358a11`), both images in EMI and read back,
+  BGF IP 0x02040200, MCU idle after 40 ms, `WMT_FUNC_CTRL` status 0, HCI_Reset status 0, controller
+  HCI 12 rev 0x3143, LMP 12 sub 0xffd7, manufacturer 0x0046, address 00:00:46:67:61:01 (MediaTek's
+  default), 6 of 6 commands, up in 7.9 s. The `a34bt probe` job opened the raw channel but sent
+  nothing: 0939's packet framing had no length for HCI commands (type 1); fixed in 0970. Its stdout
+  did not reach the log either (nor `a34wifi`'s): `a34bt` now writes to `/dev/console` itself.
+- **Milestone 2 built, not yet run**: `xnu/patches/0970-a34-bt-address.patch` (the phone's own
+  address, the raw-channel fix) and `xnu/patches/0971-a34-bt-bridge.patch` (`a34bt=2`: bluetoothd's
+  transport, see section 6b), `userland/a34bt` (`a34bt scan`, `a34bt-bluetool`).
 
 Sources are cited as `file:line`. "Samsung" means Samsung's A34 kernel source as published by
 [Fede2782/android_kernel_samsung_a34x](https://github.com/Fede2782/android_kernel_samsung_a34x),
@@ -268,6 +278,28 @@ other devices' addresses).
 5. A log ending right after an `A34 BT: step N:` / `A34 CONNSYS: phN:` line without its result =
    that step hung; next boot `a34btstep=N-1` (stops before it, the rest of the boot unaffected).
 
+
+### 6b. Milestone 2 as built (0970, 0971)
+
+| piece | what | where |
+| --- | --- | --- |
+| address | random static (two top bits 1, LAP not 0x9E8B00-3F), one per phone in `/a34/bt-address` (installer, or the kernel when missing); set with MediaTek's `01 1a fc 06 <addr, low byte first>` (answered `04 0e 04 01 1a fc 00`, `connectivity/bt/mt66xx/btmtk_buffer_mode.c:90-91`) after bring-up and before any HCI_Reset's completion is passed on; checked with Read_BD_ADDR | `a34_bt.c` (0970) |
+| transport | kernel control `com.apple.uart.sk.bluetooth` (stream, unprivileged; option `0x800c5414` taken, `0x40105412` answers the channel UUID) and the Skywalk kernel pipe | `a34_bt.c`, `a34_btsk.c` (HackiOS `redwood_btsk.c`, APSL) |
+| registry | service `bluetooth` under the platform expert, `local-mac-address` = the phone's address (no `transport-encoding`: bluetoothd's default 3 is H4BC) | `iokit/Kernel/arm/A34Bluetooth.cpp` |
+| nodes | `/dev/btwake`, `/dev/btreset`, `/dev/btpoweroff` (H4BC opens btwake) | `a34_bt.c` |
+| vendor commands | every OGF 0x3f command from bluetoothd answered in the kernel (Command Complete, status 0; 0xFD48 +1 byte, 0xFCE2 sub 0x15/0x36 +16, 0xFD1B +64 starting 0x51), never forwarded: MediaTek's own vendor commands (0xFC1A, 0xFC6F, ...) share the space | `a34_bt.c` `br_vsc` |
+| event fixes | 0x0C5B unknown -> done; Read_Local_Supported_Commands LE octets added only if octet 25 is 0 (logged either way); unknown commands logged | `a34_bt.c` `br_quirks` |
+| BlueTool | job `com.apple.BlueTool` wrapped to `/a34/a34bt-bluetool`, which serves the Mach service and answers every script with `result 0` (HackiOS's `bluetool_serves`, as a program instead of inside BlueTool) | `userland/a34bt/bluetool.c` |
+| test | `a34bt scan 60`: LE scan of its own, or listening while bluetoothd has the controller; counts Apple adverts and AirPods-type proximity pairing (type 0x07) with model bytes; the kernel logs the same counts every 10 s | `userland/a34bt/a34bt.c`, `a34_bt.c` `br_le_*` |
+
+Checked: main 0962 + 0970 + 0971 compiles and links (`xnu-a34` run
+[43714808186](https://github.com/VertexSelection/a34-ios/actions/runs/43714808186): no new warnings in
+`a34_btsk.c` or `A34Bluetooth.cpp`; the kernel carries the control, the pipe and the service);
+`a34bt` and `a34bt-bluetool` build with `-Werror` (`a34bt` workflow run 43714804186).
+
+Not done yet: HackiOS's `bt_entry_fix` in bluetoothd (only for scans of programs without a bundle;
+16.7.16 target `+0x58e944`), bluetoothd's own log capture (its restarts are seen as `exec bluetoothd`
+and the last `br>` before each), ComputerName, power-off.
 
 ## 7. Unknowns and risks
 
