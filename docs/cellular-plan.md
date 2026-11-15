@@ -198,14 +198,24 @@ rings, HS1 -> runtime feature list -> HS2, then character devices: `/dev/a34at0`
 `/dev/a34fs` (the file server channel), later `ccci_aud` and the IMS channels. Log lines:
 `A34 CELL: HS1`, `runtime data sent`, `HS2: modem ready`, per-port open.
 
-### Stage 1c -- the modem's file server, read only
+### Stage 1c -- the modem's file server, read only, inside the kernel
 
-Protocol from `ccci_mdinit`'s file server (op names in its strings: open/read/write/seek/close/
-get-file-detail/..., BIN_REGION, OTP), served by `a34cell-fsd` from `nvdata`, `protect1`,
-`protect2`, `nvcfg` through a read-only ext4 reader on `sweet_ufs_read_part()` (list extended to
-those four, still read only; no journal replay -- unlike a Linux `ro` mount). Writes: RAM overlay
-per session. Refused: BIN_REGION, OTP. Success: HS2, then `a34cell: ATI: ...` and
-`AT+CPIN?` in the log with the transmitter still off.
+Rules (coordinator, 2026-11-15): the server only reads the modem's own files in place on the
+phone and hands them to the modem, as ccci_fsd does; their contents never go to the host, the
+repository or any log (file names and sizes only, never bytes); the partitions are never
+written (the modem's writes stay in RAM for the session); nothing changes identity.
+
+So it runs in the kernel, not in user space: no device node or sysctl can read those
+partitions, and the bytes only ever travel from the disk to the modem's FS channel (CCCI 14/15).
+- `sweet_ufs_read_part()`'s read-only list gains `nvdata`, `protect1`, `protect2`, `nvcfg` --
+  still read only, still no write path in the driver for them.
+- `ext4ro` (userland/a34cell/ext4ro.c, the same code in the kernel): read-only ext4 without
+  journal replay, tested on mke2fs images (extents with index nodes, block maps, htree
+  directories, 1 KiB and 4 KiB blocks).
+- The protocol from `ccci_mdinit`'s file server (being read out of the binary: op IDs, packet
+  layout, path mapping). Writes, deletes, renames: kept in a RAM overlay, never flushed.
+  BIN_REGION (the `nvram` partition backup/restore) and OTP: refused.
+- Log: `A34 CELL FS: open <path> -> <size>`, `read <n> bytes`, counts; never data.
 
 ### Stage 2 -- SIM and network
 
