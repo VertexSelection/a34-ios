@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+index 4fa71d3..61f3949 100644
+--- a/bsd/dev/a34_wifi.c
++++ b/bsd/dev/a34_wifi.c
+@@ -726,6 +726,15 @@ a34w_poll_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uin
+ 
+ /* ---- step 4: WFSYS on, the WM MCU's ROM running its EMI image ---- */
+ 
++/*
++ * (1012) A deaf start: in 2 of ~30 boots with Bluetooth up (0980-btmetal-a, 0977-120-a) the
++ * firmware answered FW_FINISH early (426 and 116 ms, not the usual 710-790: its power-on
++ * calibration cut short) and then heard nothing at all, 2.4 or 5 GHz, for the whole boot. Such
++ * a start is restarted: WFSYS off (soc5_0.c wf_pwr_off_consys_mcu) and steps 4-6 again.
++ */
++static bool a34w_restarting;            /* steps 4 and 5 do not take "it already runs" then */
++static uint64_t a34w_fw_finish_ms;
++
+ static bool
+ a34w_rom_emi_load(void)
+ {
+@@ -787,7 +796,7 @@ a34w_step4(void)
+ 		a34w_say("step 4: conn_infra did not wake for Wi-Fi (IP version 0x%08x)", v);
+ 		return false;
+ 	}
+-	if (a34w_rd(a34w_conn, HOST_MAILBOX_DBG) == ROM_DONE && (a34w_rd(a34w_conn, WF_CPU_SW_RST_B) & 1u)) {
++	if (!a34w_restarting && a34w_rd(a34w_conn, HOST_MAILBOX_DBG) == ROM_DONE && (a34w_rd(a34w_conn, WF_CPU_SW_RST_B) & 1u)) {
+ 		a34w_say("step 4: the WM MCU already runs (mailbox 0x%x): nothing to do", ROM_DONE);
+ 		a34w_clr(a34w_conn, HOST_WAKEPU_WF, 1u);
+ 		return true;
+@@ -1374,7 +1383,7 @@ a34w_step5(void)
+ 		return false;
+ 	}
+ 	sync = a34w_rd(a34w_conn, HOST_SW_SYNC0);
+-	if ((sync & 3u) == 3u) {
++	if (!a34w_restarting && (sync & 3u) == 3u) {
+ 		a34w_say("step 5: the firmware already runs (CONN_ON_MISC 0x%08x): nothing to do", sync);
+ 		return true;
+ 	}
+@@ -1414,7 +1423,9 @@ a34w_step5(void)
+ 		    a34w_rd(a34w_conn, HOST_MAILBOX_DBG), a34w_rd(a34w_conn, HOST_SW_SYNC0));
+ 		return false;
+ 	}
+-	a34w_say("step 5: FW_FINISH answered in %llu ms", (unsigned long long)(a34w_ms() - t0));
++	a34w_fw_finish_ms = a34w_ms() - t0;
++	a34w_say("step 5: FW_FINISH answered in %llu ms%s", (unsigned long long)a34w_fw_finish_ms, a34w_fw_finish_ms < 600u ?
++	    " (1012: short -- usually 710-790 ms; the two boots that heard nothing had 116 and 426)" : "");
+ 	if (!a34w_poll_mask(a34w_conn, HOST_SW_SYNC0, 3u, 3u, 500, 5000, &sync)) {
+ 		a34w_say("step 5: the firmware is NOT ready after 2.5 s: CONN_ON_MISC 0x%08x, mailbox 0x%08x", sync,
+ 		    a34w_rd(a34w_conn, HOST_MAILBOX_DBG));
+@@ -2032,6 +2043,12 @@ a34w_scan(const char *who, bool stay)
+ 	return a34w_scan_for(who, stay, NULL, 0);
+ }
+ 
++/* (1012) the last scan heard nothing at all: the firmware counted no beacon on 20+ channels and forwarded no frame */
++static bool a34w_last_scan_deaf;
++static uint32_t a34w_deaf_scans, a34w_restarts;
++#define DEAF_SCANS                      3u      /* scans, 5 s apart, before a start is called deaf */
++static uint32_t a34w_restarts_most = 1;  /* firmware restarts a boot: kern.a34wifi.restarts_most, boot-arg a34wifirestarts */
++
+ static bool
+ a34w_scan_for(const char *who, bool stay, const uint8_t *ssid, uint32_t ssid_length)
+ {
+@@ -2107,15 +2124,136 @@ a34w_scan_for(const char *who, bool stay, const uint8_t *ssid, uint32_t ssid_len
+ 	a34w_say("%s: SCAN_DONE in %llu ms: scan %u (asked %u), %u channels done, state %u, version %u, %u beacons "
+ 	    "counted by the firmware; %u frames forwarded", who, (unsigned long long)(a34w_ms() - t0), done[0], a34w_scan_seq,
+ 	    done[4], done[5], done[6], a34w_le32(done + 8), a34w_rx_frames - frames0);
++	a34w_last_scan_deaf = done[4] >= 20u && a34w_le32(done + 8) == 0 && a34w_rx_frames == frames0;
++	a34w_deaf_scans = a34w_last_scan_deaf ? a34w_deaf_scans + 1u : 0;
+ 	a34w_heard_report(who);
+ 	a34w_results_take();                            /* (0969) for iOS */
+ 	return true;
+ }
+ 
++/* (1012) a scan, and while it hears nothing at all two more, 5 s apart */
++static bool
++a34w_scan_sure(const char *who, bool stay)
++{
++	for (uint32_t i = 1;; i++) {
++		if (!a34w_scan(who, stay)) {
++			return false;
++		}
++		if (!a34w_last_scan_deaf || i >= DEAF_SCANS) {
++			return true;
++		}
++		a34w_say("%s: not one beacon on any channel (the firmware counted none): scanning again in 5 s (%u of %u)", who,
++		    i + 1u, DEAF_SCANS);
++		sweet_log_flush();
++		delay(5000000);
++	}
++}
++
++/*
++ * (1012) WFSYS off, as soc5_0.c wf_pwr_off_consys_mcu does it (Android, at every Wi-Fi off):
++ * conn_infra kept awake, the bus sleep protection on, WFSYS_ON_TOP off and its reset seen,
++ * WFSYS's semaphore reset, the A-die's top clock 1 off, the EMI/infra requests toggled.
++ * conn_infra and Bluetooth stay as they are.
++ */
++#define WFSYS_SW_RST_B                  0x00140u        /* CONN_INFRA_RGU + 0x140: WFSYS's semaphore */
++#define WB_SLP_TOP_CK_1                 0x05124u        /* conn_wt_slp_ctl: the A-die's top clock 1 (Wi-Fi) */
++#define CONN_CFG_WFSYS_EMI_REQ          0x01414u
++
++static bool
++a34w_wf_off(void)
++{
++	uint32_t v = 0;
++	bool ok = true;
++
++	a34w_mbox_ready = false;
++	a34w_data_rings = false;
++	a34w_set(a34w_conn, HOST_WAKEPU_WF, 1u);
++	if (!a34w_poll_mask(a34w_conn, CONN_CFG_IP_VERSION, 0xffffffffu, CONN_HW_VER, 10, 1000, &v)) {
++		a34w_say("Wi-Fi off: conn_infra did not wake (IP version 0x%08x)", v);
++		return false;
++	}
++	a34w_set(a34w_conn, CONN_CFG_WF_SLP_CTRL, 1u);  /* conn_infra <-> WFSYS / WFDMA sleep protection on */
++	if (!a34w_poll_mask(a34w_conn, CONN_CFG_WF_SLP_STATUS, 1u << 25, 1u << 25, 100, 500, &v)) {
++		a34w_say("Wi-Fi off: WFDMA to conn_infra sleep protection not ready (0x%08x); going on", v);
++	}
++	for (uint32_t i = 0; i <= 100u && ((v = a34w_rd(a34w_conn, CONN_CFG_WF_SLP_STATUS)) & 0xa0000000u) == 0; i++) {
++		delay(500);
++	}
++	if ((v & 0xa0000000u) == 0) {
++		a34w_say("Wi-Fi off: WFSYS to conn_infra sleep protection not ready (0x%08x); going on", v);
++	}
++	v = a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL);
++	a34w_wr(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL, (v & 0x0000ff7fu) | 0x57460000u);    /* key 0x5746, off */
++	if (!a34w_poll_mask(a34w_conn, HOST_DBG_DUMMY_3, 1u << 30, 0, 10, 500, &v)) {
++		a34w_say("Wi-Fi off: WFSYS still powered (DBG_DUMMY_3 0x%08x)", v);
++		ok = false;
++	}
++	a34w_clr(a34w_conn, WFSYS_SW_RST_B, 1u);
++	a34w_set(a34w_conn, WFSYS_SW_RST_B, 1u);
++	a34w_clr(a34w_conn, WB_SLP_TOP_CK_1, 1u);
++	if (!a34w_poll_mask(a34w_conn, WB_SLP_TOP_CK_1, 1u << 1, 0, 100, 500, &v)) {
++		a34w_say("Wi-Fi off: the A-die's top clock 1 still on (0x%08x); going on", v);
++	}
++	a34w_set(a34w_conn, CONN_CFG_WFSYS_EMI_REQ, 1u);
++	a34w_clr(a34w_conn, CONN_CFG_WFSYS_EMI_REQ, 1u);
++	a34w_set(a34w_conn, CONN_CFG_WFSYS_EMI_REQ, 1u << 5);
++	a34w_clr(a34w_conn, CONN_CFG_WFSYS_EMI_REQ, 1u << 5);
++	delay(50);
++	/* what the next start polls for must not be left from this one: the ROM's mailbox, the ready bits */
++	v = a34w_rd(a34w_conn, HOST_MAILBOX_DBG);
++	a34w_wr(a34w_conn, HOST_MAILBOX_DBG, 0);
++	a34w_mask(a34w_conn, HOST_SW_SYNC0, 3u, 0);
++	a34w_say("Wi-Fi off: %s; ROM mailbox 0x%08x -> 0x%08x, CONN_ON_MISC 0x%08x, A-die top clock 1 0x%08x", ok ? "WFSYS off" :
++	    "WFSYS NOT OFF", v, a34w_rd(a34w_conn, HOST_MAILBOX_DBG), a34w_rd(a34w_conn, HOST_SW_SYNC0),
++	    a34w_rd(a34w_conn, WB_SLP_TOP_CK_1));
++	a34w_clr(a34w_conn, HOST_WAKEPU_WF, 1u);
++	return ok;
++}
++
++/* (1012) the firmware started again: WFSYS off, steps 4-6 */
++static bool
++a34w_restart(const char *who)
++{
++	bool ok;
++
++	a34w_restarts++;
++	a34w_say("%s: the radio hears nothing at all (%u scans without a beacon on any channel; FW_FINISH took %llu ms): "
++	    "the Wi-Fi firmware is started again (%u of %u this boot)", who, a34w_deaf_scans,
++	    (unsigned long long)a34w_fw_finish_ms, a34w_restarts, a34w_restarts_most);
++	a34w_say("%s: before: radio status 0x%08x, A-die top clocks 0x%08x/0x%08x, CONN_ON_MISC 0x%08x, LPCTL 0x%08x, WF sleep "
++	    "status 0x%08x", who, a34w_rd(a34w_conn, SYSRAM_RADIO_STATUS), a34w_rd(a34w_conn, WB_SLP_TOP_CK_1 - 4u),
++	    a34w_rd(a34w_conn, WB_SLP_TOP_CK_1), a34w_rd(a34w_conn, HOST_SW_SYNC0), a34w_rd(a34w_conn, HOST_LPCTL),
++	    a34w_rd(a34w_conn, CONN_CFG_WF_SLP_STATUS));
++	sweet_log_flush();
++	if (!a34w_wf_off()) {
++		return false;
++	}
++	a34w_restarting = true;
++	ok = a34w_step4() && a34w_step5() && a34w_step6();
++	a34w_restarting = false;
++	a34w_deaf_scans = 0;
++	a34w_say("%s: the Wi-Fi firmware %s", who, ok ? "runs again" : "did NOT start again");
++	return ok;
++}
++
++/* step 7: a scan (three while nothing at all is heard); a deaf start restarted (once by default) */
+ static bool
+ a34w_step7(void)
+ {
+-	return a34w_scan("step 7", false);
++	for (;;) {
++		if (!a34w_scan_sure("step 7", false)) {
++			return false;
++		}
++		if (!a34w_last_scan_deaf || a34w_restarts >= a34w_restarts_most) {
++			if (a34w_last_scan_deaf) {
++				a34w_say("step 7: still nothing heard after %u restarts: going on (scans can be asked again)", a34w_restarts);
++			}
++			return true;
++		}
++		if (!a34w_restart("step 7")) {
++			return false;
++		}
++	}
+ }
+ 
+ /* ---- step 8 (0964, milestone 3): joining a network ---- */
+@@ -4622,6 +4760,9 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 			lck_mtx_unlock(&a34w_run_mtx);
+ 			a34w_sta_do(leave, join ? &what : NULL, scan);
+ 			bzero(&what, sizeof(what));
++			if (a34w_deaf_scans >= DEAF_SCANS && !a34w_joined && a34w_restarts < a34w_restarts_most && a34w_done >= 7) {
++				(void)a34w_restart("iOS's scans");     /* (1012) deaf since: started again */
++			}
+ 			sweet_log_flush();
+ 			continue;
+ 		}
+@@ -4630,7 +4771,10 @@ a34w_thread(__unused void *arg, __unused wait_result_t result)
+ 		step = again ? 7 : a34w_done + 1;
+ 		lck_mtx_unlock(&a34w_run_mtx);
+ 		if (again) {
+-			(void)a34w_scan("scan", a34w_joined);  /* a scan more: done and failed stay as they are */
++			(void)a34w_scan_sure("scan", a34w_joined);     /* a scan more (1012: three while deaf) */
++			if (a34w_last_scan_deaf && !a34w_joined && a34w_restarts < a34w_restarts_most && a34w_done >= 7) {
++				(void)a34w_restart("scan");
++			}
+ 			continue;
+ 		}
+ 
+@@ -4757,6 +4901,10 @@ SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_bus
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_legacy, 0,
+     "(0968) 1: join as a legacy station (no HT, no WMM), as 0964 did");
++SYSCTL_UINT(_kern_a34wifi, OID_AUTO, restarts, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_restarts, 0,
++    "(1012) times the firmware was started again this boot because the radio heard nothing at all");
++SYSCTL_UINT(_kern_a34wifi, OID_AUTO, restarts_most, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_restarts_most, 0,
++    "(1012) at most this many such restarts a boot (0: none, to look at a deaf radio)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, width, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_width_max, 0,
+     "(1011) the widest channel a join may use: 20, 40 or 80 MHz (5 GHz; from the next join)");
+ SYSCTL_INT(_kern_a34wifi, OID_AUTO, nss, CTLFLAG_RW | CTLFLAG_LOCKED, &a34w_nss_max, 0,
+@@ -4854,6 +5002,7 @@ a34_wifi_init(void)
+ 	(void)PE_parse_boot_argn("a34wifilegacy", &a34w_legacy, sizeof(a34w_legacy));         /* (0968) */
+ 	(void)PE_parse_boot_argn("a34wifips", &a34w_powersave, sizeof(a34w_powersave));       /* (1010) */
+ 	(void)PE_parse_boot_argn("a34wifiwidth", &a34w_width_max, sizeof(a34w_width_max));    /* (1011) */
++	(void)PE_parse_boot_argn("a34wifirestarts", &a34w_restarts_most, sizeof(a34w_restarts_most));       /* (1012) */
+ 	(void)PE_parse_boot_argn("a34wifinss", &a34w_nss_max, sizeof(a34w_nss_max));
+ 	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
+ 		return;
