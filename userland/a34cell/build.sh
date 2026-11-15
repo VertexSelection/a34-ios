@@ -84,9 +84,8 @@ the modem reports a well-formed identity of its own; the identity is never print
 The status bar: liba34cell-sb.dylib, loaded into SpringBoard through the kernel's a34inject
 (several libraries separated by ':'), e.g. boot-arg
   a34inject=/a34/liba34gl-inject.dylib:/a34/liba34cell-sb.dylib,backboardd,SpringBoard,mediaserverd
-shows the bars and the operator while a34cell's state says registered. To test it without a
-modem: a job that runs "/a34/a34cell -fake Turkcell 3" (publishes a made-up state, says so,
-touches no modem).
+shows the bars and the operator while a34cell's state (from the modem's own answers) says
+registered. Nothing is shown without a modem.
 
 To remove: delete the job com.a34.cell from System/Library/xpc/launchd.plist (or reinstall the
 root image) and /a34/a34cell.

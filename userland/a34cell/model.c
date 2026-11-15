@@ -294,7 +294,6 @@ model_plist(const struct cell_state *s, char *out, size_t outsz)
 		return -1;
 	pos = (size_t)w;
 	if (put(out, outsz, &pos, B, "ModemUp", s->modem_up ? "true" : "false", 0) ||
-	    put(out, outsz, &pos, B, "Fake", s->fake ? "true" : "false", 0) ||
 	    put(out, outsz, &pos, S, "SIM", sims[s->sim], 0) ||
 	    put(out, outsz, &pos, I, "CFUN", NULL, s->cfun) ||
 	    put(out, outsz, &pos, B, "RadioGate", s->radio_gate ? "true" : "false", 0) ||
