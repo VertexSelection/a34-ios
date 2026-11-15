@@ -201,10 +201,13 @@ modem, shared memory) lies in XNU's 0x1_4000_0000-0x2_3FFF_F000; the loader now 
 if one ever does, and 0950 logs them all with an overlap count. To tell boot path, kernel and
 root state apart: `xnu-recovery-0980-cell1.img` is the same kernel and boot-args through
 `recovery`. Second run (`0980-cell1`, Metal boot-args) failed the same way right after a good
-`recovery` boot of the same root. Bisection images (kernel run 43723136471, same boot-args):
-`xnu-boot-0980-cell0` (no probe at all), `-cell1-noparts` (no partition I/O), `-cell1-nosmc`
-(no secure-monitor queries), `-cell1-nofdt` (LK's device tree and tags untouched),
-`-cell1-regs` (only the SPM/infracfg status reads).
+`recovery` boot of the same root. Cause found: those
+boot images were built in a directory without `research/ipsw-x/d22ap.adt`, and
+`mkadt_a34.py` then makes an ADT without `/product` (it only prints a note); SpringBoard's
+`IODeviceTree:/product` lookups answered "none" (good boots: IOPlatformDevice) and UIKit's
+asset lookup for the iPhone X's screen failed. Neither the `boot` path nor 0950 was at fault.
+`tools/build-xnu-boot.sh` now refuses to build without the iPhone X tree and checks the ADT
+for `/product`.
 
 ### Stage 1b -- the control path in the kernel (`a34cell=2`)
 

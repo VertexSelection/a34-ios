@@ -37,7 +37,14 @@ if aarch64-linux-gnu-readelf -r "$T/shim-start.o" "$T/a34boot.o" "$T/a34ufs.o" |
 fi
 aarch64-linux-gnu-objcopy -O binary "$T/a34boot.elf" "$T/a34boot.bin"
 
-python3 -I "$ROOT/tools/mkadt_a34.py" "$T/a34.adt"
+# The ADT's /product node (MobileGestalt's identity: without it SpringBoard dies on a UIKit
+# asset, "BoundingPathBitmap-1125x2436...") comes from the real iPhone X tree; mkadt_a34.py only
+# notes when that file is missing, so check here.
+D22AP=${D22AP:-$ROOT/research/ipsw-x/d22ap.adt}
+[ -s "$D22AP" ] || { echo "no $D22AP (the iPhone X device tree for /product); stopping" >&2; exit 1; }
+python3 -I "$ROOT/tools/mkadt_a34.py" "$T/a34.adt" --d22ap "$D22AP"
+python3 -I "$ROOT/tools/mkadt_a34.py" "$T/check.adt" --d22ap "$D22AP" --dump 2>/dev/null | grep -q -E "^\s*product \{" ||
+    { echo "the ADT has no /product node; stopping" >&2; exit 1; }
 python3 -I "$SWEET/mkpayload.py" "$KERNEL" "$T/a34.adt" "$T/xnu-payload.bin" --cmdline "$CMDLINE"
 
 # Loader, then the XNU payload; no second payload (shim_payload2_size 0: the Volume Up escape
