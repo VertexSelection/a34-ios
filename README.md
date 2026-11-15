@@ -16,7 +16,8 @@ usable as a daily system, and installing it erases the phone.
 | Buttons | volume up/down, power (patch 0902) |
 | CPU | all 8 cores (6× Cortex-A55 at 1.8 GHz, 2× Cortex-A78), one scheduler cl| GPU | Mali-G68 MC4 driven from iOS: kernel bring-up and a panfrost-style IOKit service with queued jobs (0908–0928, `a34mali=1`), raised from 385 to 670 MHz with MediaTek's table voltages (`a34gpumhz=670`, 0921), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected with `a34inject=`): **the UI is GPU-rendered, 45–58 fps in motion**; CoreImage works in SpringBoard; the earlier black lines were display tearing, fixed by 0930–0933 |Kit service (0908–0916, `a34mali=1`), Mesa 26.3 Panfrost (OpenGL ES 3.1, `userland/mesa`), and CoreAnimation rendering through it via ios-topaz's EAGL hook (`userland/a34gl`, injected into backboardd with `a34inject=/a34/liba34gl-inject.dylib,backboardd`): **the UI is GPU-rendered, ~20 fps**; some visual glitches |
 | Boot time | empty `IOAcceleratorES` (0907, from ios-topaz) saves ~45 s; first frames ~65 s after XNU starts |
-| Not yet | Metal (HackiOS's Mali driver being ported on branch `metal`), Wi-Fi, Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
+| Wi-Fi | MT6877 CONNSYS (CONNAC 2, soc5_0) with the MT6635 radio: milestone 1 written, **not yet run** -- CONNSYS powered, the A-die found, Samsung's firmware loaded and started (0939, off unless `a34wifi=N` or `a34wifi up N`); plan to Settings' Wi-Fi in `docs/wifi-plan.md` |
+| Not yet | Metal (HackiOS's Mali driver being ported on branch `metal`), Bluetooth, cellular, audio, camera, RTC, battery level, sleep |
 
 The base firmware is One UI 7 (A346EXXSADYG1). Do not go to One UI 8 or
 later: it removes bootloader unlocking. Never write the `efs`, `sec_efs`,
@@ -59,6 +60,7 @@ display timings to the kernel log)
 | Path | Contents |
 | --- | --- |
 | `tools/payload/` | loader (`a34boot.c`), UFS access, test shim and touch probe |
+| `tools/wifi-fw.sh`, `userland/a34wifi/` | the Wi-Fi firmware from the phone's own `vendor` (never kept here), the bring-up's user-space side |
 | `tools/mkadt_a34.py` | Apple device tree for the A34 |
 | `tools/build-xnu.sh`, `tools/mkrecovery.py` | boot image packing and signing |
 | `tools/build-iosroot.sh`, `tools/write-root.sh`, `tools/icl-nop*.{py,sh}` | iOS root image |
@@ -78,9 +80,13 @@ No Apple firmware, Samsung firmware or device dumps are kept in this repository.
   [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz): the XNU-on-Android-phone work this all builds on.
 - Samsung's A34 kernel sources (via
   [Fede2782/android_kernel_samsung_a34x](https://github.com/Fede2782/android_kernel_samsung_a34x)):
-  I2C, clock, PMIC and touch register facts.
+  I2C, clock, PMIC and touch register facts; MediaTek's conninfra and gen4m Wi-Fi drivers there
+  are what 0939's power-on and firmware sequences were read from (read, not copied).
 - [oosexgang/hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) (HackiOS, APSL 2.0 / MIT):
   the Mali bring-up in 0908 is ported from its `redwood_mali.c`.
+- [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) branch `mtk` (HackiOS,
+  APSL 2.0 / MIT): the Wi-Fi bring-up's method (one switch per step, each held against Android) and
+  firmware file reader follow its MT6768 CONNSYS work; its iOS-facing Wi-Fi layer is the plan for M4.
 - [UniXNU](https://github.com/UniXNU/UniXNU): reference for loaders and device trees.
 - [TWRP](https://twrp.me) for a34x, [Magisk](https://github.com/topjohnwu/Magisk),
   [Heimdall](https://git.sr.ht/~grimler/Heimdall), [samloader-rs](https://github.com/topjohnwu/samloader-rs).

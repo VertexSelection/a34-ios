@@ -1,0 +1,50 @@
+name: a34wifi
+
+# The Galaxy A34's Wi-Fi bring-up, user-space side (docs/wifi-plan.md, userland/a34wifi/README.md):
+# a34wifi, which asks the kernel (xnu/patches/0939-a34-wifi-m1.patch, bsd/dev/a34_wifi.c) for its
+# steps through sysctl kern.a34wifi.* and prints what it says. The artifact "a34wifi" holds
+# a34/wifi/a34wifi (for /a34/wifi on the phone, ad-hoc signed); the firmware beside it comes from
+# the phone's own firmware (tools/wifi-fw.sh), never from here.
+
+on:
+  push:
+    branches: [wifi]
+    paths:
+      - userland/a34wifi/**
+      - .github/workflows/a34wifi.yml
+  workflow_dispatch:
+
+concurrency:
+  group: a34wifi-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_MIN: "16.0"
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
+          [ -n "$XC" ] || { ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version): $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: a34wifi (userland/a34wifi/build.sh)
+        run: A34WIFI_OUT="$WORK/a34wifi-out" userland/a34wifi/build.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: a34wifi
+          path: ${{ env.WORK }}/a34wifi-out
+          if-no-files-found: error

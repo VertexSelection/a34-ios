@@ -1,0 +1,1995 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4c12ac2..7cc87a1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/a34_touch.c			standard
+ bsd/dev/a34_diag.c			standard
+ bsd/dev/a34_mali.c			standard
+ bsd/dev/a34_clocks.c			standard
++bsd/dev/a34_wifi.c			standard
+ bsd/dev/ruby_hal.c			standard
+ bsd/dev/ruby_eint.c			standard
+ bsd/dev/ruby_irq.c			standard
+diff --git a/bsd/dev/a34_wifi.c b/bsd/dev/a34_wifi.c
+new file mode 100644
+index 0000000..a9b896c
+--- /dev/null
++++ b/bsd/dev/a34_wifi.c
+@@ -0,0 +1,1957 @@
++/*
++ * A34 (0939): Wi-Fi, milestone 1 (docs/wifi-plan.md) -- the MT6877's CONNSYS powered, the
++ * MT6635 A-die found, the Wi-Fi subsystem started and its firmware loaded, all said in the
++ * kernel log. Nothing here runs, and nothing is mapped, unless asked: boot-arg a34wifi=N, or
++ * sysctl kern.a34wifi.want=N (root; userland/a34wifi). Each step needs the ones before it:
++ *
++ *   1  read only: SPM (CONN_PWR_CON, PWR_STATUS), the bus protection, TOPRGU's software
++ *      resets, SRCLKEN_RC's mode, the MT6359P's VCN13/VCN18/VCN33_1/VCN33_2; conn_infra's
++ *      IP version only if the domain is on and unprotected
++ *   2  conn_infra on, as conninfra.ko's consys_hw_pwr_on() part 1 and 2 (first power-on):
++ *      VCN18 and VCN13 (RC mode or legacy, as the PMIC is set up), the D-die/A-die pins,
++ *      the CONN MTCMOS (clk-mt6877-pg.c: PWR_ON, PWR_ON_2ND, both acks, CLK_DIS, ISO, RST_B),
++ *      TOPRGU's CONNSYS reset released, the bus protection released (CLR registers, step 2
++ *      then step 1), 5 ms for the XO, then IP version 0x02060002 polled
++ *   3  part 3: EMI remap (CONNSYS's memory, see below), d_die_cfg, spi_master_cfg,
++ *      a_die_cfg (MT6635 chip id over the RF SPI, efuse, XO/LDO settings), afe_wbg_cal,
++ *      subsys_pll_initial, the radio status in sysram, low_power_setting (ends with
++ *      conn_infra under hardware sleep control), then Wi-Fi's VCN33_1/VCN33_2
++ *   4  and 5: see the Wi-Fi part below
++ *
++ * Every wait has a limit and says what it read when it gives up; a failed step stops there,
++ * and nothing is undone (the domain stays as the log says). Registers of the 0x18xxxxxx
++ * space are only touched while SPM says the domain is on and its bus protection is off:
++ * reading CONNSYS while it is off hangs the bus.
++ *
++ * The sequences are MediaTek's, read in Samsung's A34 sources (One UI 7, A346BXXSFEZC7,
++ * github.com/Fede2782/android_kernel_samsung_a34x, GPL; read, not copied, the register
++ * values are data): vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/
++ * platform/consys_hw.c (the order), mt6877/mt6877_pos.c (each step, with the addresses in
++ * its comments), mt6877_pmic.c (the rails), mt6877/include/CODA (fields);
++ * kernel_device_modules-6.6/drivers/clk/mediatek/clk-mt6877-pg.c (the MTCMOS) and
++ * drivers/regulator/mt6359p-regulator.c with include/linux/mfd/mt6359p/registers.h (the LDOs).
++ * The phone's device tree (consys@18000000, wifi@18000000) agrees with them. The approach --
++ * a boot-arg per step, each held against what Android does -- is HackiOS's
++ * (bsd/dev/redwood_connsys.c and redwood_mtkwifi.c of github.com/oosexgang/hakios-xnu-kernel,
++ * branch mtk, APSL 2.0), which did the same for the MT6768's CONNSYS; the firmware file reader
++ * follows theirs.
++ *
++ * Memory: XNU manages only RAM above 4 GB (tools/mkadt_a34.py); below it, what the boot loader
++ * reserves is listed in Android's device tree (mblock-*), and none of it lies in 0x50000000..
++ * 0x71ffffff, where Android's kernel places conninfra's 7.5 MB (consys-reserve-memory) and
++ * Wi-Fi's 15 MB (wifi-reserve-memory) at run time. Here they are fixed: CONNSYS's memory
++ * ("EMI") at A34W_EMI_PA, Wi-Fi's DMA memory at A34W_DMA_PA (32-bit DMA: below 4 GB), both
++ * mapped write-combined (normal, uncached) out of kernel_map with ml_io_map_unmappable(), not
++ * the small io_submap; the registers likewise, as device memory.
++ *
++ * Steps 4 and 5 read their firmware from the iOS root, /a34/wifi (tools/wifi-fw.sh takes it from
++ * the phone's own vendor partition; it is never in the repository). See the Wi-Fi part below.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/uio.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++#include "ruby_hal.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++void a34_wifi_init(void);               /* bsd/dev/sweet_ufs.c, at boot */
++
++/* osfmk/arm/memory_types.h: VM_WIMG_IO (device) and VM_WIMG_WCOMB (normal, uncached) */
++#define A34W_WIMG_IO            0x7u
++#define A34W_WIMG_WCOMB         0x6u
++
++/* ---- where things are ---- */
++
++#define A34W_AP_PA              0x10000000u     /* infracfg_ao, gpio, spm, toprgu, srclken_rc, pwrap */
++#define A34W_AP_SIZE            0x30000u
++#define A34W_IOCFG_PA           0x11ea0000u     /* IOCFG_RT: the conn pins' drive and pulls */
++#define A34W_IOCFG_SIZE         0x1000u
++#define A34W_CONN_PA            0x18000000u     /* conn_infra: rgu .. semaphore (0x18073fff) */
++#define A34W_CONN_SIZE          0x80000u
++
++/*
++ * Memory for CONNSYS, outside XNU's (above): its "EMI" (the firmware's images, logs, dumps),
++ * 1 MB-aligned in Android's 0x50000000..0x8fffffff, Android's size rounded up; and Wi-Fi's DMA
++ * memory (rings and buffers), 16 MB-aligned as Android's wifi-reserve-memory. Both clear of
++ * what LK loads there: the recovery image's ramdisk (TWRP's, ~36 MB) at 0x51100000, unused
++ * once XNU runs but kept out of the way all the same.
++ */
++#define A34W_EMI_PA             0x50000000ull
++#define A34W_EMI_SIZE           0x00800000u     /* consys-reserve-memory: 0x780000 */
++#define A34W_DMA_PA             0x58000000ull
++#define A34W_DMA_SIZE           0x00400000u     /* of wifi-reserve-memory's 0xf20000: enough for M1 */
++
++/* AP side, offsets from A34W_AP_PA */
++#define INFRA_PROTECTEN         0x1220u
++#define INFRA_PROTECTEN_STA1    0x1228u
++#define INFRA_PROTECTEN_SET     0x12a0u
++#define INFRA_PROTECTEN_CLR     0x12a4u
++#define CONN_PROT_STEP1         ((1u << 13) | (1u << 18))       /* clk-mt6877-pg.c */
++#define CONN_PROT_STEP2         ((1u << 14) | (1u << 19))
++#define GPIO_DIR6_SET           0x5064u
++#define GPIO_DOUT6_SET          0x5164u
++#define GPIO_MODE24             0x5480u
++#define GPIO_MODE25             0x5490u
++#define SPM_POWERON_CONFIG_EN   0x6000u
++#define SPM_PROJECT_CODE        0xb16u
++#define SPM_OTHER_PWR_STATUS    0x6178u
++#define SPM_CONN_PWR_CON        0x6e04u
++#define SPM_PWR_STATUS          0x6ef0u
++#define SPM_PWR_STATUS_2ND      0x6ef4u
++#define CONN_PWR_STA            (1u << 1)
++#define PWR_RST_B               (1u << 0)
++#define PWR_ISO                 (1u << 1)
++#define PWR_ON                  (1u << 2)
++#define PWR_ON_2ND              (1u << 3)
++#define PWR_CLK_DIS             (1u << 4)
++#define TOPRGU_WDT_SWSYSRST     0x7200u
++#define RC_CENTRAL_CFG1         0xf804u         /* SRCLKEN_RC: bit 0, RC mode */
++#define PWRAP_OFF               0x26000u
++
++/* IOCFG_RT, offsets from A34W_IOCFG_PA */
++#define IOCFG_RT_DRV_CFG0       0x000u
++#define IOCFG_RT_PD_CFG0_CLR    0x078u
++#define IOCFG_RT_PU_CFG0_SET    0x094u
++
++/* conn_infra, offsets from A34W_CONN_PA (mt6877_consys_reg_offset.h and the CODA headers) */
++#define CONN_RGU_WFSYS_ON_TOP_PWR_CTL   0x00010u
++#define CONN_RGU_BGFSYS_ON_TOP_PWR_CTL  0x00020u
++#define CONN_RGU_SYSRAM_HWCTL_PDN       0x00050u
++#define CONN_RGU_SYSRAM_HWCTL_SLP       0x00054u
++#define CONN_RGU_CO_EXT_MEM_HWCTL_PDN   0x00070u
++#define CONN_RGU_CO_EXT_MEM_HWCTL_SLP   0x00074u
++#define CONN_RGU_DEBUG_SEL              0x00204u
++#define CONN_CFG_IP_VERSION             0x01000u
++#define CONN_HW_VER                     0x02060002u
++#define CONN_CFG_EFUSE                  0x01020u
++#define CONN_CFG_ADIE_CTL               0x01030u
++#define CONN_CFG_PWRCTRL0               0x01200u
++#define CONN_CFG_OSC_CTL_0              0x01300u
++#define CONN_CFG_OSC_CTL_1              0x01304u
++#define CONN_CFG_RC_CTL_0               0x01380u
++#define CONN_CFG_RC_CTL_1               0x01388u
++#define CONN_CFG_RC_CTL_0_GPS           0x01390u
++#define CONN_CFG_RC_CTL_1_GPS           0x01394u
++#define CONN_CFG_RC_CTL_0_BT            0x013a0u
++#define CONN_CFG_RC_CTL_1_BT            0x013a4u
++#define CONN_CFG_RC_CTL_0_WF            0x013b0u
++#define CONN_CFG_RC_CTL_1_WF            0x013b4u
++#define CONN_CFG_RC_CTL_0_TOP           0x013c0u
++#define CONN_CFG_RC_CTL_1_TOP           0x013c4u
++#define CONN_CFG_EMI_CTL_0              0x01400u
++#define CONN_CFG_EMI_CTL_1              0x01404u
++#define CONN_THERM_AADDR                0x02018u
++#define CONN_AFE_DIG_EN_01              0x03000u
++#define CONN_AFE_DIG_EN_02              0x03004u
++#define CONN_AFE_DIG_EN_03              0x03008u
++#define CONN_AFE_DIG_TOP_01             0x0300cu
++#define CONN_AFE_BT0_TX_03              0x03058u
++#define CONN_AFE_WF0_TX_03              0x03078u
++#define CONN_AFE_WF1_TX_03              0x03094u
++#define CONN_AFE_PLL_STB_TIME           0x030f4u
++#define CONN_RFSPI_STA                  0x04000u
++#define CONN_RFSPI_FM_CTRL              0x0400cu
++#define CONN_RFSPI_TOP_ADDR             0x04050u
++#define CONN_RFSPI_TOP_WDAT             0x04054u
++#define CONN_RFSPI_TOP_RDAT             0x04058u
++#define RFSPI_TOP_BUSY                  5u              /* SPI_STA bit of the TOP channel */
++#define RFSPI_TOP_READ                  0xb000u
++#define RFSPI_TOP_WRITE                 0xa000u
++#define CONN_WT_SLP_CTL                 0x05004u
++#define CONN_WT_BG_ADDR(n)              (0x05010u + 4u * ((n) - 1u))    /* 1..8 */
++#define CONN_WT_BG_ON(n)                (0x05030u + 4u * ((n) - 1u))
++#define CONN_WT_BG_OFF(n)               (0x05050u + 4u * ((n) - 1u))
++#define CONN_WT_WF_CK_ADDR              0x05070u
++#define CONN_WT_WF_WAKE_ADDR            0x05074u
++#define CONN_WT_WF_ZPS_ADDR             0x05078u
++#define CONN_WT_BT_CK_ADDR              0x0507cu
++#define CONN_WT_BT_WAKE_ADDR            0x05080u
++#define CONN_WT_TOP_CK_ADDR             0x05084u
++#define CONN_WT_GPS_CK_ADDR             0x05088u
++#define CONN_WT_WF_B0_CMD_ADDR          0x0508cu
++#define CONN_WT_WF_B1_CMD_ADDR          0x05090u
++#define CONN_WT_GPS_RFBUF_ADR           0x05094u
++#define CONN_WT_GPS_L5_EN_ADDR          0x05098u
++#define CONN_WT_SLP_TOP_CK_0            0x05120u
++#define CONN_CLKGEN_BPLL_DIV_1          0x09000u
++#define CONN_CLKGEN_BPLL_DIV_2          0x09004u
++#define CONN_CLKGEN_WPLL_DIV_1          0x09008u
++#define CONN_CLKGEN_WPLL_DIV_2          0x0900cu
++#define CONN_CLKGEN_RFSPI_CK_CTRL       0x09048u
++#define CONN_CLKGEN_CKGEN_BUS           0x09a00u
++#define CONN_BUS_LIGHT_SECURITY         0x0e238u
++#define CONN_BUS_OFF_TIMEOUT_CTRL       0x0e300u
++#define CONN_BUS_ON_TIMEOUT_CTRL        0x0e31cu
++#define CONN_BUS_EMI_PATH_START         0x0e360u
++#define CONN_BUS_EMI_PATH_END           0x0e364u
++#define CONN_DEBUG_CTRL_AO              0x0f000u
++#define CONN_BCRM_DCM_TOP_CTRL_0        0x2e03cu
++#define CONN_BCRM_DCM_TOP_CTRL_1        0x2e040u
++#define CONN_SYSRAM                     0x50000u        /* 16 KB */
++#define CONN_SYSRAM_SIZE                0x4000u
++#define SYSRAM_A_DIE_CHIP_ID            0x52800u
++#define SYSRAM_A_DIE_EFUSE(n)           (0x52804u + 4u * (n))
++#define SYSRAM_D_DIE_EFUSE              0x52820u
++#define SYSRAM_RADIO_STATUS             0x52834u
++#define CONN_HOST_WAKEPU_TOP            0x601a0u
++#define CONN_HOST_REMAP_MCU_EMI         0x601c4u
++#define CONN_HOST_REMAP_WF_PERI         0x601d4u
++#define CONN_HOST_REMAP_BT_PERI         0x601d8u
++#define CONN_HOST_REMAP_GPS_PERI        0x601dcu
++#define CONN_HOST_SLP_CNT_CTL           0x60380u
++#define CONN_SEMA_M2_OWN_STA(i)         (0x72000u + 4u * (i))
++#define CONN_SEMA_M2_OWN_REL(i)         (0x72200u + 4u * (i))
++#define SEMA_RFSPI                      12u
++#define SEMA_COMMON_SYSRAM              23u
++#define RADIO_WIFI                      3u              /* CONNDRV_TYPE_WIFI */
++
++/* the MT6635's registers, over the RF SPI's TOP channel (mt6877_consys_reg_offset.h) */
++#define ATOP_CHIP_ID                    0x02cu
++#define ATOP_RG_TOP_THADC_BG            0x034u
++#define ATOP_RG_TOP_THADC               0x038u
++#define ATOP_WRI_CTR2                   0x064u
++#define ATOP_RG_ENCAL_WBTAC_IF_SW       0x070u
++#define ATOP_SMCTK11                    0x0bcu
++#define ATOP_EFUSE_CTRL                 0x108u
++#define ATOP_EFUSE_RDATA(n)             (0x130u + 4u * (n))
++#define ATOP_RG_WF0_TOP_01              0x380u
++#define ATOP_RG_WF0_BG                  0x384u
++#define ATOP_RG_WF1_TOP_01              0x390u
++#define ATOP_RG_WF1_BG                  0x394u
++#define ATOP_RG_TOP_XTAL_01             0xa18u
++#define ATOP_RG_TOP_XTAL_02             0xa1cu
++
++/* MT6359P (registers.h, mt6359p-regulator.c, mt6877_pmic.h) */
++#define PMIC_VCN33_1_CON0               0x1be2u         /* [0] EN_0 (BT), [1] LP */
++#define PMIC_VCN33_1_MON                0x1be6u         /* [0] on */
++#define PMIC_VCN33_1_OP_EN_SET          0x1beau
++#define PMIC_VCN33_1_OP_CFG_SET         0x1bf0u
++#define PMIC_VCN33_1_MULTI_SW           0x1bf4u         /* [15] EN_1 (Wi-Fi) */
++#define PMIC_VCN33_2_CON0               0x1c08u
++#define PMIC_VCN33_2_MON                0x1c0cu
++#define PMIC_VCN33_2_OP_EN_SET          0x1c10u
++#define PMIC_VCN33_2_OP_CFG_SET         0x1c16u
++#define PMIC_VCN33_2_MULTI_SW           0x1c1au
++#define PMIC_VCN13_CON0                 0x1c1cu         /* [0] EN, [1] LP */
++#define PMIC_VCN13_MON                  0x1c20u
++#define PMIC_VCN13_OP_EN_SET            0x1c24u
++#define PMIC_VCN13_OP_CFG_SET           0x1c2au
++#define PMIC_VCN18_CON0                 0x1c2eu
++#define PMIC_VCN18_MON                  0x1c32u
++#define PMIC_VCN18_OP_EN_SET            0x1c36u
++#define PMIC_VCN18_OP_CFG_SET           0x1c3cu
++#define PMIC_VCN33_1_ANA_CON0           0x1f98u         /* [11:8] VOSEL: 13 = 3.3 V */
++#define PMIC_VCN33_2_ANA_CON0           0x1f9cu
++#define PMIC_VCN18_ANA_CON0             0x2010u
++#define PMIC_VCN13_ANA_CON0             0x202eu         /* [11:8] VOSEL: 4 = 1.3 V */
++#define VOSEL_SHIFT                     8u
++#define VOSEL_MASK                      (0xfu << VOSEL_SHIFT)
++#define VCN33_3V3                       13u
++#define VCN13_1V3                       4u
++#define PMIC_LP                         (1u << 1)
++#define PMIC_EN                         (1u << 0)
++#define PMIC_MULTI_SW_EN                (1u << 15)
++
++/* the PMIC wrapper's channel (as bsd/dev/a34_clocks.c) */
++#define PW_ACC                          0x880u
++#define PW_WDATA                        0x884u
++#define PW_STA                          0x8a8u
++#define PW_FSM(v)                       (((v) >> 1) & 7u)
++#define PW_INIT_DONE                    (1u << 15)
++#define PW_SPINS                        100000u
++
++/* ---- state, the log ---- */
++
++#define A34W_STEPS              5u
++#define A34W_LOG_SIZE           12288u
++
++static LCK_GRP_DECLARE(a34w_grp, "a34_wifi");
++static LCK_MTX_DECLARE(a34w_log_mtx, &a34w_grp);
++static LCK_MTX_DECLARE(a34w_run_mtx, &a34w_grp);
++
++static char a34w_log[A34W_LOG_SIZE];
++static uint32_t a34w_log_len;
++static int a34w_want;                   /* the highest step asked for (boot-arg or sysctl) */
++static int a34w_done;                   /* the highest step done */
++static int a34w_busy;
++static int a34w_failed;                 /* the step that failed (no more steps after it) */
++static bool a34w_thread_started;
++static int a34w_chan;
++
++static vm_offset_t a34w_ap, a34w_iocfg, a34w_conn;
++static bool a34w_rc_mode;
++static uint32_t a34w_adie_id;
++
++static void a34w_say(const char *fmt, ...) __printflike(1, 2);
++
++static void
++a34w_say(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	int n;
++
++	va_start(ap, fmt);
++	n = vsnprintf(line, sizeof(line) - 1, fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	if ((size_t)n > sizeof(line) - 2) {
++		n = (int)sizeof(line) - 2;
++	}
++	line[n++] = '\n';
++	line[n] = '\0';
++	printf("A34 WIFI: %s", line);
++
++	lck_mtx_lock(&a34w_log_mtx);
++	if (a34w_log_len + (uint32_t)n + 1 > A34W_LOG_SIZE) {
++		/* drop the older half, at a line's start */
++		uint32_t cut = a34w_log_len / 2;
++
++		while (cut < a34w_log_len && a34w_log[cut - 1] != '\n') {
++			cut++;
++		}
++		memmove(a34w_log, a34w_log + cut, a34w_log_len - cut);
++		a34w_log_len -= cut;
++	}
++	memcpy(a34w_log + a34w_log_len, line, (size_t)n);
++	a34w_log_len += (uint32_t)n;
++	a34w_log[a34w_log_len] = '\0';
++	lck_mtx_unlock(&a34w_log_mtx);
++}
++
++static uint64_t
++a34w_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++/* ---- registers ---- */
++
++static inline uint32_t
++a34w_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++a34w_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline void
++a34w_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t value)
++{
++	a34w_wr(base, off, (a34w_rd(base, off) & ~mask) | (value & mask));
++}
++
++static inline void
++a34w_set(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	a34w_wr(base, off, a34w_rd(base, off) | bits);
++}
++
++static inline void
++a34w_clr(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	a34w_wr(base, off, a34w_rd(base, off) & ~bits);
++}
++
++/* CONSYS_REG_BIT_POLLING: bit `bit` of the register to `want`, `tries` reads `us` apart. */
++static bool
++a34w_poll(vm_offset_t base, uint32_t off, uint32_t bit, uint32_t want, uint32_t tries, uint32_t us)
++{
++	for (uint32_t i = 0; i <= tries; i++) {
++		if (((a34w_rd(base, off) >> bit) & 1u) == want) {
++			return true;
++		}
++		delay((int)us);
++	}
++	return false;
++}
++
++/* the CONN domain powered (both acks) and reachable (no bus protection): 0x18xxxxxx may be read */
++static bool
++a34w_conn_reachable(void)
++{
++	return (a34w_rd(a34w_ap, SPM_PWR_STATUS) & CONN_PWR_STA) != 0 &&
++	       (a34w_rd(a34w_ap, SPM_PWR_STATUS_2ND) & CONN_PWR_STA) != 0 &&
++	       (a34w_rd(a34w_ap, SPM_CONN_PWR_CON) & (PWR_ISO | PWR_CLK_DIS | PWR_RST_B)) == PWR_RST_B &&
++	       (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)) == 0;
++}
++
++static bool
++a34w_map(void)
++{
++	if (a34w_ap != 0) {
++		return true;
++	}
++	a34w_ap = ml_io_map_unmappable(A34W_AP_PA, A34W_AP_SIZE, A34W_WIMG_IO);
++	a34w_iocfg = ml_io_map_unmappable(A34W_IOCFG_PA, A34W_IOCFG_SIZE, A34W_WIMG_IO);
++	a34w_conn = ml_io_map_unmappable(A34W_CONN_PA, A34W_CONN_SIZE, A34W_WIMG_IO);
++	if (a34w_ap == 0 || a34w_iocfg == 0 || a34w_conn == 0) {
++		a34w_say("registers not mapped (0x%lx 0x%lx 0x%lx)", (unsigned long)a34w_ap,
++		    (unsigned long)a34w_iocfg, (unsigned long)a34w_conn);
++		a34w_ap = 0;
++		return false;
++	}
++	return true;
++}
++
++/* ---- the PMIC (MT6359P) through the wrapper, one command at a time with the others ---- */
++
++static bool
++a34w_pmic_read(uint16_t reg, uint16_t *val)
++{
++	int err;
++
++	a34_pmic_lock();
++	err = ruby_pwrap_read(a34w_ap + PWRAP_OFF, reg, val);
++	a34_pmic_unlock();
++	return err == 0;
++}
++
++static bool
++a34w_pwrap_idle(void)
++{
++	for (uint32_t i = 0; i < PW_SPINS; i++) {
++		if (PW_FSM(a34w_rd(a34w_ap, PWRAP_OFF + PW_STA)) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Linux's pwrap_write16() for this wrapper (as a34_clocks.c's ck_pmic_write) */
++static bool
++a34w_pmic_write(uint16_t reg, uint16_t val)
++{
++	bool ok = false;
++
++	a34_pmic_lock();
++	if ((a34w_rd(a34w_ap, PWRAP_OFF + PW_STA) & PW_INIT_DONE) && a34w_pwrap_idle()) {
++		a34w_wr(a34w_ap, PWRAP_OFF + PW_WDATA, val);
++		a34w_wr(a34w_ap, PWRAP_OFF + PW_ACC, (1u << 29) | reg);
++		ok = a34w_pwrap_idle();
++	}
++	a34_pmic_unlock();
++	return ok;
++}
++
++static bool
++a34w_pmic_update(uint16_t reg, uint16_t mask, uint16_t val)
++{
++	uint16_t old = 0;
++
++	if (!a34w_pmic_read(reg, &old)) {
++		return false;
++	}
++	if ((old & mask) == (val & mask)) {
++		return true;
++	}
++	return a34w_pmic_write(reg, (uint16_t)((old & ~mask) | (val & mask)));
++}
++
++struct a34w_ldo {
++	const char *name;
++	uint16_t con0, mon, en_reg, en_bit, vosel_reg;
++};
++
++static const struct a34w_ldo a34w_ldos[] = {
++	{ "VCN18", PMIC_VCN18_CON0, PMIC_VCN18_MON, PMIC_VCN18_CON0, PMIC_EN, PMIC_VCN18_ANA_CON0 },
++	{ "VCN13", PMIC_VCN13_CON0, PMIC_VCN13_MON, PMIC_VCN13_CON0, PMIC_EN, PMIC_VCN13_ANA_CON0 },
++	{ "VCN33_1 (Wi-Fi)", PMIC_VCN33_1_CON0, PMIC_VCN33_1_MON, PMIC_VCN33_1_MULTI_SW, PMIC_MULTI_SW_EN,
++	  PMIC_VCN33_1_ANA_CON0 },
++	{ "VCN33_2 (Wi-Fi)", PMIC_VCN33_2_CON0, PMIC_VCN33_2_MON, PMIC_VCN33_2_MULTI_SW, PMIC_MULTI_SW_EN,
++	  PMIC_VCN33_2_ANA_CON0 },
++};
++
++static void
++a34w_ldo_report(const char *when)
++{
++	for (unsigned i = 0; i < sizeof(a34w_ldos) / sizeof(a34w_ldos[0]); i++) {
++		const struct a34w_ldo *l = &a34w_ldos[i];
++		uint16_t con0 = 0xdead, mon = 0xdead, en = 0xdead, vosel = 0xdead;
++		bool ok = a34w_pmic_read(l->con0, &con0) && a34w_pmic_read(l->mon, &mon) &&
++		    a34w_pmic_read(l->en_reg, &en) && a34w_pmic_read(l->vosel_reg, &vosel);
++
++		a34w_say("%s: %s: %s (sw enable %u, LP %u, CON0 0x%04x, MON 0x%04x, VOSEL %u)", when, l->name,
++		    ok ? ((mon & 1u) ? "on" : "off") : "NOT READ", (en & l->en_bit) ? 1u : 0u,
++		    (con0 & PMIC_LP) ? 1u : 0u, con0, mon, (vosel & VOSEL_MASK) >> VOSEL_SHIFT);
++	}
++}
++
++/*
++ * One LDO on as mt6877_pmic.c leaves it: in RC mode the PMRC_EN bits given (hardware on/off by
++ * SRCLKEN) and, for VCN18/VCN13, the software enable too; in legacy mode HW_OP_EN/CFG bit 0
++ * and the software enable. SW_LP 0, the voltage first.
++ */
++static bool
++a34w_ldo_on(const struct a34w_ldo *l, uint16_t op_en_set, uint16_t op_cfg_set, uint16_t rc_bits,
++    bool legacy_cfg, int vosel, bool sw_enable_in_rc)
++{
++	uint16_t mon = 0;
++	bool ok = true;
++
++	if (a34w_rc_mode) {
++		for (uint32_t b = 7; b >= 4; b--) {
++			if (rc_bits & (1u << b)) {
++				ok = ok && a34w_pmic_write(op_en_set, (uint16_t)(1u << b));
++			}
++		}
++	} else {
++		ok = ok && a34w_pmic_write(op_en_set, 1u);
++		if (legacy_cfg) {
++			ok = ok && a34w_pmic_write(op_cfg_set, 1u);
++		}
++	}
++	(void)op_cfg_set;
++	ok = ok && a34w_pmic_update(l->con0, PMIC_LP, 0);
++	if (vosel >= 0) {
++		ok = ok && a34w_pmic_update(l->vosel_reg, VOSEL_MASK, (uint16_t)((uint32_t)vosel << VOSEL_SHIFT));
++	}
++	if (!a34w_rc_mode || sw_enable_in_rc) {
++		ok = ok && a34w_pmic_update(l->en_reg, l->en_bit, l->en_bit);
++		delay(300);             /* (the LDOs' soft-start; Linux waits its ramp delay the same way) */
++		ok = ok && a34w_pmic_read(l->mon, &mon) && (mon & 1u) != 0;
++	}
++	if (!ok) {
++		a34w_say("%s did not come on (MON 0x%04x)", l->name, mon);
++	}
++	return ok;
++}
++
++/* ---- conn_infra's semaphores and the RF SPI to the A-die (mt6877_pos.c) ---- */
++
++static bool
++a34w_sema_get(uint32_t index)
++{
++	for (uint32_t i = 0; i < 1000u; i++) {          /* CONN_SEMA_TIMEOUT: 1 ms */
++		if (a34w_rd(a34w_conn, CONN_SEMA_M2_OWN_STA(index)) & 1u) {
++			return true;
++		}
++		delay(1);
++	}
++	a34w_say("semaphore %u not taken", index);
++	return false;
++}
++
++static void
++a34w_sema_put(uint32_t index)
++{
++	a34w_wr(a34w_conn, CONN_SEMA_M2_OWN_REL(index), 1u);
++}
++
++static bool
++a34w_spi_read(uint32_t addr, uint32_t *data)
++{
++	if (!a34w_poll(a34w_conn, CONN_RFSPI_STA, RFSPI_TOP_BUSY, 0, 100, 50)) {
++		a34w_say("RF SPI busy before reading 0x%03x (STA 0x%08x)", addr, a34w_rd(a34w_conn, CONN_RFSPI_STA));
++		return false;
++	}
++	a34w_wr(a34w_conn, CONN_RFSPI_TOP_ADDR, RFSPI_TOP_READ | addr);
++	a34w_wr(a34w_conn, CONN_RFSPI_TOP_WDAT, 0);
++	delay(1);
++	if (!a34w_poll(a34w_conn, CONN_RFSPI_STA, RFSPI_TOP_BUSY, 0, 100, 50)) {
++		a34w_say("RF SPI: no answer reading 0x%03x (STA 0x%08x)", addr, a34w_rd(a34w_conn, CONN_RFSPI_STA));
++		return false;
++	}
++	*data = a34w_rd(a34w_conn, CONN_RFSPI_TOP_RDAT);
++	return true;
++}
++
++static bool
++a34w_spi_write(uint32_t addr, uint32_t data)
++{
++	if (!a34w_poll(a34w_conn, CONN_RFSPI_STA, RFSPI_TOP_BUSY, 0, 100, 50)) {
++		a34w_say("RF SPI busy before writing 0x%03x (STA 0x%08x)", addr, a34w_rd(a34w_conn, CONN_RFSPI_STA));
++		return false;
++	}
++	a34w_wr(a34w_conn, CONN_RFSPI_TOP_ADDR, RFSPI_TOP_WRITE | addr);
++	a34w_wr(a34w_conn, CONN_RFSPI_TOP_WDAT, data);
++	delay(1);
++	if (!a34w_poll(a34w_conn, CONN_RFSPI_STA, RFSPI_TOP_BUSY, 0, 100, 50)) {
++		a34w_say("RF SPI: no answer writing 0x%03x (STA 0x%08x)", addr, a34w_rd(a34w_conn, CONN_RFSPI_STA));
++		return false;
++	}
++	return true;
++}
++
++/* consys_spi_write_offset_range_nolock(): bits [reg_off, reg_off + size) of an A-die register from value's [value_off ...) */
++static void
++a34w_spi_field(uint32_t addr, uint32_t value, uint32_t reg_off, uint32_t value_off, uint32_t size)
++{
++	uint32_t data = 0, mask = ((1u << size) - 1u) << reg_off;
++
++	if (!a34w_spi_read(addr, &data)) {
++		return;
++	}
++	value = ((value >> value_off) & ((1u << size) - 1u)) << reg_off;
++	(void)a34w_spi_write(addr, (data & ~mask) | value);
++}
++
++/* connsys_adie_top_ck_en_ctl_mt6877() */
++static bool
++a34w_adie_top_ck(bool on)
++{
++	a34w_mask(a34w_conn, CONN_WT_SLP_TOP_CK_0, 1u, on ? 1u : 0u);
++	if (!a34w_poll(a34w_conn, CONN_WT_SLP_TOP_CK_0, 1, 0, 100, 5)) {
++		a34w_say("A-die top_ck_en %s: still busy (0x%08x)", on ? "on" : "off",
++		    a34w_rd(a34w_conn, CONN_WT_SLP_TOP_CK_0));
++		return false;
++	}
++	return true;
++}
++
++/* conninfra wakeup (consys_conninfra_wakeup_mt6877): force on, then the IP version polled */
++static bool
++a34w_conninfra_wakeup(void)
++{
++	a34w_wr(a34w_conn, CONN_HOST_WAKEPU_TOP, 1u);
++	for (uint32_t i = 0; i < 10u; i++) {
++		if (a34w_rd(a34w_conn, CONN_CFG_IP_VERSION) == CONN_HW_VER) {
++			return true;
++		}
++		delay(1000);
++	}
++	a34w_say("conn_infra did not wake (IP version 0x%08x)", a34w_rd(a34w_conn, CONN_CFG_IP_VERSION));
++	return false;
++}
++
++static void
++a34w_conninfra_sleep(void)
++{
++	a34w_wr(a34w_conn, CONN_HOST_WAKEPU_TOP, 0);
++}
++
++/* ---- step 1: what the boot loader left, read only ---- */
++
++static bool
++a34w_step1(void)
++{
++	uint32_t pwr_con = a34w_rd(a34w_ap, SPM_CONN_PWR_CON);
++
++	a34w_rc_mode = (a34w_rd(a34w_ap, RC_CENTRAL_CFG1) & 1u) != 0;
++	a34w_say("step 1: SPM POWERON_CONFIG_EN 0x%08x CONN_PWR_CON 0x%08x PWR_STATUS 0x%08x/0x%08x OTHER 0x%08x",
++	    a34w_rd(a34w_ap, SPM_POWERON_CONFIG_EN), pwr_con, a34w_rd(a34w_ap, SPM_PWR_STATUS),
++	    a34w_rd(a34w_ap, SPM_PWR_STATUS_2ND), a34w_rd(a34w_ap, SPM_OTHER_PWR_STATUS));
++	a34w_say("step 1: bus protection PROTECTEN 0x%08x STA1 0x%08x (CONN: 0x%x), TOPRGU SWSYSRST 0x%08x",
++	    a34w_rd(a34w_ap, INFRA_PROTECTEN), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1),
++	    CONN_PROT_STEP1 | CONN_PROT_STEP2, a34w_rd(a34w_ap, TOPRGU_WDT_SWSYSRST));
++	a34w_say("step 1: SRCLKEN_RC CENTRAL_CFG1 0x%08x: %s mode; GPIO_MODE24 0x%08x MODE25 0x%08x",
++	    a34w_rd(a34w_ap, RC_CENTRAL_CFG1), a34w_rc_mode ? "RC" : "legacy",
++	    a34w_rd(a34w_ap, GPIO_MODE24), a34w_rd(a34w_ap, GPIO_MODE25));
++	a34w_ldo_report("step 1");
++	if (a34w_conn_reachable()) {
++		bool awake = a34w_conninfra_wakeup();
++
++		a34w_say("step 1: CONN domain is on: conn_infra %s, IP version 0x%08x, A-die id in sysram 0x%08x",
++		    awake ? "awake" : "NOT awake", a34w_rd(a34w_conn, CONN_CFG_IP_VERSION),
++		    awake ? a34w_rd(a34w_conn, SYSRAM_A_DIE_CHIP_ID) : 0u);
++		a34w_conninfra_sleep();
++	} else {
++		a34w_say("step 1: CONN domain is off or protected (as expected after LK): 0x18xxxxxx not read");
++	}
++	return true;
++}
++
++/* ---- step 2: conn_infra on (consys_hw_pwr_on, parts 1 and 2) ---- */
++
++static bool
++a34w_step2(void)
++{
++	uint32_t v;
++
++	if (a34w_conn_reachable() && a34w_conninfra_wakeup()) {
++		a34w_say("step 2: conn_infra already on (IP version 0x%08x): nothing to do", CONN_HW_VER);
++		return true;
++	}
++
++	/* PMIC: VCN18 1.8 V, then VCN13 1.3 V (consys_plt_pmic_common_power_ctrl_mt6877) */
++	if (!a34w_ldo_on(&a34w_ldos[0], PMIC_VCN18_OP_EN_SET, PMIC_VCN18_OP_CFG_SET, 0xf0u, true, -1, true) ||
++	    !a34w_ldo_on(&a34w_ldos[1], PMIC_VCN13_OP_EN_SET, PMIC_VCN13_OP_CFG_SET, 0xf0u, true, VCN13_1V3, true)) {
++		a34w_ldo_report("step 2");
++		return false;
++	}
++	a34w_ldo_report("step 2");
++
++	/* pins between the D-die and the A-die, aux 1; 2 mA; TOP_DATA/BT_DATA pulled up (consys_set_if_pinmux_mt6877) */
++	a34w_mask(a34w_ap, GPIO_MODE24, 0x77770000u, 0x11110000u);
++	a34w_mask(a34w_ap, GPIO_MODE25, 0x07777777u, 0x01111111u);
++	a34w_mask(a34w_iocfg, IOCFG_RT_DRV_CFG0, 0x38000000u, 0);
++	a34w_wr(a34w_iocfg, IOCFG_RT_PD_CFG0_CLR, (1u << 14) | (1u << 9));
++	a34w_wr(a34w_iocfg, IOCFG_RT_PU_CFG0_SET, (1u << 14) | (1u << 9));
++	a34w_say("step 2: pins: GPIO_MODE24 0x%08x MODE25 0x%08x IOCFG_RT DRV 0x%08x",
++	    a34w_rd(a34w_ap, GPIO_MODE24), a34w_rd(a34w_ap, GPIO_MODE25), a34w_rd(a34w_iocfg, IOCFG_RT_DRV_CFG0));
++
++	/* the CONN MTCMOS (spm_mtcmos_ctrl_conn_pwr(STA_POWER_ON)), SPM writes enabled first */
++	v = a34w_rd(a34w_ap, SPM_POWERON_CONFIG_EN);
++	if ((v & 1u) == 0) {
++		a34w_wr(a34w_ap, SPM_POWERON_CONFIG_EN, (SPM_PROJECT_CODE << 16) | 1u);
++	}
++	a34w_set(a34w_ap, SPM_CONN_PWR_CON, PWR_ON);
++	a34w_set(a34w_ap, SPM_CONN_PWR_CON, PWR_ON_2ND);
++	if (!a34w_poll(a34w_ap, SPM_PWR_STATUS, 1, 1, 1000, 10) || !a34w_poll(a34w_ap, SPM_PWR_STATUS_2ND, 1, 1, 1000, 10)) {
++		a34w_say("step 2: CONN MTCMOS: no power ack (CONN_PWR_CON 0x%08x PWR_STATUS 0x%08x/0x%08x)",
++		    a34w_rd(a34w_ap, SPM_CONN_PWR_CON), a34w_rd(a34w_ap, SPM_PWR_STATUS), a34w_rd(a34w_ap, SPM_PWR_STATUS_2ND));
++		return false;
++	}
++	a34w_clr(a34w_ap, SPM_CONN_PWR_CON, PWR_CLK_DIS);
++	delay(1);
++	a34w_clr(a34w_ap, SPM_CONN_PWR_CON, PWR_ISO);
++	/* TOPRGU's CONNSYS software reset (WDT_SWSYSRST bit 9, key 0x88), as the manual flow of mt6877_pos.c */
++	v = a34w_rd(a34w_ap, TOPRGU_WDT_SWSYSRST);
++	if (v & (1u << 9)) {
++		a34w_wr(a34w_ap, TOPRGU_WDT_SWSYSRST, (v & ~0xff000200u) | 0x88000000u);
++	}
++	a34w_set(a34w_ap, SPM_CONN_PWR_CON, PWR_RST_B);
++	delay(500);
++	a34w_say("step 2: CONN MTCMOS on: CONN_PWR_CON 0x%08x PWR_STATUS 0x%08x/0x%08x OTHER 0x%08x, SWSYSRST 0x%08x -> 0x%08x",
++	    a34w_rd(a34w_ap, SPM_CONN_PWR_CON), a34w_rd(a34w_ap, SPM_PWR_STATUS), a34w_rd(a34w_ap, SPM_PWR_STATUS_2ND),
++	    a34w_rd(a34w_ap, SPM_OTHER_PWR_STATUS), v, a34w_rd(a34w_ap, TOPRGU_WDT_SWSYSRST));
++
++	/* bus protection released (spm_mtcmos_ctrl_conn_bus_prot(STA_RELEASE_BUS)): step 2, then step 1 */
++	a34w_wr(a34w_ap, INFRA_PROTECTEN_CLR, CONN_PROT_STEP2);
++	a34w_wr(a34w_ap, INFRA_PROTECTEN_CLR, CONN_PROT_STEP1);
++	for (uint32_t i = 0; i < 100u && (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)); i++) {
++		delay(500);
++	}
++	if (a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1) & (CONN_PROT_STEP1 | CONN_PROT_STEP2)) {
++		a34w_say("step 2: CONN bus protection still on: PROTECTEN 0x%08x STA1 0x%08x",
++		    a34w_rd(a34w_ap, INFRA_PROTECTEN), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++		return false;
++	}
++	delay(5000);            /* "Wait 5ms (apply this for CONNSYS XO clock ready)" */
++
++	/* consys_polling_chipid_mt6877(): 10 tries, 1 ms apart */
++	for (uint32_t i = 0; i < 10u; i++) {
++		v = a34w_rd(a34w_conn, CONN_CFG_IP_VERSION);
++		if (v == CONN_HW_VER) {
++			a34w_say("step 2: conn_infra IP version 0x%08x (expected 0x%08x): CONNSYS is on", v, CONN_HW_VER);
++			return true;
++		}
++		delay(1000);
++	}
++	a34w_say("step 2: conn_infra IP version 0x%08x, not 0x%08x", v, CONN_HW_VER);
++	return false;
++}
++
++/* ---- step 3: conn_infra set up (consys_hw_pwr_on, part 3), then Wi-Fi's rails ---- */
++
++static void
++a34w_emi_remap(void)
++{
++	/* consys_emi_set_remapping_reg_mt6877(): the EMI base's bits [35:16]; the peripherals at 0x10000000 */
++	a34w_mask(a34w_conn, CONN_HOST_REMAP_MCU_EMI, 0xfffffu, (uint32_t)(A34W_EMI_PA >> 16));
++	a34w_mask(a34w_conn, CONN_HOST_REMAP_WF_PERI, 0xfffffu, 0x01000u);
++	a34w_mask(a34w_conn, CONN_HOST_REMAP_BT_PERI, 0xfffffu, 0x01000u);
++	a34w_mask(a34w_conn, CONN_HOST_REMAP_GPS_PERI, 0xfffffu, 0x01000u);
++	a34w_say("step 3: EMI at 0x%llx (%u KB), remap 0x%08x, WF peripherals 0x%08x",
++	    (unsigned long long)A34W_EMI_PA, A34W_EMI_SIZE >> 10, a34w_rd(a34w_conn, CONN_HOST_REMAP_MCU_EMI),
++	    a34w_rd(a34w_conn, CONN_HOST_REMAP_WF_PERI));
++}
++
++static void
++a34w_d_die_cfg(void)
++{
++	for (uint32_t off = 0; off < CONN_SYSRAM_SIZE; off += 4u) {
++		a34w_wr(a34w_conn, CONN_SYSRAM + off, 0);
++	}
++	a34w_wr(a34w_conn, CONN_BUS_EMI_PATH_START, 0x04000000u);
++	a34w_wr(a34w_conn, CONN_BUS_EMI_PATH_END, 0x43ffffffu);
++	a34w_wr(a34w_conn, SYSRAM_D_DIE_EFUSE, a34w_rd(a34w_conn, CONN_CFG_EFUSE));
++	a34w_wr(a34w_conn, CONN_RGU_SYSRAM_HWCTL_PDN, 0);
++	a34w_wr(a34w_conn, CONN_RGU_SYSRAM_HWCTL_SLP, 1);
++	a34w_wr(a34w_conn, CONN_RGU_CO_EXT_MEM_HWCTL_PDN, 0);
++	a34w_wr(a34w_conn, CONN_RGU_CO_EXT_MEM_HWCTL_SLP, 1);
++}
++
++static void
++a34w_spi_master_cfg(void)
++{
++	/* the addresses of the A-die's registers the sleep controller drives (Wi-Fi on: not "BT only") */
++	a34w_mask(a34w_conn, CONN_WT_WF_CK_ADDR, 0x0fff0fffu, (0xaf4u << 16) | 0xa04u);
++	a34w_mask(a34w_conn, CONN_WT_WF_WAKE_ADDR, 0x0fff0fffu, (0x0a0u << 16) | 0x090u);
++	a34w_mask(a34w_conn, CONN_WT_WF_ZPS_ADDR, 0x0fff0fffu, (0x09cu << 16) | 0x08cu);
++	a34w_mask(a34w_conn, CONN_WT_BT_CK_ADDR, 0xfffu, 0xa08u);
++	a34w_mask(a34w_conn, CONN_WT_BT_WAKE_ADDR, 0xfffu, 0x094u);
++	a34w_mask(a34w_conn, CONN_WT_TOP_CK_ADDR, 0xfffu, 0x02cu);
++	a34w_mask(a34w_conn, CONN_WT_GPS_CK_ADDR, 0x0fff0fffu, (0xafcu << 16) | 0xa0cu);
++	a34w_mask(a34w_conn, CONN_WT_WF_B0_CMD_ADDR, 0xfffu, 0x0f0u);
++	a34w_mask(a34w_conn, CONN_WT_WF_B1_CMD_ADDR, 0xfffu, 0x0f4u);
++	a34w_mask(a34w_conn, CONN_WT_GPS_RFBUF_ADR, 0xfffu, 0x0fcu);
++	a34w_mask(a34w_conn, CONN_WT_GPS_L5_EN_ADDR, 0xfffu, 0x0f8u);
++	a34w_mask(a34w_conn, CONN_WT_SLP_CTL, 0x1fu, 0x8u);
++
++	static const uint16_t bg_addr[8] = { 0xa03c, 0xa03c, 0xaa18, 0xaa18, 0xa0c8, 0xaa00, 0xa0b4, 0xa34c };
++	static const uint32_t bg_on[8] = { 0, 0, 0x74e0fff5u, 0x76e8fff5u, 0, 0xffffffffu, 0x00000019u, 0x00010400u };
++	static const uint32_t bg_off[8] = { 0x57400000u, 0x57400000u, 0x44e0fff5u, 0x44e0fff5u, 0x00000001u, 0,
++		                            0x00040019u, 0x00410440u };
++	for (uint32_t n = 1; n <= 8u; n++) {
++		a34w_mask(a34w_conn, CONN_WT_BG_ADDR(n), 0xffffu, bg_addr[n - 1u]);
++		a34w_wr(a34w_conn, CONN_WT_BG_ON(n), bg_on[n - 1u]);
++		a34w_wr(a34w_conn, CONN_WT_BG_OFF(n), bg_off[n - 1u]);
++	}
++}
++
++/* connsys_a_die_efuse_read_nolock() and connsys_a_die_thermal_cal_nolock() (the RF SPI semaphore held) */
++static void
++a34w_adie_efuse(void)
++{
++	uint32_t ctrl = 0, e[4] = { 0, 0, 0, 0 };
++	uint32_t tries = 0;
++
++	if (!a34w_spi_read(ATOP_EFUSE_CTRL, &ctrl)) {
++		return;
++	}
++	(void)a34w_spi_write(ATOP_EFUSE_CTRL, ctrl & ~(1u << 30));
++	(void)a34w_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++	(void)a34w_spi_write(ATOP_EFUSE_CTRL, (ctrl & ~0x43ff00c0u) | (1u << 30));     /* address 0, kick */
++	(void)a34w_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++	while ((ctrl & (1u << 30)) != 0 && tries < 70u) {
++		tries++;
++		delay(30);
++		(void)a34w_spi_read(ATOP_EFUSE_CTRL, &ctrl);
++	}
++	if ((ctrl & (1u << 29)) == 0) {
++		a34w_say("step 3: A-die efuse not valid (EFUSE_CTRL 0x%08x)", ctrl);
++		return;
++	}
++	for (uint32_t n = 0; n < 4u; n++) {
++		(void)a34w_spi_read(ATOP_EFUSE_RDATA(n), &e[n]);
++		a34w_wr(a34w_conn, SYSRAM_A_DIE_EFUSE(n), e[n]);
++	}
++	a34w_say("step 3: A-die efuse 0x%08x 0x%08x 0x%08x 0x%08x", e[0], e[1], e[2], e[3]);
++	if (e[1] & (1u << 7)) {
++		a34w_spi_field(ATOP_RG_TOP_THADC_BG, e[1], 12, 3, 4);
++		a34w_spi_field(ATOP_RG_TOP_THADC, e[1], 23, 0, 3);
++	}
++	if (e[1] & (1u << 15)) {
++		a34w_spi_field(ATOP_RG_TOP_THADC, e[1], 26, 13, 2);
++	}
++}
++
++/* connsys_a_die_cfg_mt6877() (26 MHz co-clock: conninfra.cfg has no TCXO, the device tree no tcxo_support) */
++static bool
++a34w_a_die_cfg(void)
++{
++	uint32_t id = 0;
++
++	a34w_wr(a34w_ap, GPIO_DIR6_SET, 0x00001000u);  /* CONN_WF_CTRL2 as a GPIO, high, until the end */
++	a34w_wr(a34w_ap, GPIO_DOUT6_SET, 0x00001000u);
++	a34w_mask(a34w_ap, GPIO_MODE25, 0x70000u, 0);
++	(void)a34w_adie_top_ck(true);                   /* (Android goes on if it stays busy: so do we) */
++	a34w_set(a34w_conn, CONN_CFG_ADIE_CTL, 1u);     /* A-die reset released */
++	if (!a34w_sema_get(SEMA_RFSPI)) {
++		return false;
++	}
++	if (!a34w_spi_read(ATOP_CHIP_ID, &id) || (id & 0xffff0000u) != 0x66350000u) {
++		a34w_say("step 3: A-die chip id 0x%08x: not an MT6635", id);
++		a34w_sema_put(SEMA_RFSPI);
++		return false;
++	}
++	a34w_adie_id = id;
++	a34w_say("step 3: A-die chip id 0x%08x: MT6635 %s", id,
++	    id == 0x66358a00u ? "E1" : id == 0x66358a10u ? "E2" : id == 0x66358a11u ? "E3" : "(unknown revision)");
++	a34w_wr(a34w_conn, SYSRAM_A_DIE_CHIP_ID, id);
++	(void)a34w_spi_write(ATOP_WRI_CTR2, 0x00007700u);
++	(void)a34w_spi_write(ATOP_SMCTK11, 0x00000021u);
++	a34w_mask(a34w_conn, CONN_RFSPI_FM_CTRL, (1u << 15) | 0xffu, 0);
++	a34w_wr(a34w_conn, CONN_THERM_AADDR, 0x50305a00u);
++	a34w_adie_efuse();
++	(void)a34w_spi_write(ATOP_RG_ENCAL_WBTAC_IF_SW, 0x80000000u);
++	(void)a34w_spi_write(ATOP_RG_WF0_TOP_01, 0x000e8002u);
++	(void)a34w_spi_write(ATOP_RG_WF1_TOP_01, 0x000e8002u);
++	(void)a34w_spi_write(ATOP_RG_TOP_XTAL_01, 0xf6e8fff5u);
++	(void)a34w_spi_write(ATOP_RG_TOP_XTAL_02, id == 0x66358a00u ? 0xd5555fffu : 0x55555fffu);
++	(void)a34w_spi_write(ATOP_RG_WF0_BG, 0x00002008u);
++	(void)a34w_spi_write(ATOP_RG_WF1_BG, 0x00002008u);
++	a34w_sema_put(SEMA_RFSPI);
++	a34w_mask(a34w_ap, GPIO_MODE25, 0x70000u, 0x10000u);   /* CONN_WF_CTRL2 back to CONN */
++	return true;
++}
++
++static void
++a34w_afe_wbg_cal(void)
++{
++	a34w_set(a34w_conn, CONN_AFE_DIG_EN_01, 1u);           /* RC calibration */
++	delay(60);
++	a34w_clr(a34w_conn, CONN_AFE_DIG_EN_01, 1u);
++	a34w_mask(a34w_conn, CONN_AFE_BT0_TX_03, 0x03c00000u, 0);      /* VCM to 0.6 V for the DACK */
++	a34w_mask(a34w_conn, CONN_AFE_WF0_TX_03, 0x03c00000u, 0);
++	a34w_mask(a34w_conn, CONN_AFE_WF1_TX_03, 0x03c00000u, 0);
++	a34w_set(a34w_conn, CONN_AFE_DIG_EN_03, 1u << 21);     /* BPLL up */
++	delay(30);
++	a34w_set(a34w_conn, CONN_AFE_DIG_EN_03, 1u << 20);     /* WPLL up */
++	delay(60);
++	a34w_set(a34w_conn, CONN_AFE_DIG_EN_01, (1u << 21) | (1u << 20) | (1u << 19));   /* TX calibration */
++	delay(800);
++	a34w_clr(a34w_conn, CONN_AFE_DIG_EN_01, (1u << 21) | (1u << 20) | (1u << 19));
++	a34w_clr(a34w_conn, CONN_AFE_DIG_EN_03, (1u << 21) | (1u << 20));
++	a34w_mask(a34w_conn, CONN_AFE_BT0_TX_03, 0x03c00000u, 4u << 22);
++	a34w_mask(a34w_conn, CONN_AFE_WF0_TX_03, 0x03c00000u, 4u << 22);
++	a34w_mask(a34w_conn, CONN_AFE_WF1_TX_03, 0x03c00000u, 4u << 22);
++	if (a34w_sema_get(SEMA_RFSPI)) {
++		(void)a34w_spi_write(ATOP_RG_ENCAL_WBTAC_IF_SW, 0x00000005u);
++		a34w_sema_put(SEMA_RFSPI);
++	}
++}
++
++static void
++a34w_subsys_pll_initial(void)
++{
++	a34w_mask(a34w_conn, CONN_AFE_PLL_STB_TIME, 0x7fff7fffu, 0x03140521u);
++	a34w_mask(a34w_conn, CONN_AFE_DIG_EN_02, 0xc0u, 1u << 6);       /* BT PLL */
++	a34w_mask(a34w_conn, CONN_AFE_DIG_EN_02, 0x03u, 3u);            /* WF PLL */
++	a34w_mask(a34w_conn, CONN_AFE_DIG_EN_02, 0x0cu, 1u << 2);       /* MCU PLL (BGF) */
++	a34w_mask(a34w_conn, CONN_AFE_DIG_EN_02, 0x30000u, 3u << 16);   /* MCU PLL (WF) */
++	a34w_mask(a34w_conn, CONN_AFE_DIG_TOP_01, 0x78000u, 0xdu << 15);
++}
++
++/* connsys_adie_clock_buffer_setting(bt_only = false), from connsys_low_power_setting_mt6877() */
++static void
++a34w_adie_clock_buffer(void)
++{
++	uint32_t x1 = 0, x2 = 0;
++	bool e1 = a34w_adie_id == 0x66358a00u;
++
++	if (!a34w_adie_top_ck(true)) {
++		return;
++	}
++	if (a34w_sema_get(SEMA_RFSPI)) {
++		if (a34w_spi_read(ATOP_RG_TOP_XTAL_01, &x1)) {
++			(void)a34w_spi_write(ATOP_RG_TOP_XTAL_01, (x1 & ~0xc180u) | 0xc180u);
++		}
++		if (a34w_spi_read(ATOP_RG_TOP_XTAL_02, &x2)) {
++			(void)a34w_spi_write(ATOP_RG_TOP_XTAL_02, (x2 & ~0xf0ff0080u) | (e1 ? 0xd0550080u : 0x50550080u));
++		}
++		a34w_sema_put(SEMA_RFSPI);
++	}
++	(void)a34w_adie_top_ck(false);
++}
++
++static void
++a34w_low_power_setting(void)
++{
++	a34w_adie_clock_buffer();
++	a34w_mask(a34w_conn, CONN_CFG_PWRCTRL0, 0xf000u, 0x1000u);
++	if (!a34w_rc_mode) {
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 7);
++		a34w_mask(a34w_conn, CONN_CFG_OSC_CTL_0, 0x00ffffffu, 0x00080706u);
++		a34w_clr(a34w_conn, CONN_CFG_OSC_CTL_1, 1u << 16);
++	} else {
++		a34w_wr(a34w_conn, CONN_CFG_RC_CTL_1_GPS, 0x02080706u);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0_GPS, 1u << 15);
++		a34w_wr(a34w_conn, CONN_CFG_RC_CTL_1_BT, 0x02080706u);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0_BT, 1u << 15);
++		a34w_wr(a34w_conn, CONN_CFG_RC_CTL_1_WF, 0x02080706u);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0_WF, 1u << 15);
++		a34w_wr(a34w_conn, CONN_CFG_RC_CTL_1_TOP, 0x02080706u);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0_TOP, 1u << 15);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_1, 1u << 3);
++		delay(30);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_1, 1u << 0);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_1, 1u << 1);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_1, 1u << 2);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 4);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 5);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 6);
++		a34w_set(a34w_conn, CONN_CFG_EMI_CTL_0, 1u << 0);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 31);
++		a34w_clr(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 0);
++		a34w_mask(a34w_conn, CONN_CFG_OSC_CTL_0, 0x00ffffffu, 0x00080706u);
++		a34w_clr(a34w_conn, CONN_CFG_OSC_CTL_1, 1u << 16);
++		a34w_set(a34w_conn, CONN_CFG_RC_CTL_0, 1u << 30);
++		a34w_mask(a34w_conn, CONN_CFG_RC_CTL_1, 0xf0u, 0xd0u);
++		a34w_set(a34w_conn, CONN_CFG_EMI_CTL_0, 1u << 16);
++		a34w_set(a34w_conn, CONN_CFG_EMI_CTL_1, 1u << 1);
++	}
++	a34w_mask(a34w_conn, CONN_RGU_BGFSYS_ON_TOP_PWR_CTL, 0xffff0040u, 0x42540000u);
++	a34w_mask(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL, 0xffff0040u, 0x57460000u);
++	a34w_set(a34w_conn, CONN_CFG_EMI_CTL_0, 1u << 18);
++	a34w_mask(a34w_conn, CONN_CFG_EMI_CTL_0, 0x7ff0u, 1023u << 4);
++	a34w_set(a34w_conn, CONN_CFG_EMI_CTL_0, 1u << 15);
++	a34w_clr(a34w_conn, CONN_CFG_EMI_CTL_0, 1u << 15);
++	a34w_mask(a34w_conn, CONN_BCRM_DCM_TOP_CTRL_0, 0xf80000u, 0x80000u);
++	a34w_mask(a34w_conn, CONN_BCRM_DCM_TOP_CTRL_1, 0x3e0u, 0x20u);
++	a34w_mask(a34w_conn, CONN_BCRM_DCM_TOP_CTRL_0, 0x3u, 0x3u);
++	a34w_mask(a34w_conn, CONN_BCRM_DCM_TOP_CTRL_0, 0x18u, 0x18u);
++	a34w_set(a34w_conn, CONN_BUS_LIGHT_SECURITY, (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4));
++	a34w_mask(a34w_conn, CONN_BUS_OFF_TIMEOUT_CTRL, 0x7f80u, 0x12u << 7);
++	a34w_mask(a34w_conn, CONN_BUS_OFF_TIMEOUT_CTRL, 0x7u, 0x7u);
++	a34w_mask(a34w_conn, CONN_BUS_ON_TIMEOUT_CTRL, 0x7f80u, 0x2u << 7);
++	a34w_mask(a34w_conn, CONN_BUS_ON_TIMEOUT_CTRL, 0x7u, 0x7u);
++	a34w_set(a34w_conn, CONN_DEBUG_CTRL_AO, 1u << 9);
++	a34w_mask(a34w_conn, CONN_DEBUG_CTRL_AO, 0xffff0000u, 0x07f40000u);
++	a34w_set(a34w_conn, CONN_DEBUG_CTRL_AO, (1u << 2) | (1u << 3) | (1u << 4));
++	a34w_clr(a34w_conn, CONN_DEBUG_CTRL_AO, 1u << 9);
++	a34w_mask(a34w_ap, TOPRGU_WDT_SWSYSRST, 0xff001000u, 0x88000000u);       /* bit 12, key 0x88 */
++	a34w_set(a34w_conn, CONN_CLKGEN_BPLL_DIV_1, 1u);
++	a34w_set(a34w_conn, CONN_CLKGEN_BPLL_DIV_2, 1u);
++	a34w_set(a34w_conn, CONN_CLKGEN_WPLL_DIV_1, 1u);
++	a34w_set(a34w_conn, CONN_CLKGEN_WPLL_DIV_2, 1u);
++	a34w_clr(a34w_conn, CONN_CLKGEN_RFSPI_CK_CTRL, 1u << 7);
++	a34w_set(a34w_conn, CONN_CLKGEN_RFSPI_CK_CTRL, 1u << 6);
++	a34w_set(a34w_conn, CONN_CLKGEN_RFSPI_CK_CTRL, 1u << 4);
++	a34w_set(a34w_conn, CONN_HOST_SLP_CNT_CTL, 1u << 31);
++	a34w_set(a34w_conn, CONN_HOST_SLP_CNT_CTL, 1u << 0);
++	a34w_set(a34w_conn, CONN_CLKGEN_CKGEN_BUS, 0x3fu | (1u << 25) | (1u << 26) | (1u << 27));
++	a34w_set(a34w_conn, CONN_CFG_PWRCTRL0, 1u << 9);
++	a34w_wr(a34w_conn, CONN_RGU_DEBUG_SEL, 0x6u);
++	/* "CANNOT add code after HERE": bus clock to hardware control, then conn_infra may sleep */
++	a34w_clr(a34w_conn, CONN_CLKGEN_CKGEN_BUS, 1u << 23);
++	a34w_set(a34w_conn, CONN_CFG_PWRCTRL0, 1u << 0);
++}
++
++static bool
++a34w_step3(void)
++{
++	uint64_t t0 = a34w_ms();
++
++	if (!a34w_conn_reachable()) {
++		a34w_say("step 3: the CONN domain is off or protected (CONN_PWR_CON 0x%08x STA1 0x%08x): not touched",
++		    a34w_rd(a34w_ap, SPM_CONN_PWR_CON), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++		return false;
++	}
++	a34w_emi_remap();
++	a34w_d_die_cfg();
++	a34w_spi_master_cfg();
++	if (!a34w_a_die_cfg()) {
++		return false;
++	}
++	a34w_afe_wbg_cal();
++	a34w_subsys_pll_initial();
++	if (a34w_sema_get(SEMA_COMMON_SYSRAM)) {
++		a34w_set(a34w_conn, SYSRAM_RADIO_STATUS, 1u << RADIO_WIFI);
++		a34w_sema_put(SEMA_COMMON_SYSRAM);
++	}
++	a34w_low_power_setting();
++	if (a34w_rc_mode) {     /* pmic_mng_common_power_low_power_mode(): RC mode only */
++		(void)a34w_pmic_update(PMIC_VCN18_CON0, PMIC_LP, PMIC_LP);
++		(void)a34w_pmic_update(PMIC_VCN13_CON0, PMIC_LP, PMIC_LP);
++	}
++	/* opfunc_vcn_control_internal(WIFI) -> consys_plt_pmic_wifi_power_ctrl_mt6877(1): VCN33_1, VCN33_2 at 3.3 V */
++	(void)a34w_ldo_on(&a34w_ldos[2], PMIC_VCN33_1_OP_EN_SET, PMIC_VCN33_1_OP_CFG_SET, 0x60u, false, VCN33_3V3, false);
++	(void)a34w_ldo_on(&a34w_ldos[3], PMIC_VCN33_2_OP_EN_SET, PMIC_VCN33_2_OP_CFG_SET, 0x40u, false, VCN33_3V3, false);
++	a34w_ldo_report("step 3");
++	if (!a34w_conninfra_wakeup()) {
++		return false;
++	}
++	a34w_say("step 3: conn_infra set up in %llu ms: A-die 0x%08x, radio status 0x%08x, PWRCTRL0 0x%08x, "
++	    "RC_CTL_0 0x%08x, OSC_CTL_0 0x%08x", (unsigned long long)(a34w_ms() - t0), a34w_rd(a34w_conn, SYSRAM_A_DIE_CHIP_ID),
++	    a34w_rd(a34w_conn, SYSRAM_RADIO_STATUS), a34w_rd(a34w_conn, CONN_CFG_PWRCTRL0),
++	    a34w_rd(a34w_conn, CONN_CFG_RC_CTL_0), a34w_rd(a34w_conn, CONN_CFG_OSC_CTL_0));
++	a34w_conninfra_sleep();
++	return true;
++}
++
++/*
++ * ---- the Wi-Fi subsystem (steps 4 and 5) ----
++ *
++ * What wlan_drv_gen4m_6877.ko does on this chip. The phone's module is built from
++ * connectivity/wlan/core/gen4m_s1 (its strings name those files); Samsung's published
++ * gen4m_s1/chips/soc5_0/soc5_0.c lacks the ROM-EMI and chip-info parts the module carries,
++ * which gen4m/chips/soc5_0/soc5_0.c has; the register sequences are the same in both.
++ *
++ *   4  wf_pwr_on_consys_mcu() (gen4m_s1 soc5_0.c): conn_infra woken for Wi-Fi, the WM MCU held
++ *      in reset, the Wi-Fi sleep protection off, WFSYS's power on (0x57460080 into
++ *      WFSYS_ON_TOP_PWR_CTL), its acks, WFSYS's version 0x02050002, the bus-hang and debug
++ *      controls; the MCU's RAM image "ROM EMI" (soc5_0_ram_wmmcu_1_1_hdr.bin: a 48-byte
++ *      ROM_EMI_HEADER, then the image for u4PatchAddr 0xf0380000, i.e. EMI + 0x380000; its
++ *      build date at EMI + 0x4954e0: soc5_0_wlanPowerOnInit, fw_dl.c's ROM-EMI branch); the MCU
++ *      released and its ROM's "done" 0x1d1e polled in CONNAC2X_MAILBOX_DBG (0x18060260); then
++ *      FW own (asicConnac2xPwrOnWmMcu).
++ *   5  wlanAdapterStart()'s part up to a running firmware: driver own (LPCTL 0x18060010: BIT1,
++ *      then bit 2 clear), asicConnac2xCapInit (IRQ enable, the MCU's software interrupts), the
++ *      host WFDMA (0x18024000) set up as halWpdmaInitRing/soc5_0's manual prefetch/WpdmaConfig
++ *      do it for the two rings the start needs -- TX ring 17 (INIT commands) and RX ring 0
++ *      (events) --, the ROM asked for TOP_HVR/TOP_FVR (INIT_CMD_ID_ACCESS_REG, as
++ *      wlanSetChipEcoInfo), PCCIF "Wi-Fi on" (0x10003220 = 0), WIFI_RAM_CODE_soc5_0_1_1.bin by
++ *      its tailer (36 bytes, its regions' 40-byte entries before it, the data back to back from
++ *      the start): regions with feature 0x80 copied into the EMI (wlanDownloadEMISection: the
++ *      address's low 24 bits), the others written through the AP2WF window (downloadImgByDyn
++ *      MemMap: the region's address into AP2WF_REMAP_1 0x18400120, the data at 0x18500000),
++ *      then INIT_CMD_ID_DYN_MEM_MAP_FW_FINISH {0, 0} answered by INIT_EVENT_ID_CMD_RESULT, and
++ *      the firmware's ready bits (0x180600f0 [1:0] = 3, polled 5 ms apart for 2.5 s).
++ *
++ * Not done (M2, docs/wifi-plan.md): PHY_ACTION (pre-calibration with the NVRAM's ePA/eLNA bytes
++ * and connfem's front-end id -- the firmware is expected to start without it, uncalibrated),
++ * LOG_TIME_SYNC, the front-end's GPIO modes, DMASHDL, the other rings, interrupts (everything
++ * here is polled), and the running firmware's commands, which on this chip go through a
++ * mailbox in the EMI ("SW WFDMA") rather than a DMA ring.
++ *
++ * INIT command (asicConnac2xFillInitCmdTxdInfo; nic_connac2x_tx.h, wsys_cmd_handler_fw.h): a
++ * 32-byte TXD -- DW0 the whole length and packet format 2 (command) at [24:23], DW1 header
++ * format 1 (command) at [17:16] --, INIT_HIF_TX_HEADER at 32 (u16 length after the TXD, u16
++ * PQ_ID 0, then INIT_WIFI_CMD: CID, 0xA0, 0, sequence number, 24 bytes reserved), the payload
++ * at 64. Event: a 24-byte RXD (init_evt_rxd_size), INIT_WIFI_EVENT (u16 length, u16 0xE000,
++ * EID, sequence, 2 reserved), the payload. DMA descriptors: DW0 the buffer, DW1 SDLen0 [29:16],
++ * LastSec0 [30], DMADONE [31]; base, count, CPU index and DMA index at a ring's +0/+4/+8/+C.
++ */
++
++#define A34W_WF_PA              0x18400000u     /* WF MCU bus CR .. the AP2WF window */
++#define A34W_WF_SIZE            0x200000u
++
++/* in the conn_infra map (0x18000000 + ...) */
++#define WF_CPU_SW_RST_B                 0x00120u        /* CONN_INFRA_RGU + 0x120: bit 0 the WM MCU runs */
++#define CONN_CFG_WF_SLP_CTRL            0x01540u
++#define CONN_CFG_WF_SLP_STATUS          0x01544u
++#define CONN_VDNR_AXI_DEBUG_CTRL0       0x1d000u
++#define WFDMA_HOST                      0x24000u        /* WF_WFDMA_HOST_DMA0 */
++#define WFDMA_INT_STA                   (WFDMA_HOST + 0x200u)
++#define WFDMA_INT_ENA                   (WFDMA_HOST + 0x204u)
++#define WFDMA_GLO_CFG                   (WFDMA_HOST + 0x208u)
++#define WFDMA_RST_DTX_PTR               (WFDMA_HOST + 0x20cu)
++#define WFDMA_INT_ENA_CLR               (WFDMA_HOST + 0x22cu)
++#define WFDMA_PAUSE_RX_Q_TH10           (WFDMA_HOST + 0x260u)
++#define WFDMA_RST_DRX_PTR               (WFDMA_HOST + 0x280u)
++#define WFDMA_INT_RX_PRI_SEL            (WFDMA_HOST + 0x298u)
++#define WFDMA_MCU2HOST_SW_INT_ENA       (WFDMA_HOST + 0x1f4u)
++#define WFDMA_TX_RING(n)                (WFDMA_HOST + 0x300u + 0x10u * (n))     /* 0..19 */
++#define WFDMA_RX_RING(n)                (WFDMA_HOST + 0x500u + 0x10u * (n))
++#define WFDMA_TX_EXT_CTRL(n)            (WFDMA_HOST + 0x600u + 4u * (n))
++#define WFDMA_RX_EXT_CTRL(n)            (WFDMA_HOST + 0x680u + 4u * (n))
++#define GLO_TX_DMA_EN                   (1u << 0)
++#define GLO_TX_DMA_BUSY                 (1u << 1)
++#define GLO_RX_DMA_EN                   (1u << 2)
++#define GLO_RX_DMA_BUSY                 (1u << 3)
++#define GLO_CHAIN_EN                    (1u << 15)      /* csr_disp_base_ptr_chain_en */
++#define GLO_OMIT_RX_INFO_PFET2          (1u << 21)
++#define GLO_OMIT_RX_INFO                (1u << 27)
++#define GLO_OMIT_TX_INFO                (1u << 28)
++/* asicConnac2xWfdmaControl(enable): bt_size 3, tx_wb_ddone, fifo_little_endian, clk_gate_dis, omit_tx_info,
++ * chain_en, omit_rx_info_pfet2; then tx/rx_dma_en (soc5_0asicConnac2xWpdmaConfig): 0x50209075 */
++#define GLO_ENABLE_BITS                 (0x30u | (1u << 6) | (1u << 12) | (1u << 30) | GLO_OMIT_TX_INFO | \
++	                                 GLO_CHAIN_EN | GLO_OMIT_RX_INFO_PFET2 | GLO_TX_DMA_EN | GLO_RX_DMA_EN)
++#define CCIF_WF_BASE                    0x3d000u        /* AP2WF_CONN_INFRA_ON_CCIF4 */
++#define SYSRAM_SW_WFDMA_OFFSET          0x537fcu        /* where the firmware says its command mailbox is */
++#define HOST_LPCTL                      0x60010u        /* CONNAC2X_BN0_LPCTL */
++#define LPCTL_SET_OWN                   (1u << 0)
++#define LPCTL_CLR_OWN                   (1u << 1)
++#define LPCTL_OWNER_SYNC                (1u << 2)       /* 1: the firmware owns it */
++#define HOST_IRQ_ENA                    0x60018u        /* CONNAC2X_BN0_IRQ_ENA */
++#define HOST_SW_SYNC0                   0x600f0u        /* CONN_ON_MISC: the firmware's ready bits [1:0] */
++#define HOST_WAKEPU_WF                  0x601a4u
++#define HOST_MAILBOX_DBG                0x60260u        /* the ROM's progress: 0x1d1e when done */
++#define HOST_DBG_DUMMY_3                0x602ccu        /* bit 30: WFSYS's power ack */
++#define HOST_WF_MCUSYS_BUS_TIMEOUT      0x6016cu
++#define WFSYS_VERSION                   0x02050002u
++#define ROM_DONE                        0x00001d1eu
++
++/* in the WF map (0x18400000 + ...) */
++#define WF_AP2WF_REMAP_1                0x000120u       /* WF_MCU_BUS_CR + 0x120: what the window shows */
++#define WF_WFDMA_DUMMY_CR               0x002120u       /* MCU WPDMA0 + 0x120: bit 1 "the host set the DMA up" */
++#define WF_TOP_CFG_VERSION              0x0b0010u       /* WF_TOP_CFG (0x184b0000) + 0x10 */
++#define WF_TOP_SLPPROT_ON_STATUS        0x0c300cu       /* 0x184c300c: bits 23 and 21 */
++#define WF_MCU_CFG_LS_BUSHANG           0x0f0440u       /* 0x184f0440 */
++#define WF_WINDOW                       0x100000u       /* 0x18500000: the AP2WF window */
++#define WF_MCUSYS_PWA_CTRL0             0x100000u       /* the window while it shows debug_ctrl_ao 0x810f0000 */
++#define WF_MCUSYS_PWA_CTRL3             0x10000cu
++#define WF_WINDOW_SIZE                  0x100000u
++#define WF_DEBUG_CTRL_AO                0x810f0000u
++
++/* the firmware */
++#define A34W_FW_DIR                     "/a34/wifi/"
++#define FW_ROM_EMI                      "soc5_0_ram_wmmcu_1_1_hdr.bin"
++#define FW_RAM_CODE                     "WIFI_RAM_CODE_soc5_0_1_1.bin"
++#define ROM_EMI_HEADER_SIZE             48u
++#define ROM_EMI_DATE_OFFSET             0x4954e0u       /* WMMCU_MCU_ROM_EMI_DATE_ADDR 0xf04954e0 */
++#define EMI_ADDR_MASK                   0xffffffu       /* WIFI_EMI_ADDR_MASK */
++#define TAILER_SIZE                     36u
++#define REGION_SIZE                     40u
++#define FEATURE_DL_TO_EMI               0x80u
++#define FEATURE_NOT_DOWNLOAD            0x40u
++#define FEATURE_ENCRYPTED               0x01u
++
++/* INIT commands and events (nic_init_cmd_event.h) */
++#define INIT_CMD_ID_ACCESS_REG          3u
++#define INIT_CMD_ID_DYN_MEM_MAP_FW_FINISH 0x41u
++#define INIT_EVENT_ID_CMD_RESULT        1u
++#define INIT_EVENT_ID_ACCESS_REG        2u
++#define INIT_CMD_PACKET_TYPE_ID         0xa0u
++#define TXD_SIZE                        32u
++#define INIT_CMD_HEADER_SIZE            64u             /* TXD + INIT_HIF_TX_HEADER */
++#define INIT_RXD_SIZE                   24u
++#define INIT_EVENT_HEADER_SIZE          8u
++#define TOP_HVR                         0x88000000u
++#define TOP_FVR                         0x88000004u
++
++/* the DMA memory (A34W_DMA_PA): two rings, their buffers */
++#define RING_SLOTS                      32u
++#define SLOT_SIZE                       0x1000u
++#define RX_BUF_SIZE                     3840u
++#define DMA_TX17_DESC                   0x00000u
++#define DMA_RX0_DESC                    0x01000u
++#define DMA_TX17_BUFS                   0x10000u
++#define DMA_RX0_BUFS                    (DMA_TX17_BUFS + RING_SLOTS * SLOT_SIZE)
++#define DESC_DMADONE                    (1u << 31)
++#define DESC_LS0                        (1u << 30)
++#define DESC_SDLEN0(n)                  (((uint32_t)(n) & 0x3fffu) << 16)
++#define HW_TX_CMD_RING                  17u
++#define HW_RX_EVENT_RING                0u
++
++static vm_offset_t a34w_wf, a34w_emi, a34w_dma;
++static uint32_t a34w_tx_cidx, a34w_rx_cidx;
++static uint8_t a34w_seq;
++
++static uint8_t *
++a34w_file(const char *name, uint32_t *size)
++{
++	char path[96];
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
++	uint8_t *data = NULL;
++	int left = 0, error;
++
++	for (unsigned s = 0; s < 240u && rootvnode == NULLVP; s++) {
++		if (s == 0) {
++			a34w_say("waiting for the root file system");
++		}
++		delay_for_interval(1, NSEC_PER_SEC);
++	}
++	snprintf(path, sizeof(path), A34W_FW_DIR "%s", name);
++	if ((error = vnode_lookup(path, 0, &vnode, context)) != 0) {
++		a34w_say("%s: not found (%d): tools/wifi-fw.sh puts it there", path, error);
++		return NULL;
++	}
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size < 64u ||
++	    attributes.va_data_size > (8u << 20)) {
++		a34w_say("%s: no size, or not a plausible one", path);
++		vnode_put(vnode);
++		return NULL;
++	}
++	data = kalloc_data((vm_size_t)attributes.va_data_size, Z_WAITOK);
++	if (data == NULL || vn_rdwr(UIO_READ, vnode, (caddr_t)data, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(context), &left, vfs_context_proc(context)) != 0 || left != 0) {
++		a34w_say("%s: not read", path);
++		if (data != NULL) {
++			kfree_data(data, (vm_size_t)attributes.va_data_size);
++		}
++		vnode_put(vnode);
++		return NULL;
++	}
++	vnode_put(vnode);
++	*size = (uint32_t)attributes.va_data_size;
++	return data;
++}
++
++static inline uint32_t
++a34w_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static bool
++a34w_map_wf(void)
++{
++	if (a34w_wf != 0) {
++		return true;
++	}
++	a34w_wf = ml_io_map_unmappable(A34W_WF_PA, A34W_WF_SIZE, A34W_WIMG_IO);
++	a34w_emi = ml_io_map_unmappable((vm_offset_t)A34W_EMI_PA, A34W_EMI_SIZE, A34W_WIMG_WCOMB);
++	a34w_dma = ml_io_map_unmappable((vm_offset_t)A34W_DMA_PA, A34W_DMA_SIZE, A34W_WIMG_WCOMB);
++	if (a34w_wf == 0 || a34w_emi == 0 || a34w_dma == 0) {
++		a34w_say("Wi-Fi registers or memory not mapped (0x%lx 0x%lx 0x%lx)", (unsigned long)a34w_wf,
++		    (unsigned long)a34w_emi, (unsigned long)a34w_dma);
++		a34w_wf = 0;
++		return false;
++	}
++	return true;
++}
++
++/* a register polled until (value & mask) == want, `tries` reads `us` apart; the last value read in *last */
++static bool
++a34w_poll_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t tries, uint32_t us,
++    uint32_t *last)
++{
++	uint32_t v = 0;
++
++	for (uint32_t i = 0; i <= tries; i++) {
++		v = a34w_rd(base, off);
++		if ((v & mask) == want) {
++			*last = v;
++			return true;
++		}
++		delay((int)us);
++	}
++	*last = v;
++	return false;
++}
++
++/* ---- step 4: WFSYS on, the WM MCU's ROM running its EMI image ---- */
++
++static bool
++a34w_rom_emi_load(void)
++{
++	uint32_t size = 0, addr, offset;
++	uint8_t *file = a34w_file(FW_ROM_EMI, &size);
++	char date[17];
++
++	if (file == NULL) {
++		return false;
++	}
++	addr = a34w_le32(file + 24);                    /* ROM_EMI_HEADER.u4PatchAddr */
++	offset = addr & EMI_ADDR_MASK;
++	memcpy(date, file, 16);
++	date[16] = '\0';
++	for (unsigned i = 0; i < 16u; i++) {
++		if (date[i] < 0x20 || date[i] > 0x7e) {
++			date[i] = '.';
++		}
++	}
++	if (memcmp(file + 16, "ALPS", 4) != 0 || (addr & 0xff000000u) != 0xf0000000u ||
++	    offset + (size - ROM_EMI_HEADER_SIZE) > ROM_EMI_DATE_OFFSET) {
++		a34w_say("step 4: %s: not a ROM_EMI image this driver knows (platform %.4s, address 0x%08x)", FW_ROM_EMI,
++		    (const char *)(file + 16), addr);
++		kfree_data(file, size);
++		return false;
++	}
++	/* CONNSYS's memory as Android leaves it before a first power-on: nothing in it (logs, dumps, mailboxes) */
++	bzero((void *)a34w_emi, A34W_EMI_SIZE);
++	memcpy((void *)(a34w_emi + offset), file + ROM_EMI_HEADER_SIZE, size - ROM_EMI_HEADER_SIZE);
++	memcpy((void *)(a34w_emi + ROM_EMI_DATE_OFFSET), file, 16);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_say("step 4: %s (built %s, hw 0x%02x%02x): %u bytes into the EMI at +0x%x", FW_ROM_EMI, date, file[20],
++	    file[21], size - ROM_EMI_HEADER_SIZE, offset);
++	kfree_data(file, size);
++	return true;
++}
++
++static bool
++a34w_step4(void)
++{
++	uint32_t v = 0;
++	uint64_t t0;
++
++	if (!a34w_conn_reachable()) {
++		a34w_say("step 4: the CONN domain is off or protected (CONN_PWR_CON 0x%08x STA1 0x%08x): not touched",
++		    a34w_rd(a34w_ap, SPM_CONN_PWR_CON), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++		return false;
++	}
++	if (!a34w_map_wf()) {
++		return false;
++	}
++	/* conn_infra woken for Wi-Fi, its version polled */
++	a34w_set(a34w_conn, HOST_WAKEPU_WF, 1u);
++	if (!a34w_poll_mask(a34w_conn, CONN_CFG_IP_VERSION, 0xffffffffu, CONN_HW_VER, 10, 1000, &v)) {
++		a34w_say("step 4: conn_infra did not wake for Wi-Fi (IP version 0x%08x)", v);
++		return false;
++	}
++	if (a34w_rd(a34w_conn, HOST_MAILBOX_DBG) == ROM_DONE && (a34w_rd(a34w_conn, WF_CPU_SW_RST_B) & 1u)) {
++		a34w_say("step 4: the WM MCU already runs (mailbox 0x%x): nothing to do", ROM_DONE);
++		a34w_clr(a34w_conn, HOST_WAKEPU_WF, 1u);
++		return true;
++	}
++	a34w_clr(a34w_conn, WF_CPU_SW_RST_B, 1u);              /* the WM MCU held */
++	a34w_clr(a34w_conn, CONN_CFG_WF_SLP_CTRL, 1u);         /* conn_infra <-> Wi-Fi sleep protection off */
++	v = a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL);
++	a34w_wr(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL, (v & 0x0000ff7fu) | 0x57460080u);    /* key 0x5746, on */
++	if (!a34w_poll_mask(a34w_conn, HOST_DBG_DUMMY_3, 1u << 30, 1u << 30, 10, 500, &v)) {
++		a34w_say("step 4: WFSYS power: no ack (DBG_DUMMY_3 0x%08x, WFSYS_ON_TOP_PWR_CTL 0x%08x)", v,
++		    a34w_rd(a34w_conn, CONN_RGU_WFSYS_ON_TOP_PWR_CTL));
++		return false;
++	}
++	if (!a34w_poll_mask(a34w_conn, CONN_CFG_WF_SLP_STATUS, 0xa0000000u, 0, 100, 500, &v)) {
++		a34w_say("step 4: Wi-Fi to conn_infra sleep protection still on (0x%08x)", v);
++		return false;
++	}
++	if (!a34w_poll_mask(a34w_wf, WF_TOP_SLPPROT_ON_STATUS, 1u << 23, 0, 100, 500, &v) ||
++	    !a34w_poll_mask(a34w_wf, WF_TOP_SLPPROT_ON_STATUS, 1u << 21, 0, 100, 500, &v)) {
++		a34w_say("step 4: WFDMA to conn_infra sleep protection still on (0x%08x)", v);
++		return false;
++	}
++	if (!a34w_poll_mask(a34w_wf, WF_TOP_CFG_VERSION, 0xffffffffu, WFSYS_VERSION, 10, 500, &v)) {
++		a34w_say("step 4: WFSYS version 0x%08x, not 0x%08x", v, WFSYS_VERSION);
++		return false;
++	}
++	a34w_say("step 4: WFSYS on: version 0x%08x", v);
++	/* bus-hang detection, then the WF MCU's debug controls (through the window shown debug_ctrl_ao) */
++	a34w_mask(a34w_wf, WF_MCU_CFG_LS_BUSHANG, 0xffu, 0x03u);
++	a34w_set(a34w_wf, WF_MCU_CFG_LS_BUSHANG, 0x90000000u);
++	a34w_wr(a34w_wf, WF_AP2WF_REMAP_1, WF_DEBUG_CTRL_AO);
++	a34w_set(a34w_wf, WF_MCUSYS_PWA_CTRL0, 0x8u);
++	a34w_set(a34w_wf, WF_MCUSYS_PWA_CTRL0, 0x200u);
++	a34w_clr(a34w_wf, WF_MCUSYS_PWA_CTRL0, 0x200u);
++	a34w_mask(a34w_wf, WF_MCUSYS_PWA_CTRL0, 0xffff0000u, 0x04f50000u);
++	a34w_set(a34w_wf, WF_MCUSYS_PWA_CTRL3, 0x10000u);
++	a34w_set(a34w_wf, WF_MCUSYS_PWA_CTRL0, 0x1cu);
++	a34w_set(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0x200u);
++	a34w_mask(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0xffff0000u, 0x30e00000u);
++	a34w_set(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0x4u);
++	a34w_set(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0x8u);
++	a34w_set(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0x10u);
++	a34w_clr(a34w_conn, CONN_VDNR_AXI_DEBUG_CTRL0, 0x200u);
++
++	/* soc5_0_wlanPowerOnInit(): the MCU's image into the EMI, before the MCU is let go */
++	if (!a34w_rom_emi_load()) {
++		return false;
++	}
++	t0 = a34w_ms();
++	a34w_set(a34w_conn, WF_CPU_SW_RST_B, 1u);
++	if (!a34w_poll_mask(a34w_conn, HOST_MAILBOX_DBG, 0xffffffffu, ROM_DONE, 1000, 1000, &v)) {
++		a34w_say("step 4: the WM MCU's ROM did not finish: mailbox 0x%08x (0x%x expected), bus timeout 0x%08x", v,
++		    ROM_DONE, a34w_rd(a34w_conn, HOST_WF_MCUSYS_BUS_TIMEOUT));
++		return false;
++	}
++	a34w_say("step 4: WM MCU ROM done (mailbox 0x%08x) %llu ms after its release", v,
++	    (unsigned long long)(a34w_ms() - t0));
++	a34w_clr(a34w_conn, HOST_WAKEPU_WF, 1u);
++	/* FW own, so that driver and firmware agree (asicConnac2xPwrOnWmMcu) */
++	v = a34w_rd(a34w_conn, HOST_LPCTL);
++	if ((v & LPCTL_OWNER_SYNC) == 0) {
++		a34w_wr(a34w_conn, HOST_LPCTL, LPCTL_SET_OWN);
++	}
++	a34w_say("step 4: LPCTL 0x%08x -> 0x%08x (firmware owns)", v, a34w_rd(a34w_conn, HOST_LPCTL));
++	return true;
++}
++
++/* ---- step 5: the host DMA, the RAM code, the firmware running ---- */
++
++static bool
++a34w_driver_own(void)
++{
++	uint64_t began = a34w_ms(), asked = 0;
++
++	while (a34w_ms() - began < 2048u) {
++		if (asked != 0 && (a34w_rd(a34w_conn, HOST_LPCTL) & LPCTL_OWNER_SYNC) == 0) {
++			a34w_say("step 5: driver own in %llu ms (LPCTL 0x%08x)", (unsigned long long)(a34w_ms() - began),
++			    a34w_rd(a34w_conn, HOST_LPCTL));
++			return true;
++		}
++		if (asked == 0 || a34w_ms() - asked >= 200u) {
++			a34w_wr(a34w_conn, HOST_LPCTL, LPCTL_CLR_OWN);
++			asked = a34w_ms() | 1u;
++		}
++		delay(100);
++	}
++	a34w_say("step 5: driver own NOT taken in 2 s (LPCTL 0x%08x)", a34w_rd(a34w_conn, HOST_LPCTL));
++	return false;
++}
++
++static volatile uint32_t *
++a34w_desc(uint32_t ring_off, uint32_t slot)
++{
++	return (volatile uint32_t *)(a34w_dma + ring_off + slot * 16u);
++}
++
++static void
++a34w_wfdma_init(void)
++{
++	uint32_t glo, v, wr;
++
++	/* asicConnac2xWfdmaControl(disable): DMA off, its idle waited for, the indices reset; interrupts off */
++	glo = a34w_rd(a34w_conn, WFDMA_GLO_CFG);
++	a34w_wr(a34w_conn, WFDMA_GLO_CFG, glo & ~(GLO_TX_DMA_EN | GLO_RX_DMA_EN | GLO_CHAIN_EN | GLO_OMIT_TX_INFO |
++	    GLO_OMIT_RX_INFO | GLO_OMIT_RX_INFO_PFET2));
++	(void)a34w_poll_mask(a34w_conn, WFDMA_GLO_CFG, GLO_TX_DMA_BUSY | GLO_RX_DMA_BUSY, 0, 100, 1000, &v);
++	a34w_wr(a34w_conn, WFDMA_RST_DTX_PTR, 0xffffffffu);
++	a34w_wr(a34w_conn, WFDMA_RST_DRX_PTR, 0xffffffffu);
++	a34w_wr(a34w_conn, WFDMA_INT_ENA_CLR, 0xffffffffu);
++
++	/* TX ring 17: every slot free (DMADONE); RX ring 0: every slot the DMA's, CPU index one behind */
++	for (uint32_t s = 0; s < RING_SLOTS; s++) {
++		volatile uint32_t *t = a34w_desc(DMA_TX17_DESC, s), *r = a34w_desc(DMA_RX0_DESC, s);
++
++		t[0] = 0;
++		t[1] = DESC_DMADONE;
++		t[2] = 0;
++		t[3] = 0;
++		r[0] = (uint32_t)A34W_DMA_PA + DMA_RX0_BUFS + s * SLOT_SIZE;
++		r[1] = DESC_SDLEN0(RX_BUF_SIZE);
++		r[2] = 0;
++		r[3] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_tx_cidx = 0;
++	a34w_rx_cidx = RING_SLOTS - 1u;
++	a34w_wr(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_TX17_DESC);
++	a34w_wr(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x8u, 0);
++	a34w_wr(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x4u, RING_SLOTS);
++	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x0u, (uint32_t)A34W_DMA_PA + DMA_RX0_DESC);
++	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u, a34w_rx_cidx);
++	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x4u, RING_SLOTS);
++
++	/* soc5_0asicConnac2xWfdmaManualPrefetch(): chain off, each ring's prefetch slot, as Android orders them */
++	a34w_clr(a34w_conn, WFDMA_GLO_CFG, GLO_CHAIN_EN);
++	wr = 0x00000004u;
++	a34w_wr(a34w_conn, WFDMA_RX_EXT_CTRL(0), wr);
++	wr += 0x00400000u;
++	for (uint32_t n = 2; n <= 5u; n++, wr += 0x00400000u) {
++		a34w_wr(a34w_conn, WFDMA_RX_EXT_CTRL(n), wr);
++	}
++	a34w_wr(a34w_conn, WFDMA_RX_EXT_CTRL(1), wr);
++	wr += 0x00400000u;
++	for (uint32_t n = 6; n <= 9u; n++, wr += 0x00400000u) {
++		a34w_wr(a34w_conn, WFDMA_RX_EXT_CTRL(n), wr);
++	}
++	for (uint32_t n = 0; n <= 2u; n++, wr += 0x00400000u) {
++		a34w_wr(a34w_conn, WFDMA_TX_EXT_CTRL(n), wr);
++	}
++	for (uint32_t n = 16; n <= 17u; n++, wr += 0x00400000u) {
++		a34w_wr(a34w_conn, WFDMA_TX_EXT_CTRL(n), wr);
++	}
++	for (uint32_t n = 8; n <= 10u; n++, wr += 0x00400000u) {
++		a34w_wr(a34w_conn, WFDMA_TX_EXT_CTRL(n), wr);
++	}
++	a34w_wr(a34w_conn, WFDMA_TX_EXT_CTRL(18), 0x04000004u);
++	wr += 0x00400000u;
++	a34w_wr(a34w_conn, WFDMA_TX_EXT_CTRL(19), wr);
++	a34w_set(a34w_conn, WFDMA_INT_RX_PRI_SEL, (1u << 1) | (0xfu << 6));
++	a34w_wr(a34w_conn, WFDMA_RST_DTX_PTR, 0xffffffffu);
++	a34w_wr(a34w_conn, WFDMA_RST_DRX_PTR, 0xffffffffu);
++	/* the reset cleared the CPU indices: the RX ring's again */
++	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u, a34w_rx_cidx);
++
++	/* on (asicConnac2xWfdmaControl(enable), soc5_0asicConnac2xWpdmaConfig); interrupts stay masked: polled */
++	a34w_set(a34w_conn, WFDMA_GLO_CFG, GLO_ENABLE_BITS);
++	v = a34w_rd(a34w_conn, WFDMA_PAUSE_RX_Q_TH10);
++	a34w_wr(a34w_conn, WFDMA_PAUSE_RX_Q_TH10, (v & 0x0fff0000u) + 4u);
++	a34w_set(a34w_wf, WF_WFDMA_DUMMY_CR, 1u << 1);
++	a34w_say("step 5: WFDMA: GLO_CFG 0x%08x, TX17 at 0x%x (%u slots) cidx/didx %u/%u, RX0 at 0x%x cidx/didx %u/%u",
++	    a34w_rd(a34w_conn, WFDMA_GLO_CFG), (uint32_t)A34W_DMA_PA + DMA_TX17_DESC, RING_SLOTS,
++	    a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x8u), a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0xcu),
++	    (uint32_t)A34W_DMA_PA + DMA_RX0_DESC, a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u),
++	    a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0xcu));
++}
++
++/* one frame into TX ring 17, and the DMA waited for until it has taken it */
++static bool
++a34w_tx(const uint8_t *frame, uint32_t length)
++{
++	uint32_t slot = a34w_tx_cidx, next = (slot + 1u) % RING_SLOTS, didx = 0;
++	volatile uint32_t *d = a34w_desc(DMA_TX17_DESC, slot);
++
++	if (length > SLOT_SIZE) {
++		return false;
++	}
++	memcpy((void *)(a34w_dma + DMA_TX17_BUFS + slot * SLOT_SIZE), frame, length);
++	d[0] = (uint32_t)A34W_DMA_PA + DMA_TX17_BUFS + slot * SLOT_SIZE;
++	d[2] = 0;
++	d[3] = 0;
++	d[1] = DESC_SDLEN0(length) | DESC_LS0;          /* DMADONE clear: the DMA's */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_tx_cidx = next;
++	a34w_wr(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x8u, next);
++	if (a34w_poll_mask(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0xcu, 0xfffu, next, 2000, 50, &didx)) {
++		return true;
++	}
++	a34w_say("TX ring 17: the DMA did not take slot %u (DMA index %u, GLO_CFG 0x%08x, INT_STA 0x%08x)", slot, didx,
++	    a34w_rd(a34w_conn, WFDMA_GLO_CFG), a34w_rd(a34w_conn, WFDMA_INT_STA));
++	return false;
++}
++
++/* the next frame the DMA put into RX ring 0 (copied to `frame`), or -1 after `wait_ms` */
++static int
++a34w_rx(uint8_t *frame, uint32_t room, uint32_t wait_ms)
++{
++	uint32_t slot = (a34w_rx_cidx + 1u) % RING_SLOTS, length;
++	volatile uint32_t *d = a34w_desc(DMA_RX0_DESC, slot);
++	uint64_t until = a34w_ms() + wait_ms;
++
++	while ((d[1] & DESC_DMADONE) == 0) {
++		if (a34w_ms() >= until) {
++			return -1;
++		}
++		delay(100);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	length = (d[1] >> 16) & 0x3fffu;
++	if (length > room) {
++		length = room;
++	}
++	if (length > SLOT_SIZE) {
++		length = SLOT_SIZE;
++	}
++	memcpy(frame, (const void *)(a34w_dma + DMA_RX0_BUFS + slot * SLOT_SIZE), length);
++	d[0] = (uint32_t)A34W_DMA_PA + DMA_RX0_BUFS + slot * SLOT_SIZE;
++	d[1] = DESC_SDLEN0(RX_BUF_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a34w_rx_cidx = slot;
++	a34w_wr(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u, slot);
++	return (int)length;
++}
++
++/* an INIT command on TX ring 17; its sequence number (0: not sent) */
++static uint8_t
++a34w_init_cmd(uint8_t cid, const void *payload, uint32_t payload_length)
++{
++	static uint8_t frame[INIT_CMD_HEADER_SIZE + 64u];
++	const uint32_t length = INIT_CMD_HEADER_SIZE + payload_length;
++	uint32_t dw;
++
++	if (payload_length > 64u) {
++		return 0;
++	}
++	bzero(frame, sizeof(frame));
++	dw = (length & 0xffffu) | (2u << 23);           /* TX byte count; packet format: command */
++	memcpy(frame + 0, &dw, 4);
++	dw = 1u << 16;                                  /* header format: command */
++	memcpy(frame + 4, &dw, 4);
++	frame[32] = (uint8_t)(length - TXD_SIZE);
++	frame[33] = (uint8_t)((length - TXD_SIZE) >> 8);
++	frame[36] = cid;
++	frame[37] = INIT_CMD_PACKET_TYPE_ID;
++	if (++a34w_seq == 0) {
++		a34w_seq = 1;
++	}
++	frame[39] = a34w_seq;
++	memcpy(frame + INIT_CMD_HEADER_SIZE, payload, payload_length);
++	return a34w_tx(frame, length) ? a34w_seq : 0;
++}
++
++/* the event answering sequence `seq` on RX ring 0: its EID, what follows its header in `body`; -1 if none */
++static int
++a34w_init_event(uint8_t seq, uint8_t *eid, uint8_t *body, uint32_t room, uint32_t wait_ms)
++{
++	uint8_t frame[256];
++	uint64_t until = a34w_ms() + wait_ms;
++	int got;
++
++	while (a34w_ms() < until && (got = a34w_rx(frame, sizeof(frame), (uint32_t)(until - a34w_ms()))) >= 0) {
++		if (got < (int)(INIT_RXD_SIZE + INIT_EVENT_HEADER_SIZE)) {
++			a34w_say("RX ring 0: a %d-byte frame (too short for an event)", got);
++			continue;
++		}
++		if (frame[INIT_RXD_SIZE + 5] != seq) {
++			a34w_say("RX ring 0: event 0x%02x of sequence %u (waiting for %u)", frame[INIT_RXD_SIZE + 4],
++			    frame[INIT_RXD_SIZE + 5], seq);
++			continue;
++		}
++		*eid = frame[INIT_RXD_SIZE + 4];
++		got -= (int)(INIT_RXD_SIZE + INIT_EVENT_HEADER_SIZE);
++		if ((uint32_t)got > room) {
++			got = (int)room;
++		}
++		memcpy(body, frame + INIT_RXD_SIZE + INIT_EVENT_HEADER_SIZE, (uint32_t)got);
++		return got;
++	}
++	return -1;
++}
++
++/* INIT_CMD_ID_ACCESS_REG, a query (wlanSetChipEcoInfo's way to read TOP_HVR/TOP_FVR) */
++static bool
++a34w_access_reg(uint32_t address, uint32_t *value)
++{
++	uint8_t cmd[12], answer[8], eid = 0;
++	uint8_t seq;
++
++	bzero(cmd, sizeof(cmd));
++	memcpy(cmd + 4, &address, 4);
++	seq = a34w_init_cmd(INIT_CMD_ID_ACCESS_REG, cmd, sizeof(cmd));
++	if (seq == 0 || a34w_init_event(seq, &eid, answer, sizeof(answer), 1000) < 8 || eid != INIT_EVENT_ID_ACCESS_REG) {
++		return false;
++	}
++	*value = a34w_le32(answer + 4);
++	return true;
++}
++
++/* the RAM code's regions (fw_dl.c: wlanImageSectionDownloadStage with dynamic memory mapping) */
++static bool
++a34w_ram_code_load(void)
++{
++	uint32_t size = 0, regions, at = 0, end;
++	uint8_t *file = a34w_file(FW_RAM_CODE, &size);
++	const uint8_t *tailer;
++	bool ok = true;
++
++	if (file == NULL) {
++		return false;
++	}
++	tailer = file + size - TAILER_SIZE;
++	regions = tailer[2];
++	if (regions == 0 || regions > 8u || size < TAILER_SIZE + regions * REGION_SIZE) {
++		a34w_say("step 5: %s: the tailer says %u regions", FW_RAM_CODE, regions);
++		kfree_data(file, size);
++		return false;
++	}
++	end = size - TAILER_SIZE - regions * REGION_SIZE;
++	a34w_say("step 5: %s: %u bytes, %u regions, chip 0x%02x, version %.10s of %.14s", FW_RAM_CODE, size, regions,
++	    tailer[0], (const char *)(tailer + 7), (const char *)(tailer + 17));
++	for (uint32_t i = 0; i < regions && ok; i++) {
++		const uint8_t *r = file + end + i * REGION_SIZE;
++		uint32_t address = a34w_le32(r + 16), length = a34w_le32(r + 20);
++		uint8_t feature = r[24];
++
++		if ((feature & FEATURE_NOT_DOWNLOAD) || length == 0) {
++			at += length;
++			continue;
++		}
++		if (at + length > end || (length & 3u) != 0) {
++			a34w_say("step 5: region %u (%u bytes at file offset 0x%x) does not fit the file", i, length, at);
++			ok = false;
++			break;
++		}
++		if (feature & FEATURE_DL_TO_EMI) {
++			uint32_t offset = address & EMI_ADDR_MASK;
++
++			if (offset + length > A34W_EMI_SIZE) {
++				a34w_say("step 5: region %u: EMI +0x%x..0x%x is past CONNSYS's memory", i, offset, offset + length);
++				ok = false;
++				break;
++			}
++			memcpy((void *)(a34w_emi + offset), file + at, length);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			a34w_say("step 5: region %u: %u bytes to 0x%08x: into the EMI at +0x%x", i, length, address, offset);
++		} else if (feature & FEATURE_ENCRYPTED) {
++			a34w_say("step 5: region %u (to 0x%08x) is encrypted (feature 0x%02x): it needs the DMA download, "
++			    "not written here", i, address, feature);
++			ok = false;
++			break;
++		} else {
++			if (length > WF_WINDOW_SIZE) {
++				ok = false;
++				break;
++			}
++			/* downloadImgByDynMemMap(): the window shown the region's address, the data written through it */
++			a34w_wr(a34w_wf, WF_AP2WF_REMAP_1, address);
++			for (uint32_t w = 0; w < length; w += 4u) {
++				*(volatile uint32_t *)(a34w_wf + WF_WINDOW + w) = a34w_le32(file + at + w);
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			a34w_say("step 5: region %u: %u bytes to 0x%08x: through the AP2WF window (feature 0x%02x)", i, length,
++			    address, feature);
++		}
++		at += length;
++	}
++	kfree_data(file, size);
++	return ok;
++}
++
++static bool
++a34w_step5(void)
++{
++	uint32_t hvr = 0, fvr = 0, sync = 0, v;
++	uint8_t start[8], result[4] = { 0xff, 0, 0, 0 }, eid = 0, seq;
++	uint64_t t0;
++	int got;
++
++	if (!a34w_conn_reachable()) {
++		a34w_say("step 5: the CONN domain is off or protected (CONN_PWR_CON 0x%08x STA1 0x%08x): not touched",
++		    a34w_rd(a34w_ap, SPM_CONN_PWR_CON), a34w_rd(a34w_ap, INFRA_PROTECTEN_STA1));
++		return false;
++	}
++	if (!a34w_map_wf() || !a34w_driver_own()) {
++		return false;
++	}
++	sync = a34w_rd(a34w_conn, HOST_SW_SYNC0);
++	if ((sync & 3u) == 3u) {
++		a34w_say("step 5: the firmware already runs (CONN_ON_MISC 0x%08x): nothing to do", sync);
++		return true;
++	}
++	/* asicConnac2xCapInit() */
++	a34w_wr(a34w_conn, HOST_IRQ_ENA, 1u);
++	a34w_wr(a34w_conn, WFDMA_MCU2HOST_SW_INT_ENA, 0xffffu);
++	a34w_wfdma_init();
++
++	/* the ROM over the INIT channel: does TX ring 17 / RX ring 0 work at all */
++	if (!a34w_access_reg(TOP_HVR, &hvr) || !a34w_access_reg(TOP_FVR, &fvr)) {
++		a34w_say("step 5: the ROM did not answer ACCESS_REG (TX17 cidx/didx %u/%u, RX0 cidx/didx %u/%u, INT_STA 0x%08x)",
++		    a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0x8u),
++		    a34w_rd(a34w_conn, WFDMA_TX_RING(HW_TX_CMD_RING) + 0xcu),
++		    a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0x8u),
++		    a34w_rd(a34w_conn, WFDMA_RX_RING(HW_RX_EVENT_RING) + 0xcu), a34w_rd(a34w_conn, WFDMA_INT_STA));
++		return false;
++	}
++	a34w_say("step 5: the ROM answers: TOP_HVR 0x%08x TOP_FVR 0x%08x", hvr, fvr);
++
++	a34w_wr(a34w_ap, 0x3220u, 0);                   /* wlanConnacPccifon(): "Wi-Fi on" for the modem's PCCIF */
++	if (!a34w_ram_code_load()) {
++		return false;
++	}
++	bzero(start, sizeof(start));                    /* INIT_CMD_WIFI_START {u4Override 0, u4Address 0}: no RAM entry */
++	t0 = a34w_ms();
++	seq = a34w_init_cmd(INIT_CMD_ID_DYN_MEM_MAP_FW_FINISH, start, sizeof(start));
++	got = seq != 0 ? a34w_init_event(seq, &eid, result, sizeof(result), 3000) : -1;
++	if (got < 1 || eid != INIT_EVENT_ID_CMD_RESULT || result[0] != 0) {
++		a34w_say("step 5: FW_FINISH %s (event 0x%02x, status 0x%02x), mailbox 0x%08x, CONN_ON_MISC 0x%08x",
++		    seq == 0 ? "NOT SENT" : got < 0 ? "NOT ANSWERED" : "REFUSED", eid, result[0],
++		    a34w_rd(a34w_conn, HOST_MAILBOX_DBG), a34w_rd(a34w_conn, HOST_SW_SYNC0));
++		return false;
++	}
++	a34w_say("step 5: FW_FINISH answered in %llu ms", (unsigned long long)(a34w_ms() - t0));
++	if (!a34w_poll_mask(a34w_conn, HOST_SW_SYNC0, 3u, 3u, 500, 5000, &sync)) {
++		a34w_say("step 5: the firmware is NOT ready after 2.5 s: CONN_ON_MISC 0x%08x, mailbox 0x%08x", sync,
++		    a34w_rd(a34w_conn, HOST_MAILBOX_DBG));
++		return false;
++	}
++	v = a34w_rd(a34w_conn, SYSRAM_SW_WFDMA_OFFSET);
++	a34w_say("step 5: THE WI-FI FIRMWARE IS READY %llu ms after FW_FINISH: CONN_ON_MISC 0x%08x; its command mailbox "
++	    "(SW WFDMA) at EMI +0x%x", (unsigned long long)(a34w_ms() - t0), sync, v & EMI_ADDR_MASK);
++	return true;
++}
++
++/* ---- the thread: steps up to what is asked, one at a time ---- */
++
++static bool
++a34w_run_step(int step)
++{
++	switch (step) {
++	case 1:
++		return a34w_step1();
++	case 2:
++		return a34w_step2();
++	case 3:
++		return a34w_step3();
++	case 4:
++		return a34w_step4();
++	case 5:
++		return a34w_step5();
++	default:
++		return false;
++	}
++}
++
++static void
++a34w_thread(__unused void *arg, __unused wait_result_t result)
++{
++	for (;;) {
++		int step;
++
++		lck_mtx_lock(&a34w_run_mtx);
++		while (a34w_want <= a34w_done || a34w_failed != 0) {
++			a34w_busy = 0;
++			lck_mtx_sleep(&a34w_run_mtx, LCK_SLEEP_DEFAULT, (event_t)&a34w_chan, THREAD_UNINT);
++		}
++		a34w_busy = 1;
++		step = a34w_done + 1;
++		lck_mtx_unlock(&a34w_run_mtx);
++
++		if (!a34w_map()) {
++			lck_mtx_lock(&a34w_run_mtx);
++			a34w_failed = step;
++			lck_mtx_unlock(&a34w_run_mtx);
++			continue;
++		}
++		uint64_t t0 = a34w_ms();
++		bool ok = a34w_run_step(step);
++
++		a34w_say("step %d %s (%llu ms)%s", step, ok ? "done" : "FAILED: nothing more will be tried this boot",
++		    (unsigned long long)(a34w_ms() - t0), ok && step == (int)A34W_STEPS ? ": milestone 1 reached" : "");
++		lck_mtx_lock(&a34w_run_mtx);
++		if (ok) {
++			a34w_done = step;
++		} else {
++			a34w_failed = step;
++		}
++		lck_mtx_unlock(&a34w_run_mtx);
++	}
++}
++
++/* Asks for steps up to `step` (1..A34W_STEPS); the thread is started on the first request. */
++static int
++a34w_ask(int step)
++{
++	thread_t thread;
++
++	if (step < 1 || step > (int)A34W_STEPS) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&a34w_run_mtx);
++	if (a34w_failed != 0) {
++		lck_mtx_unlock(&a34w_run_mtx);
++		a34w_say("asked for step %d, but step %d failed this boot: not trying again", step, a34w_failed);
++		return EIO;
++	}
++	if (step > a34w_want) {
++		a34w_want = step;
++		a34w_busy = a34w_want > a34w_done;
++	}
++	if (!a34w_thread_started) {
++		if (kernel_thread_start(a34w_thread, NULL, &thread) != KERN_SUCCESS) {
++			lck_mtx_unlock(&a34w_run_mtx);
++			a34w_say("kernel_thread_start failed");
++			return ENOMEM;
++		}
++		thread_deallocate(thread);
++		a34w_thread_started = true;
++	}
++	thread_wakeup((event_t)&a34w_chan);
++	lck_mtx_unlock(&a34w_run_mtx);
++	return 0;
++}
++
++/* ---- sysctl kern.a34wifi: want (root writes N), done, busy, log ---- */
++
++SYSCTL_NODE(_kern, OID_AUTO, a34wifi, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "A34 Wi-Fi bring-up (docs/wifi-plan.md)");
++
++static int
++a34w_sysctl_want SYSCTL_HANDLER_ARGS
++{
++	int value = a34w_want, changed = 0;
++	int error;
++
++	(void)arg1;
++	(void)arg2;
++	(void)oidp;
++	error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	return a34w_ask(value);
++}
++
++SYSCTL_PROC(_kern_a34wifi, OID_AUTO, want, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    a34w_sysctl_want, "I", "steps asked for (write N: 1..5)");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, done, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_done, 0, "steps done");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, busy, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_busy, 0, "working");
++SYSCTL_INT(_kern_a34wifi, OID_AUTO, failed, CTLFLAG_RD | CTLFLAG_LOCKED, &a34w_failed, 0, "the step that failed");
++
++static int
++a34w_sysctl_log SYSCTL_HANDLER_ARGS
++{
++	int error;
++
++	(void)arg1;
++	(void)arg2;
++	(void)oidp;
++	lck_mtx_lock(&a34w_log_mtx);
++	error = SYSCTL_OUT(req, a34w_log, a34w_log_len + 1u);
++	lck_mtx_unlock(&a34w_log_mtx);
++	return error;
++}
++
++SYSCTL_PROC(_kern_a34wifi, OID_AUTO, log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    a34w_sysctl_log, "A", "the Wi-Fi bring-up's log");
++
++/* bsd/dev/sweet_ufs.c, at boot: a34wifi=N asks for steps up to N now; otherwise nothing */
++void
++a34_wifi_init(void)
++{
++	int step = 0;
++
++	if (!PE_parse_boot_argn("a34wifi", &step, sizeof(step)) || step <= 0) {
++		return;
++	}
++	if (step > (int)A34W_STEPS) {
++		step = (int)A34W_STEPS;
++	}
++	a34w_say("boot-arg a34wifi=%d", step);
++	(void)a34w_ask(step);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9b19d93..79988d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void a34_touch_init(void);
+ extern void a34_diag_init(void);
+ extern void a34_mali_init(void);
+ extern void a34_clocks_init(void);
++extern void a34_wifi_init(void);         /* A34 (0939): bsd/dev/a34_wifi.c */
+ extern void sweet_touch_init(void);
+ extern void sweet_goodix_spi_kick(void);
+ extern void sweet_usb_probe(void);
+@@ -712,6 +713,7 @@ sweet_ufs_init(void)
+ 	a34_clocks_init();      /* 0921: clocks and voltages as the boot loader left them; a34gpumhz */
+ 	a34_diag_init();
+ 	a34_mali_init();        /* 0907: GPU bring-up, its own thread; a34mali=1 */
++	a34_wifi_init();        /* 0939: Wi-Fi bring-up, its own thread; a34wifi=N or sysctl kern.a34wifi.want */
+ 	int keys = 0;
+ 	if (PE_parse_boot_argn("rubkeys", &keys, sizeof(keys)) && keys == 1)
+ 		ruby_keys_init();
