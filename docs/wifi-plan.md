@@ -609,6 +609,10 @@ address: services named `sdio`, `wlan`, `marconi-wifi` (none), then a wait for a
   nothing, if one is missing; leaves the `com.a34.wifi` fallback job; makes `/a34/wifi/network`
   root's, mode 0600, without reading it.
 
+Built in CI with every patch through 0995:
+[43729951490](https://github.com/VertexSelection/a34-ios/actions/runs/43729951490) (no warnings of
+our own); `a34wifi` [43729951074](https://github.com/VertexSelection/a34-ios/actions/runs/43729951074).
+
 **The Settings test**: kernel with 0995; `sudo tools/wifi-settings-setup.sh /mnt`; keep the
 `a34wifi connect` job. In the log: `A34WLAN: en0 in the registry ("wlan": ...)`, `exec wifid`,
 `A34 WIFI: apple80211: wifid gets/sets ...` (the request list says what wifid needs: a REFUSED
