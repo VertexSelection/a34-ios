@@ -559,6 +559,13 @@ What wifid (and through it Settings and the status bar) needs, after HackiOS (`r
   simulated firmware and its results, a join with the name alone, ASSOCIATE_RESULT 1, STATE 4,
   the events in order.
 
+**Built in CI** with every patch through 0988 (0963-0969 apply in numeric order before 0970):
+0967 [43724219300](https://github.com/VertexSelection/a34-ios/actions/runs/43724219300), 0968
+[43725478583](https://github.com/VertexSelection/a34-ios/actions/runs/43725478583), 0969
+[43726426826](https://github.com/VertexSelection/a34-ios/actions/runs/43726426826) (A34WLAN.cpp and
+a34_apple80211.c compiled and linked, no warnings of our own); `a34wifi`
+[43726426380](https://github.com/VertexSelection/a34-ios/actions/runs/43726426380).
+
 **The next test** (kernel with 0963-0969 and the rest of main; network file as before):
 
 1. Job `a34wifi connect` as before. Expect at step 8 `joining as an HT (20 MHz, one stream) QoS
