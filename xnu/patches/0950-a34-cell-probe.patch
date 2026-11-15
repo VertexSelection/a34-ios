@@ -15,10 +15,10 @@ index 70c2540..bc4c017 100644
  bsd/dev/sweet_keys.c			standard
 diff --git a/bsd/dev/a34_ccci.c b/bsd/dev/a34_ccci.c
 new file mode 100644
-index 0000000..ecdc24f
+index 0000000..80d13fa
 --- /dev/null
 +++ b/bsd/dev/a34_ccci.c
-@@ -0,0 +1,2163 @@
+@@ -0,0 +1,2170 @@
 +/*
 + * A34 (0951): cellular stage 1b -- the modem's control path, boot-arg a34cell=3.
 + *
@@ -2102,12 +2102,19 @@ index 0000000..ecdc24f
 +		uint8_t rec[64];
 +		uint32_t sz = 0;
 +		int e = a34_cellfs_nvdata_file("/APCFG/APRDCL/MD_SBP", rec, sizeof(rec), &sz);
-+		if (e == 0 && sz == 24) {
-+			uint32_t v = le32(rec);
-+			if ((int32_t)v > 0)
++		/* 24-byte record; libnvram's files may carry a 2-byte checksum after it (26 bytes):
++		 * ccci_mdinit reads the record from the start of the file (NVM_GetFileDesc, read 24). */
++		uint32_t at = 0;
++		bool ok = e == 0 && (sz == 24 || sz == 26);
++		if (ok && sz == 26 && le32(rec) >= 0x10000u && le32(rec + 2) < 0x10000u)
++			at = 2;                 /* not a plausible SBP at 0, but at 2: a 2-byte header */
++		if (ok) {
++			uint32_t v = le32(rec + at);
++			if ((int32_t)v > 0 && v < 0x10000u)
 +				sbp_code = v;
-+			printf("A34 CELL: SBP: nvdata APCFG/APRDCL/MD_SBP (%u bytes): %s\n", sz,
-+			    (int32_t)v > 0 ? "its md1 value is sent, as ccci_mdinit" : "no md1 value: 0 is sent");
++			printf("A34 CELL: SBP: nvdata APCFG/APRDCL/MD_SBP (%u bytes, record at +%u): %s\n", sz, at,
++			    (int32_t)v > 0 && v < 0x10000u ? "its md1 value is sent, as ccci_mdinit" :
++			    "no plausible md1 value: 0 is sent");
 +		} else {
 +			printf("A34 CELL: SBP: nvdata APCFG/APRDCL/MD_SBP %s (%u bytes): 0 is sent\n",
 +			    e == 0 ? "has an unknown layout" : sz ? "not readable" : "not found", sz);
